@@ -5502,7 +5502,9 @@ class ContextBuilder:
         # longer match and the KV prefix would break. Freezing the profile
         # hash keeps the whole Block A prefix stable for the window; a profile
         # change is picked up when the window ends and Block A rebuilds.
-        pstate["block_a_frozen_profile_hash"] = self._f._user_profile.cache_hash(project_id)
+        pstate["block_a_frozen_profile_hash"] = self._f._user_profile.cache_hash(
+            project_id
+        )
         pstate["block_a_freeze_edits_used"] = 0
         pstate["block_a_freeze_capture_turn"] = capture_turn
         psm.set_structure_hash_for_cache(project_id, structure_hash)
@@ -6678,10 +6680,7 @@ class ContextBuilder:
                 if body:
                     # ── Step 3: cap oversized bodies (parity with LOD-3) ──
                     _cap = self._f.valves.max_code_block_tokens
-                    if (
-                        _cap > 0
-                        and self._f._tokens.estimate_code_tokens(body) > _cap
-                    ):
+                    if _cap > 0 and self._f._tokens.estimate_code_tokens(body) > _cap:
                         body = (
                             self._f._tokens.truncate_text_to_tokens(body, _cap)
                             + "\n# ... [truncated — use /expand for full body]"
@@ -11898,7 +11897,9 @@ class LLMOrchestrator:
     # 2. Main LLM caller (with retries, cache, deduplication)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def _align_system_to_prefix(self, system_prompt: str, effective_model: str) -> str:
+    def _align_system_to_prefix(
+        self, system_prompt: str, effective_model: str, prompt: str = ""
+    ) -> str:
         """Prepend the turn's preliminary system prompt to an auxiliary call.
 
         The 'against N' server logs settled how the checkpoint pool dies: a
@@ -11910,9 +11911,10 @@ class LLMOrchestrator:
         turns restored @78140 at 36 t/s; one bare call killed the pool and
         every turn after it re-prefilled ~78k tokens for 62-75s.
 
-        e2f91d0 aligned the four metacognitive calls by hand. This is the
-        general fix at the single choke point every auxiliary call passes
-        through, guarded three ways:
+        e2f91d0 aligned the four metacognitive calls by hand and left ~36
+        labels bare; that partial fix has been removed in favour of this one,
+        which sits at the single choke point every auxiliary call passes
+        through. Guarded three ways:
 
         - SAME MODEL ONLY. The prefix is a free checkpoint restore only on
           the slot that holds it. Against any other model it would be a
@@ -11920,8 +11922,10 @@ class LLMOrchestrator:
           model (override or default) and the guard compares basenames with
           the turn's main model — backends may prefix ids
           ('llamacpp/<name>' vs '<name>').
-        - IDEMPOTENT. Calls that already carry the prefix (the metacognitive
-          four, the agentic steps via _aligned_prefix) pass through intact.
+        - IDEMPOTENT BY HEAD. The agentic steps build their own aligned
+          prefix via _aligned_prefix, which head-caps it when prelim exceeds
+          the window; comparing heads recognises both the exact and the
+          capped form, so neither is prefixed twice.
         - BUDGETED. If prefix + role would not leave room for the response
           inside the context window, the call goes out bare — the old
           behaviour, always correct, merely slower.
@@ -11932,17 +11936,62 @@ class LLMOrchestrator:
         """
         if not getattr(self._f.valves, "align_aux_calls_to_prefix", True):
             return system_prompt
+        # ── Guard: mutual exclusion with the sidecar ────────────────────────
+        # The slot-persistence continuity protocol predates central
+        # alignment and does not know about it: aligned_hot is set only by
+        # the agentic steps, while the per-call continuity sites mark
+        # dirtied=True / aligned_hot=False unconditionally after every
+        # auxiliary call. A centrally-aligned call would therefore leave the
+        # slot holding this turn's prefix, be recorded as dirt, and the
+        # authoritative end-of-inlet decision would restore the PREVIOUS
+        # turn's .bin over the fresh prefix — sabotaging the alignment and
+        # guaranteeing the main call a full re-prefill. Until the protocol
+        # is taught about central alignment (its own design and test), the
+        # sidecar path runs exactly as it always did: bare auxiliary
+        # prompts. This also keeps the A/B honest — enable_slot_persistence
+        # ON reproduces the old system verbatim with one valve.
+        if getattr(self._f.valves, "enable_slot_persistence", False):
+            return system_prompt
         _prelim = getattr(self._f, "_prelim_system_this_turn", "") or ""
         if not _prelim:
             return system_prompt
-        if system_prompt.startswith(_prelim):
+        # ── Guard: idempotence, by HEAD rather than by whole prefix ────────
+        # AgenticStepExecutor._aligned_prefix head-caps its copy when prelim
+        # exceeds the window, and a capped copy does not satisfy
+        # startswith(_prelim) — the full prefix would then be prepended in
+        # front of the truncated one. Comparing heads recognises the exact
+        # and the capped form alike. 512 bytes is safe in both directions:
+        # that cap floors at 8000 tokens (~32k chars), so any capped copy is
+        # far longer than this window, while no role instruction opens with
+        # the same 512 bytes as Block A.
+        _head = _prelim[:512]
+        if system_prompt[:512] == _head:
             return system_prompt
         # ── Guard: the call must target the model whose slot holds the prefix ──
         _main = getattr(self._f, "_main_model_this_turn", "") or ""
         _aux = effective_model or ""
         if not _main or not _aux or _main.split("/")[-1] != _aux.split("/")[-1]:
+            # A name mismatch here (e.g. an OpenWebUI alias in body['model']
+            # vs the configured llm_model) silently disables alignment for
+            # the whole deployment — the symptom in a run would just be "the
+            # fix changed nothing". Log it once per turn so it is
+            # diagnosable without drowning debug output in 40 repeats.
+            if (
+                _main
+                and _aux
+                and not getattr(self._f, "_align_reject_logged_this_turn", False)
+            ):
+                self._f._align_reject_logged_this_turn = True
+                self._f._log_debug(
+                    f"prefix alignment skipped: aux model '{_aux}' does not "
+                    f"match turn model '{_main}' (basename comparison); "
+                    "auxiliary calls go out bare this turn"
+                )
             return system_prompt
         # ── Guard: the aligned call must still fit the context window ──────
+        # Measured over prefix + role + THE PROMPT ITSELF: summarize and
+        # raptor calls carry multi-10k-token prompts, and prefix + role
+        # fitting is no guarantee the whole request does.
         if self._f.tokenizer:
             try:
                 budget = (
@@ -11950,7 +11999,8 @@ class LLMOrchestrator:
                     - self._f.valves.response_reserve_tokens
                     - 4000
                 )
-                if len(self._f.tokenizer.encode(_prelim + system_prompt)) > budget:
+                _total = _prelim + system_prompt + (prompt or "")
+                if len(self._f.tokenizer.encode(_total)) > budget:
                     return system_prompt
             except Exception:
                 return system_prompt
@@ -12016,6 +12066,7 @@ class LLMOrchestrator:
             system_prompt = self._align_system_to_prefix(
                 system_prompt,
                 model_override or self._f.valves.llm_model or "",
+                prompt=prompt,
             )
 
         dedup_key = hashlib.md5(
@@ -12395,7 +12446,9 @@ class AgenticStep:
     symbols: List[str] = field(default_factory=list)
     cached: bool = False
     skip_reason: str = ""
-    display_no: int = 0  # 1-based execution position for user-facing labels; id stays the stable cache/ledger key
+    display_no: int = (
+        0  # 1-based execution position for user-facing labels; id stays the stable cache/ledger key
+    )
 
 
 @dataclass
@@ -12405,7 +12458,9 @@ class AgenticPlan:
     steps: List[AgenticStep] = field(default_factory=list)
     source: str = "manual_fixed"
     rationale: str = ""
-    ask: str = ""  # planner-level clarification question; honored only when steps is empty
+    ask: str = (
+        ""  # planner-level clarification question; honored only when steps is empty
+    )
 
 
 @dataclass
@@ -13153,8 +13208,7 @@ class AgenticToolBroker:
             _shown = body[:_cap]
             _total = len(body)
             body = (
-                _shown
-                + f"\n# ... [truncated by broker: showing {_cap} of {_total} "
+                _shown + f"\n# ... [truncated by broker: showing {_cap} of {_total} "
                 f"chars. To see the rest, GREP a distinctive token from the "
                 f"missing region, or state that the tail of {qid} was not "
                 f"inspected — do NOT guess its remaining calls.]"
@@ -14632,10 +14686,10 @@ class AgenticPreplanner:
         "question and leave chosen empty.\n\n"
         "When you are ready to answer (no more TOOL lines), reply ONLY "
         "with a JSON object, no prose, no fences:\n"
-        "{\"framings\": [\"...\", \"...\"], \"chosen\": \"<the framing "
-        "you pick, verbatim>\", \"rationale\": \"<one sentence, "
-        "evidence-based>\", \"memory_findings\": \"<one short line on "
-        "what memory contributed, or empty>\", \"ask\": \"\"}\n\n"
+        '{"framings": ["...", "..."], "chosen": "<the framing '
+        'you pick, verbatim>", "rationale": "<one sentence, '
+        'evidence-based>", "memory_findings": "<one short line on '
+        'what memory contributed, or empty>", "ask": ""}\n\n'
         "{tool_results}"
         "Request:\n{question}"
     )
@@ -14716,9 +14770,7 @@ class AgenticPreplanner:
         if not response:
             return None
         try:
-            cleaned = (
-                response.replace("```json", "").replace("```", "").strip()
-            )
+            cleaned = response.replace("```json", "").replace("```", "").strip()
             start = cleaned.find("{")
             end = cleaned.rfind("}")
             if start < 0 or end <= start:
@@ -14744,9 +14796,7 @@ class AgenticPreplanner:
             A capped markdown block ending in a blank line, or "".
         """
         framings = [
-            str(f).strip()[:220]
-            for f in (data.get("framings") or [])
-            if str(f).strip()
+            str(f).strip()[:220] for f in (data.get("framings") or []) if str(f).strip()
         ][:3]
         chosen = str(data.get("chosen", "") or "").strip()[:220]
         rationale = str(data.get("rationale", "") or "").strip()[:300]
@@ -14754,8 +14804,7 @@ class AgenticPreplanner:
         if not chosen or not framings:
             return ""
         lines = [
-            "Pre-planning brief (the WHAT, explored before you decide the "
-            "HOW):",
+            "Pre-planning brief (the WHAT, explored before you decide the " "HOW):",
             "Framings considered:",
         ]
         lines += [f"{i}. {f}" for i, f in enumerate(framings, 1)]
@@ -14840,14 +14889,11 @@ class AgenticPreplanner:
             rendered: List[str] = []
             for q in queries:
                 try:
-                    res = await self._broker.resolve_async(
-                        "MEMORY", q, project_id
-                    )
+                    res = await self._broker.resolve_async("MEMORY", q, project_id)
                 except Exception as e:
                     res = f"[MEMORY({q}) failed: {e}]"
                 self._f._log_debug(
-                    f"🧭 Preplanner: MEMORY('{q[:60]}') → "
-                    f"{len(res)} chars"
+                    f"🧭 Preplanner: MEMORY('{q[:60]}') → " f"{len(res)} chars"
                 )
                 rendered.append(f"MEMORY({q}) →\n{res}")
             tool_results = (
@@ -14872,8 +14918,7 @@ class AgenticPreplanner:
         }
         if ask and not chosen:
             self._f._log_debug(
-                f"🧭 Preplanner: no framing defensible — asking "
-                f"('{ask[:80]}')"
+                f"🧭 Preplanner: no framing defensible — asking " f"('{ask[:80]}')"
             )
             return "", ask
         if brief:
@@ -14886,9 +14931,7 @@ class AgenticPreplanner:
             )
             self._f._log_debug(f"🧭 Preplanner brief:\n{brief.strip()}")
         else:
-            self._f._log_debug(
-                "🧭 Preplanner: parsed but no usable framing — no brief"
-            )
+            self._f._log_debug("🧭 Preplanner: parsed but no usable framing — no brief")
         return brief, ""
 
 
@@ -14924,9 +14967,9 @@ class AgenticPlanner:
         "Rules:\n"
         "- 2 to {max_steps} steps.\n"
         "- If, and ONLY if, the question is so ambiguous that ANY plan would "
-        "likely investigate the wrong thing (e.g. \"fix the bug\" without "
+        'likely investigate the wrong thing (e.g. "fix the bug" without '
         "naming a bug and with no error or traceback anywhere in the "
-        "context), output instead {\"ask\": \"<one concrete question>\"} "
+        'context), output instead {"ask": "<one concrete question>"} '
         "with NO steps. When a reasonable default interpretation exists, "
         "plan it — do not ask.\n"
         "- kind must be one of: investigate (gather facts), hypothesize "
@@ -15092,9 +15135,7 @@ class AgenticPlanner:
         if not response:
             return ""
         try:
-            cleaned = (
-                response.replace("```json", "").replace("```", "").strip()
-            )
+            cleaned = response.replace("```json", "").replace("```", "").strip()
             data = json.loads(cleaned)
             if not isinstance(data, dict):
                 return ""
@@ -15168,9 +15209,7 @@ class AgenticPlanner:
         response rejected with no trace of why).
         """
         if not response:
-            self._f._log_debug(
-                "🤖 Planner: empty response → fixed plan"
-            )
+            self._f._log_debug("🤖 Planner: empty response → fixed plan")
             return None
         cleaned = response.replace("```json", "").replace("```", "").strip()
         # The planner is a reasoning model and often wraps its JSON in prose
@@ -15215,8 +15254,7 @@ class AgenticPlanner:
                 continue
             if kind not in self._VALID_KINDS:
                 self._f._log_debug(
-                    f"🤖 Planner: unknown kind '{kind}' coerced to "
-                    "investigate"
+                    f"🤖 Planner: unknown kind '{kind}' coerced to " "investigate"
                 )
                 kind = "investigate"
             steps.append(
@@ -15659,11 +15697,7 @@ class AgenticSynthesisComposer:
         # not another textual plea.
         if _all_citations_invalid:
             _ghost_syms = sorted(
-                {
-                    q
-                    for c in ledger.claims
-                    for q in (c.invalid_qids or [])
-                }
+                {q for c in ledger.claims for q in (c.invalid_qids or [])}
             )
             _ghost_hint = (
                 f" The investigated name(s) not found in the index: "
@@ -15766,9 +15800,7 @@ class AgenticSynthesisComposer:
             and not _all_citations_invalid
             and _claims_total > 0
         ):
-            _ratio = (
-                _claims_bad / _claims_total if _claims_total > 0 else 0.0
-            )
+            _ratio = _claims_bad / _claims_total if _claims_total > 0 else 0.0
             _suspect = _ratio >= float(
                 getattr(self._f.valves, "premortem_suspect_ratio", 0.34)
             )
@@ -16861,21 +16893,19 @@ class AgenticOrchestrator:
                 and _pre_ask
                 and len(_pre_ask) >= 8
             ):
-                await self._f._emit_status(
-                    "🧭 Pre-planner: clarification needed"
-                )
-                self._append_clarification_injections(
-                    dynamic_injections, _pre_ask
-                )
+                await self._f._emit_status("🧭 Pre-planner: clarification needed")
+                self._append_clarification_injections(dynamic_injections, _pre_ask)
                 self._f._log_debug(
-                    "🧭 Preplanner requested clarification — pipeline not "
-                    "started"
+                    "🧭 Preplanner requested clarification — pipeline not " "started"
                 )
                 return
 
         await self._f._emit_status("🤖 Agentic: planning…")
         plan = await self._planner.plan(
-            question, aligned_prefix, slot_free, project_id,
+            question,
+            aligned_prefix,
+            slot_free,
+            project_id,
             preplan_brief=preplan_brief,
         )
         self._f._log_debug(
@@ -16896,8 +16926,7 @@ class AgenticOrchestrator:
             await self._f._emit_status("🤖 Agentic: clarification needed")
             self._append_clarification_injections(dynamic_injections, plan.ask)
             self._f._log_debug(
-                "🤖 Agentic: planner requested clarification — pipeline "
-                "not started"
+                "🤖 Agentic: planner requested clarification — pipeline " "not started"
             )
             return
 
@@ -17089,7 +17118,8 @@ class AgenticOrchestrator:
                     _rem_compete,
                     project_id,
                     status_prefix=(
-                        f"🤖 Agentic step {step.display_no}/{len(plan.steps)} " f"(hypothesize)"
+                        f"🤖 Agentic step {step.display_no}/{len(plan.steps)} "
+                        f"(hypothesize)"
                     ),
                 )
                 if _slot_dirtied and self._f.valves.enable_slot_persistence:
@@ -17771,6 +17801,7 @@ class ReasoningHelper:
             return f"{prefix}\n\n{response}"
 
         return "Unable to generate reasoning."
+
 
 class MultiPhasePlanner:
     """Generates the multi‑phase protocol instructions injected into the
@@ -24084,42 +24115,6 @@ class MetacognitiveReasoningEngine:
         self._performance_history: Dict[str, List["CompetitionRecord"]] = {}
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 0. KV alignment — share the turn's prefix instead of evicting it
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _aligned_system(self, role_instruction: str) -> str:
-        """Prefix a metacognitive role instruction with the turn's prelim.
-
-        These calls are small — 134 to 620 tokens — and used to go out as
-        bare prompts sharing nothing with the ~74k context resident in the
-        slot. llama.cpp cannot reuse a prefix that is not there, so each one
-        erased the whole checkpoint pool (two checkpoints, 422 MiB, measured)
-        and left a 33-token one in its place. Fourteen of them run inside a
-        single hypothesize step, between the last aligned agentic step and
-        the main inference — so by the time the real answer is generated,
-        the prefix its own pipeline had just paid ~62s to build is gone, and
-        it pays again. The competition's true cost was never its own calls
-        (1-5s each); it was the re-prefill it billed to the main call.
-
-        Returning prelim + role makes each call a prefix EXTENSION of what
-        the slot already holds, exactly as AgenticStepExecutor._aligned_prefix
-        does for steps: the shared head restores from a checkpoint and only
-        the role line plus the user turn are processed. The extra tokens are
-        free in wall time precisely because they are already computed.
-
-        The prefix is a head, never a tail, or the invariant breaks. Falls
-        back to the bare instruction when the stash is absent (an auxiliary
-        call outside a normal turn, or the valve off), which is the current
-        behaviour and always correct — just slower.
-        """
-        if not self._f.valves.agentic_align_metacog_calls:
-            return role_instruction
-        _prelim = getattr(self._f, "_prelim_system_this_turn", "") or ""
-        if not _prelim:
-            return role_instruction
-        return f"{_prelim}\n\n---\n\n{role_instruction}"
-
-    # ═══════════════════════════════════════════════════════════════════════
     # 1. Epistemic toolkit — evidence collection and analysis
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -24653,7 +24648,7 @@ class MetacognitiveReasoningEngine:
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt=self._aligned_system(
+            system_prompt=(
                 "You are a structural claim classifier for software architecture. "
                 "Output ONLY a valid JSON object with three keys: "
                 "'critical', 'supportive', 'unknown' (all lists of strings). "
@@ -24751,7 +24746,7 @@ class MetacognitiveReasoningEngine:
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt=self._aligned_system(
+            system_prompt=(
                 "You are a structural prediction generator for software architecture. "
                 "Output ONLY a valid JSON object with key 'predictions' "
                 "(list of strings). "
@@ -25025,9 +25020,7 @@ class MetacognitiveReasoningEngine:
                 kept.append((t, conf))
                 continue
             dup = any(
-                difflib.SequenceMatcher(
-                    None, t.lower(), k.lower()
-                ).ratio() > 0.8
+                difflib.SequenceMatcher(None, t.lower(), k.lower()).ratio() > 0.8
                 for k, _ in kept
             )
             if not dup:
@@ -25108,14 +25101,10 @@ class MetacognitiveReasoningEngine:
             label=f"{label}_presearch_div" if label else "sci_presearch_div",
         )
         if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(
-                project_id
-            )
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
         if not response:
             return []
-        return MetacognitiveReasoningEngine._parse_hypotheses_from_response(
-            response
-        )
+        return MetacognitiveReasoningEngine._parse_hypotheses_from_response(response)
 
     async def _generate_abductive_hypotheses(
         self,
@@ -25145,11 +25134,14 @@ class MetacognitiveReasoningEngine:
             (text, confidence) tuples parsed from the response; [] on failure.
         """
         # ── Step 1: obituary of the dead hypothesis space ───────────────────
-        obituary = "\n".join(
-            f"- '{s.text}' — falsified: {s.falsification_reason or 'unknown'}"
-            for s in falsified
-            if s.falsified
-        ) or "- (no detail available)"
+        obituary = (
+            "\n".join(
+                f"- '{s.text}' — falsified: {s.falsification_reason or 'unknown'}"
+                for s in falsified
+                if s.falsified
+            )
+            or "- (no detail available)"
+        )
         prompt = (
             f"ALL of these hypotheses were falsified against the real code "
             f"graph:\n{obituary}\n\n"
@@ -25179,14 +25171,10 @@ class MetacognitiveReasoningEngine:
             label=f"{label}_abductive" if label else "sci_abductive",
         )
         if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(
-                project_id
-            )
+            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
         if not response:
             return []
-        return MetacognitiveReasoningEngine._parse_hypotheses_from_response(
-            response
-        )
+        return MetacognitiveReasoningEngine._parse_hypotheses_from_response(response)
 
     async def _generate_divergent_hypotheses(
         self,
@@ -25637,15 +25625,13 @@ class MetacognitiveReasoningEngine:
             # (low coverage — the indexed code does not carry enough evidence
             # to rule anything in or out). Popper's falsified-vs-not-testable,
             # surfaced instead of a flat failure. Verdict itself unchanged.
-            _abstain = (
-                getattr(self._f.valves, "enable_abstention", False)
-                and _avg_cov
-                < float(getattr(self._f.valves, "abstention_coverage_floor", 0.35))
+            _abstain = getattr(
+                self._f.valves, "enable_abstention", False
+            ) and _avg_cov < float(
+                getattr(self._f.valves, "abstention_coverage_floor", 0.35)
             )
             if _abstain:
-                await self._f._emit_status(
-                    "🤔 Insufficient evidence — abstaining"
-                )
+                await self._f._emit_status("🤔 Insufficient evidence — abstaining")
                 self._f._log_debug(
                     f"compete_hypotheses: abstaining (avg coverage "
                     f"{_avg_cov:.2f} < floor) — evidence insufficient, not "
@@ -25855,7 +25841,7 @@ class MetacognitiveReasoningEngine:
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt=self._aligned_system(
+            system_prompt=(
                 "You are a scientific experiment designer for software architecture. "
                 "Output ONLY a valid JSON object with 'claim' (string) and "
                 "'supports' ('H1' or 'H2'). "
@@ -26222,7 +26208,7 @@ class MetacognitiveReasoningEngine:
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt=self._aligned_system(
+            system_prompt=(
                 "You are a devil's advocate for software architecture hypotheses. "
                 "Find real structural flaws grounded in the evidence provided. "
                 "Output ONLY a valid JSON object with 'has_flaw' (bool) and "
@@ -26407,6 +26393,7 @@ class MetacognitiveReasoningEngine:
     # ═══════════════════════════════════════════════════════════════════════
     # 7. QueryDecomposition (Capa 1)
     # ═══════════════════════════════════════════════════════════════════════
+
 
 class HistoryCompressor:
     """
@@ -30660,9 +30647,7 @@ class InletOrchestrator:
         budget = int(getattr(self._f.valves, "paste_diet_max_chars", 100_000))
         if budget <= 0 or not messages:
             return messages
-        target = next(
-            (m for m in reversed(messages) if m.get("role") == "user"), None
-        )
+        target = next((m for m in reversed(messages) if m.get("role") == "user"), None)
         if target is None:
             return messages
         content = self._f._coerce_message_content(target.get("content"))
@@ -30696,17 +30681,13 @@ class InletOrchestrator:
             if span_len < self._PASTE_DIET_SPAN_FLOOR:
                 continue
             code = blk.get("code", "") or ""
-            known = blocks_by_hash.get(
-                hashlib.md5(code.encode()).hexdigest()[:16]
-            )
+            known = blocks_by_hash.get(hashlib.md5(code.encode()).hexdigest()[:16])
             if known is None:
                 continue
             name = blk.get("file_path") or known.file_path or "pasted code"
             sym_count = len(getattr(known, "symbols", []) or []) or "?"
             stub = self._indexed_reference_line(name, sym_count)
-            new_content = (
-                new_content[:span_start] + stub + new_content[span_end:]
-            )
+            new_content = new_content[:span_start] + stub + new_content[span_end:]
             replaced += 1
             saved_chars += span_len - len(stub)
 
@@ -30736,6 +30717,16 @@ class InletOrchestrator:
             self._f._symbol_index.clear_project(self._f._last_project_id)
             self._f._project_state_manager.clear_project(self._f._last_project_id)
             self._f._block_change_summaries.clear()
+            # The prelim stash belongs to the project that built it. The
+            # Filter is a singleton across conversations, and the new
+            # project's early auxiliary calls (classify_turn fires before
+            # Block B is rebuilt) would otherwise be prefix-aligned to the
+            # PREVIOUS project's code context — a cross-project leak into
+            # their prompts, and a prefix that buys nothing since this
+            # project's turns will never extend it. Cleared, those early
+            # calls go out bare (correct, merely uncached) until this
+            # project's Block B populates the stash again.
+            self._f._prelim_system_this_turn = ""
 
         self._f._last_project_id = project_id
 
@@ -31805,7 +31796,7 @@ _INJECTION_TRAILING = ("trailing",)
 
 
 def _order_injections_for_render(
-    selected: List[Tuple[str, str]]
+    selected: List[Tuple[str, str]],
 ) -> List[Tuple[str, str]]:
     """Move trailing injections after all others, preserving relative order.
 
@@ -31999,11 +31990,11 @@ class SystemPromptBuilder:
         )
         # Turn-scoped stash, mirroring _original_system_prompt. The agentic
         # executor receives prelim_system as a parameter and aligns its steps
-        # to it; the metacognitive calls fired from inside a hypothesize step
-        # are several frames below that parameter and had no way to reach it,
-        # so they went out as bare few-hundred-token prompts and evicted the
-        # shared prefix from llama.cpp's checkpoint pool. See
-        # MetacognitiveReasoningEngine._aligned_system.
+        # to it, but the ~40 auxiliary calls are several frames below that
+        # parameter and had no way to reach it, so they went out as bare
+        # few-hundred-token prompts and evicted the shared prefix from
+        # llama.cpp's checkpoint pool. This stash is how they reach it: see
+        # LLMOrchestrator._align_system_to_prefix.
         self._f._prelim_system_this_turn = prelim_system
 
         pstate["last_activation_scores"] = getattr(
@@ -33581,10 +33572,7 @@ class MessageAssembler:
         # outranks automatic detection, and the pipeline injects its own
         # workspace so the normal CoT path must not also run this turn.
         # ------------------------------------------------------------------
-        if (
-            not is_continuation
-            and user_content.strip().startswith("/agent")
-        ):
+        if not is_continuation and user_content.strip().startswith("/agent"):
             handled = await self._f._agentic.handle_command(
                 user_content=user_content,
                 prelim_system=prelim_system,
@@ -34188,9 +34176,7 @@ class MessageAssembler:
         """
         # ── Step 1: collect the declared rules ─────────────────────────────
         _rules: List[str] = []
-        _clang = str(
-            getattr(self._f.valves, "code_comment_language", "") or ""
-        ).strip()
+        _clang = str(getattr(self._f.valves, "code_comment_language", "") or "").strip()
         if _clang:
             _rules.append(
                 f"write every code comment and docstring in {_clang} "
@@ -34206,11 +34192,7 @@ class MessageAssembler:
         if not _rules:
             return ""
         # ── Step 2: render as one bracketed line ───────────────────────────
-        return (
-            "_[When you write code in this reply: "
-            + "; ".join(_rules)
-            + ".]_"
-        )
+        return "_[When you write code in this reply: " + "; ".join(_rules) + ".]_"
 
     def _assemble_final_system_and_log(
         self,
@@ -34717,9 +34699,7 @@ class UserProfileManager:
         raw_parts: List[str] = []
         if prof:
             items = sorted(
-                (k, str(v.get("value", "")))
-                for k, v in prof.items()
-                if v.get("value")
+                (k, str(v.get("value", ""))) for k, v in prof.items() if v.get("value")
             )
             raw_parts.extend(f"{k}={val}" for k, val in items)
         # ── Declared valves: part of the rendered block, part of the key ──
@@ -35024,7 +35004,9 @@ class UserProfileManager:
                 )
         else:
             out.append("- _(empty — nothing corroborated/declared yet)_")
-        out.append("## User profile — provisional (NOT in Block A; awaiting corroboration)")
+        out.append(
+            "## User profile — provisional (NOT in Block A; awaiting corroboration)"
+        )
         if prov:
             for k, v in prov.items():
                 out.append(
@@ -35316,9 +35298,7 @@ class ContextDumper:
             "final_system": final_system or "",
             "messages": msg_copy,
             "block_a_hash": block_a_hash,
-            "user_profile_rendered": self._f._user_profile.render_for_dump(
-                project_id
-            ),
+            "user_profile_rendered": self._f._user_profile.render_for_dump(project_id),
             "block_a_rebuild_reason": pstate.get("block_a_rebuild_reason"),
             "code_state_hash": code_state_hash,
             "slot_saved_hash": slot_hash,
@@ -39836,26 +39816,6 @@ class Filter:
                 "pool-destroying)."
             ),
         )
-        agentic_align_metacog_calls: bool = Field(
-            default=True,
-            description=(
-                "Prefix the metacognitive calls (design_critical_experiment, "
-                "generate_predictions, experimentum_crucis, devil_advocate) "
-                "with the turn's preliminary system prompt, so they extend "
-                "the KV prefix already resident in the slot instead of "
-                "evicting it. Measured: 14 such calls run inside one "
-                "hypothesize step, each a bare 134-620 token prompt sharing "
-                "no prefix, and each erased llama.cpp's checkpoint pool (422 "
-                "MiB) — leaving the main inference to re-prefill ~77k tokens "
-                "for ~62s that its own pipeline had already paid. The extra "
-                "prefix tokens cost no wall time: they restore from a "
-                "checkpoint. Turn OFF to send these calls bare again, which "
-                "keeps their prompts focal at the cost of the re-prefill — "
-                "worth testing if hypothesis quality regresses, since these "
-                "are tight JSON classifiers that previously reasoned from "
-                "claim text alone and now also see the code context."
-            ),
-        )
         agentic_metacog_max_iters: int = Field(
             default=4,
             ge=1,
@@ -39874,7 +39834,7 @@ class Filter:
                 "4 (default) is the lowest value that reaches "
                 "stagnation, so the full method is available; each iteration "
                 "costs one design + prediction + evidence pass per surviving "
-                "hypothesis, but with agentic_align_metacog_calls on those "
+                "hypothesis, but with align_aux_calls_to_prefix on those "
                 "calls extend the resident KV prefix instead of evicting it, "
                 "which is what makes this default affordable. Drop to 1 if "
                 "latency matters more than reaching the divergent pool."
@@ -40947,21 +40907,40 @@ class Filter:
             default=False,
             description=(
                 "Save/restore the llama.cpp KV slot to sidecar .bin files "
-                "across turns. OFF by default: current llama.cpp keeps a "
-                "native prompt cache with per-prompt context checkpoints "
-                "(observed reusing a 79929-token prefix across four tasks "
-                "with auxiliary traffic in between — the exact problem this "
-                "mechanism was built to solve, handled server-side). With "
-                "SWA / hybrid-memory models, partial prefix reuse is "
-                "architecturally impossible: a restored checkpoint whose "
-                "position does not exactly match the incoming prompt makes "
-                "the server 'force full prompt re-processing due to lack of "
-                "cache data' (its own words, llama.cpp PR #13194), erase "
-                "the checkpoint pool (pos_next = 0), and re-prefill ~80k "
-                "tokens — observed as 76+ second stalls at 3% GPU. Enable "
-                "ONLY on llama.cpp builds without native context "
-                "checkpoints, where the sidecar is the sole survivor of "
-                "auxiliary-call slot churn."
+                "across turns. OFF by default: llama.cpp keeps a native "
+                "prompt cache with per-prompt context checkpoints, observed "
+                "here reusing a 78141-token prefix across four consecutive "
+                "turns with auxiliary traffic in between — the exact problem "
+                "this mechanism was built to solve, handled server-side. The "
+                "sidecar cannot compete on this model and never could: its "
+                "premise is an exact-position snapshot matching the NEXT "
+                "turn's prompt, but Block B is per-query by design, so the "
+                "snapshot never matches. A restored non-matching checkpoint "
+                "makes the server 'force full prompt re-processing due to "
+                "lack of cache data' (its own words, PR #13194), erase the "
+                "native pool with pos_next = 0, and re-prefill ~80k tokens — "
+                "measured as 76+ second stalls at 3% GPU. It was costing us "
+                "the native reuse it was meant to provide.\n"
+                "KEEP BOTH PATHS TESTABLE. The native side has a live "
+                "upstream regression (issue #24055, first bad commit "
+                "e98cb51): builds before it created checkpoints DURING "
+                "prefill via --checkpoint-every-n-tokens, so one always sat "
+                "below any divergence point and restored; builds after it "
+                "(--checkpoint-min-step) create one only where the prompt "
+                "ENDS, which is past the next turn's divergence and useless. "
+                "On b9354+ our reuse depends on the last checkpoint landing "
+                "below the divergence by luck — 78140 against 78146 in the "
+                "good run, six tokens. Re-enable this valve if a future "
+                "build removes native checkpoints entirely, or to A/B the "
+                "sidecar against a build where the regression is fixed. "
+                "Re-enabling takes TWO changes: this valve, and returning "
+                "--slot-save-path to the llama.cpp command line (without it "
+                "every save/restore fails gracefully but constantly). While "
+                "ON, central prefix alignment stands down automatically — "
+                "the continuity flag protocol predates it and would restore "
+                "the previous turn's .bin over a freshly aligned prefix — "
+                "so this valve alone reproduces the old system verbatim, "
+                "which is exactly what an honest A/B needs."
             ),
         )
         slot_save_path: str = Field(default="/kvcache")
@@ -41490,6 +41469,15 @@ class Filter:
         self._llm_orchestrator.init_cache()
         self._last_used_model: Optional[str] = None
         self._main_model_this_turn: str = ""
+        # Preliminary system prompt of the current turn, stashed by
+        # SystemPromptBuilder after Block B assembly and consumed by
+        # LLMOrchestrator._align_system_to_prefix. Cleared on project switch
+        # (see InletOrchestrator.inlet_preprocess); deliberately NOT cleared
+        # between turns of the same project, so background tasks that run
+        # after outlet (docstrings, raptor) align to the prefix the slot
+        # still holds.
+        self._prelim_system_this_turn: str = ""
+        self._align_reject_logged_this_turn: bool = False
 
         # -- Tracking of active LLM tasks --
         self._active_llm_tasks: Set[asyncio.Task] = set()
@@ -41984,9 +41972,8 @@ class Filter:
             # would be a genuine ~74k-token prefill instead of a checkpoint
             # restore. Compared by basename because backends may prefix the
             # id (e.g. 'llamacpp/<name>' in aux calls vs '<name>' in body).
-            self._main_model_this_turn = str(
-                (body or {}).get("model") or ""
-            ).strip()
+            self._main_model_this_turn = str((body or {}).get("model") or "").strip()
+            self._align_reject_logged_this_turn = False
 
             # ------------------------------------------------------------------
             # Region: stop background tasks gracefully before any inlet work
@@ -42541,9 +42528,7 @@ class Filter:
                 # Feed the code-stripped question, not the raw query: pasted
                 # code is English and would both muddy language detection and
                 # push useful messages out of the short rolling buffer.
-                psm.push_recent_user_message(
-                    project_id, user_question or user_query
-                )
+                psm.push_recent_user_message(project_id, user_question or user_query)
 
             await self._task_registry.run_lazy_tasks(project_id, pstate)
 
