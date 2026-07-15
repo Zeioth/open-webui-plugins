@@ -4759,9 +4759,9 @@ class ContextBuilder:
             structure_hash = hashlib.md5("no_symbols".encode()).hexdigest()[:16]
 
         # --- 2b. Block A freeze: use the frozen hash as the cache key while a
-        #         window is active, so the same cached text (and the same slot
-        #         file, pinned in _evaluate_block_a_freeze) is reused across
-        #         structural edits. structure_hash_for_cache was already pinned
+        #         window is active, so the same cached text — and therefore the
+        #         same byte-identical KV prefix — is reused across structural
+        #         edits. structure_hash_for_cache was already pinned
         #         to the frozen value by _evaluate_block_a_freeze; we mirror it
         #         into the local key here so the cache lookup below matches.
         freeze_active = pstate_raw.get("block_a_freeze_active", False)
@@ -5354,8 +5354,8 @@ class ContextBuilder:
         Captures the hash that will be pinned for the window's lifetime, resets
         the counted-change tally, and records the capture turn used only by the
         staleness header in build_block_a. Pins structure_hash_for_cache
-        immediately so this turn's slot save/restore already target the window's
-        file. The Block A text built this turn (fresh, since a capture only
+        immediately so this turn's Block A cache lookup and the PPR score cache
+        already key off the window's hash. The Block A text built this turn (fresh, since a capture only
         happens on the first turn or right after a break invalidated the cache)
         becomes the frozen text served for the rest of the window.
         """
@@ -6443,7 +6443,8 @@ class ContextBuilder:
         removed: resolving depth per turn varied the mode, and any variation
         changed the Block A cache key, forcing a full KV prefill on nothing more
         than a differently-phrased question. A constant mode keeps the Block A
-        prefix — and thus the slot file — stable across the whole session.
+        prefix byte-identical across the whole session, which is what lets the
+        server's context checkpoints stay valid from turn to turn.
 
         The one behaviour preserved from the old global-scope branch is the
         multi-phase trigger: a whole-project question still forces multi-phase
@@ -11795,9 +11796,14 @@ class LLMOrchestrator:
         # and the capped form alike. 512 bytes is safe in both directions:
         # that cap floors at 8000 tokens (~32k chars), so any capped copy is
         # far longer than this window, while no role instruction opens with
-        # the same 512 bytes as Block A.
+        # the same 512 bytes as Block A. startswith (not slice equality)
+        # keeps the guard correct when the prelim itself is SHORTER than
+        # 512 bytes (a near-empty project): an already-aligned prompt then
+        # continues past the prelim into the separator and role, so a
+        # 512-byte slice comparison would miss the match and prepend the
+        # prelim a second time.
         _head = _prelim[:512]
-        if system_prompt[:512] == _head:
+        if system_prompt.startswith(_head):
             return system_prompt
         # ── Guard: the call must target the model whose slot holds the prefix ──
         _main = getattr(self._f, "_main_model_this_turn", "") or ""
@@ -12174,8 +12180,7 @@ class LLMOrchestrator:
         response_format={"type":"json_object"} and enable_thinking=False so the
         server-side GBNF grammar returns clean JSON with no reasoning preamble.
         The default on empty/parse failure is True (assume full code) to avoid
-        biasing the hint toward omitting implementation detail. Restores the KV
-        slot afterwards.
+        biasing the hint toward omitting implementation detail.
 
         Args:
             user_question: The user's message (truncated to 500 chars).
@@ -15103,7 +15108,9 @@ class AgenticStepExecutor:
     prompt verbatim — a byte-prefix of the main call's system prompt — so
     llama.cpp reuses the static-prefix KV across all steps and the main
     inference. Everything step-specific (workspace digests, the step
-    instruction) rides in the user turn. No slot save/restore is needed.
+    instruction) rides in the user turn, past the shared prefix, so each
+    step prefills only its own delta and the checkpoints taken inside the
+    prefix stay valid for the main inference.
     """
 
     _INSTRUCTION_TEMPLATES = {
@@ -15724,9 +15731,20 @@ class AgenticOrchestrator:
             dynamic_injections: The turn's injection list (mutated).
             question: The clarification question to surface.
         """
+        # Trailing on purpose: this fires after the preliminary system
+        # prompt was assembled and the turn's auxiliary calls were aligned
+        # to it. A "high" injection would stable-sort between the prelim's
+        # high and medium items, inserting new bytes in the MIDDLE of the
+        # final system prompt — the aligned prefix, and every context
+        # checkpoint the pipeline steps just prefilled at positions inside
+        # it, would diverge right there. Trailing renders past every byte
+        # the prelim contains, so final == prelim + suffix holds; budget
+        # rank is unchanged, since trailing ties "high". Recency is a
+        # bonus: the ask-and-stop instruction becomes the last thing the
+        # model reads before generating.
         dynamic_injections.append(
             (
-                "high",
+                "trailing",
                 "## 🤖 Clarification needed\n"
                 "Before continuing, the agentic pipeline needs one "
                 "point clarified. Ask the user this question directly "
@@ -15738,7 +15756,7 @@ class AgenticOrchestrator:
         )
         dynamic_injections.append(
             (
-                "low",
+                "trailing",
                 "**Note:** Sections in this system prompt marked with "
                 "🤖 are automatically generated by the agentic "
                 "pipeline. They are context to help you, not user "
@@ -15943,7 +15961,7 @@ class AgenticOrchestrator:
             status_prefix: UI status prefix.
 
         Returns:
-            True if a competition ran (slot dirtied), False otherwise.
+            True if a competition ran, False otherwise.
         """
         mode = self._f.valves.agentic_hypothesize_compete
         if mode == "off" or step.kind != "hypothesize":
@@ -16075,7 +16093,7 @@ class AgenticOrchestrator:
             status_prefix: UI status prefix.
 
         Returns:
-            True if a dynamic verification ran (slot dirtied), else False.
+            True if a dynamic verification ran, else False.
         """
         mode = self._f.valves.agentic_gate_verify_dynamic
         if mode == "off":
@@ -16435,9 +16453,14 @@ class AgenticOrchestrator:
 
         # Region: help mode — usage note, no execution
         if mode == "help":
+            # Trailing, not "high": appended after the preliminary system
+            # prompt exists, so anything sorting before the prelim's
+            # medium/low items would insert mid-prompt and break the
+            # final == prelim + suffix invariant the aligned prefix and
+            # the checkpoint pool depend on. Budget rank is unchanged.
             dynamic_injections.append(
                 (
-                    "high",
+                    "trailing",
                     "## 🤖 Agentic pipeline\n"
                     "The user sent a bare or malformed `/agent` command. "
                     "Briefly explain the usage: `/agent <question>` runs an "
@@ -16460,9 +16483,12 @@ class AgenticOrchestrator:
                 if plan.source == "planner_llm"
                 else (f" (fallback plan: {plan.rationale})")
             )
+            # Trailing for the same render-position reason as the help
+            # note above: post-prelim content must extend the prompt, not
+            # interleave with it.
             dynamic_injections.append(
                 (
-                    "high",
+                    "trailing",
                     "## 🤖 Agentic plan (dry run — not executed)\n"
                     f"The user asked to preview the agentic plan for: "
                     f'"{question}"{note}\n'
@@ -16538,9 +16564,12 @@ class AgenticOrchestrator:
         # Region: slot gate
         if not slot_free:
             self._f._log_debug(f"🤖 Agentic: skipped (no free slot, trigger={trigger})")
+            # Trailing so the note extends the assembled prompt instead of
+            # sorting into it (final == prelim + suffix; see the
+            # clarification injections for the full rationale).
             dynamic_injections.append(
                 (
-                    "low",
+                    "trailing",
                     "**Note:** the agentic pipeline was skipped because the "
                     "inference slot was busy; this is a normal single-pass "
                     "answer.",
@@ -16578,9 +16607,11 @@ class AgenticOrchestrator:
                 f"🤖 Agentic: pipeline crashed ({type(exc).__name__}: {exc}) "
                 f"— degrading to a normal single-pass turn (trigger={trigger})"
             )
+            # Trailing for the same render-position reason as the
+            # slot-busy note: post-prelim content extends the prompt.
             dynamic_injections.append(
                 (
-                    "low",
+                    "trailing",
                     "**Note:** the agentic pipeline hit an internal error and "
                     "was skipped this turn; this is a normal single-pass "
                     "answer.",
@@ -24786,7 +24817,7 @@ class MetacognitiveReasoningEngine:
             f"Hypothesis: <one concise sentence>\n"
             f"Confidence: <0.0-1.0>"
         )
-        # ── Step 2: high-temperature call + slot continuity ────────────────
+        # ── Step 2: high-temperature call ─────────────────────────────────
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -24854,7 +24885,7 @@ class MetacognitiveReasoningEngine:
             f"Hypothesis: <one concise sentence>\n"
             f"Confidence: <0.0-1.0>"
         )
-        # ── Step 2: high-temperature call + slot continuity ────────────────
+        # ── Step 2: high-temperature call ─────────────────────────────────
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
@@ -30215,7 +30246,8 @@ class InletOrchestrator:
     Provides:
     * ``get_project_id()`` — returns the current project id from valves.
     * ``inlet_preprocess(body, project_id)`` — detects project switches,
-      loads persisted edges and path views, and initiates KV‑slot restore.
+      loads persisted edges and path views, and drops the previous project's
+      aligned-prefix stash.
     * ``inlet_extract_user_info(messages)`` — finds the last user message,
       strips code spans to isolate the question, and detects explicit
       slash‑commands.
@@ -30366,11 +30398,11 @@ class InletOrchestrator:
         return messages
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 2. Preprocessing (project switch, cache load, slot restore)
+    # 2. Preprocessing (project switch, cache load)
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def inlet_preprocess(self, body: dict, project_id: str) -> list:
-        """Handle project switching, symbol cache loading, and KV slot restore."""
+        """Handle project switching and symbol cache loading."""
         messages = body.get("messages", [])
 
         if self._f._last_project_id and self._f._last_project_id != project_id:
@@ -32806,10 +32838,8 @@ class WindowManager:
         Persist the generated summary and update WindowManager metrics.
 
         Stores the summary entry in ``state.conversation_summaries``, updates
-        the summarized-turn high-water mark, emits LTM persistence, triggers
-        L1→L2 consolidation when enough entries have accumulated, and saves
-        the KV slot with ``force=True`` so that the next inlet restores from
-        the post-eviction prefix rather than the pre-eviction state.
+        the summarized-turn high-water mark, emits LTM persistence, and
+        triggers L1→L2 consolidation when enough entries have accumulated.
 
         Args:
             summary_text: The summary text to store.
@@ -33501,14 +33531,12 @@ class MessageAssembler:
     async def _merge_summaries(
         self,
         group_summaries: List[dict],
-        project_id: str = "",
     ) -> Optional[dict]:
         """
         Fuse several L1 turn-range summaries into one L2 summary via the LLM.
 
         Args:
             group_summaries: List of L1 summary dicts to consolidate.
-            project_id:      Current project identifier.
 
         Returns:
             A single L2 summary dict, or None when merging fails.
@@ -33607,9 +33635,7 @@ class MessageAssembler:
 
             if len(l1) >= group:
                 oldest = l1[:group]
-                # Pass project_id so _merge_summaries can restore the slot
-                # after its auxiliary LLM call.
-                merged = await self._merge_summaries(oldest, project_id=project_id)
+                merged = await self._merge_summaries(oldest)
                 if merged:
                     summaries = l2plus + [merged] + l1[group:]
                     self._f._log_debug(
@@ -39735,16 +39761,19 @@ class Filter:
             ),
         )
         block_a_freeze_break_on_ingestion: bool = Field(
-            default=False,  #
+            default=False,
             description=(
-                "When True (default), silent ingestion of a code paste breaks "
-                "the freeze and re-captures, since a large paste changes the "
-                "structure wholesale and freezing a map of just-replaced code "
-                "would be maximally misleading. When False, ingestion leaves the "
-                "current freeze window untouched."
-                "In short: Determines if code pasted mid session will trigger prefill."
-                "It doesn't affect turn 2: It will prefill no matter what."
-                "(but improves thanks to the existing kvcache from previous sessions)"
+                "When True, silent ingestion of a code paste breaks the freeze "
+                "and re-captures, since a large paste changes the structure "
+                "wholesale and freezing a map of just-replaced code would be "
+                "maximally misleading. When False (default), ingestion leaves "
+                "the current freeze window untouched. "
+                "In short: determines whether code pasted mid-session triggers "
+                "a prefill. It does not affect the first turn after a paste, "
+                "which prefills either way; from there on, the server's own "
+                "context checkpoints absorb the cost for as long as the prefix "
+                "holds and the server keeps running (they live in its memory "
+                "and do not survive a restart)."
             ),
         )
 
@@ -41158,8 +41187,8 @@ class Filter:
 
             # 🚀 RESOURCE OPTIMISATION
             #   Evaluate Block A freeze BEFORE mode resolution and assembly, so
-            #   the frozen structure hash is pinned before slot save/restore and
-            #   build_block_a consult it. With call_graph_context_mode fixed
+            #   the frozen structure hash is pinned before build_block_a
+            #   consults it. With call_graph_context_mode fixed
             #   (not 'auto'), the mode is already constant; the freeze governs
             #   only the structure hash.
             self._ctx_builder._evaluate_block_a_freeze(project_id)
