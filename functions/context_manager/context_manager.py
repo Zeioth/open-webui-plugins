@@ -100,7 +100,6 @@ from shared_resources import (
     AsyncLRUCache as _AsyncLRUCache,
     call_llm as _shared_call_llm,
     get_conversation_compressor as _shared_get_conversation_compressor,
-    get_model_name,
     get_model_backend,
 )
 
@@ -1216,12 +1215,12 @@ class SymbolIndex:
     def compute_structure_hash(self, project_id: str) -> str:
         """
         Hash of symbol signatures and structure only, excluding docstrings.
-        Used for KV‑cache and slot persistence stability.
+        Used for KV‑cache prefix stability.
 
         This hash changes only when the symbol set or signatures change,
         not when docstrings are added/updated. This keeps the Block A
         prefix hash stable across the docstring-fill-in period, preventing
-        spurious KV-cache misses and slot-restore failures.
+        spurious KV-cache misses.
 
         Args:
             project_id (str): The project identifier.
@@ -1356,9 +1355,6 @@ class ConversationState(BaseModel):
 
     # -- History compression tracker ----------------------------------------
     history_blocked_age: Dict[str, int] = Field(default_factory=dict)
-
-    # -- KV slot persistence ------------------------------------------------
-    pending_slot_resave: bool = False
 
     # -- WindowManager instrumentation (persistent metrics) ------------------
     wm_fired: bool = False
@@ -1774,10 +1770,6 @@ class ConversationStateManager:
                 "wm_degradation_guard",
                 data.get("_wm_degradation_guard", False),
             ),
-            pending_slot_resave=data.get(
-                "pending_slot_resave",
-                data.get("_pending_slot_resave", False),
-            ),
             hub_tier_last_modified=data.get("hub_tier_last_modified", {}),
             hub_tier_body_hashes=data.get("hub_tier_body_hashes", {}),
             hub_tier_query_heat=data.get("hub_tier_query_heat", {}),
@@ -1847,7 +1839,6 @@ class ConversationStateManager:
             "wm_batch_too_small": state.wm_batch_too_small,
             "wm_no_slot": state.wm_no_slot,
             "wm_degradation_guard": state.wm_degradation_guard,
-            "pending_slot_resave": state.pending_slot_resave,
             # ── Hub‑Bodies Tier tracker (cross‑restart) ──
             "hub_tier_last_modified": state.hub_tier_last_modified,
             "hub_tier_body_hashes": state.hub_tier_body_hashes,
@@ -3363,7 +3354,7 @@ class ContextPager:
             block: The block being considered for paging.
             query: Current user query (truncated to 400 chars).
             ce_scores: [keep_score, pageout_score] from the CrossEncoder.
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             bool: True if the block should be paged out, False to keep it.
@@ -3394,9 +3385,6 @@ class ContextPager:
             enable_thinking=False,
             log_raw_response=False,
         )
-
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             self._f._log_debug(
@@ -3650,7 +3638,7 @@ class ContextPager:
             block: The block to evaluate.
             query: Current user query (truncated to 500 chars).
             ce_scores: [keep_score, purge_score] from the CrossEncoder.
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             bool: True if the block should be purged, False to keep it.
@@ -3681,9 +3669,6 @@ class ContextPager:
             enable_thinking=False,
             log_raw_response=False,
         )
-
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             self._f._log_debug(
@@ -4587,7 +4572,7 @@ class RaptorCodeIndex:
 
 class ContextBuilder:
     """
-    Builds Block A + Block B, owns KV slot lifecycle, and provides skeleton
+    Builds Block A + Block B and provides skeleton
     and inventory utilities for the system prompt.
 
     Block A is the static, KV‑cache‑anchoring part (hub symbols, architecture
@@ -4598,7 +4583,6 @@ class ContextBuilder:
     * Skeleton tier (stable signatures) inside Block A.
     * Scaffolding / skeleton responses for intent queries.
     * Chain‑of‑Thought (CoT) expand resolution.
-    * Slot persistence (save / restore of KV cache state).
     * Use case classification with cascade (Heuristic → CE → LLM).
     * LOD-3 semantic relevance filtering with cascade.
     """
@@ -4704,123 +4688,6 @@ class ContextBuilder:
             r"c[oó]mo\s+implementar|how\s+to\s+implement)\b",
             re.IGNORECASE,
         )
-
-    # ======================================================================
-    # Warmup stub
-    # ======================================================================
-
-    async def _warmup_tier_prefill(self, project_id: str) -> None:
-        """
-        Background prefill of the stable KV-cache prefix (Block A + Hub-Bodies
-        Tier) immediately after silent ingestion, so the next inlet's
-        slot_restore() finds a fresh, compatible slot file instead of either
-        finding nothing or finding a stale file the server rejects.
-
-        Gated by enable_slot_persistence (checked here) plus
-        enable_hub_bodies_tier / hub_bodies_tier_warmup_on_ingestion (already
-        checked by the call site before this task is even scheduled). Fired
-        as a background asyncio.create_task() from inlet()'s silent-ingestion
-        branch, so it never blocks the synthetic acknowledgment response
-        from returning to the user.
-
-        Mechanism: issues ONE minimal auxiliary LLM call (max_tokens=1) whose
-        system_prompt is exactly the static_block + hub_tier text that the
-        *next* real turn's system prompt will begin with, forcing llama.cpp
-        to compute and hold the KV cache for that prefix in the shared
-        inference slot. Immediately afterward, slot_save(force=True)
-        persists that freshly-computed KV state to disk under the
-        structure-hash-derived filename — the exact filename the next
-        inlet's slot_restore() will look for. Both static_block and
-        hub_tier_text are read back from pstate rather than passed as
-        parameters: build_block_a() and the call site already populate
-        block_a_cached / pstate["hub_tier_text"] moments before this task
-        is created, so no signature change at the call site is needed.
-
-        This uses the SAME single shared slot (valves.slot_id) as every
-        other auxiliary call in this Filter. The warmup call necessarily
-        "dirties" that slot exactly like any auxiliary call does, but since
-        this method's entire purpose IS to leave the slot warmed with this
-        prefix and then immediately save it, no slot_restore_for_continuity()
-        call follows — the opposite of every other auxiliary call site in
-        this codebase.
-
-        Cost caveat: this issues a real prefill of the entire static prefix
-        (often 15-20k+ tokens per the logs in this project) — genuine GPU
-        work, just relocated to a moment when the user isn't actively
-        waiting on it rather than eliminated. Worth monitoring after
-        enabling: confirm "✓ Slot saved" appears right after silent
-        ingestion in the logs, and that the "Slot restore failed: HTTP 400"
-        pattern previously seen at the start of the following turn
-        disappears.
-
-        Args:
-            project_id: Current project identifier.
-        """
-        if not (
-            self._f.valves.enable_slot_persistence
-            and self._f.valves.enable_hub_bodies_tier
-            and self._f.valves.hub_bodies_tier_warmup_on_ingestion
-        ):
-            return
-
-        psm = self._f._project_state_manager
-        pstate = psm.get_pstate(project_id)
-
-        static_block = psm.get_block_a_cached(project_id) or ""
-        hub_tier_text = pstate.get("hub_tier_text", "") or ""
-
-        prefix_text = (
-            static_block + "\n\n---\n\n" + hub_tier_text
-            if (static_block and hub_tier_text)
-            else (static_block or hub_tier_text)
-        )
-
-        if not prefix_text.strip():
-            self._f._log_debug(
-                "_warmup_tier_prefill: empty Block A + tier text, skipping warmup"
-            )
-            return
-
-        self._f._log_debug(
-            f"_warmup_tier_prefill: warming KV cache for "
-            f"~{self._f._tokens.estimate_code_tokens(prefix_text)}-token "
-            f"static prefix"
-        )
-
-        try:
-            _ack = await self._f._llm_orchestrator.call_llm(
-                prompt="Acknowledge silently.",
-                system_prompt=prefix_text,
-                model_override=self._f.valves.llm_model,
-                max_tokens=1,
-                temperature=0.0,
-                label="tier_prefill_warmup",
-                enable_thinking=False,
-            )
-        except Exception as e:
-            self._f._log_debug(f"_warmup_tier_prefill: warmup call failed: {e}")
-            return
-
-        if _ack is None:
-            # call_llm returned without hitting the server (gated, deduped
-            # away, or refused). The slot never received the prefill, so a
-            # force-save here would capture whatever junk the slot holds and
-            # poison the launchpad for the next turn — exactly the 297-token
-            # snapshot observed in production. No prefill, no save.
-            self._f._log_debug(
-                "_warmup_tier_prefill: warmup call returned no response — "
-                "slot not prefilled, skipping launchpad save"
-            )
-            return
-
-        try:
-            saved = await psm.slot_save(project_id, force=True)
-            self._f._log_debug(
-                f"_warmup_tier_prefill: slot_save → "
-                f"{'OK' if saved else 'failed/skipped'}"
-            )
-        except Exception as e:
-            self._f._log_debug(f"_warmup_tier_prefill: slot_save raised: {e}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # 1. Block A – static, KV‑cache‑anchoring content
@@ -5322,10 +5189,9 @@ class ContextBuilder:
         The freeze makes Block A a byte-identical KV prefix across a window of
         counted structural edits, so edits do not each pay a full prefill.
         While the freeze is active this pins structure_hash_for_cache to the
-        hash captured at the window's start; because slot_save, slot_restore
-        and slot_restore_for_continuity all key their filename off
-        get_structure_hash_for_cache, pinning it here makes all three reuse the
-        same slot file for the whole window — no other slot code changes.
+        hash captured at the window's start, so Block A serves the same
+        cached text — and therefore the same KV prefix — for the whole
+        window.
 
         Two independent measurements, for two distinct purposes:
 
@@ -6204,8 +6070,6 @@ class ContextBuilder:
         Scaffolding and degrades the LOD profile to signatures-only for a
         question that actually needs bodies.
 
-        Restores KV slot after any LLM call.
-
         Returns:
             Tuple[str, dict, str]: (use_case_key, lod_profile, human_label)
         """
@@ -6465,7 +6329,7 @@ class ContextBuilder:
                 misclassification.
             ce_scores: List of 5 CE scores [Architecture, Planning, Programming,
                        Refactoring, Scaffolding] (heuristically reinforced).
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
             n_syms_masked: How many indexed symbol names were masked in the
                 query. When >= 1, the prompt states what 'this symbol' means
                 and gives the pointwise-comprehension criterion (a question
@@ -6528,10 +6392,6 @@ class ContextBuilder:
             enable_thinking=False,
             log_raw_response=False,
         )
-
-        # Restore the KV slot after any auxiliary LLM call.
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         # Map the string value to the internal use case key.
         _label_map = {
@@ -7569,8 +7429,6 @@ class ContextBuilder:
         3. LLM (only when extremely uncertain, diff < LLM_THRESHOLD)
         4. Conservative default (include) when CE fails or in middle zone
 
-        Restores KV slot after any LLM call.
-
         Args:
             block (CodeBlock): The block to evaluate.
             qid (str): The qualified symbol id.
@@ -7644,8 +7502,6 @@ class ContextBuilder:
     ) -> bool:
         """
         Use the LLM to decide if a block is relevant enough for LOD-3.
-
-        Restores KV slot after the call.
         """
         snippet = block.content[:800]
         ce_summary = f"""
@@ -7678,9 +7534,6 @@ Output only "YES" or "NO".
             label="lod3_relevance_llm",
             enable_thinking=False,
         )
-
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if response and response.strip().upper() == "YES":
             self._f._log_debug(
@@ -9486,7 +9339,6 @@ class StateStore:
             "wm_batch_too_small": state.wm_batch_too_small,
             "wm_no_slot": state.wm_no_slot,
             "wm_degradation_guard": state.wm_degradation_guard,
-            "pending_slot_resave": state.pending_slot_resave,
             "hub_tier_last_modified": state.hub_tier_last_modified,
             "hub_tier_body_hashes": state.hub_tier_body_hashes,
             "hub_tier_query_heat": state.hub_tier_query_heat,
@@ -10120,7 +9972,7 @@ class LongTermMemory:
 
         The query is sanitized (code stripped past the size valve) before
         embedding, so duplicate matching compares the user's words, not a
-        pasted file. Restores KV slot after any LLM call.
+        pasted file.
 
         Args:
             query (str): The user's current question.
@@ -10256,7 +10108,7 @@ class LongTermMemory:
             query: The user's current question (truncated to 500 chars).
             candidate: The candidate question from LTM (truncated to 500 chars).
             ce_score: CrossEncoder logit score (higher = more similar).
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             bool: True if the questions are duplicates, False otherwise.
@@ -10283,9 +10135,6 @@ class LongTermMemory:
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
-
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             return False
@@ -11874,9 +11723,8 @@ class LLMOrchestrator:
     * ``infer_user_wants_full_code(query)`` — lightweight CrossEncoder call
       that decides whether the user wants the full implementation or a
       summary.
-    * ``wait_for_slot()`` / ``wait_for_llm_tasks()`` — coordination
-      primitives used by the inlet and outlet to avoid dirtying the KV
-      cache while auxiliary LLM work is in flight.
+    * ``wait_for_llm_tasks()`` — coordination primitive used by the inlet
+      and outlet to drain in-flight auxiliary LLM work.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -11935,22 +11783,6 @@ class LLMOrchestrator:
         effective request.
         """
         if not getattr(self._f.valves, "align_aux_calls_to_prefix", True):
-            return system_prompt
-        # ── Guard: mutual exclusion with the sidecar ────────────────────────
-        # The slot-persistence continuity protocol predates central
-        # alignment and does not know about it: aligned_hot is set only by
-        # the agentic steps, while the per-call continuity sites mark
-        # dirtied=True / aligned_hot=False unconditionally after every
-        # auxiliary call. A centrally-aligned call would therefore leave the
-        # slot holding this turn's prefix, be recorded as dirt, and the
-        # authoritative end-of-inlet decision would restore the PREVIOUS
-        # turn's .bin over the fresh prefix — sabotaging the alignment and
-        # guaranteeing the main call a full re-prefill. Until the protocol
-        # is taught about central alignment (its own design and test), the
-        # sidecar path runs exactly as it always did: bare auxiliary
-        # prompts. This also keeps the A/B honest — enable_slot_persistence
-        # ON reproduces the old system verbatim with one valve.
-        if getattr(self._f.valves, "enable_slot_persistence", False):
             return system_prompt
         _prelim = getattr(self._f, "_prelim_system_this_turn", "") or ""
         if not _prelim:
@@ -12035,7 +11867,6 @@ class LLMOrchestrator:
         if getattr(self._f, "_is_silent_ingestion", False) and label not in (
             "bg_docstring",
             "lazy_docstring_batch",
-            "tier_prefill_warmup",
         ):
             return None
 
@@ -12060,14 +11891,12 @@ class LLMOrchestrator:
         # turn's main model: several killers (contradiction_llm,
         # session_summary, change_summary) reach here through overrides that
         # in single-model deployments resolve to the very slot holding the
-        # prefix. The warmup call builds its own prefill prompt and is
-        # deliberately excluded.
-        if label != "tier_prefill_warmup":
-            system_prompt = self._align_system_to_prefix(
-                system_prompt,
-                model_override or self._f.valves.llm_model or "",
-                prompt=prompt,
-            )
+        # prefix.
+        system_prompt = self._align_system_to_prefix(
+            system_prompt,
+            model_override or self._f.valves.llm_model or "",
+            prompt=prompt,
+        )
 
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}"
@@ -12209,16 +12038,6 @@ class LLMOrchestrator:
         async with self._f._llm_semaphore:
             pass
 
-    async def wait_for_slot(self) -> None:
-        """
-        Wait until the inference slot is free.
-
-        This is an alias for `wait_for_llm_tasks()` that provides semantic
-        clarity when the caller only needs to know the slot is available.
-        """
-        async with self._f._llm_semaphore:
-            pass
-
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. CrossEncoder helper (keep full code decision)
     # ═══════════════════════════════════════════════════════════════════════════
@@ -12247,11 +12066,9 @@ class LLMOrchestrator:
                keep_full_code_llm_threshold.
             5. Conservative default — keep full (True) in the middle band.
 
-        Restores the KV slot after any auxiliary LLM call.
-
         Args:
             user_question (str): The user's question.
-            project_id (str): Project id for slot restoration.
+            project_id (str): Project id.
 
         Returns:
             bool: True when the user likely wants full code, False for a summary.
@@ -12363,7 +12180,7 @@ class LLMOrchestrator:
         Args:
             user_question: The user's message (truncated to 500 chars).
             ce_scores: Optional [full_score, summary_score] from the CrossEncoder.
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             bool: True to signal full-code intent, False for summary intent.
@@ -12405,11 +12222,7 @@ class LLMOrchestrator:
             log_raw_response=False,
         )
 
-        # ── Step 3: restore the KV slot dirtied by the auxiliary call ──
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-
-        # ── Step 4: parse the structured verdict (conservative default True) ──
+        # ── Step 3: parse the structured verdict (conservative default True) ──
         if not response:
             self._f._log_debug(
                 "_infer_user_wants_full_code_with_llm: empty response, defaulting to FULL"
@@ -15533,15 +15346,6 @@ class AgenticStepExecutor:
         if response:
             step.output = response
             step.status = "done"
-            # The slot now holds this turn's aligned system prefix — a
-            # strictly better starting point for the main call than the
-            # previous turn's .bin, unless history depth says otherwise
-            # (the authoritative restore at the end of the inlet decides;
-            # any later non-aligned auxiliary call clears this flag).
-            if project_id:
-                self._f._project_state_manager.get_pstate(project_id)[
-                    "_slot_cont_aligned_hot"
-                ] = True
         else:
             step.output = "(empty response)"
             step.status = "failed"
@@ -16127,8 +15931,9 @@ class AgenticOrchestrator:
         purpose is to weigh rivals — when it enumerated >= 2 hypotheses or the
         turn intent is debugging. The surviving verdict (with scope) is
         appended to the step output before digest/cache, so synthesis sees
-        the competed result. The competition dirties the KV slot, so the
-        caller re-fires the launchpad afterwards (same discipline as
+        the competed result. The competition runs on the single inference
+        slot like any auxiliary call; llama.cpp's native context checkpoints
+        recover the main prefix afterwards (same discipline as
         _reinforce_step).
 
         Args:
@@ -16260,8 +16065,8 @@ class AgenticOrchestrator:
         (not pure structure), a real test harness is the stronger evidence.
         This reuses run_dynamic_step against the SAME step — its valid
         citations become the dynamic targets — so no synthetic step is
-        needed. Requires subprocess exec mode; dirties the KV slot, so the
-        caller re-fires the launchpad.
+        needed. Requires subprocess exec mode; its LLM calls run on the
+        single inference slot like any other auxiliary call.
 
         Args:
             step: The escalated step.
@@ -16361,9 +16166,8 @@ class AgenticOrchestrator:
         timeout skips that claim and keeps going.
 
         KV: the design calls use their own prompts and dirty the single
-        slot, so afterwards the pre-aligned launchpad guards are reset, the
-        launchpad re-fires, and the continuity flags are set to the truthful
-        state (slot holds the .bin: not aligned-hot, not dirty).
+        inference slot; recovery of the main prefix afterwards is the
+        server's job via native context checkpoints.
 
         Returns:
             Number of claims refuted (0 also when nothing could be tested).
@@ -16447,23 +16251,6 @@ class AgenticOrchestrator:
                 f"{_prefix} · metacog: {n_tested} claim(s) tested, "
                 f"{n_refuted} refuted"
             )
-
-        # Region: re-arm the pre-aligned launchpad + truthful flags
-        if self._f.valves.enable_slot_persistence and project_id:
-            pstate = self._f._project_state_manager.get_pstate(project_id)
-            stale = [
-                k
-                for k in list(pstate.keys())
-                if k.startswith("_slot_cont_attempted_pre_aligned_")
-                or k.startswith("_slot_cont_succeeded_pre_aligned_")
-            ]
-            for k in stale:
-                del pstate[k]
-            await self._f._project_state_manager.slot_restore_for_continuity(
-                project_id, authoritative=True, purpose="pre_aligned"
-            )
-            pstate["_slot_cont_aligned_hot"] = False
-            pstate["_slot_cont_dirtied"] = False
         return n_refuted
 
     async def _generative_evaluation(
@@ -16664,10 +16451,6 @@ class AgenticOrchestrator:
         # Region: dry run — plan with the planner, present, do not execute
         if mode == "plan":
             aligned_prefix = self._aligned_prefix(prelim_system)
-            if self._f.valves.enable_slot_persistence and project_id:
-                await self._f._project_state_manager.slot_restore_for_continuity(
-                    project_id, authoritative=True, purpose="pre_aligned"
-                )
             plan = await self._planner.plan(
                 question, aligned_prefix, slot_free, project_id
             )
@@ -16832,7 +16615,7 @@ class AgenticOrchestrator:
         # continuation check is load-bearing: observed live (phase 7), the
         # valve-only gate restored the previous turn's claims into UNRELATED
         # fresh questions — build_block_a claims surfacing as a 'Nota
-        # crítica' inside an answer about slot_restore — because three
+        # crítica' inside an answer about an unrelated topic — because three
         # different bugs in a row each inherited the prior bug's ledger.
         # is_continuation is classified in the inlet before the pipeline
         # runs, so pstate already holds this turn's verdict here.
@@ -16860,15 +16643,6 @@ class AgenticOrchestrator:
                     )
             except Exception:
                 self._ledger.claims = []
-        # Pre-aligned launchpad: earlier non-aligned auxiliaries (intent
-        # classifiers, cot_config) leave the slot on their own small
-        # prompts; without this, the FIRST aligned call below re-prefills
-        # the whole system prefix. Restoring the .bin first means every
-        # pipeline call only pays the Block B divergence.
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(
-                project_id, authoritative=True, purpose="pre_aligned"
-            )
         # Region: pre-planner — discover the WHAT before the planner decides
         # the HOW. Agentic (may consult MEMORY autonomously), same aligned
         # prefix so it pays the hybrid prefill and the planner call becomes
@@ -17113,7 +16887,7 @@ class AgenticOrchestrator:
                 # the step's purpose, not a reaction to a fabricated id.
                 # Runs before digest/cache so both carry the competed output.
                 _rem_compete = budget - (time.monotonic() - started)
-                _slot_dirtied = await self._maybe_compete_hypothesize(
+                await self._maybe_compete_hypothesize(
                     step,
                     _rem_compete,
                     project_id,
@@ -17122,10 +16896,6 @@ class AgenticOrchestrator:
                         f"(hypothesize)"
                     ),
                 )
-                if _slot_dirtied and self._f.valves.enable_slot_persistence:
-                    await self._f._project_state_manager.slot_restore_for_continuity(
-                        project_id, authoritative=True, purpose="pre_aligned"
-                    )
 
                 # -- metacognitive reinforcement gate (Fase 8) ----------
                 # Runs BEFORE digest/cache so both carry the reinforced
@@ -17160,7 +16930,7 @@ class AgenticOrchestrator:
                             # claims — static evidence can pass what the
                             # running code refutes.
                             _rem_dyn = budget - (time.monotonic() - started)
-                            _dyn_dirtied = await self._maybe_verify_dynamic_on_gate(
+                            await self._maybe_verify_dynamic_on_gate(
                                 step,
                                 _rem_dyn,
                                 project_id,
@@ -17169,12 +16939,6 @@ class AgenticOrchestrator:
                                     f"{len(plan.steps)} ({step.kind})"
                                 ),
                             )
-                            if _dyn_dirtied and self._f.valves.enable_slot_persistence:
-                                await self._f._project_state_manager.slot_restore_for_continuity(
-                                    project_id,
-                                    authoritative=True,
-                                    purpose="pre_aligned",
-                                )
                         else:
                             self._f._log_debug(
                                 f"🤖 Agentic: step {step.id} qualifies for "
@@ -17663,9 +17427,8 @@ class ReasoningHelper:
         With cot_prefix_aligned (default), the context is sent verbatim as the
         system prompt — a byte-prefix of the main call's system prompt — so
         llama.cpp reuses the static-prefix KV across this call and the main
-        inference; no slot restore is needed afterwards. In legacy mode the
-        context is inlined in the user turn and the KV slot is restored after
-        the call so auxiliary inference does not leave a dirty slot.
+        inference. In legacy mode the context is inlined in the user turn;
+        the server's native context checkpoints recover the main prefix.
 
         Args:
             question:      The user's question to reason about.
@@ -17673,9 +17436,7 @@ class ReasoningHelper:
                            mode this must be a byte-prefix of the main call's
                            system prompt (the caller guarantees it).
             label:         Optional label for LLM call logging.
-            project_id:    Current project identifier used for KV slot
-                           restoration after the auxiliary LLM call (legacy
-                           mode only). Empty string skips restoration.
+            project_id:    Current project identifier.
             focus_context: Optional per-question focused material (aligned
                            mode only) rendered in the user turn, e.g. the
                            volatile activation context from FocalReasoning.
@@ -17746,21 +17507,6 @@ class ReasoningHelper:
             )
 
         # ------------------------------------------------------------------
-        # Region: Pre-aligned launchpad
-        # The cot_config LLM call (its own small prompt) runs right before
-        # this one and leaves the slot on an unrelated 3-figure-token
-        # context, so the aligned call below would re-prefill the ENTIRE
-        # system prefix from scratch (~70k+ tokens, measured 324-537s).
-        # One authoritative restore re-establishes the .bin first: the
-        # aligned call then shares A+tier with it and only prefills the
-        # Block B divergence.
-        # ------------------------------------------------------------------
-        if aligned and self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(
-                project_id, authoritative=True, purpose="pre_aligned"
-            )
-
-        # ------------------------------------------------------------------
         # Region: Call the LLM
         # ------------------------------------------------------------------
         response = await self._f._llm_orchestrator.call_llm(
@@ -17771,22 +17517,6 @@ class ReasoningHelper:
             temperature=0.4,
             label=label,
         )
-
-        # ------------------------------------------------------------------
-        # Region: Restore KV slot after auxiliary LLM call
-        # Legacy mode only: an aligned call leaves the slot sharing the
-        # static prefix with the upcoming main inference, so the restore's
-        # disk I/O would be pure waste there.
-        # ------------------------------------------------------------------
-        if self._f.valves.enable_slot_persistence and project_id and not aligned:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-        elif self._f.valves.enable_slot_persistence and project_id and aligned:
-            # The slot now holds this turn's aligned system prefix; record it
-            # so the authoritative end-of-inlet decision can keep it instead
-            # of blindly restoring the previous turn's .bin over it.
-            self._f._project_state_manager.get_pstate(project_id)[
-                "_slot_cont_aligned_hot"
-            ] = True
 
         # ------------------------------------------------------------------
         # Region: Format and return
@@ -18205,7 +17935,7 @@ class CommandRouter:
 
         Args:
             messages: The list of conversation messages.
-            project_id: The current project identifier (used for slot restoration).
+            project_id: The current project identifier.
         """
         # ── Step 1: Entry guards ──
         if not self._f.valves.enable_contradiction_detection or len(messages) < 3:
@@ -18250,7 +17980,7 @@ class CommandRouter:
         Args:
             history: Excerpt of the conversation history (truncated to 1500 chars).
             new_msg: The new user message to check (truncated to 500 chars).
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             Optional[str]: A warning string if a contradiction is detected,
@@ -18284,11 +18014,7 @@ class CommandRouter:
             log_raw_response=False,
         )
 
-        # ── Step 3: Restore the KV slot after the auxiliary LLM call ──
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-
-        # ── Step 4: Parse — any failure resolves to None, no fallback ──
+        # ── Step 3: Parse — any failure resolves to None, no fallback ──
         if not response:
             return None
         try:
@@ -18625,8 +18351,6 @@ class CommandRouter:
         5. If CrossEncoder unavailable, use LLM alone.
         6. Middle zone: conservative heuristic distribution.
 
-        Restores KV slot after any LLM call.
-
         Args:
             user_query (str): The user's query.
             project_id (str): Current project identifier.
@@ -18829,7 +18553,7 @@ class CommandRouter:
             ce_scores: Optional [explain, modify, debug, refactor] CE scores.
             stripped_query: Pre-cleaned version of the query (unused here,
                             kept for API compatibility).
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             dict: Intent vector with keys explain/modify/debug/refactor,
@@ -18880,10 +18604,6 @@ class CommandRouter:
             enable_thinking=False,
             log_raw_response=False,
         )
-
-        # Restore the KV slot after any auxiliary LLM call.
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         _CONSERVATIVE_FALLBACK = {
             "explain": 0.2,
@@ -19033,8 +18753,6 @@ class CommandRouter:
         Only the PROSE reaches the LLM: any fenced/inline code is stripped first,
         so identifiers inside code (e.g. build_block_b) can never be read as a
         command.
-
-        Restores KV slot after the LLM call.
         """
         none = {"action": "none"}
         all_none = {"forget": none, "remember": none, "obsolete": none}
@@ -19094,7 +18812,7 @@ class CommandRouter:
 
         Args:
             prose: The user's message with code spans already removed.
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             Dict[str, Any]: Intent dict with keys forget/remember/obsolete,
@@ -19149,11 +18867,7 @@ class CommandRouter:
             log_raw_response=False,
         )
 
-        # ── Step 3: Restore the KV slot after the auxiliary LLM call ──
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-
-        # ── Step 4: Parse — any failure resolves to 'none', no fallback ──
+        # ── Step 3: Parse — any failure resolves to 'none', no fallback ──
         if not response:
             self._f._log_debug(
                 "_parse_all_intents_with_llm: empty response, resolving to none"
@@ -19178,7 +18892,7 @@ class CommandRouter:
                 )
             return _RESULT_NONE
 
-        # ── Step 5: Map the action to its intent category ──
+        # ── Step 4: Map the action to its intent category ──
         result = {"forget": _NONE, "remember": _NONE, "obsolete": _NONE}
         if action.startswith("forget"):
             result["forget"] = {"action": action}
@@ -20235,8 +19949,6 @@ class CommandRouter:
         3. LLM verdict: everything else. A message carrying request/question
            intent is by definition not code-only, so one call decides both
            dimensions.
-
-        Restores the KV slot after the LLM call.
         """
         # ── Step 0: length guard ──────────────────────────────────────────────
         if not content or len(content.strip()) < 20:
@@ -20360,7 +20072,7 @@ class CommandRouter:
         Args:
             query: The message text to classify (already truncated).
             ce_scores: Deprecated; None on the migrated path.
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             bool: True if the message is code-only (no request intent).
@@ -20403,11 +20115,6 @@ class CommandRouter:
             enable_thinking=False,
             log_raw_response=False,
         )
-
-        # Restore the KV slot after any LLM call (auxiliary calls dirty the slot
-        # due to the SWA architecture).
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             return False
@@ -22416,8 +22123,6 @@ Output only the symbol name.
             label="seed_disambiguate_llm",
             enable_thinking=False,
         )
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if response:
             candidate = response.strip()
@@ -24662,9 +24367,6 @@ class MetacognitiveReasoningEngine:
             enable_thinking=False,
         )
 
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-
         if not response:
             return _empty
 
@@ -24759,9 +24461,6 @@ class MetacognitiveReasoningEngine:
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
-
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             return []
@@ -25100,8 +24799,6 @@ class MetacognitiveReasoningEngine:
             temperature=temperature,
             label=f"{label}_presearch_div" if label else "sci_presearch_div",
         )
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
         if not response:
             return []
         return MetacognitiveReasoningEngine._parse_hypotheses_from_response(response)
@@ -25170,8 +24867,6 @@ class MetacognitiveReasoningEngine:
             temperature=0.9,
             label=f"{label}_abductive" if label else "sci_abductive",
         )
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
         if not response:
             return []
         return MetacognitiveReasoningEngine._parse_hypotheses_from_response(response)
@@ -25225,9 +24920,6 @@ class MetacognitiveReasoningEngine:
             temperature=0.9,
             label=f"{label}_divergent" if label else "sci_divergent",
         )
-
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             return []
@@ -25298,9 +24990,6 @@ class MetacognitiveReasoningEngine:
             temperature=0.4,
             label=f"{label}_refine" if label else "sci_refine",
         )
-
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not refine_response:
             return []
@@ -25855,9 +25544,6 @@ class MetacognitiveReasoningEngine:
             enable_thinking=False,
         )
 
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-
         if not response:
             return None
 
@@ -25995,9 +25681,6 @@ class MetacognitiveReasoningEngine:
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
-
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             return hypothesis
@@ -26223,9 +25906,6 @@ class MetacognitiveReasoningEngine:
             enable_thinking=False,
         )
 
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-
         if not response:
             return None
 
@@ -26353,9 +26033,6 @@ class MetacognitiveReasoningEngine:
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
-
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             return PeerReviewResult(
@@ -26839,7 +26516,7 @@ Code context (recent symbols referenced):
 
         Args:
             content: The code message content (truncated to 2000 chars in prompt).
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
             part_num: The part number within a multi-phase message.
             total_parts: Total number of parts.
             force_no_expand: If True, skip LLM and use legacy summary directly.
@@ -26894,9 +26571,6 @@ Code context (recent symbols referenced):
             enable_thinking=False,
             log_raw_response=False,
         )
-
-        if self._f.valves.enable_slot_persistence:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         # ------------------------------------------------------------------
         # Region: Handle no-response from LLM
@@ -27347,17 +27021,15 @@ Code context (recent symbols referenced):
         """
         Summarise a list of old conversation messages into a single paragraph.
 
-        After the LLM call the KV slot is restored so that the auxiliary
-        inference does not leave a dirty slot that would cause a cache miss
-        when the main inference runs immediately after.
+        This is an auxiliary LLM call on the shared inference slot;
+        llama.cpp's native context checkpoints recover the main prefix for
+        the inference that runs immediately after.
 
         Args:
             old_messages:    Messages to be summarised (user and assistant roles).
             is_code_context: True when the conversation involves source code;
                              selects a more technical system prompt.
-            project_id:      Current project identifier used for KV slot
-                             restoration.  Pass an empty string to skip
-                             restoration (e.g. when called outside an inlet).
+            project_id:      Current project identifier.
 
         Returns:
             A single-paragraph summary string, or None when the input is empty
@@ -27396,14 +27068,6 @@ Code context (recent symbols referenced):
             label="summarize_messages",
             enable_thinking=False,
         )
-
-        # ------------------------------------------------------------------
-        # Region: Restore KV slot after auxiliary LLM call
-        # Every auxiliary LLM call dirties the slot.  Restoring here keeps
-        # the slot aligned with the stable prefix before the main inference.
-        # ------------------------------------------------------------------
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         return summary.strip() if summary else None
 
@@ -30877,8 +30541,6 @@ class InletOrchestrator:
         2. CrossEncoder (primary decision)
         3. LLM (only when CrossEncoder is extremely uncertain, diff < 0.15)
         4. Heuristic fallback (when 0.15 ≤ diff < 0.25)
-
-        After any LLM call, the KV slot is restored to avoid cache pollution.
         """
         last_user = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -31011,7 +30673,7 @@ class InletOrchestrator:
         Args:
             query: The user message to classify.
             ce_scores: [code_score, text_score] from the CrossEncoder.
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             bool: True if the message belongs to a coding session, False otherwise.
@@ -31049,10 +30711,6 @@ class InletOrchestrator:
             enable_thinking=False,
             log_raw_response=False,
         )
-
-        # Restore the KV slot after any auxiliary LLM call.
-        if self._f.valves.enable_slot_persistence:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             return False
@@ -32322,7 +31980,7 @@ class SystemPromptBuilder:
             window_excerpts: List of current conversation excerpts to compare
                              against. Only the first 3 are used.
             ce_score: CrossEncoder duplicate score (higher = more likely duplicate).
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             bool: True if the fragment is a duplicate, False if unique.
@@ -32361,9 +32019,6 @@ class SystemPromptBuilder:
             enable_thinking=False,
             log_raw_response=False,
         )
-
-        if self._f.valves.enable_slot_persistence:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             return False
@@ -32708,7 +32363,6 @@ class WindowManager:
         Total session (T turns): O(T) linear — same as v9.0.0.
 
     Seams for future phases:
-        _on_frontier_advance(old_hwm, new_hwm)  → Phase 2 (KV-freeze)
         _frontier_c_turn                        → Phase 3 (LLMLingua)
     """
 
@@ -33266,16 +32920,6 @@ class WindowManager:
             )
 
         # ------------------------------------------------------------------
-        # Region: KV-freeze hook — save slot after history eviction
-        #
-        # Uses force=True because the structure hash (signatures) may not have
-        # changed even though the history prefix changed: the standard
-        # last_saved_slot_hash guard in slot_save would skip the write without
-        # the force flag, leaving the slot file stale.
-        # ------------------------------------------------------------------
-        await self._on_frontier_advance(old_hwm, new_hwm, project_id)
-
-        # ------------------------------------------------------------------
         # Region: persist state and return the injection string
         # ------------------------------------------------------------------
         self._f._conversation_state_manager.set(project_id, state)
@@ -33285,41 +32929,6 @@ class WindowManager:
     # ═══════════════════════════════════════════════════════════════════════
     # 4. Seams and static helpers
     # ═══════════════════════════════════════════════════════════════════════
-
-    async def _on_frontier_advance(
-        self, old_hwm: int, new_hwm: int, project_id: str
-    ) -> None:
-        """
-        Phase-2 KV-freeze hook: save the slot synchronously after history eviction.
-
-        Called from ``_persist()`` after a successful summary is generated and
-        the frontier HWM advances. Saving here ensures the next inlet restores
-        from the new stabilised prefix rather than re-prefilling from scratch.
-
-        Args:
-            old_hwm:    Summarized-turn high-water mark before this advance.
-            new_hwm:    Summarized-turn high-water mark after this advance.
-            project_id: Project whose KV slot should be saved.
-        """
-        # ------------------------------------------------------------------
-        # Region: guard — skip if no real advance occurred
-        # ------------------------------------------------------------------
-        if old_hwm >= new_hwm:
-            return
-
-        # ------------------------------------------------------------------
-        # Region: save slot synchronously
-        #
-        # force=True bypasses the static-hash guard because the history prefix
-        # changed (new summary evicted old turns) even though Block A did not.
-        # Without force=True, slot_save() would skip because the structure hash
-        # looks unchanged.
-        # ------------------------------------------------------------------
-        self._f._log_debug(
-            f"KV-3: frontier advanced hwm {old_hwm}→{new_hwm} — "
-            "saving slot synchronously before inlet returns"
-        )
-        await self._f._project_state_manager.slot_save(project_id, force=True)
 
     @staticmethod
     def _is_autocontinue_active(messages: List[dict]) -> bool:
@@ -33544,7 +33153,7 @@ class MessageAssembler:
             state: Persistent ConversationState for the project.
             user_question: Cleaned user question (code spans removed).
             prelim_system: Preliminary system prompt (Block A + B assembled so far).
-            project_id: Current project identifier for slot restoration.
+            project_id: Current project identifier.
             is_continuation: True for genuine AutoContinue continuation turns.
             slot_free: False when the LLM slot is busy; suppresses generation.
             messages: Full conversation message list (used for token estimation).
@@ -33899,8 +33508,7 @@ class MessageAssembler:
 
         Args:
             group_summaries: List of L1 summary dicts to consolidate.
-            project_id:      Current project identifier used for KV slot
-                             restoration after the auxiliary LLM call.
+            project_id:      Current project identifier.
 
         Returns:
             A single L2 summary dict, or None when merging fails.
@@ -33949,12 +33557,6 @@ class MessageAssembler:
             enable_thinking=False,
         )
 
-        # ------------------------------------------------------------------
-        # Region: Restore KV slot after auxiliary LLM call
-        # ------------------------------------------------------------------
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
-
         if not merged or not merged.strip():
             return None
 
@@ -33984,8 +33586,7 @@ class MessageAssembler:
 
         Args:
             state:      ConversationState mutated in-place.
-            project_id: Current project identifier, threaded through to
-                        ``_merge_summaries`` for KV slot restoration.
+            project_id: Current project identifier.
             slot_free:  False suppresses the LLM consolidation call so the
                         method degrades gracefully when the slot is busy.
         """
@@ -34205,12 +33806,10 @@ class MessageAssembler:
         """
         Assemble final system prompt, inject it, and log token breakdown.
 
-        Also records the turn's context metrics in pstate. Both metrics are
-        written unconditionally (not gated on the debug valve): they feed
-        other subsystems — last_total_context_tokens drives the slot_save
-        growth guard, last_system_tokens the budget heuristics — and were
-        previously starved to 0 when written from the empty outlet body or
-        skipped with debug off, which silently disabled the KV re-save.
+        Also records the turn's system-prompt token metric in pstate. It is
+        written unconditionally (not gated on the debug valve): it feeds the
+        budget heuristics and was previously skipped with debug off, which
+        starved those heuristics to 0.
         """
         budget = self._f.valves.global_injection_token_budget
         priority_order = _INJECTION_PRIORITY
@@ -34229,8 +33828,7 @@ class MessageAssembler:
         # Hub-bodies tier: read back from pstate, where build() persists it
         # each turn (the dumper already reads it the same way). It must be
         # part of the FINAL system prompt, not only the preliminary one —
-        # otherwise the main model never sees the hub bodies, the warmup
-        # prefills a prefix the real request never sends, and the aligned
+        # otherwise the main model never sees the hub bodies and the aligned
         # prefix of every auxiliary call diverges from the main call right
         # after Block A whenever the tier is non-empty.
         hub_tier_text = pstate.get("hub_tier_text", "") or ""
@@ -34397,21 +33995,6 @@ class MessageAssembler:
                     f"{_leaned_msgs} user msg(s) leaned"
                 )
             self._f._log_debug("─" * 60)
-
-        # ── Persist total-context metric for the slot_save growth guard ──
-        # Measured here, on the FINAL message list of the turn (system + leaned
-        # history + user), because the outlet body arrives empty in this
-        # OpenWebUI and overwrote the metric with 0 every turn — permanently
-        # muting the size-aware re-save.
-        try:
-            psm.set_last_total_context_tokens(
-                project_id, self._f._tokens.estimate_tokens(messages)
-            )
-        except Exception as _tok_err:
-            self._f._log_debug(
-                f"_assemble_final_system_and_log: total-token metric failed: "
-                f"{_tok_err}"
-            )
 
         # ── Context dump (evolution tracking) ─────────────────────────
         if self._f.valves.enable_context_dump:
@@ -35192,7 +34775,6 @@ class ContextDumper:
 
         # ── Get hashes from pstate ──────────────────────────────────────────
         block_a_hash = pstate.get("last_static_prefix_hash", "")
-        slot_hash = pstate.get("last_saved_slot_hash", "")
 
         # ── Block A freeze state ────────────────────────────────────────────
         # Captured so a frozen turn is legible in the evolution series: when
@@ -35301,7 +34883,6 @@ class ContextDumper:
             "user_profile_rendered": self._f._user_profile.render_for_dump(project_id),
             "block_a_rebuild_reason": pstate.get("block_a_rebuild_reason"),
             "code_state_hash": code_state_hash,
-            "slot_saved_hash": slot_hash,
             "n_active_blocks": n_active_blocks,
             "n_symbols": n_symbols,
             "n_symbols_with_parent": n_with_parent,
@@ -35435,7 +35016,6 @@ class ContextDumper:
                 # ── M7: rebuild reason (string or null) ──────────────────────
                 "block_a_rebuild_reason": payload.get("block_a_rebuild_reason"),
                 "code_state_hash": payload.get("code_state_hash", ""),
-                "slot_saved_hash": payload.get("slot_saved_hash", ""),
                 # ── WindowManager metrics ──────────────────────────────────
                 "wm_fired": payload.get("wm_fired", False),
                 "wm_msgs_evicted": payload.get("wm_msgs_evicted", 0),
@@ -35518,7 +35098,6 @@ class ContextDumper:
         lines.append(f"- history tokens:           ~{history_tokens}")
         lines.append(f"- Block A prefix hash: `{payload['block_a_hash'] or 'N/A'}`")
         lines.append(f"- code_state_hash:     `{payload['code_state_hash'] or 'N/A'}`")
-        lines.append(f"- slot saved hash:     `{payload['slot_saved_hash'] or 'N/A'}`")
         # User profile — rendered by UserProfileManager (single owner).
         lines.append("")
         lines.extend(payload.get("user_profile_rendered", []))
@@ -36475,11 +36054,6 @@ class ProjectStateManager:
             "lod3_sticky": {},
             # -- Token accounting -----------------------------------------
             "last_system_tokens": 0,
-            "last_total_context_tokens": 0,
-            # -- KV cache persistence -------------------------------------
-            "last_saved_slot_hash": "",
-            "slot_restored": False,
-            "slot_restore_attempted": False,
             # -- Query / response tracking --------------------------------
             "last_user_query": "",
             "last_assistant_response": "",
@@ -36617,7 +36191,7 @@ class ProjectStateManager:
         self.get_pstate(project_id)["block_a_cached"] = text
 
     def get_structure_hash_for_cache(self, project_id: str) -> Optional[str]:
-        """Return the structural hash used to key the Block A and slot files."""
+        """Return the structural hash used to key the Block A cache."""
         return self.get_pstate(project_id).get("structure_hash_for_cache")
 
     def set_structure_hash_for_cache(self, project_id: str, hash_val: str) -> None:
@@ -36716,48 +36290,6 @@ class ProjectStateManager:
         """Store the system prompt token count for context budget calculation."""
         self.get_pstate(project_id)["last_system_tokens"] = tokens
 
-    def get_last_total_context_tokens(self, project_id: str) -> int:
-        """Return the total context token count for the last turn."""
-        return self.get_pstate(project_id).get("last_total_context_tokens", 0)
-
-    def set_last_total_context_tokens(self, project_id: str, tokens: int) -> None:
-        """Store the total context token count for KV slot size guard."""
-        self.get_pstate(project_id)["last_total_context_tokens"] = tokens
-
-    # -- KV cache slot state (persistence metadata) ---------------------------
-
-    def get_last_saved_slot_hash(self, project_id: str) -> str:
-        """Return the structural hash of the last successfully saved KV slot."""
-        return self.get_pstate(project_id).get("last_saved_slot_hash", "")
-
-    def set_last_saved_slot_hash(self, project_id: str, hash_val: str) -> None:
-        """Store the structural hash of the last successfully saved KV slot."""
-        self.get_pstate(project_id)["last_saved_slot_hash"] = hash_val
-
-    def get_last_saved_slot_tokens(self, project_id: str) -> int:
-        """Token count captured by the last successful slot save (0 = none)."""
-        return self.get_pstate(project_id).get("last_saved_slot_tokens", 0)
-
-    def set_last_saved_slot_tokens(self, project_id: str, tokens: int) -> None:
-        """Record the token count reported by llama.cpp for the last slot save."""
-        self.get_pstate(project_id)["last_saved_slot_tokens"] = int(tokens or 0)
-
-    def get_slot_restore_attempted(self, project_id: str) -> bool:
-        """Return True if a KV slot restore has been attempted for this project."""
-        return self.get_pstate(project_id).get("slot_restore_attempted", False)
-
-    def set_slot_restore_attempted(self, project_id: str, val: bool) -> None:
-        """Mark that a KV slot restore has been attempted for this project."""
-        self.get_pstate(project_id)["slot_restore_attempted"] = val
-
-    def get_slot_restored(self, project_id: str) -> bool:
-        """Return True if the KV slot was successfully restored for this project."""
-        return self.get_pstate(project_id).get("slot_restored", False)
-
-    def set_slot_restored(self, project_id: str, val: bool) -> None:
-        """Mark whether the KV slot was successfully restored for this project."""
-        self.get_pstate(project_id)["slot_restored"] = val
-
     # -- Continuation tracking ------------------------------------------------
 
     def get_is_continuation(self, project_id: str) -> bool:
@@ -36812,739 +36344,6 @@ class ProjectStateManager:
     def set_force_multi_phase_this_turn(self, project_id: str, value: bool) -> None:
         """Set the one-shot flag to force multi-phase protocol this turn."""
         self.get_pstate(project_id)["force_multi_phase_this_turn"] = value
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # 3 — KVCache persistence
-    # ═══════════════════════════════════════════════════════════════════════
-
-    async def slot_save(
-        self, project_id: str, force: bool = False, wait_slot_free: bool = False
-    ) -> bool:
-        """
-        Save the KV slot after a turn.
-
-        force=True ignores the static-hash guard (used after monotonic
-        compaction, when the history prefix changed but Block A did not).
-        The token-threshold guard (P5) is always respected.
-
-        Uses the structural hash (signatures only) for the filename so
-        docstring population does not cause slot file proliferation.
-
-        Same-hash re-save semantics
-        ───────────────────────────
-        A save is skipped for an unchanged structural hash UNLESS the current
-        context is at least slot_resave_min_growth times larger than the token
-        count captured by the previous save. This closes the warmup-fossil
-        trap: the hub-tier warmup saves a few thousand tokens early, and a
-        size-blind hash guard would then veto the full main-chat save forever,
-        leaving every restore with a tiny prefix and forcing a cold multi-10k
-        prefill each turn. One large save per structural hash captures all the
-        reusable value (llama.cpp prefix-matching only ever reuses up to the
-        stable Block A prefix), so per-turn re-saves would be pure disk churn.
-
-        Slot-contention semantics
-        ─────────────────────────
-        Under --parallel 1 the server processes one request at a time. If this
-        save POSTs while a prefill/generation is still in flight (e.g. the ~43k-
-        token Block A prefill right after a large ingestion), it queues behind
-        that work and burns the whole slot_operation_timeout for nothing.
-
-        wait_slot_free controls how that is handled, and the default is the SAFE
-        one:
-
-        • wait_slot_free=False (default): do NOT block waiting for the slot.
-          The save POSTs immediately; the HTTP call is bounded by
-          slot_operation_timeout, which absorbs the contention. Correct for
-          callers ON THE CRITICAL PATH (inlet: WindowManager._persist and the
-          build_block_a saves) where an unbounded wait could hang the whole
-          request behind an in-flight generation.
-
-        • wait_slot_free=True: first wait (unbounded) for the inference slot to
-          drain via the shared LLM semaphore, then POST into an idle server so
-          the save completes cleanly in milliseconds. Only safe for a DETACHED
-          caller that nothing awaits — currently just Filter.outlet, which fires
-          this as a background task. The wait is best-effort: the semaphore is
-          released before the POST, so another task could momentarily re-take
-          the slot; slot_operation_timeout remains the backstop either way.
-
-        Args:
-            project_id: The project identifier.
-            force: Whether to force save even if the hash hasn't changed.
-            wait_slot_free: Whether to wait for the inference slot to drain
-                before POSTing. Only pass True from a detached (non-awaited)
-                caller; see semantics above.
-
-        Returns:
-            bool: True if the slot was saved successfully.
-        """
-        if not self._f.valves.enable_slot_persistence:
-            return False
-
-        # --- 1. Token threshold guard (skip oversized KV writes) ---
-        _max_ctx = self._f.valves.slot_save_max_context_tokens
-        _ctx_tok = self.get_last_total_context_tokens(project_id)
-        if _max_ctx > 0 and _ctx_tok > _max_ctx:
-            self._f._log_debug(
-                f"Slot save skipped: context {_ctx_tok} tokens > threshold "
-                f"{_max_ctx} (avoids large KV write under mutex)"
-            )
-            return False
-
-        # --- 2. Get the structural hash from pstate (set by build_block_a) ---
-        static_hash = self.get_structure_hash_for_cache(project_id)
-        if not static_hash:
-            cached = self.get_block_a_cached(project_id)
-            if cached:
-                static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
-            else:
-                return False
-
-        # --- 3. Skip if already saved, not forced, and not materially larger ---
-        # Size-aware: a previous SMALL save (hub-tier warmup) must not veto the
-        # full main-chat save for the same structural hash. Re-save only when
-        # the current context sufficiently outgrows what the .bin captured;
-        # afterwards the guard closes again, so the large KV write happens once
-        # per structural hash, not once per turn.
-        if not force and self.get_last_saved_slot_hash(project_id) == static_hash:
-            _saved_tok = self.get_last_saved_slot_tokens(project_id)
-            if (
-                _saved_tok > 0
-                and _ctx_tok <= _saved_tok * self._f.valves.slot_resave_min_growth
-            ):
-                self._f._log_debug(
-                    f"Slot save skipped: same hash, context {_ctx_tok} tokens "
-                    f"within {self._f.valves.slot_resave_min_growth}× of saved "
-                    f"snapshot ({_saved_tok} tokens)"
-                )
-                return False
-            if _saved_tok > 0:
-                self._f._log_debug(
-                    f"Slot re-save allowed: context {_ctx_tok} tokens outgrew "
-                    f"saved snapshot ({_saved_tok} tokens × "
-                    f"{self._f.valves.slot_resave_min_growth})"
-                )
-
-        # --- 4. Optionally wait for the inference slot to drain before POSTing.
-        # Only detached callers (Filter.outlet) request this; on-critical-path
-        # callers pass wait_slot_free=False and rely on slot_operation_timeout
-        # to bound the POST instead of risking an unbounded wait.
-        if wait_slot_free:
-            try:
-                await self._f._llm_orchestrator.wait_for_slot()
-            except Exception as _wait_err:
-                self._f._log_debug(
-                    f"Slot save: slot-wait error (non-fatal): {_wait_err}"
-                )
-
-        # --- 5. Build filename and call llama.cpp API ---
-        filename = self._slot_filename(project_id, static_hash)
-        base = self._f.valves.LLM_BASE_URL.rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-
-        async def _do_save():
-            from shared_resources import get_http_session as _shared_get_http_session
-
-            session = await _shared_get_http_session(
-                timeout_seconds=self._f.valves.llm_per_call_timeout
-            )
-            async with session.post(
-                f"{base}/slots/{self._f.valves.slot_id}",
-                params={"action": "save"},
-                json={
-                    "filename": filename,
-                    "model": get_model_name(self._f.valves.llm_model),
-                },
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return True, data, None
-                body_text = await resp.text()
-                return False, None, (resp.status, body_text)
-
-        # --- 6. Execute, bounded only if slot_operation_timeout > 0 ---
-        _timeout = self._f.valves.slot_operation_timeout
-
-        try:
-            if _timeout > 0:
-                ok, data, err = await asyncio.wait_for(_do_save(), timeout=_timeout)
-            else:
-                ok, data, err = await _do_save()
-
-            if ok:
-                n_saved = int(data.get("n_saved", 0) or 0)
-                if n_saved <= 0:
-                    # HTTP success but an EMPTY snapshot: the server saved
-                    # nothing (slot empty at save time, or the slot-save
-                    # capability is broken — missing --slot-save-path or
-                    # an API change after a server update). Treating this
-                    # as success used to record the hash as saved and
-                    # poison every restore of the session with a 0-token
-                    # file the resave guards then never overwrote.
-                    self._f._log_debug(
-                        f"⚠️ Slot save returned n_saved=0 for {filename} — "
-                        f"treating as FAILED (empty snapshot). Check the "
-                        f"server: is --slot-save-path set after the last "
-                        f"restart? Deleting the empty file so the next "
-                        f"turn retries cleanly."
-                    )
-                    try:
-                        os.remove(os.path.join(self._f.valves.slot_save_path, filename))
-                    except Exception:
-                        pass
-                    return False
-                self.set_last_saved_slot_hash(project_id, static_hash)
-                self.set_last_saved_slot_tokens(project_id, n_saved)
-                self._f._log_debug(
-                    f"✓ Slot saved → {filename} "
-                    f"({data.get('n_saved', '?')} tokens, "
-                    f"{data.get('timings', {}).get('save_ms', '?'):.0f}ms)"
-                )
-                await self._cleanup_old_slot_files(project_id, filename)
-                return True
-            status, body_text = err
-            self._f._log_debug(f"Slot save failed: HTTP {status} — {body_text}")
-            return False
-        except asyncio.TimeoutError:
-            self._f._log_debug(
-                f"Slot save timed out after {_timeout}s — the server may still "
-                f"be processing other work. Skipping save for this turn."
-            )
-            return False
-        except Exception as e:
-            self._f._log_debug(f"Slot save error: {e}")
-            return False
-
-    def _find_most_recent_slot_hash(self, project_id: str) -> Optional[str]:
-        """
-        Scan the slot directory and return the structural hash embedded in the
-        most recently modified slot file for this project AND the current model.
-
-        Used as a fallback by ``slot_restore`` when neither
-        ``structure_hash_for_cache`` nor ``block_a_cached`` are available in
-        pstate (e.g. after a cold process restart where pstate is empty but slot
-        files from the previous session still exist on disk).
-
-        The slot filename format is:
-            slot{slot_id}_{project_slug}_{static_hash16}_{model_hash8}.bin
-
-        The scan is restricted to files whose model-hash suffix matches the
-        model currently configured: a KV snapshot is only loadable by the model
-        that produced it, so picking the newest file regardless of model made a
-        model switch restore a foreign .bin, fail with HTTP 400, and delete a
-        perfectly valid snapshot under a misleading "corrupt file" diagnosis.
-        Foreign-model files are left untouched for when that model returns.
-
-        Args:
-            project_id: The project identifier used to build the filename prefix.
-
-        Returns:
-            The 16-character structural hash string, or None if no matching
-            slot file is found or the directory cannot be read.
-        """
-        slot_dir = self._f.valves.slot_save_path.rstrip("/")
-        if not os.path.isdir(slot_dir):
-            return None
-
-        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
-        prefix = f"slot{self._f.valves.slot_id}_{project_slug}_"
-        model_hash = hashlib.md5(
-            get_model_name(self._f.valves.llm_model).encode()
-        ).hexdigest()[:8]
-        suffix = f"_{model_hash}.bin"
-
-        # ── Collect matching slot files (this project, this model) ────────────
-        candidates: List[Tuple[float, str]] = []
-        try:
-            for fname in os.listdir(slot_dir):
-                if fname.startswith(prefix) and fname.endswith(suffix):
-                    fpath = os.path.join(slot_dir, fname)
-                    try:
-                        candidates.append((os.path.getmtime(fpath), fname))
-                    except OSError:
-                        pass
-        except Exception as e:
-            self._f._log_debug(f"Slot directory scan failed: {e}")
-            return None
-
-        if not candidates:
-            return None
-
-        # ── Pick the most recently modified file ──────────────────────────────
-        candidates.sort(reverse=True)
-        most_recent_fname = candidates[0][1]
-
-        # ── Extract structural hash via regex (16 hex chars before _8hex.bin) ─
-        match = re.search(r"([0-9a-f]{16})_[0-9a-f]{8}\.bin$", most_recent_fname)
-        if not match:
-            self._f._log_debug(
-                f"Slot directory scan: could not parse hash from '{most_recent_fname}'"
-            )
-            return None
-
-        found_hash = match.group(1)
-        self._f._log_debug(
-            f"Slot directory scan: found hash '{found_hash}' "
-            f"from '{most_recent_fname}'"
-        )
-        return found_hash
-
-    async def slot_restore(self, project_id: str) -> bool:
-        """
-        Restore the KV slot at session start.
-
-        Uses the structural hash (signatures only) to locate the correct
-        slot file, ensuring that docstring population does not cause a miss.
-
-        Timeout semantics
-        ─────────────────
-        A restore has two distinct failure modes, and they must NOT be
-        conflated:
-
-        * HTTP failure (the ``err`` branch): the server received the file,
-          tried to deserialize it, and rejected it (400/500). That is real
-          evidence of a corrupt/truncated ``.bin`` — delete it so a directory
-          scan does not rediscover it next turn.
-        * Timeout (this branch): the server never answered within
-          ``slot_operation_timeout``. This is the symptom of a *busy* server —
-          e.g. the single --parallel 1 slot is held by an in-flight background
-          generation — NOT of a corrupt file. Deleting on timeout would throw
-          away a perfectly valid slot (observed: a clean 6112-token save wiped
-          because a bg_docstring call monopolised the slot for 337s). So on
-          timeout we skip the restore and LEAVE the file: a genuinely corrupt
-          file will still be deleted later via the HTTP-failure path once the
-          server actually gets to process it.
-
-        The underlying stall (an orphaned auxiliary generation holding the
-        slot) is addressed in BackgroundTaskManager.stop_all(); this method
-        only guarantees it no longer destroys good cache as a side effect.
-
-        Args:
-            project_id: The project identifier.
-
-        Returns:
-            True if the slot was restored successfully, False otherwise.
-        """
-        if not self._f.valves.enable_slot_persistence:
-            return False
-
-        # ── Step 1: skip if already attempted this session ────────────────────────
-        if self.get_slot_restore_attempted(project_id):
-            return self.get_slot_restored(project_id)
-
-        self.set_slot_restore_attempted(project_id, True)
-
-        # ── Step 2: resolve the structural hash ───────────────────────────────────
-        static_hash = self.get_structure_hash_for_cache(project_id)
-        if not static_hash:
-            cached = self.get_block_a_cached(project_id)
-            if cached:
-                static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
-
-        # -- Fallback to directory scan when pstate has no hash --
-        if not static_hash:
-            self._f._log_debug(
-                "slot_restore: no hash in pstate — scanning slot directory for "
-                "most recent file (cold restart fallback)"
-            )
-            static_hash = self._find_most_recent_slot_hash(project_id)
-            if not static_hash:
-                self._f._log_debug(
-                    "slot_restore: no slot file found on disk — restore skipped"
-                )
-                return False
-
-        # ── Step 3: build filename and call llama.cpp API ─────────────────────────
-        filename = self._slot_filename(project_id, static_hash)
-        base = self._f.valves.LLM_BASE_URL.rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-
-        async def _do_restore():
-            from shared_resources import get_http_session as _shared_get_http_session
-
-            session = await _shared_get_http_session(
-                timeout_seconds=self._f.valves.llm_per_call_timeout
-            )
-            async with session.post(
-                f"{base}/slots/{self._f.valves.slot_id}",
-                params={"action": "restore"},
-                json={
-                    "filename": filename,
-                    "model": get_model_name(self._f.valves.llm_model),
-                },
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return True, data, None
-                body_text = await resp.text()
-                return False, None, (resp.status, body_text)
-
-        # ── Step 4: execute, bounded only if slot_operation_timeout > 0 ───────────
-        _timeout = self._f.valves.slot_operation_timeout
-
-        try:
-            if _timeout > 0:
-                ok, data, err = await asyncio.wait_for(_do_restore(), timeout=_timeout)
-            else:
-                ok, data, err = await _do_restore()
-
-            if ok:
-                if int(data.get("n_restored", 0) or 0) <= 0:
-                    self._f._log_debug(
-                        f"⚠️ Slot restore returned n_restored=0 for "
-                        f"{filename} — the snapshot is empty; deleting it "
-                        f"and treating as a failed restore."
-                    )
-                    try:
-                        os.remove(os.path.join(self._f.valves.slot_save_path, filename))
-                    except Exception:
-                        pass
-                    return False
-                self.set_slot_restored(project_id, True)
-                self._f._log_debug(
-                    f"✓ Slot restored ← {filename} "
-                    f"({data.get('n_restored', '?')} tokens)"
-                )
-                return True
-
-            # -- HTTP failure: server rejected the file → real corruption evidence --
-            status, body_text = err
-            self._f._log_debug(f"Slot restore failed: HTTP {status} — {body_text}")
-            self._delete_slot_file(filename)
-            self._f._log_debug(
-                f"⚠️ WARNING: deleted slot file '{filename}' after a failed "
-                f"restore — the next turn will pay a full prefill. This usually "
-                f"means the file was written incompletely."
-            )
-            return False
-
-        except asyncio.TimeoutError:
-            # -- Busy server, NOT a corrupt file: keep the .bin, skip the restore --
-            # A timeout is zero evidence of corruption; the single --parallel 1
-            # slot was almost certainly held by an in-flight generation. Deleting
-            # here destroys valid cache. A genuinely corrupt file is still caught
-            # by the HTTP-failure branch above on a later turn, when the server
-            # actually processes it. The full prefill paid this turn is the price
-            # of a busy server, not a reason to discard next turn's cache too.
-            self._f._log_debug(
-                f"Slot restore timed out after {_timeout}s — server busy, not "
-                f"corruption. Keeping '{filename}'; restore skipped this turn "
-                f"(a full KV prefill will be paid). File left intact for the "
-                f"next attempt."
-            )
-            return False
-
-        except Exception as e:
-            self._f._log_debug(f"Slot restore error: {e}")
-            return False
-
-    async def slot_restore_for_continuity(
-        self,
-        project_id: str,
-        authoritative: bool = False,
-        purpose: str = "pre_main",
-    ) -> bool:
-        """
-        Track slot dirt from auxiliary LLM calls and restore ONCE before the
-        main inference.
-
-        Two modes:
-
-        * ``authoritative=False`` (every per-call site after an auxiliary,
-          non-aligned LLM call): record that the slot no longer holds a
-          useful prefix (``_slot_cont_dirtied``) and clear the aligned-hot
-          flag, WITHOUT touching the server. Mid-turn restores were pure
-          cost: they only ever help the request that follows, consecutive
-          small auxiliary prompts share nothing with the .bin, and each
-          restore destroyed whatever mutual KV reuse those prompts had. The
-          old once-per-turn guard had already collapsed them to a single
-          early restore — which then left the END-of-inlet restore (the only
-          one positioned to matter, right before the main call) as a
-          guaranteed no-op, so the main inference saw whatever the LAST
-          auxiliary call left in the slot.
-
-        * ``authoritative=True`` (one call, end of inlet, after all auxiliary
-          work): decide what state serves the imminent main call best.
-          - Slot untouched this turn → skip (it still holds the state the
-            early ``slot_restore`` established, or last turn's main-call KV).
-          - Aligned-hot (the last LLM work was prefix-aligned: agentic
-            pipeline / aligned CoT) → the slot holds THIS turn's system
-            prefix. Restore the .bin over it only when the .bin is deeper:
-            the saved snapshot covers last turn's system PLUS chat history,
-            and with --cache-reuse the history chunks survive the
-            B_prev→B_now divergence, so once the conversation outgrows the
-            system block the .bin wins; early in a session the aligned
-            prefill wins. ``last_saved_slot_tokens`` vs
-            ``last_system_tokens`` decides in one comparison.
-          - Dirtied and not aligned-hot → the slot holds an unrelated
-            auxiliary prompt; restore the .bin.
-
-        The per-turn flags live under the ``_slot_cont_`` prefix, so the
-        existing inlet-prologue sweep clears them automatically.
-
-        Timeout semantics — see slot_save() for the full rationale.
-
-        Args:
-            project_id: The project identifier.
-            authoritative: False = mark dirty only; True = perform the
-                single pre-main restore decision described above.
-
-        Returns:
-            True if the slot was restored successfully, False otherwise
-            (including every mark-only and skip path).
-        """
-        if not self._f.valves.enable_slot_persistence:
-            self._f._log_debug(
-                "slot_restore_for_continuity: disabled (enable_slot_persistence=False)"
-            )
-            return False
-
-        # --- 1. Resolve per-project state ---
-        pstate = self.get_pstate(project_id)
-
-        # --- 2. Non-authoritative: mark and return, never touch the server ---
-        if not authoritative:
-            pstate["_slot_cont_dirtied"] = True
-            pstate["_slot_cont_aligned_hot"] = False
-            return False
-
-        # --- 3. Authoritative decision ---
-        # purpose='pre_main': serve the imminent MAIN call (system + full
-        # chat history), where a deep .bin can beat an aligned prefill.
-        # purpose='pre_aligned': serve the FIRST prefix-aligned auxiliary
-        # call of the turn (system only). If the slot is already aligned-
-        # hot it is strictly the best state for that call — the history
-        # depth heuristic below does not apply.
-        if pstate.get("_slot_cont_aligned_hot"):
-            if purpose != "pre_main":
-                self._f._log_debug(
-                    f"slot_restore_for_continuity[{purpose}]: slot already "
-                    f"aligned-hot — restore skipped"
-                )
-                return False
-            saved_tok = self.get_last_saved_slot_tokens(project_id)
-            system_tok = self.get_last_system_tokens(project_id)
-            if system_tok > 0 and saved_tok <= system_tok:
-                self._f._log_debug(
-                    f"slot_restore_for_continuity: aligned prefill "
-                    f"(~{system_tok} system tokens) is at least as deep as "
-                    f"the saved slot ({saved_tok} tokens) — restore skipped"
-                )
-                return False
-            self._f._log_debug(
-                f"slot_restore_for_continuity: saved slot ({saved_tok} tokens, "
-                f"includes history) beats the aligned system-only prefill "
-                f"(~{system_tok} tokens) — restoring"
-            )
-        elif not pstate.get("_slot_cont_dirtied"):
-            self._f._log_debug(
-                "slot_restore_for_continuity: slot untouched by non-aligned "
-                "auxiliary calls this turn — restore skipped"
-            )
-            return False
-
-        # --- 4. Get the structural hash ---
-        static_hash = self.get_structure_hash_for_cache(project_id)
-        if not static_hash:
-            cached = self.get_block_a_cached(project_id)
-            if cached:
-                static_hash = hashlib.md5(cached.encode()).hexdigest()[:16]
-            else:
-                self._f._log_debug(
-                    "slot_restore_for_continuity: no static hash available, skipping"
-                )
-                return False
-
-        filename = self._slot_filename(project_id, static_hash)
-
-        # ── Per-(purpose, filename) attempt guard ─────────────────────
-        # Idempotence belt: each purpose gets its own one-shot per turn,
-        # so the pre-aligned launchpad restore never consumes the
-        # pre-main authoritative attempt (and vice versa).
-        _attempt_key = f"_slot_cont_attempted_{purpose}_{filename}"
-        _success_key = f"_slot_cont_succeeded_{purpose}_{filename}"
-
-        if pstate.get(_attempt_key):
-            # Already attempted (succeeded or failed) for this filename this turn
-            return pstate.get(_success_key, False)
-
-        # Mark attempted before any await so concurrent calls (if any) also see it
-        pstate[_attempt_key] = True
-
-        # --- 3. Check if file exists ---
-        slot_dir = self._f.valves.slot_save_path.rstrip("/")
-        file_path = os.path.join(slot_dir, filename)
-        self._f._log_debug(
-            f"slot_restore_for_continuity: looking for {file_path} (hash={static_hash})"
-        )
-        if not os.path.exists(file_path):
-            self._f._log_debug(
-                f"slot_restore_for_continuity: file not found: {file_path}, skipping"
-            )
-            pstate[_success_key] = False
-            return False
-
-        # --- 4. Call llama.cpp API to restore ---
-        base = self._f.valves.LLM_BASE_URL.rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-
-        self._f._log_debug(
-            f"slot_restore_for_continuity: attempting restore for '{project_id}' "
-            f"with hash {static_hash} → {filename}"
-        )
-
-        async def _do_restore():
-            from shared_resources import get_http_session as _shared_get_http_session
-
-            session = await _shared_get_http_session(
-                timeout_seconds=self._f.valves.llm_per_call_timeout
-            )
-            async with session.post(
-                f"{base}/slots/{self._f.valves.slot_id}",
-                params={"action": "restore"},
-                json={
-                    "filename": filename,
-                    "model": get_model_name(self._f.valves.llm_model),
-                },
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return True, data, None
-                body_text = await resp.text()
-                return False, None, (resp.status, body_text)
-
-        # --- 5. Execute, bounded only if slot_operation_timeout > 0 ---
-        _timeout = self._f.valves.slot_operation_timeout
-
-        try:
-            if _timeout > 0:
-                ok, data, err = await asyncio.wait_for(_do_restore(), timeout=_timeout)
-            else:
-                ok, data, err = await _do_restore()
-
-            if ok:
-                if int(data.get("n_restored", 0) or 0) <= 0:
-                    self._f._log_debug(
-                        f"⚠️ Post-aux restore returned n_restored=0 for "
-                        f"{filename} — empty snapshot; deleting it and "
-                        f"treating as failed."
-                    )
-                    try:
-                        os.remove(os.path.join(self._f.valves.slot_save_path, filename))
-                    except Exception:
-                        pass
-                    return False
-                pstate[_success_key] = True
-                self._f._log_debug(
-                    f"✓ KV cache restored post-aux ← {filename} "
-                    f"({data.get('n_restored', '?')} tokens)"
-                )
-                return True
-            status, body_text = err
-            pstate[_success_key] = False
-            self._f._log_debug(
-                f"slot_restore_for_continuity: restore failed: "
-                f"HTTP {status} — {body_text}"
-            )
-            return False
-        except asyncio.TimeoutError:
-            pstate[_success_key] = False
-            self._f._log_debug(
-                f"slot_restore_for_continuity: timed out after {_timeout}s — "
-                f"server may still be processing other work"
-            )
-            return False
-        except Exception as e:
-            pstate[_success_key] = False
-            self._f._log_debug(f"slot_restore_for_continuity: error: {e}")
-            return False
-
-    def _slot_filename(self, project_id: str, static_hash: str) -> str:
-        """
-        Deterministic slot file name.
-        Encodes: project + static block hash + model hash.
-        If any of the three changes → different name → no stale restore.
-
-        The static_hash must be the structural hash (signatures only, no docstrings)
-        to ensure slot persistence survives docstring population.
-
-        The model hash uses the bare model name without backend prefix so that
-        renaming the valve from "Qwopus3.6" to "llamacpp/Qwopus3.6" does not
-        invalidate existing slot files.
-
-        Args:
-            project_id (str): The project identifier.
-            static_hash (str): The structural hash of the code state.
-
-        Returns:
-            str: The filename for the slot file.
-        """
-        model_hash = hashlib.md5(
-            get_model_name(self._f.valves.llm_model).encode()
-        ).hexdigest()[:8]
-        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
-        return f"slot{self._f.valves.slot_id}_{project_slug}_{static_hash}_{model_hash}.bin"
-
-    def _delete_slot_file(self, filename: str) -> None:
-        """Delete a single slot .bin file by name, tolerating its absence.
-
-        Used to purge a slot file that failed to restore (corrupt / truncated,
-        typically from a save that timed out mid-write) so a directory scan on a
-        later turn does not rediscover it and hang on another restore timeout.
-
-        Args:
-            filename: The slot filename as passed to the llama.cpp API (the
-                same value _slot_filename produces).
-        """
-        import os
-
-        # ── Resolve the on-disk path the server writes to ──
-        slot_dir = self._f.valves.slot_save_path or "."
-        path = os.path.join(slot_dir, filename)
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-                self._f._log_debug(f"Deleted slot file: {path}")
-        except Exception as _e:
-            self._f._log_debug(f"Could not delete slot file {path!r}: {_e}")
-
-    async def _cleanup_old_slot_files(self, project_id: str, keep: str) -> None:
-        """
-        Delete stale slot files for the CURRENT model, keeping only the file
-        just saved.
-
-        Cleanup is scoped by the model-hash suffix: slot snapshots from other
-        models are loadable only by those models and would otherwise be purged
-        on every save here, forcing a cold prefill each time the user switches
-        back. One file per (project, model) is retained; a foreign model's
-        files are its own cleanup's responsibility.
-
-        Args:
-            project_id: The project identifier.
-            keep: The filename to keep (current slot).
-        """
-        slot_dir = self._f.valves.slot_save_path.rstrip("/")
-        if not os.path.isdir(slot_dir):
-            return
-        project_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", project_id)[:20]
-        prefix = f"slot{self._f.valves.slot_id}_{project_slug}_"
-        model_hash = hashlib.md5(
-            get_model_name(self._f.valves.llm_model).encode()
-        ).hexdigest()[:8]
-        suffix = f"_{model_hash}.bin"
-        try:
-            for fname in os.listdir(slot_dir):
-                if (
-                    fname.startswith(prefix)
-                    and fname.endswith(suffix)
-                    and fname != keep
-                ):
-                    os.remove(os.path.join(slot_dir, fname))
-                    self._f._log_debug(f"Removed obsolete slot file: {fname}")
-        except Exception as e:
-            self._f._log_debug(f"Slot cleanup error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -38042,8 +36841,8 @@ class SemanticSeedInferencer:
     ─────────────────
     - ONE auxiliary call bounded by seed_inference_skeleton_max_tokens.
     - Gated by slot_free (does not run during AutoContinue continuations).
-    - Dirties the KV slot exactly like CoT/contradiction.
-    - Covered by slot_restore_for_continuity at the end of the inlet.
+    - Dirties the shared inference slot exactly like CoT/contradiction;
+      llama.cpp's native context checkpoints recover the main prefix.
     """
 
     # ------------------------------------------------------------------
@@ -38234,7 +37033,7 @@ class SemanticSeedInferencer:
             query: The user's query (truncated to 500 chars).
             ce_scores: Optional [needs_inference, literal_only] CE scores.
             use_case: The detected use case key (A-E).
-            project_id: Current project identifier, used for slot restoration.
+            project_id: Current project identifier.
 
         Returns:
             bool: True if seed inference should be performed, False otherwise.
@@ -38277,10 +37076,6 @@ class SemanticSeedInferencer:
             enable_thinking=False,
             log_raw_response=False,
         )
-
-        # Restore the KV slot after any auxiliary LLM call.
-        if self._f.valves.enable_slot_persistence and project_id:
-            await self._f._project_state_manager.slot_restore_for_continuity(project_id)
 
         if not response:
             self._f._log_debug(
@@ -38756,7 +37551,7 @@ class Filter:
               11.3 Feedback tracking
               11.4 Response & duplicate cache
         12. PERFORMANCE & PERSISTENCE
-              12.1 KV cache (slots)
+              12.1 Block A freeze (KV prefix stability)
               12.2 Volatility‑tiered context
               12.3 Graph & ingestion
               12.4 Block lifecycle
@@ -39168,10 +37963,6 @@ class Filter:
         hub_bodies_tier_recency_pointers: bool = Field(
             default=True,
             description="Include recency pointers for hub seeds in Block B.",
-        )
-        hub_bodies_tier_warmup_on_ingestion: bool = Field(
-            default=False,
-            description="Background prefill of the stable prefix (Block A + tier) after silent ingestion.",
         )
 
         # ═════════════════════════════════════════════════════════════════════════
@@ -39704,8 +38495,8 @@ class Filter:
                 "rivals. 'off' = never. 'shadow' (default) = evaluate the "
                 "gate and log 'would escalate' WITHOUT running it (grep "
                 "[METACOG-SHADOW]). 'on' = run it, bounded by half the "
-                "remaining budget. It dirties the KV slot, so the pre-aligned "
-                "launchpad re-fires afterwards."
+                "remaining budget. It adds auxiliary LLM calls between the "
+                "aligned prefill and the main inference."
             ),
         )
         agentic_verify_dynamic_gated: str = Field(
@@ -39758,8 +38549,8 @@ class Filter:
                 "Requires agentic_exec_mode='subprocess'. 'off' = never. "
                 "'shadow' (default) = log '[DYNGATE-SHADOW] would run dynamic "
                 "verification' WITHOUT running it. 'on' = run it (bounded by "
-                "the remaining budget); it dirties the KV slot, so the "
-                "launchpad re-fires afterwards."
+                "the remaining budget); it adds auxiliary LLM calls between "
+                "the aligned prefill and the main inference."
             ),
         )
         agentic_hypothesize_compete: str = Field(
@@ -39779,8 +38570,9 @@ class Filter:
                 "hypothesis count WITHOUT running it, to calibrate first "
                 "(the shadow phase confirmed the trigger live: 3 rivals, "
                 "debug intent, would-compete logged correctly). 'on' "
-                "(default) = run it, bounded by the remaining budget; it "
-                "dirties the KV slot, so the launchpad re-fires afterwards. "
+                "(default) = run it, bounded by the remaining budget; it adds "
+                "auxiliary LLM calls between the aligned prefill and the main "
+                "inference. "
                 "Expect hypothesize turns to be noticeably slower when on — "
                 "the competition adds several LLM calls (experiment design "
                 "and predictions per rival, challenge, possible tiebreaker)."
@@ -40533,9 +39325,9 @@ class Filter:
                 "Auxiliary CoT calls send the preliminary system prompt as a "
                 "byte-identical prefix (context as system, instructions in the "
                 "user turn), so llama.cpp reuses the static-prefix KV across "
-                "reasoning calls and the main inference — replacing per-call "
-                "slot save/restore I/O and the ~100k re-prefill the legacy "
-                "truncated-context calls caused. Off = pre-alignment behavior."
+                "reasoning calls and the main inference — replacing the ~100k "
+                "re-prefill the legacy truncated-context calls caused. "
+                "Off = pre-alignment behavior."
             ),
         )
 
@@ -40902,105 +39694,14 @@ class Filter:
         # 12. PERFORMANCE & PERSISTENCE
         # ═════════════════════════════════════════════════════════════════════════
 
-        # ── 12.1 KV cache (slots) ─────────────────────────────────────────────
-        enable_slot_persistence: bool = Field(
-            default=False,
-            description=(
-                "Save/restore the llama.cpp KV slot to sidecar .bin files "
-                "across turns. OFF by default: llama.cpp keeps a native "
-                "prompt cache with per-prompt context checkpoints, observed "
-                "here reusing a 78141-token prefix across four consecutive "
-                "turns with auxiliary traffic in between — the exact problem "
-                "this mechanism was built to solve, handled server-side. The "
-                "sidecar cannot compete on this model and never could: its "
-                "premise is an exact-position snapshot matching the NEXT "
-                "turn's prompt, but Block B is per-query by design, so the "
-                "snapshot never matches. A restored non-matching checkpoint "
-                "makes the server 'force full prompt re-processing due to "
-                "lack of cache data' (its own words, PR #13194), erase the "
-                "native pool with pos_next = 0, and re-prefill ~80k tokens — "
-                "measured as 76+ second stalls at 3% GPU. It was costing us "
-                "the native reuse it was meant to provide.\n"
-                "KEEP BOTH PATHS TESTABLE. The native side has a live "
-                "upstream regression (issue #24055, first bad commit "
-                "e98cb51): builds before it created checkpoints DURING "
-                "prefill via --checkpoint-every-n-tokens, so one always sat "
-                "below any divergence point and restored; builds after it "
-                "(--checkpoint-min-step) create one only where the prompt "
-                "ENDS, which is past the next turn's divergence and useless. "
-                "On b9354+ our reuse depends on the last checkpoint landing "
-                "below the divergence by luck — 78140 against 78146 in the "
-                "good run, six tokens. Re-enable this valve if a future "
-                "build removes native checkpoints entirely, or to A/B the "
-                "sidecar against a build where the regression is fixed. "
-                "Re-enabling takes TWO changes: this valve, and returning "
-                "--slot-save-path to the llama.cpp command line (without it "
-                "every save/restore fails gracefully but constantly). While "
-                "ON, central prefix alignment stands down automatically — "
-                "the continuity flag protocol predates it and would restore "
-                "the previous turn's .bin over a freshly aligned prefix — "
-                "so this valve alone reproduces the old system verbatim, "
-                "which is exactly what an honest A/B needs."
-            ),
-        )
-        slot_save_path: str = Field(default="/kvcache")
-        warmup_prefill_wait_timeout: float = Field(
-            default=30.0,
-            ge=0.0,
-            description=(
-                "Maximum seconds outlet() waits for a pending hub-tier warmup "
-                "prefill (triggered after silent ingestion) to finish before "
-                "dispatching other background tasks (docstrings, raptor, etc). "
-                "Ensures the new code state's KV slot gets saved to disk before "
-                "the LLM semaphore gets occupied by potentially many docstring "
-                "or RAPTOR calls. 0 disables waiting — background tasks may "
-                "then race the warmup task for the shared semaphore, delaying "
-                "when that slot file becomes available."
-            ),
-        )
-        slot_id: int = Field(default=0, ge=0)
-        slot_save_max_context_tokens: int = Field(
-            default=0,
-            ge=0,
-            description="Skip slot save when total context exceeds this many tokens. 0 = no guard.",
-        )
-        slot_resave_min_growth: float = Field(
-            default=1.5,
-            ge=1.0,
-            description=(
-                "Re-save the KV slot for an unchanged structural hash only when "
-                "the current context exceeds the previously saved token count by "
-                "this factor. Prevents a small early save (the hub-tier warmup, "
-                "~6.5k tokens) from permanently vetoing the full main-chat save, "
-                "while avoiding a multi-GB KV rewrite every turn: llama.cpp "
-                "prefix-matching only ever reuses up to Block A anyway, so one "
-                "large save per structural hash captures all the value."
-            ),
-        )
-        slot_operation_timeout: float = Field(
-            default=10.0,  # This could be low, be aware of this.
-            ge=0.0,
-            le=600.0,
-            description=(
-                "Bound, in seconds, for individual slot save/restore HTTP "
-                "calls to llama.cpp, independent of llm_per_call_timeout. "
-                "This is a backstop for a genuinely hung server — NOT the "
-                "primary reliability mechanism for slot persistence. That "
-                "role belongs to BackgroundTaskManager never hard-cancelling "
-                "in-flight LLM calls (see stop_all() docstring); with that "
-                "fix in place this should rarely if ever fire. Set to 0 to "
-                "disable the bound entirely and wait until the underlying "
-                "HTTP session times out (llm_per_call_timeout, default 900s)."
-            ),
-        )
-        # ── 12.1b Block A freeze (KV prefix stability across edits) ──────────
+        # ── 12.1 Block A freeze (KV prefix stability across edits) ───────────
         block_a_freeze_turns: int = Field(
             default=10,
             ge=0,
             description=(
-                "Freeze Block A (and its slot hash) for up to N counted changes, "
+                "Freeze Block A (and its structure hash) for up to N counted changes, "
                 "so structural edits do not each trigger a full KV prefill. "
-                "During the window the same slot file is reused and Block A "
+                "During the window Block A "
                 "serves its cached text with a staleness header. The window "
                 "breaks and re-captures on the Nth counted change (paying one "
                 "prefill then). What counts as a change is governed by "
@@ -41538,10 +40239,6 @@ class Filter:
         # -- Task registry --
         self._task_registry = TaskRegistry(self)
 
-        # -- KVCache warmup --
-        self._pending_warmup_task: Optional[asyncio.Task] = None
-        self._pending_slot_save_task = None
-
         # --- Validate valve coherence at startup ---
         self._validate_valve_coherence()
 
@@ -41718,22 +40415,7 @@ class Filter:
                     "Note: docstrings are included in the skeleton and generated "
                     "lazily. The Block A prefix hash is computed over a "
                     "docstring-stripped projection (structure hash), so KV cache "
-                    "and slot restore remain stable across docstring population."
-                )
-
-        # ------------------------------------------------------------------
-        # 6. Slot persistence guard threshold sanity
-        # ------------------------------------------------------------------
-        if (
-            hasattr(v, "slot_save_max_context_tokens")
-            and v.slot_save_max_context_tokens > 0
-        ):
-            if v.slot_save_max_context_tokens < v.context_window_tokens // 2:
-                warnings.append(
-                    f"slot_save_max_context_tokens ({v.slot_save_max_context_tokens}) "
-                    f"is less than half the window ({v.context_window_tokens}). "
-                    f"KV slot saves will be skipped even when there is plenty "
-                    f"of room, reducing cross-session performance."
+                    "reuse remains stable across docstring population."
                 )
 
         # ------------------------------------------------------------------
@@ -41942,15 +40624,6 @@ class Filter:
         longer touches continuation — it cannot see streamed content — so this
         is the single source of truth.
 
-        Per-turn slot-restore guards (_slot_cont_attempted_{filename} /
-        _slot_cont_succeeded_{filename}) live in pstate, which persists across
-        turns, and are cleared at the start of every inlet.
-
-        slot_restore_attempted / slot_restored are also reset each inlet, so
-        the explicit slot_restore() call issued after preprocessing reflects the
-        clean post-outlet-save state of the slot rather than whatever
-        background-task activity touched it afterward.
-
         use_case_key / use_case_label, computed once here via
         classify_intent_with_continuation(), are threaded through
         assemble_for_turn() → SystemPromptBuilder.build() →
@@ -42009,26 +40682,6 @@ class Filter:
             )
 
             # ------------------------------------------------------------------
-            # Region: clear per-turn slot-restore guards
-            # ------------------------------------------------------------------
-            _guards_cleared = [
-                k for k in list(pstate.keys()) if k.startswith("_slot_cont_")
-            ]
-            for _key in _guards_cleared:
-                del pstate[_key]
-            if _guards_cleared:
-                self._log_debug(
-                    f"Cleared {len(_guards_cleared)} stale slot-restore "
-                    f"guard(s) from previous turn"
-                )
-
-            # ------------------------------------------------------------------
-            # Reset once-per-session slot lifecycle flags
-            # ------------------------------------------------------------------
-            psm.set_slot_restore_attempted(project_id, False)
-            psm.set_slot_restored(project_id, False)
-
-            # ------------------------------------------------------------------
             # Region: determine slot_busy and is_continuation
             # ------------------------------------------------------------------
             slot_busy = False
@@ -42055,8 +40708,6 @@ class Filter:
                     psm.set_is_continuation(project_id, False)
                     is_continuation = False
                     _watchdog_broke = True
-                    if self.valves.enable_slot_persistence:
-                        await psm.slot_restore_for_continuity(project_id)
 
             # ------------------------------------------------------------------
             # Region: cancel background enrichment tasks from previous turn
@@ -42079,16 +40730,6 @@ class Filter:
             )
             if not messages:
                 return body
-
-            # 🚀 RESOURCE OPTIMISATION
-            #   Explicit slot restore after preprocessing completes
-            # ----------------------------------------------------------------
-            if self.valves.enable_slot_persistence:
-                _restored = await psm.slot_restore(project_id)
-                self._log_debug(
-                    f"Initial slot restore → "
-                    f"{'OK' if _restored else 'skipped / no slot file'}"
-                )
 
             # 🔥 STATE MANAGEMENT
             #   0. Process previous turn's assistant response (prologue)
@@ -42391,23 +41032,6 @@ class Filter:
                                 len(self.tokenizer.encode(static_block)),
                             )
 
-                        # -- optional hub-bodies tier warmup ----------------------
-                        if (
-                            self.valves.enable_hub_bodies_tier
-                            and self.valves.hub_bodies_tier_warmup_on_ingestion
-                        ):
-                            tier_text, tier_hash, tier_qids = (
-                                self._ctx_builder._build_hub_bodies_tier(project_id)
-                            )
-                            pstate_local["hub_tier_text"] = tier_text
-                            pstate_local["hub_tier_hash"] = tier_hash
-                            psm.set_hub_tier_qids(project_id, tier_qids)
-                            state.hub_tier_qids_persisted = tier_qids
-                            self._conversation_state_manager.set(project_id, state)
-                            self._pending_warmup_task = asyncio.create_task(
-                                self._ctx_builder._warmup_tier_prefill(project_id)
-                            )
-
                         # -- persist state ----------------------------------------
                         self._conversation_state_manager.mark_dirty(project_id)
                         await self._conversation_state_manager.save_if_dirty(project_id)
@@ -42584,17 +41208,6 @@ class Filter:
 
             body["messages"] = messages
 
-            # 🚀 RESOURCE OPTIMISATION
-            #   KV cache — restore stable prefix after all auxiliary LLM work
-            # ----------------------------------------------------------------
-            # The ONLY restore positioned to matter: it runs after every
-            # auxiliary call and immediately before the main inference.
-            # authoritative=True lets it decide between keeping an aligned
-            # prefill, restoring the .bin, or doing nothing (see the
-            # docstring). Mid-turn calls only mark dirt and never POST.
-            if not slot_busy and self.valves.enable_slot_persistence:
-                await psm.slot_restore_for_continuity(project_id, authoritative=True)
-
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._log_section(
                 "CONTEXT MANAGER - INLET END",
@@ -42618,7 +41231,7 @@ class Filter:
         """
         Post-process the request after the LLM has generated its response.
 
-        Content-independent only: save the KV slot, run DB maintenance, persist
+        Content-independent only: run DB maintenance, persist
         symbol edges / path views / conversation state, then resume background
         enrichment for the next turn. Assistant-content processing (indexing,
         LTM store, response cache, continuation) is handled by the next inlet's
@@ -42658,32 +41271,6 @@ class Filter:
             pstate = psm.get_pstate(project_id)
 
             # ------------------------------------------------------------------
-            # 🔥 STATE MANAGEMENT
-            #   KV slot save — content-independent.
-            #
-            #   slot_save() keys off the code structure hash, not assistant
-            #   content, and guards against redundant / oversized writes
-            #   internally. It runs unconditionally every turn.
-            # ------------------------------------------------------------------
-            if self.valves.enable_slot_persistence:
-                # last_total_context_tokens is written authoritatively at the end
-                # of the inlet, on the final message list. The outlet body in
-                # this OpenWebUI arrives nearly empty (~the last message, 23-43
-                # tokens observed), NOT fully empty, so the previous `_est > 0`
-                # gate never worked as an empty-body guard: it wrote the ~23-token
-                # count over the real ~51k metric every turn, which permanently
-                # muted the size-aware KV re-save and pinned every restore to the
-                # first snapshot ("same hash, context 23 tokens within 1.5× of
-                # saved snapshot"). The metric is therefore not written from the
-                # outlet at all.
-                pass
-                # The KV save itself is deferred to after wait_for_llm_tasks()
-                # (see the sequential-save block below). It is a critical,
-                # non-deferrable step — it captures the clean main-chat KV before
-                # the background tasks dirty the slot — so it must run
-                # synchronously, in order, not detached.
-
-            # ------------------------------------------------------------------
             # 🚀 RESOURCE OPTIMISATION — maintenance, every turn
             # ------------------------------------------------------------------
             await self._ltm.purge_expired_memories()
@@ -42721,23 +41308,6 @@ class Filter:
             if getattr(self, "_is_silent_ingestion", False):
                 self._is_silent_ingestion = False
 
-        # 🔥 KV SLOT SAVE — sequential, critical, non-deferrable.
-        # wait_for_llm_tasks() in the finally above drained every auxiliary call
-        # of this turn, so the slot now holds the clean main-chat KV and is idle.
-        # The next thing to touch it are the background tasks launched by
-        # the guarded relaunch below, which dirty it. Saving here — after
-        # the drain, before the launch — captures the clean KV so the next turn's
-        # slot_restore recovers it instead of a version polluted by raptor /
-        # docstrings. Synchronous by design: a detached save races the background
-        # tasks and can be truncated mid-write, producing the corrupt .bin that
-        # hangs the next restore. The slot is idle here, so no wait_slot_free is
-        # needed.
-        if self.valves.enable_slot_persistence:
-            try:
-                await self._project_state_manager.slot_save(project_id)
-            except Exception as _save_err:
-                self._log_debug(f"outlet: slot_save failed (non-fatal): {_save_err}")
-
         # 🚀 BACKGROUND TASKS
         #   Resume after all critical outlet work is done.
         #   Drain SQLite writes first to reduce lock contention.
@@ -42758,37 +41328,6 @@ class Filter:
         _last_response = self._project_state_manager.get_last_assistant_response(
             project_id
         )
-
-        # If silent ingestion fired a hub-tier warmup prefill earlier (or a
-        # previous one is still in flight), give it priority over
-        # docstrings/raptor/etc for the shared LLM semaphore.
-        if (
-            self._pending_warmup_task is not None
-            and not self._pending_warmup_task.done()
-        ):
-            _warmup_timeout = self.valves.warmup_prefill_wait_timeout
-            self._log_debug(
-                f"outlet: waiting up to {_warmup_timeout}s for pending hub-tier "
-                f"warmup prefill to finish before dispatching background tasks"
-            )
-            try:
-                if _warmup_timeout > 0:
-                    await asyncio.wait_for(
-                        asyncio.shield(self._pending_warmup_task),
-                        timeout=_warmup_timeout,
-                    )
-                else:
-                    await self._pending_warmup_task
-                self._log_debug("outlet: warmup prefill finished")
-            except asyncio.TimeoutError:
-                self._log_debug(
-                    f"outlet: warmup prefill still running after "
-                    f"{_warmup_timeout}s — proceeding without waiting further"
-                )
-            except Exception as e:
-                self._log_debug(f"outlet: warmup prefill failed: {e}")
-
-        self._pending_warmup_task = None
 
         # Guarded relaunch: only resume + launch when no newer inlet paused the
         # background tasks while this outlet was running. When skipped, the
