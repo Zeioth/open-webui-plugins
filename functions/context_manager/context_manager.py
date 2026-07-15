@@ -5863,17 +5863,14 @@ class ContextBuilder:
     def _build_instruction_tail(self, use_case: str = "C") -> str:
         """M2: instruction tail adapted to the active use case.
 
-        The tail also RESTATES the declared code preferences (comment
-        language and style contract). They already sit at the top of Block A
-        for KV stability, but that is ~60k tokens of class index and call
-        graph away from where generation starts, and the model was observed
-        writing Spanish comments while the profile line asked for English.
-        This is a position problem, not a wording one: the tail is the last
-        thing read before the answer, so the standing rules are repeated
-        here where they are actually attended to. The cost is a few dozen
-        tokens on a block that is per-query anyway (nothing in Block A's
-        cached prefix moves), and the restatement is byte-identical each
-        turn, so it adds no churn of its own.
+        Only the use-case line lives here. The declared code preferences used
+        to be restated here too, on the reasoning that this is the last thing
+        the model reads — the dump proved otherwise: Block B is injected at
+        "critical" priority, so it sorts FIRST in the dynamic block, and 158
+        lines of agentic workspace follow this tail before generation starts.
+        The restatement now rides as a trailing injection appended after the
+        workspace, which is where "last" actually is. See
+        MessageAssembler._build_code_preferences_restatement.
         """
         tails = {
             "A": "_[Architecture mode: focus on contracts, interfaces, and invariants. "
@@ -5887,29 +5884,7 @@ class ContextBuilder:
             "_[Reasoning mode: code review checklist + critical reasoning "
             "guidelines from system above apply to this response]_"
         )
-        out = [tails.get(use_case, default)]
-        # ── Restate the declared preferences at the point of generation ──
-        _rules: List[str] = []
-        _clang = str(
-            getattr(self._f.valves, "code_comment_language", "") or ""
-        ).strip()
-        if _clang:
-            _rules.append(
-                f"write every code comment and docstring in {_clang} "
-                "(the conversation language does not apply to code)"
-            )
-        _style = str(getattr(self._f.valves, "code_style_contract", "") or "")
-        for _raw in _style.splitlines():
-            _rule = _raw.strip().lstrip("- ").strip()
-            if _rule:
-                _rules.append(_rule[0].lower() + _rule[1:] if _rule else _rule)
-        if _rules:
-            out.append(
-                "_[When you write code in this reply: "
-                + "; ".join(_rules).rstrip(".")
-                + ".]_"
-            )
-        return "\n".join(out)
+        return tails.get(use_case, default)
 
     def _is_skeleton_tier_active(self, project_id: str) -> bool:
         """True only if the skeleton tier was actually rendered into Block A THIS turn."""
@@ -11923,6 +11898,64 @@ class LLMOrchestrator:
     # 2. Main LLM caller (with retries, cache, deduplication)
     # ═══════════════════════════════════════════════════════════════════════════
 
+    def _align_system_to_prefix(self, system_prompt: str, effective_model: str) -> str:
+        """Prepend the turn's preliminary system prompt to an auxiliary call.
+
+        The 'against N' server logs settled how the checkpoint pool dies: a
+        single bare call sharing almost nothing with the resident context
+        ('Checking checkpoint with [78140, 78140] against 3') erases every
+        valid checkpoint with pos_next = 0, and the system cannot recover,
+        because the replacement checkpoints are created where prompts END —
+        past the divergence point of every future turn. Four consecutive
+        turns restored @78140 at 36 t/s; one bare call killed the pool and
+        every turn after it re-prefilled ~78k tokens for 62-75s.
+
+        e2f91d0 aligned the four metacognitive calls by hand. This is the
+        general fix at the single choke point every auxiliary call passes
+        through, guarded three ways:
+
+        - SAME MODEL ONLY. The prefix is a free checkpoint restore only on
+          the slot that holds it. Against any other model it would be a
+          genuine ~74k-token prefill, so the caller passes the EFFECTIVE
+          model (override or default) and the guard compares basenames with
+          the turn's main model — backends may prefix ids
+          ('llamacpp/<name>' vs '<name>').
+        - IDEMPOTENT. Calls that already carry the prefix (the metacognitive
+          four, the agentic steps via _aligned_prefix) pass through intact.
+        - BUDGETED. If prefix + role would not leave room for the response
+          inside the context window, the call goes out bare — the old
+          behaviour, always correct, merely slower.
+
+        Runs BEFORE dedup/cache key computation, so the aligned text is part
+        of the call's identity and deduplicated consumers await the same
+        effective request.
+        """
+        if not getattr(self._f.valves, "align_aux_calls_to_prefix", True):
+            return system_prompt
+        _prelim = getattr(self._f, "_prelim_system_this_turn", "") or ""
+        if not _prelim:
+            return system_prompt
+        if system_prompt.startswith(_prelim):
+            return system_prompt
+        # ── Guard: the call must target the model whose slot holds the prefix ──
+        _main = getattr(self._f, "_main_model_this_turn", "") or ""
+        _aux = effective_model or ""
+        if not _main or not _aux or _main.split("/")[-1] != _aux.split("/")[-1]:
+            return system_prompt
+        # ── Guard: the aligned call must still fit the context window ──────
+        if self._f.tokenizer:
+            try:
+                budget = (
+                    self._f.valves.context_window_tokens
+                    - self._f.valves.response_reserve_tokens
+                    - 4000
+                )
+                if len(self._f.tokenizer.encode(_prelim + system_prompt)) > budget:
+                    return system_prompt
+            except Exception:
+                return system_prompt
+        return f"{_prelim}\n\n---\n\n{system_prompt}"
+
     async def call_llm(
         self,
         prompt: str,
@@ -11970,6 +12003,20 @@ class LLMOrchestrator:
             enable_thinking = False
         elif _think_mode in ("on", "true", "1", "yes"):
             enable_thinking = True
+
+        # Region: KV prefix alignment — must precede dedup/cache keys so the
+        # aligned system prompt is part of the call's identity. The guard
+        # compares the call's EFFECTIVE model (override or default) with the
+        # turn's main model: several killers (contradiction_llm,
+        # session_summary, change_summary) reach here through overrides that
+        # in single-model deployments resolve to the very slot holding the
+        # prefix. The warmup call builds its own prefill prompt and is
+        # deliberately excluded.
+        if label != "tier_prefill_warmup":
+            system_prompt = self._align_system_to_prefix(
+                system_prompt,
+                model_override or self._f.valves.llm_model or "",
+            )
 
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}"
@@ -24037,6 +24084,42 @@ class MetacognitiveReasoningEngine:
         self._performance_history: Dict[str, List["CompetitionRecord"]] = {}
 
     # ═══════════════════════════════════════════════════════════════════════
+    # 0. KV alignment — share the turn's prefix instead of evicting it
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _aligned_system(self, role_instruction: str) -> str:
+        """Prefix a metacognitive role instruction with the turn's prelim.
+
+        These calls are small — 134 to 620 tokens — and used to go out as
+        bare prompts sharing nothing with the ~74k context resident in the
+        slot. llama.cpp cannot reuse a prefix that is not there, so each one
+        erased the whole checkpoint pool (two checkpoints, 422 MiB, measured)
+        and left a 33-token one in its place. Fourteen of them run inside a
+        single hypothesize step, between the last aligned agentic step and
+        the main inference — so by the time the real answer is generated,
+        the prefix its own pipeline had just paid ~62s to build is gone, and
+        it pays again. The competition's true cost was never its own calls
+        (1-5s each); it was the re-prefill it billed to the main call.
+
+        Returning prelim + role makes each call a prefix EXTENSION of what
+        the slot already holds, exactly as AgenticStepExecutor._aligned_prefix
+        does for steps: the shared head restores from a checkpoint and only
+        the role line plus the user turn are processed. The extra tokens are
+        free in wall time precisely because they are already computed.
+
+        The prefix is a head, never a tail, or the invariant breaks. Falls
+        back to the bare instruction when the stash is absent (an auxiliary
+        call outside a normal turn, or the valve off), which is the current
+        behaviour and always correct — just slower.
+        """
+        if not self._f.valves.agentic_align_metacog_calls:
+            return role_instruction
+        _prelim = getattr(self._f, "_prelim_system_this_turn", "") or ""
+        if not _prelim:
+            return role_instruction
+        return f"{_prelim}\n\n---\n\n{role_instruction}"
+
+    # ═══════════════════════════════════════════════════════════════════════
     # 1. Epistemic toolkit — evidence collection and analysis
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -24570,7 +24653,7 @@ class MetacognitiveReasoningEngine:
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt=(
+            system_prompt=self._aligned_system(
                 "You are a structural claim classifier for software architecture. "
                 "Output ONLY a valid JSON object with three keys: "
                 "'critical', 'supportive', 'unknown' (all lists of strings). "
@@ -24668,7 +24751,7 @@ class MetacognitiveReasoningEngine:
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt=(
+            system_prompt=self._aligned_system(
                 "You are a structural prediction generator for software architecture. "
                 "Output ONLY a valid JSON object with key 'predictions' "
                 "(list of strings). "
@@ -25772,7 +25855,7 @@ class MetacognitiveReasoningEngine:
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt=(
+            system_prompt=self._aligned_system(
                 "You are a scientific experiment designer for software architecture. "
                 "Output ONLY a valid JSON object with 'claim' (string) and "
                 "'supports' ('H1' or 'H2'). "
@@ -26139,7 +26222,7 @@ class MetacognitiveReasoningEngine:
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
-            system_prompt=(
+            system_prompt=self._aligned_system(
                 "You are a devil's advocate for software architecture hypotheses. "
                 "Find real structural flaws grounded in the evidence provided. "
                 "Output ONLY a valid JSON object with 'has_flaw' (bool) and "
@@ -31914,6 +31997,14 @@ class SystemPromptBuilder:
             dynamic_injections,
             messages,
         )
+        # Turn-scoped stash, mirroring _original_system_prompt. The agentic
+        # executor receives prelim_system as a parameter and aligns its steps
+        # to it; the metacognitive calls fired from inside a hypothesize step
+        # are several frames below that parameter and had no way to reach it,
+        # so they went out as bare few-hundred-token prompts and evicted the
+        # shared prefix from llama.cpp's checkpoint pool. See
+        # MetacognitiveReasoningEngine._aligned_system.
+        self._f._prelim_system_this_turn = prelim_system
 
         pstate["last_activation_scores"] = getattr(
             self._f, "_last_activation_scores", {}
@@ -33481,7 +33572,7 @@ class MessageAssembler:
         # ------------------------------------------------------------------
         _pending_tdd = getattr(self._f, "_pending_agentic_tdd_injection", "")
         if _pending_tdd:
-            dynamic_injections.append(("high", _pending_tdd))
+            dynamic_injections.append(("trailing", _pending_tdd))
             self._f._pending_agentic_tdd_injection = ""
 
         # ------------------------------------------------------------------
@@ -33653,7 +33744,7 @@ class MessageAssembler:
             messages
         )
         if _refactor_state:
-            dynamic_injections.append(("medium", _refactor_state))
+            dynamic_injections.append(("trailing", _refactor_state))
             self._f._log_debug(
                 "Code history: injected refactor state into Block B "
                 f"({self._f._tokens.estimate_code_tokens(_refactor_state)} tokens)."
@@ -34059,7 +34150,7 @@ class MessageAssembler:
                 is_continuation=is_continuation,
                 project_id=project_id,
             )
-            dynamic_injections.append(("critical", _mp_instructions))
+            dynamic_injections.append(("trailing", _mp_instructions))
             self._f._log_debug(
                 f"Multi-phase injected (priority=critical): "
                 f"{_mp_available} available, reporting {_mp_budget_reported} to model "
@@ -34075,6 +34166,51 @@ class MessageAssembler:
     # ═══════════════════════════════════════════════════════════════════════
     # 6. Final system assembly & logging (MIGRADO)
     # ═══════════════════════════════════════════════════════════════════════
+
+    def _build_code_preferences_restatement(self) -> str:
+        """Restate the declared code preferences for the point of generation.
+
+        The rules already sit at the top of Block A, which is what keeps them
+        in the cached prefix — but that is ~74k tokens upstream of where
+        generation begins, and generated code kept arriving with Spanish
+        comments and no docstrings. An earlier attempt appended this to the
+        instruction tail inside Block B; the dump showed Block B is injected
+        at "critical" priority and therefore sorts FIRST, leaving 158 lines
+        of agentic workspace between the restatement and the answer. Emitted
+        as a trailing injection from the final assembler, after the pipeline
+        has appended its own, the stable trailing sort puts this last of all.
+
+        KV cost is nil: trailing injections live past every byte the
+        preliminary prompt contains, so no cached prefix moves, and the text
+        is byte-identical between turns while the valves are unchanged.
+
+        Returns "" when no preference is declared.
+        """
+        # ── Step 1: collect the declared rules ─────────────────────────────
+        _rules: List[str] = []
+        _clang = str(
+            getattr(self._f.valves, "code_comment_language", "") or ""
+        ).strip()
+        if _clang:
+            _rules.append(
+                f"write every code comment and docstring in {_clang} "
+                "(the conversation language does not apply to code)"
+            )
+        _style = str(getattr(self._f.valves, "code_style_contract", "") or "")
+        for _raw in _style.splitlines():
+            # Rules are authored as sentences; strip the terminal period so
+            # joining them with "; " cannot produce the ".;" the dump caught.
+            _rule = _raw.strip().lstrip("- ").strip().rstrip(".")
+            if _rule:
+                _rules.append(_rule[0].lower() + _rule[1:])
+        if not _rules:
+            return ""
+        # ── Step 2: render as one bracketed line ───────────────────────────
+        return (
+            "_[When you write code in this reply: "
+            + "; ".join(_rules)
+            + ".]_"
+        )
 
     def _assemble_final_system_and_log(
         self,
@@ -34096,6 +34232,14 @@ class MessageAssembler:
         """
         budget = self._f.valves.global_injection_token_budget
         priority_order = _INJECTION_PRIORITY
+
+        # ── Restate the declared code preferences at the true end ───────────
+        # Appended here, after the agentic pipeline has already appended its
+        # workspace, so the stable trailing sort puts this last of all: the
+        # final thing the model reads before it starts generating.
+        _prefs = self._build_code_preferences_restatement()
+        if _prefs:
+            dynamic_injections.append(("trailing", _prefs))
 
         psm = self._f._project_state_manager
         pstate = psm.get_pstate(project_id)
@@ -39672,14 +39816,53 @@ class Filter:
                 "signal, fabricated identifiers, escalates regardless)."
             ),
         )
+        align_aux_calls_to_prefix: bool = Field(
+            default=True,
+            description=(
+                "Prepend the turn's preliminary system prompt to EVERY "
+                "auxiliary LLM call that targets the turn's main model "
+                "(classify_turn, contradiction_llm, session_summary, "
+                "change_summary, docstrings, and the rest), so each one is a "
+                "prefix extension of the resident context instead of a bare "
+                "prompt. The server logs showed a single bare call sharing 3 "
+                "tokens ('against 3') erasing every valid checkpoint with no "
+                "possible recovery: replacement checkpoints are created where "
+                "prompts end, past the divergence point of every future "
+                "turn, so one killer condemns every subsequent turn to a "
+                "~65s full re-prefill. Calls to a different model, calls "
+                "that already carry the prefix, and calls that would not fit "
+                "the context window are passed through unchanged. Turn OFF "
+                "to restore bare auxiliary prompts (focal but "
+                "pool-destroying)."
+            ),
+        )
+        agentic_align_metacog_calls: bool = Field(
+            default=True,
+            description=(
+                "Prefix the metacognitive calls (design_critical_experiment, "
+                "generate_predictions, experimentum_crucis, devil_advocate) "
+                "with the turn's preliminary system prompt, so they extend "
+                "the KV prefix already resident in the slot instead of "
+                "evicting it. Measured: 14 such calls run inside one "
+                "hypothesize step, each a bare 134-620 token prompt sharing "
+                "no prefix, and each erased llama.cpp's checkpoint pool (422 "
+                "MiB) — leaving the main inference to re-prefill ~77k tokens "
+                "for ~62s that its own pipeline had already paid. The extra "
+                "prefix tokens cost no wall time: they restore from a "
+                "checkpoint. Turn OFF to send these calls bare again, which "
+                "keeps their prompts focal at the cost of the re-prefill — "
+                "worth testing if hypothesis quality regresses, since these "
+                "are tight JSON classifiers that previously reasoned from "
+                "claim text alone and now also see the code context."
+            ),
+        )
         agentic_metacog_max_iters: int = Field(
-            default=1,
+            default=4,
             ge=1,
             le=6,
             description=(
                 "compete_hypotheses iterations when reinforcing a step. "
-                "1 (default) = one falsification pass — the in-pipeline "
-                "budget rarely affords a multi-iteration loop. Refinement "
+                "1 = a single falsification pass. Refinement "
                 "of surviving hypotheses needs >= 2. Stagnation detection "
                 "(and the divergent pool it gates) needs >= "
                 "stagnation_window + 2, i.e. 4 at the default window of 2: "
@@ -39688,8 +39871,13 @@ class Filter:
                 "The old ceiling of 3 made stagnation unreachable at every "
                 "permitted value. Each iteration costs one design + "
                 "prediction + evidence pass per surviving hypothesis, so "
-                "raise this only when a step's reasoning is worth the "
-                "latency."
+                "4 (default) is the lowest value that reaches "
+                "stagnation, so the full method is available; each iteration "
+                "costs one design + prediction + evidence pass per surviving "
+                "hypothesis, but with agentic_align_metacog_calls on those "
+                "calls extend the resident KV prefix instead of evicting it, "
+                "which is what makes this default affordable. Drop to 1 if "
+                "latency matters more than reaching the divergent pool."
             ),
         )
         agentic_metacog_min_remaining_s: int = Field(
@@ -41301,6 +41489,7 @@ class Filter:
         self._pending_llm_lock = asyncio.Lock()
         self._llm_orchestrator.init_cache()
         self._last_used_model: Optional[str] = None
+        self._main_model_this_turn: str = ""
 
         # -- Tracking of active LLM tasks --
         self._active_llm_tasks: Set[asyncio.Task] = set()
@@ -41789,6 +41978,15 @@ class Filter:
             self._log_debug("inlet called")
             inlet_start = time.monotonic()
             self._log_section("CONTEXT MANAGER - INLET START")
+            # Record the model this turn is served by. Auxiliary calls only
+            # prepend the turn's KV prefix when they target this same model:
+            # against any other model the prefix is not resident anywhere and
+            # would be a genuine ~74k-token prefill instead of a checkpoint
+            # restore. Compared by basename because backends may prefix the
+            # id (e.g. 'llamacpp/<name>' in aux calls vs '<name>' in body).
+            self._main_model_this_turn = str(
+                (body or {}).get("model") or ""
+            ).strip()
 
             # ------------------------------------------------------------------
             # Region: stop background tasks gracefully before any inlet work
