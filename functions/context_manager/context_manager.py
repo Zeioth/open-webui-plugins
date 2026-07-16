@@ -12253,8 +12253,21 @@ class LLMOrchestrator:
                                         content
                                     )
                                 )
-                            except Exception:
+                            except Exception as _norm_exc:
+                                # A crash here silently hands RAW text to a
+                                # strict consumer — the one failure shape
+                                # that is indistinguishable from "producer
+                                # normalization not deployed" in the logs.
+                                # Name it, so the next live parse error can
+                                # be attributed instead of re-investigated.
                                 _norm, _how = None, ""
+                                self._f._log_debug(
+                                    f"[LLM]{label_str} json contract "
+                                    f"normalization CRASHED "
+                                    f"({type(_norm_exc).__name__}: "
+                                    f"{_norm_exc}) — raw content passed "
+                                    f"through to a strict consumer"
+                                )
                             if _norm is not None:
                                 self._f._log_debug(
                                     f"[LLM]{label_str} json contract "
@@ -12735,6 +12748,10 @@ class AgenticEvidenceLedger:
                     break
         if data is None:
             _tail = (step.output or "")[-180:].replace("\n", "⏎")
+            # The absent tail is marked explicitly so the orchestrator can
+            # tell "no tail found" apart from a legitimate '{"claims": []}'
+            # — the recovery path must only fire for the former.
+            control["tail_missing"] = True
             if getattr(step, "truncated", False):
                 # Not a contract violation: the generation hit
                 # agentic_step_max_tokens before it could emit the tail, which
@@ -12859,6 +12876,113 @@ class AgenticEvidenceLedger:
     def claims_for(self, step_id: int) -> List[LedgerClaim]:
         """Claims emitted by one step."""
         return [c for c in self.claims if c.step_id == step_id]
+
+    _RECOVERY_MIN_REMAINING_S = 45.0
+    _RECOVERY_MAX_TOKENS = 800
+
+    async def recover_claims_tail(
+        self,
+        step: AgenticStep,
+        project_id: str,
+        remaining: float,
+    ) -> bool:
+        """
+        Re-ask for the claims JSON tail a truncated step never emitted.
+
+        The step contract puts the claims block at the very END of the
+        output — after the prose — so a generation that hits
+        agentic_step_max_tokens loses exactly the structured part while
+        the analysis it summarizes sits complete above the cut (live:
+        three steps in one validation run lost every claim this way,
+        leaving the verify report and the difficulty gate evidence-blind
+        for those steps). The prose already paid for is not re-generated:
+        a single short follow-up call hands it back and asks for ONLY the
+        JSON block, grounded in that analysis.
+
+        The response is normalized through the tolerant contract ladder
+        and appended (as a fenced block, re-serialized from the parsed
+        dict) only when it carries a "claims" key, so the caller's
+        re-extraction is guaranteed a well-formed tail; every recovered
+        claim then passes the same citation validation as a natively
+        emitted one — the ledger's fabrication checks bound what a re-ask
+        can smuggle in. The recovery call itself may truncate at its own
+        cap; the repair ladder salvages the complete prefix of the claims
+        array, which still beats an empty ledger.
+
+        Args:
+            step: A done-but-truncated step whose output holds prose only.
+            project_id: Current project identifier.
+            remaining: Seconds left in the pipeline budget — below
+                _RECOVERY_MIN_REMAINING_S the recovery is skipped with a
+                log line (one aux call plus re-extraction must fit).
+
+        Returns:
+            True when a well-formed tail was appended to step.output and
+            re-extraction should run; False otherwise (output untouched).
+        """
+        if not self._f.valves.agentic_claims_tail_recovery:
+            return False
+        prose = (step.output or "").strip()
+        if not prose:
+            return False
+        if remaining < self._RECOVERY_MIN_REMAINING_S:
+            self._f._log_debug(
+                f"🤖 Ledger: step {step.id} claims tail recovery skipped — "
+                f"only {remaining:.0f}s remain "
+                f"(< {self._RECOVERY_MIN_REMAINING_S:.0f}s)"
+            )
+            return False
+        prompt = (
+            "The analysis below was cut off by a token limit BEFORE it "
+            "could emit its final claims JSON block.\n\n"
+            "--- ANALYSIS (truncated) ---\n"
+            f"{prose}\n"
+            "--- END ANALYSIS ---\n"
+            f"{AgenticStepExecutor._JSON_CONTRACT}\n\n"
+            "Based ONLY on the analysis above, emit that JSON block now. "
+            "Output nothing else."
+        )
+        try:
+            raw = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=(
+                    "You extract structured claims from an analysis you "
+                    "already wrote. Output ONLY the fenced JSON block."
+                ),
+                max_tokens=self._RECOVERY_MAX_TOKENS,
+                temperature=0.1,
+                label="claims_tail_recovery",
+                total_timeout=min(remaining, 60.0),
+                response_format={"type": "json_object"},
+                enable_thinking=False,
+            )
+        except Exception:
+            raw = None
+        if not raw:
+            self._f._log_debug(
+                f"🤖 Ledger: step {step.id} claims tail recovery — no "
+                f"response, prose kept as-is"
+            )
+            return False
+        data, how = self._f._meta_reasoning._parse_json_contract(raw)
+        if not isinstance(data, dict) or "claims" not in data:
+            self._f._log_debug(
+                f"🤖 Ledger: step {step.id} claims tail recovery — response "
+                f"did not carry a claims object, prose kept as-is"
+            )
+            return False
+        step.output = (
+            prose
+            + "\n\n```json\n"
+            + json.dumps(data, ensure_ascii=False)
+            + "\n```"
+        )
+        self._f._log_debug(
+            f"🤖 Ledger: step {step.id} claims tail recovered "
+            f"({how or 'clean'}: {len(data.get('claims') or [])} claim(s)) "
+            f"— re-extraction follows"
+        )
+        return True
 
     def counts(self) -> Tuple[int, int, int]:
         """(total claims, claims fully valid, claims with invalid citations)."""
@@ -16670,7 +16794,9 @@ class AgenticOrchestrator:
                 )
                 evidence = meta.gather_evidence(claim.text, project_id)
                 coverage = meta._compute_coverage_score(design)
-                falsified, reason = meta.is_falsified(evidence, design, coverage)
+                falsified, reason = meta.is_falsified(
+                    evidence, design, coverage, project_id=project_id
+                )
             except asyncio.TimeoutError:
                 continue
             except Exception:
@@ -16706,6 +16832,47 @@ class AgenticOrchestrator:
                 f"{n_refuted} refuted"
             )
         return n_refuted
+
+    async def _extract_with_recovery(
+        self,
+        step: AgenticStep,
+        project_id: str,
+        remaining: float,
+    ) -> Dict[str, Any]:
+        """
+        Extract a step's claims tail, re-asking for it once when the
+        generation was truncated before emitting it.
+
+        Wraps AgenticEvidenceLedger.extract_and_validate with the tail
+        recovery path: a step that hits agentic_step_max_tokens loses its
+        end-positioned claims block while its prose survives intact above
+        the cut, so one short grounded follow-up call (recover_claims_tail)
+        re-asks for the block and extraction is retried on the
+        reconstructed output. The recovery only fires when the tail was
+        genuinely absent (tail_missing), the step was truncated, and no
+        claims were registered — a legitimate '{"claims": []}' tail never
+        triggers it. Applied identically to main-loop and re-plan wave
+        steps so both feed the ledger.
+
+        Args:
+            step: A step with status "done".
+            project_id: Current project identifier.
+            remaining: Seconds left in the pipeline budget.
+
+        Returns:
+            The step's control signals (see extract_and_validate).
+        """
+        control = self._ledger.extract_and_validate(step, project_id)
+        if (
+            control.get("tail_missing")
+            and getattr(step, "truncated", False)
+            and not self._ledger.claims_for(step.id)
+            and await self._ledger.recover_claims_tail(
+                step, project_id, remaining
+            )
+        ):
+            control = self._ledger.extract_and_validate(step, project_id)
+        return control
 
     async def _generative_evaluation(
         self,
@@ -16986,8 +17153,10 @@ class AgenticOrchestrator:
           skipped — hard evidence is never traded for speed, reasoning is.
         - NEEDS insertion: a step reporting a concrete gap inserts ONE
           extra investigate step right after itself (insertion only, never
-          reordering), bounded by agentic_max_steps and two insertions per
-          run.
+          reordering), bounded by agentic_max_steps, two insertions per
+          run, and agentic_needs_min_remaining_s of pipeline budget — a
+          gap reported with the clock nearly spent stays uninvestigated
+          (logged) rather than burning the remainder on a doomed step.
 
         Args:
             question: The question driving the pipeline.
@@ -17369,7 +17538,9 @@ class AgenticOrchestrator:
                 "ask": "",
             }
             if step.status == "done":
-                control = self._ledger.extract_and_validate(step, project_id)
+                control = await self._extract_with_recovery(
+                    step, project_id, budget - (time.monotonic() - started)
+                )
 
                 # -- 0030: proactive hypothesis competition ------------
                 # A hypothesize step enumerated rival root causes; compete
@@ -17455,10 +17626,20 @@ class AgenticOrchestrator:
             )
 
             # -- NEEDS: insert ONE extra investigate step after this one ---
-            if (
+            # The insertion is optional extra work, exactly like the
+            # reinforcement gate above, and gets the same budget courtesy:
+            # an investigate step is a full LLM call, so inserting one into
+            # a nearly-exhausted budget burns the remainder on a step that
+            # times out and starves everything scheduled after the loop.
+            _rem_needs = budget - (time.monotonic() - started)
+            _needs_capacity = (
                 control["needs"]
                 and len(plan.steps) < self._f.valves.agentic_max_steps
                 and inserted < 2
+            )
+            if (
+                _needs_capacity
+                and _rem_needs >= self._f.valves.agentic_needs_min_remaining_s
             ):
                 new_step = AgenticStep(
                     id=max(s.id for s in plan.steps) + 1,
@@ -17475,6 +17656,14 @@ class AgenticOrchestrator:
                 self._f._log_debug(
                     f"🤖 Agentic: step {step.id} reported gaps — inserted "
                     f"step {new_step.id} ({new_step.goal[:60]})"
+                )
+            elif _needs_capacity:
+                self._f._log_debug(
+                    f"🤖 Agentic: step {step.id} reported gaps "
+                    f"({'; '.join(control['needs'][:2])[:80]}) but only "
+                    f"{_rem_needs:.0f}s remain (< "
+                    f"{self._f.valves.agentic_needs_min_remaining_s}s) — "
+                    f"insertion skipped, gap left uninvestigated"
                 )
 
             # -- early exit: hard evidence steps are never skipped ---------
@@ -17647,7 +17836,9 @@ class AgenticOrchestrator:
                     broker=self._broker,
                 )
                 if wstep.status == "done":
-                    _wctl = self._ledger.extract_and_validate(wstep, project_id)
+                    _wctl = await self._extract_with_recovery(
+                        wstep, project_id, budget - (time.monotonic() - started)
+                    )
                     # Same reinforcement gate as main-loop steps: shadow
                     # counting must include waves or the calibration lies.
                     if _mc_gate_mode in ("shadow", "on"):
@@ -18577,17 +18768,34 @@ class CommandRouter:
             log_raw_response=False,
         )
 
-        # ── Step 3: Parse — any failure resolves to None, no fallback ──
+        # ── Step 3: Parse — strict first, tolerant ladder as the belt ──
+        # Producer-side normalization is the first line of defense, but
+        # this exact consumer received a raw '{...}\n\n[Confidence: 95%]'
+        # in live validation with the producer path deployed — whatever
+        # lets raw text through (a partial deploy, a crash inside the
+        # normalizer), the local ladder costs nothing and keeps the
+        # contradiction check alive instead of silently returning None.
         if not response:
             return None
         try:
             data = json.loads(response)
-        except (json.JSONDecodeError, Exception):
+        except Exception:
+            try:
+                data, _how = self._f._meta_reasoning._parse_json_contract(
+                    response
+                )
+            except Exception:
+                data = None
+            if data is None:
+                self._f._log_debug(
+                    f"_detect_contradictions_with_llm: JSON parse error — "
+                    f"response: {response[:200]!r}"
+                )
+                return None
             self._f._log_debug(
-                f"_detect_contradictions_with_llm: JSON parse error — "
-                f"response: {response[:200]!r}"
+                f"_detect_contradictions_with_llm: strict parse failed — "
+                f"local ladder rescued ({_how})"
             )
-            return None
 
         if data.get("contradiction", False):
             return (
@@ -18829,7 +19037,26 @@ class CommandRouter:
         result["_source"] = "llm"
         try:
             cleaned_raw = (raw or "").replace("```json", "").replace("```", "").strip()
-            data = json.loads(cleaned_raw)
+            try:
+                data = json.loads(cleaned_raw)
+            except Exception:
+                # Producer-side normalization is the first line of defense;
+                # this exact consumer still fell to its neutral default in
+                # live validation on a '{...}\n[Confidence: 95%]' response,
+                # and the default cascades hard (intent lost → CFG gate
+                # silent → CoT level floor on the very turn that needed
+                # depth). Whatever lets raw text through — a partial
+                # deploy, a crash inside the normalizer — the local ladder
+                # costs nothing and keeps the classification alive.
+                data, _how = self._f._meta_reasoning._parse_json_contract(
+                    raw or ""
+                )
+                if data is None:
+                    raise
+                self._f._log_debug(
+                    f"classify_turn: strict parse failed — local ladder "
+                    f"rescued ({_how})"
+                )
             if isinstance(data, dict):
                 if isinstance(data.get("is_code_only"), bool):
                     result["is_code_only"] = data["is_code_only"]
@@ -24508,21 +24735,21 @@ class MetacognitiveReasoningEngine:
             for name in mentioned
         }
 
-        # The same constant _claim_verified reads with: whatever verb this
+        # The same constant _claim_verdict reads with: whatever verb this
         # pattern accepts here becomes a "_calls_" key there, and one owner
-        # keeps the two sides from drifting apart again.
+        # keeps the two sides from drifting apart again. The edge lookup is
+        # delegated to _relation_in_graph, which resolves the caller's bare
+        # name to its qualified ids before reading edges — a bare
+        # get_edges_out here missed every class-method edge (edges are
+        # indexed by qualified src), marking VALID relations False and
+        # feeding false contradictions into predictions and negatives.
         call_patterns = self._CALL_RELATION_RE.findall(hypothesis)
         call_relations_valid = {}
         for caller, callee in call_patterns:
-            if caller not in all_names or callee not in all_names:
+            verified = self._relation_in_graph(caller, callee, project_id)
+            if verified is None:
                 continue
-            key = f"{caller}_calls_{callee}"
-            caller_edges = self._f._symbol_index.get_edges_out(caller, project_id)
-            verified = any(
-                e.dst == callee and e.type in ("calls", "reads", "writes")
-                for e in caller_edges
-            )
-            call_relations_valid[key] = verified
+            call_relations_valid[f"{caller}_calls_{callee}"] = verified
 
         now = time.time()
         recent_window = 3600
@@ -24655,74 +24882,166 @@ class MetacognitiveReasoningEngine:
         return min(1.0, max(0.0, uncertainty))
 
     _CALL_RELATION_RE = re.compile(
-        r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
+        r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|reads?|writes?|depends on)"
+        r"\s+`?(\w+)`?",
         re.IGNORECASE,
     )
 
-    def _claim_verified(self, claim: str, evidence: "StaticEvidence") -> bool:
+    def _relation_in_graph(
+        self,
+        caller: str,
+        callee: str,
+        project_id: str,
+    ) -> Optional[bool]:
         """
-        Check if a textual claim is confirmed by the structural evidence.
+        Check whether the SymbolGraph carries an edge caller→callee.
 
-        The match runs EVIDENCE-KEY-INSIDE-CLAIM, which is the only
-        direction the two shapes allow. Claims are sentences the design
-        step wrote ("build_activation_graph is called during continuation
-        turns"); evidence keys are compact identifiers built by
-        gather_evidence ("build_block_a_calls_compute_structure_hash", or a
-        bare symbol name). The short thing can be inside the long one; the
-        reverse cannot.
+        Returns None when either endpoint is not a known symbol (a local
+        variable, a stdlib name, an invented identifier the qid path
+        already covers): an unresolvable relation must ABSTAIN, not guess.
+        Otherwise True/False against the live edge graph.
 
-        The previous implementation tested `claim in key`, so it demanded
-        that an entire sentence be a substring of a short identifier. It
-        could only ever fire when a claim was verbatim identical to a
-        relation key — the literal string "foo calls bar" and nothing else
-        — and no design step writes those. Every real claim fell through to
-        the benefit-of-the-doubt return, which pinned obj_score at
-        verified/total = 1.0 and made combined_score a straight function of
-        self-reported confidence (0.5 + 0.5*llm_conf, hence the famously
-        constant 0.85/0.90). is_falsified, which asks this same question of
-        every critical claim, could never answer no: the Popperian half of
-        the engine was structurally unable to falsify anything.
+        The caller's bare name is resolved to every qualified id that
+        carries it before edges are read: the relation regex captures bare
+        names (a word pattern cannot span the dot in
+        'ContextBuilder.build_block_b') while edges are indexed by the
+        QUALIFIED src id, so a bare get_edges_out lookup silently misses
+        every class-method edge — the exact false negative the ledger's
+        _validate_call_relations already fixed on its side. Edge dst is
+        stored bare-or-qualified depending on resolution, so it is
+        compared by its bare tail for the same reason. Any edge type the
+        validator accepts (calls, reads, writes) satisfies any of the
+        relation verbs: a claim phrased 'X uses Y' is confirmed by a
+        calls edge — lax on the verb, strict on the endpoints.
+        """
+        idx = self._f._symbol_index
+        all_names = idx.get_all_names(project_id)
+        if caller not in all_names or callee not in all_names:
+            return None
+        callee_bare = callee.split(".")[-1]
+        for cq in idx.get_qualified_names_for(caller, project_id):
+            for e in idx.get_edges_out(cq, project_id):
+                if e.dst.split(".")[-1] == callee_bare and e.type in (
+                    "calls",
+                    "reads",
+                    "writes",
+                ):
+                    return True
+        return False
 
-        Relations are read with the same pattern that WROTE the keys —
-        one constant now owns both sides, so they cannot drift, and a
-        claim phrased with "invokes" or "depends on" resolves to the
-        "_calls_" key exactly as gather_evidence intended. Symbols are
-        matched on word boundaries, longest first, so a claim naming
-        `build_block_a` cannot be answered by an unrelated `block`.
+    def _claim_verdict(
+        self,
+        claim: str,
+        evidence: "StaticEvidence",
+        project_id: str = "",
+    ) -> Tuple[Optional[bool], str]:
+        """
+        Resolve a textual claim against structural evidence and the live
+        SymbolGraph, returning (verdict, why).
 
-        Unverifiable claims (nothing in evidence speaks to them) keep the
-        benefit of the doubt and return True.
+        The verdict is TRI-STATE:
+            True  — every checkable assertion in the claim is confirmed.
+            False — the claim asserts structure the SymbolGraph refutes.
+            None  — nothing checkable: no known symbol, no resolvable
+                    relation. Callers must treat None as ABSTENTION, not
+                    confirmation. The previous contract returned True for
+                    unverifiable claims ("benefit of the doubt"), and
+                    compute_weighted_score counted that True at full
+                    critical weight (10x) — which, combined with design
+                    claims being routinely MORE SPECIFIC than the
+                    hypothesis whose evidence they were matched against
+                    (their relations never present in the evidence dict),
+                    kept obj_score pinned at 1.0 even after the 0019
+                    direction fix. Live run: nine evaluations, obj=1.000
+                    in all of them, combined back to 0.5 + 0.5*llm_conf.
+
+        Resolution ladder (refutation-dominant: any resolvable assertion
+        that fails decides False immediately; confirmations only win when
+        nothing refuted):
+
+        1. Relations, parsed with the same _CALL_RELATION_RE that
+           gather_evidence uses to WRITE the keys: the evidence dict is
+           consulted first (relations the hypothesis itself asserted),
+           then — because design claims outrun their hypothesis — the
+           live edge graph via _relation_in_graph. A relation touching
+           an unknown name (a local variable like `effective_hash`, a
+           stdlib call) stays unresolved rather than guessed.
+        2. Symbols, matched on word boundaries against
+           evidence.symbols_found, longest first, so a claim naming
+           `build_block_a` cannot be answered by an unrelated `block`.
+
+        The why string names the deciding fact so is_falsified can
+        surface it verbatim in the falsification reason.
         """
         claim_lower = claim.lower()
 
-        # ── Step 1: call relations — parse the claim exactly as the keys
-        # were parsed from the hypothesis, then look one up ──
+        # ── Step 1: call relations — evidence dict first, then the live
+        # edge graph; refutation short-circuits, confirmations accumulate ──
         _relations = {k.lower(): v for k, v in evidence.call_relations_valid.items()}
+        _confirmed_why = ""
         for caller, callee in self._CALL_RELATION_RE.findall(claim):
             key = f"{caller}_calls_{callee}".lower()
+            verdict: Optional[bool] = None
+            source = ""
             if key in _relations:
-                return _relations[key]
+                verdict = _relations[key]
+                source = "evidence"
+            elif project_id:
+                verdict = self._relation_in_graph(caller, callee, project_id)
+                source = "SymbolGraph"
+            if verdict is False:
+                return False, f"relation '{key}' does not exist in {source}"
+            if verdict is True:
+                _confirmed_why = f"relation '{key}' confirmed by {source}"
 
         # ── Step 2: symbols — the key is the short side; require a whole
         # word so substrings of longer identifiers cannot answer ──
         for symbol in sorted(evidence.symbols_found, key=len, reverse=True):
             if re.search(rf"\b{re.escape(symbol.lower())}\b", claim_lower):
-                return evidence.symbols_found[symbol]
+                if not evidence.symbols_found[symbol]:
+                    return False, f"symbol '{symbol}' not found in SymbolGraph"
+                if not _confirmed_why:
+                    _confirmed_why = f"symbol '{symbol}' found in SymbolGraph"
 
-        return True  # unverifiable → benefit of doubt
+        if _confirmed_why:
+            return True, _confirmed_why
+        return None, "no checkable content"
+
+    def _claim_verified(
+        self,
+        claim: str,
+        evidence: "StaticEvidence",
+        project_id: str = "",
+    ) -> Optional[bool]:
+        """
+        Tri-state claim check: True (confirmed), False (refuted), None
+        (unverifiable — must be scored as abstention, never as True).
+        Thin wrapper over _claim_verdict; see there for the resolution
+        ladder and the production history behind the tri-state contract.
+        """
+        verdict, _ = self._claim_verdict(claim, evidence, project_id)
+        return verdict
 
     def is_falsified(
         self,
         evidence: "StaticEvidence",
         design: "ExperimentDesign",
         coverage_score: float = 1.0,
+        project_id: str = "",
     ) -> Tuple[bool, Optional[str]]:
         """
         Popperian asymmetric falsification with coverage guard.
 
-        Claim matching normalizes spaces→underscores in both directions
-        so that natural language claims ("foo calls bar") match
-        underscore-keyed evidence ("foo_calls_bar").
+        Verdicts come from _claim_verdict — the single owner of claim
+        matching. The previous implementation kept its own duplicated
+        matcher here, running in the INVERTED direction the 0019 fix
+        removed from _claim_verified: `any(v in relation for v in
+        claim_variants)` demands an entire claim sentence be a substring
+        of a short key like 'foo_calls_bar', which no real text ever
+        satisfies. The asymmetric kill below had therefore never fired
+        since it was written — confirmed live: primary_failure=none,
+        call_failures=0, symbol_failures=0 across every competition in
+        the validation run, with the direction fix already deployed.
 
         Coverage guard (H4 + H2 interaction):
             If coverage_score < min_coverage_for_falsification and
@@ -24763,44 +25082,21 @@ class MetacognitiveReasoningEngine:
                 )
             return False, None
 
-        # Asymmetric: ONE critical claim failure → hard kill (or downgrade)
+        # Asymmetric: ONE refuted critical claim → hard kill (or downgrade)
         for claim in design.critical_claims:
-            claim_lower = claim.lower()
-            # Normalize spaces→underscores to match evidence key format
-            # LLM writes "foo calls bar", evidence uses "foo_calls_bar"
-            claim_normalized = claim_lower.replace(" ", "_")
-            claim_variants = {claim_lower, claim_normalized}
-
-            for relation, valid in evidence.call_relations_valid.items():
-                if any(v in relation.lower() for v in claim_variants) and not valid:
-                    reason = (
-                        f"Critical claim falsified: '{claim}' — "
-                        f"relation '{relation}' does not exist in SymbolGraph"
-                    )
-                    if _coverage_guard_active:
-                        self._f._log_debug(
-                            f"is_falsified: coverage guard active "
-                            f"(coverage={coverage_score:.2f} < "
-                            f"{self._f.valves.min_coverage_for_falsification:.2f}) "
-                            f"→ downgrading hard kill to penalty"
-                        )
-                        return False, reason  # caller applies penalty
-                    return True, reason  # hard kill
-
-            for symbol, found in evidence.symbols_found.items():
-                if any(v in symbol.lower() for v in claim_variants) and not found:
-                    reason = (
-                        f"Critical claim falsified: '{claim}' — "
-                        f"symbol '{symbol}' not found in SymbolGraph"
-                    )
-                    if _coverage_guard_active:
-                        self._f._log_debug(
-                            f"is_falsified: coverage guard active "
-                            f"(coverage={coverage_score:.2f}) "
-                            f"→ downgrading hard kill to penalty"
-                        )
-                        return False, reason  # caller applies penalty
-                    return True, reason  # hard kill
+            verdict, why = self._claim_verdict(claim, evidence, project_id)
+            if verdict is not False:
+                continue
+            reason = f"Critical claim falsified: '{claim}' — {why}"
+            if _coverage_guard_active:
+                self._f._log_debug(
+                    f"is_falsified: coverage guard active "
+                    f"(coverage={coverage_score:.2f} < "
+                    f"{self._f.valves.min_coverage_for_falsification:.2f}) "
+                    f"→ downgrading hard kill to penalty"
+                )
+                return False, reason  # caller applies penalty
+            return True, reason  # hard kill
 
         return False, None
 
@@ -24814,6 +25110,7 @@ class MetacognitiveReasoningEngine:
         downgraded_reason: Optional[str] = None,
         obj_weight: float = 0.5,
         llm_weight: float = 0.5,
+        project_id: str = "",
     ) -> Tuple[float, float, float]:
         """
         Compute (obj_score, combined_score, coverage_score).
@@ -24826,10 +25123,21 @@ class MetacognitiveReasoningEngine:
         existing behavior — LLM design judgment matters more).
 
         Scoring layers:
-        1. Structural: critical claims 10x, supportive 1x.
+        1. Structural: critical claims 10x, supportive 1x. Claims whose
+           verdict is None ABSTAIN — excluded from both sides of the
+           ratio. Counting unverifiable claims as verified (the previous
+           benefit-of-the-doubt True at full weight) is what kept
+           obj_score pinned at 1.0 in production; with abstention, obj
+           measures the fraction verified OF WHAT IS CHECKABLE, and the
+           coverage machinery separately reports how much was checkable.
+           When nothing is checkable, obj falls back to the neutral 0.5.
         2. Downgrade penalty: if is_falsified() was coverage-guarded.
         3. Prediction bonus: verified predictions +10% max.
         4. Coverage penalty: low coverage penalizes combined proportionally.
+
+        project_id enables live SymbolGraph resolution of relation claims
+        (see _claim_verdict); empty string preserves evidence-only
+        matching for callers without a project in scope.
 
         Returns (obj_score, combined_score, coverage_score).
         """
@@ -24853,12 +25161,18 @@ class MetacognitiveReasoningEngine:
             total_weight = 0.0
             verified_weight = 0.0
             for claim in design.critical_claims:
+                verdict = self._claim_verified(claim, evidence, project_id)
+                if verdict is None:
+                    continue
                 total_weight += CRITICAL_WEIGHT
-                if self._claim_verified(claim, evidence):
+                if verdict:
                     verified_weight += CRITICAL_WEIGHT
             for claim in design.supportive_claims:
+                verdict = self._claim_verified(claim, evidence, project_id)
+                if verdict is None:
+                    continue
                 total_weight += SUPPORTIVE_WEIGHT
-                if self._claim_verified(claim, evidence):
+                if verdict:
                     verified_weight += SUPPORTIVE_WEIGHT
             obj_score = verified_weight / total_weight if total_weight > 0 else 0.5
 
@@ -24985,11 +25299,36 @@ class MetacognitiveReasoningEngine:
         Recover the parseable prefix of a JSON object cut off mid-generation.
 
         A single scan tracks string state and the bracket stack, remembering
-        the last position that ended a COMPLETE element (a closed string or a
-        closing bracket). The text is cut there — dropping any half-emitted
-        string the truncation left dangling — and the stack is unwound with
-        the matching closers. The result either parses or the whole attempt
-        returns None; no partially-guessed content is ever fabricated.
+        the last position that ended a COMPLETE element. The text is cut
+        there — dropping any half-emitted content the truncation left
+        dangling — and the stack is unwound with the matching closers. The
+        result either parses or the whole attempt returns None; no
+        partially-guessed content is ever fabricated.
+
+        What counts as a safe cut point is the load-bearing decision, and
+        production found the second hole here: a closed STRING is only a
+        complete element when it is a value or an array item. When it is an
+        object KEY, cutting after it yields '{"symbols"}' — not JSON — so
+        the repair parsed nothing and the whole response was lost even
+        though a perfectly good prefix sat before the truncated field
+        (live: seed_inference truncated mid-array → repair produced
+        '{"symbols"}' → parse failed → zero seeds; same shape lost a
+        classify_turn with its intent field already complete on the line
+        above the cut). Each string is therefore classified at its OPENING
+        quote — a key is a string directly inside an object preceded by
+        '{' or ',' — and only non-keys mark a safe point.
+
+        Two cut points are added for the same reason:
+        * A comma (outside strings) proves the element before it is
+          complete — this is what rescues scalar values, which have no
+          closing character of their own ('{"count": 42, "items' cuts at
+          the comma; a dangling comma is stripped before unwinding). A
+          scalar NOT followed by a delimiter stays unsalvageable by
+          design: the truncation may have cut its digits ('{"n": 25' could
+          have been 2500 — guessing fabricates data).
+        * An opening bracket, so a container truncated before its first
+          complete element degrades to honestly-empty ('{"symbols": ['
+          → '{"symbols": []}') instead of losing sibling fields.
 
         Args:
             text: Candidate JSON starting at its opening brace.
@@ -25000,6 +25339,8 @@ class MetacognitiveReasoningEngine:
         stack: List[str] = []
         in_str = False
         esc = False
+        str_is_key = False
+        prev_sig = ""
         last_safe = -1
         last_stack: Optional[List[str]] = None
         for i, ch in enumerate(text):
@@ -25010,42 +25351,59 @@ class MetacognitiveReasoningEngine:
                     esc = True
                 elif ch == '"':
                     in_str = False
-                    last_safe = i
-                    last_stack = list(stack)
-            else:
-                if ch == '"':
-                    in_str = True
-                elif ch in "{[":
-                    stack.append(ch)
-                elif ch in "}]":
-                    if stack:
-                        stack.pop()
-                    last_safe = i
-                    last_stack = list(stack)
-                    if not stack:
-                        # The top-level container just closed, so the object
-                        # is COMPLETE and everything after it is extra data.
-                        # Production found the hole: this model habitually
-                        # signs off with "[Confidence: 95%]", and those
-                        # brackets kept the scan going, dragging last_safe
-                        # past the JSON and out to the sign-off's own "]".
-                        # The repair then "fixed" the whole string back into
-                        # itself, json.loads failed on the trailing prose a
-                        # second time, and the contract was lost with a
-                        # perfectly good object sitting in the first line —
-                        # classify_turn fell back to its neutral default and
-                        # contradiction detection to none, silently. Cutting
-                        # at the top-level close is also strictly more
-                        # correct for the truncation case it was written
-                        # for: a complete object never needs repairing.
-                        try:
-                            data = json.loads(text[: i + 1])
-                        except Exception:
-                            break
-                        return data if isinstance(data, dict) else None
+                    prev_sig = '"'
+                    if not str_is_key:
+                        last_safe = i
+                        last_stack = list(stack)
+                continue
+            if ch == '"':
+                in_str = True
+                str_is_key = bool(stack) and stack[-1] == "{" and prev_sig in "{,"
+                continue
+            if ch in "{[":
+                stack.append(ch)
+                last_safe = i
+                last_stack = list(stack)
+                prev_sig = ch
+            elif ch in "}]":
+                if stack:
+                    stack.pop()
+                last_safe = i
+                last_stack = list(stack)
+                prev_sig = ch
+                if not stack:
+                    # The top-level container just closed, so the object
+                    # is COMPLETE and everything after it is extra data.
+                    # Production found the hole: this model habitually
+                    # signs off with "[Confidence: 95%]", and those
+                    # brackets kept the scan going, dragging last_safe
+                    # past the JSON and out to the sign-off's own "]".
+                    # The repair then "fixed" the whole string back into
+                    # itself, json.loads failed on the trailing prose a
+                    # second time, and the contract was lost with a
+                    # perfectly good object sitting in the first line —
+                    # classify_turn fell back to its neutral default and
+                    # contradiction detection to none, silently. Cutting
+                    # at the top-level close is also strictly more
+                    # correct for the truncation case it was written
+                    # for: a complete object never needs repairing.
+                    try:
+                        data = json.loads(text[: i + 1])
+                    except Exception:
+                        break
+                    return data if isinstance(data, dict) else None
+            elif ch == ",":
+                last_safe = i
+                last_stack = list(stack)
+                prev_sig = ch
+            elif not ch.isspace():
+                prev_sig = ch
         if last_safe < 0 or last_stack is None:
             return None
-        repaired = text[: last_safe + 1] + "".join(
+        prefix = text[: last_safe + 1].rstrip()
+        if prefix.endswith(","):
+            prefix = prefix[:-1]
+        repaired = prefix + "".join(
             "}" if c == "{" else "]" for c in reversed(last_stack)
         )
         try:
@@ -25960,7 +26318,10 @@ class MetacognitiveReasoningEngine:
                 # ⑦ Falsification with coverage guard
                 current_coverage = self._compute_coverage_score(design)
                 falsified, reason = self.is_falsified(
-                    evidence, design, coverage_score=current_coverage
+                    evidence,
+                    design,
+                    coverage_score=current_coverage,
+                    project_id=project_id,
                 )
 
                 if falsified:
@@ -25996,6 +26357,7 @@ class MetacognitiveReasoningEngine:
                     downgraded_reason=downgraded_reason,
                     obj_weight=obj_weight,
                     llm_weight=llm_weight,
+                    project_id=project_id,
                 )
 
                 # ⑨ Epistemic uncertainty (H2 — Bayesian-inspired, deterministic)
@@ -39668,6 +40030,34 @@ class Filter:
             description=(
                 "Reinforcement is skipped (with a log line) when less than "
                 "this many seconds of pipeline budget remain."
+            ),
+        )
+        agentic_needs_min_remaining_s: int = Field(
+            default=90,
+            ge=0,
+            description=(
+                "A NEEDS-reported gap only inserts its extra investigate "
+                "step when at least this many seconds of pipeline budget "
+                "remain. An investigate step is a full LLM call (40-90s "
+                "measured live); inserting one into a nearly-exhausted "
+                "budget burns the remainder on a step that times out AND "
+                "starves everything scheduled after the step loop — "
+                "observed live: a gap-inserted step started with ~42s left, "
+                "died at '(step timed out)', and the generative evaluation "
+                "was then skipped at '-0s remain'."
+            ),
+        )
+        agentic_claims_tail_recovery: bool = Field(
+            default=True,
+            description=(
+                "When a step's generation is truncated at "
+                "agentic_step_max_tokens before emitting its end-positioned "
+                "claims JSON block, re-ask for the block with one short "
+                "grounded follow-up call (the paid-for prose is handed "
+                "back; only the JSON is regenerated). Recovered claims pass "
+                "the same citation validation as native ones. Observed "
+                "live: three truncated steps in one run lost every claim, "
+                "leaving verify and the difficulty gate evidence-blind."
             ),
         )
         agentic_coherence_check: str = Field(
