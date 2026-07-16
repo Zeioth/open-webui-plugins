@@ -11925,10 +11925,22 @@ class LLMOrchestrator:
                 and not getattr(self._f, "_align_reject_logged_this_turn", False)
             ):
                 self._f._align_reject_logged_this_turn = True
-                self._f._log_debug(
-                    f"prefix alignment skipped: aux model '{_aux}' does not "
-                    f"match turn model '{_main}' (basename comparison); "
-                    "auxiliary calls go out bare this turn"
+                # logger.warning, not _log_debug: this guard silently
+                # disables the single largest performance feature in the
+                # file for the WHOLE deployment, and _log_debug is gated
+                # behind valves.debug — so in a default config the symptom
+                # is every auxiliary call re-prefilling ~74k tokens for
+                # 60-75s with no line anywhere saying why. The trigger is
+                # mundane: change the model in the UI and forget that
+                # llm_model / cot_model_level2 still name the old one.
+                # Once per turn, so 40 aux calls do not drown the log.
+                logger.warning(
+                    f"[CodeAware] prefix alignment DISABLED this turn — aux "
+                    f"model '{_aux}' does not match turn model '{_main}' "
+                    f"(basename comparison). Auxiliary calls go out bare and "
+                    f"re-prefill the full context. Point llm_model / "
+                    f"cot_model_level2 (and the other *_model valves) at the "
+                    f"model actually selected in the UI."
                 )
             return system_prompt
         # ── Guard: the aligned call must still fit the context window ──────
@@ -13024,10 +13036,33 @@ class AgenticStepCache:
         visible result would contradict the valve. Folding the mode in makes
         a valve change a cache miss for that step, so the cache always
         reflects the current setting.
+
+        The MODEL belongs in the key for the same reason, with more force:
+        it is the thing that WROTE the cached text. The structure_hash gate
+        catches code edits, but swapping the model changes nothing the gate
+        can see — so every row this cache holds survives a model swap and
+        replays the previous model's prose, verbatim, on a config that no
+        longer runs it. That inverts the purpose of a swap: the first thing
+        someone does after changing models is re-ask the question that
+        misbehaved, and on the same unchanged code every cached step
+        answers in the OLD model's voice, hallucinations included. The
+        resolution mirrors what the executor actually sends — it calls
+        call_llm with model_override=cot_model_level2, and call_llm falls
+        back to llm_model when that is empty — so the key names the model
+        that produced the row. A swap becomes a clean miss for every step;
+        the SQLite rows of the previous model simply stop being reachable
+        instead of being served to a model that never said them.
         """
         norm = " ".join(step.goal.split()).lower()
         mode = getattr(self._f.valves, "agentic_metacog_reinforce", "off")
-        return hashlib.md5(f"{step.kind}\x1f{norm}\x1f{mode}".encode()).hexdigest()
+        model = (
+            getattr(self._f.valves, "cot_model_level2", "")
+            or getattr(self._f.valves, "llm_model", "")
+            or ""
+        )
+        return hashlib.md5(
+            f"{step.kind}\x1f{norm}\x1f{mode}\x1f{model}".encode()
+        ).hexdigest()
 
     async def get(
         self, project_id: str, structure_hash: str, step: AgenticStep
@@ -24182,11 +24217,36 @@ Output only the symbol name.
     def compute_call_graph_hash(
         self, symbol_names: Iterable[str], project_id: str
     ) -> str:
-        """Hash of the call relationships (changes when the graph changes)."""
+        """
+        Hash of the call relationships (changes when the graph changes).
+
+        Confidence is part of the relationship, not decoration. Views are
+        built from PPR, which propagates over Edge.effective_weight() =
+        weight * confidence, and resolve_dangling_edges rewrites confidence
+        in place — 0.3 to 1.0 when a referenced symbol gains a definition,
+        back to 0.3 when it loses one — without adding or removing a single
+        edge. A hash over src:type:dst alone therefore cannot move when the
+        very numbers the view was computed from change, and is_stale keeps
+        certifying a persisted CodePathView whose ranking no longer matches
+        the graph. The in-memory PPR cache solved this with a volatile
+        generation counter; that has no business in a hash persisted to
+        SQLite, so here the confidence travels inside the hash itself,
+        which makes a stored hash self-describing across restarts.
+
+        Weight needs no such treatment: add_edge's duplicate check is by
+        (dst, type), so the first weight for a triple wins permanently and
+        nothing rewrites it afterwards — the triple already determines it.
+
+        Known limitation, unchanged: only OUTGOING edges from the given
+        symbols are enumerated, so a new edge pointing INTO one of them
+        from outside the set is still invisible here.
+        """
         edge_strs = []
         for name in sorted(symbol_names):
             for edge in self._f._symbol_index.get_edges_out(name, project_id):
-                edge_strs.append(f"{edge.src}:{edge.type}:{edge.dst}")
+                edge_strs.append(
+                    f"{edge.src}:{edge.type}:{edge.dst}:{edge.confidence:.3f}"
+                )
         return (
             hashlib.md5("|".join(sorted(edge_strs)).encode()).hexdigest()[:16]
             if edge_strs
