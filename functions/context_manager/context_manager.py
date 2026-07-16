@@ -35,6 +35,7 @@ from typing import (
     Iterable,
     Literal,
     Callable,
+    Union,
 )
 from enum import Enum
 from pydantic import BaseModel, Field
@@ -101,6 +102,7 @@ from shared_resources import (
     call_llm as _shared_call_llm,
     get_conversation_compressor as _shared_get_conversation_compressor,
     get_model_backend,
+    LLMResult,
 )
 
 _db_global_lock = threading.Lock()
@@ -10046,10 +10048,14 @@ class LongTermMemory:
                         break
 
                     ce_score = ce_scores[0]
-                    # predict() output is already sigmoid-activated to [0,1];
-                    # a second sigmoid here compressed the range to
-                    # [0.5, 0.731], leaving the >=0.85 strong-accept and the
-                    # (0.5 - p) > threshold reject branches below unreachable.
+                    # Already on the [0,1] scale — _predict_cross_encoder
+                    # normalizes. The comment that stood here asserted
+                    # predict() self-activates and removed a sigmoid on that
+                    # basis; it described the previous reranker. The current
+                    # one resolves to Identity and returned raw logits, which
+                    # made every branch below constant (a negative logit is
+                    # always < 0.6 and never >= 0.85, so this loop rejected
+                    # every candidate and no duplicate was ever found).
                     ce_prob = float(ce_score)
 
                     CE_CONFIDENCE_THRESHOLD = self._f.valves.duplicate_ce_threshold
@@ -10520,11 +10526,9 @@ class LongTermMemory:
             metas = list(metas) + [{}] * (len(docs) - len(metas))
 
         # ── Step 3: rerank with the CrossEncoder ───────────────────────────
-        # Scores are expected in [0,1], but a reranker loaded with Identity
-        # activation returns raw logits (observed live: best score -8.06).
-        # Squash out-of-range values through a sigmoid so ordering,
-        # thresholding and display stay consistent regardless of how the
-        # model was loaded. Fallback score is 1 - cosine distance.
+        # Scores arrive on the [0,1] scale: _predict_cross_encoder is the sole
+        # owner of that coercion, so the local squash this site used to carry
+        # is gone. Fallback score is 1 - cosine distance.
         ce_scores = await self._f._commands._predict_cross_encoder(
             [(query, doc) for doc in docs]
         )
@@ -10532,9 +10536,6 @@ class LongTermMemory:
         for idx, doc in enumerate(docs):
             if ce_scores is not None and idx < len(ce_scores):
                 score = float(ce_scores[idx])
-                if score < 0.0 or score > 1.0:
-                    _clamped = max(-60.0, min(60.0, score))
-                    score = 1.0 / (1.0 + math.exp(-_clamped))
             elif isinstance(dists[idx], (int, float)):
                 score = max(0.0, min(1.0, 1.0 - float(dists[idx])))
             else:
@@ -11626,16 +11627,69 @@ class LongTermMemory:
             return 0
         return len(test_vec[0])
 
+    def _runtime_embedding_model_name(self) -> str:
+        """
+        Resolve the loaded embedder's model name from the live object.
+
+        The previous fingerprint read a valves attribute that has never
+        existed anywhere in this file — the embedder is a hardcoded default
+        inside shared_resources.get_embedder() — so getattr's fallback made
+        the recorded name a constant "unknown" and the name half of the
+        check could not detect anything. The object itself knows what it
+        loaded: sentence-transformers stores the load path in
+        model_card_data.base_model (set_base_model at load time), and the
+        underlying HF tokenizer has carried name_or_path for years, which
+        covers older library versions. "unknown" remains the last resort,
+        and the comparison below treats it as "name unavailable" rather
+        than as a name, so it can never brick the LTM by mismatching
+        against a real one.
+
+        Returns:
+            The model name/path, or "unknown" when neither source exists.
+        """
+        emb = getattr(self._f, "embedder", None)
+        for attr_chain in (("model_card_data", "base_model"), ("tokenizer", "name_or_path")):
+            obj = emb
+            for a in attr_chain:
+                obj = getattr(obj, a, None)
+                if obj is None:
+                    break
+            if obj:
+                return str(obj)
+        return "unknown"
+
+    def _fingerprint_path(self) -> str:
+        """Path of the embedding-fingerprint JSON, beside the collection."""
+        return os.path.join(
+            self._f.valves.long_term_memory_dir,
+            "_codeaware_embedding_fingerprint.json",
+        )
+
     def _validate_embedding_model(self) -> bool:
         """
         Validate that the current embedding model matches the stored fingerprint.
 
-        On the first run (no fingerprint stored), persists the current model
-        name and output dimension to the ChromaDB collection metadata.
+        On the first run (no fingerprint stored for THIS collection), persists
+        the current model name and output dimension to a JSON file beside the
+        collection, keyed to the collection's UUID.
 
         On subsequent runs, compares the stored fingerprint against the model
         currently loaded. If there is a mismatch, both retrieval and writes are
         disabled via ``_retrieval_disabled_reason`` and ``_write_disabled_reason``.
+
+        Why a sidecar JSON and not collection.metadata: Chroma's
+        _validate_modify_request raises for ANY modify() whose metadata
+        contains "hnsw:space" — the key's mere presence, not a changed value —
+        and the previous implementation spread the collection's existing
+        metadata (created with hnsw:space=cosine) into every write. The
+        persist therefore failed on every startup since the day it was
+        written, each run believed itself the first, and the protection never
+        protected. Stripping hnsw:* before modify() would dodge the guard but
+        gambles on unpinned Chroma versions where collection metadata IS the
+        index configuration re-read on load; a file avoids the API entirely.
+        The stored collection UUID gives dies-with-the-collection semantics:
+        recreate the collection and the stale fingerprint self-invalidates,
+        no matter how the old one was removed.
 
         Returns:
             True if the model fingerprint matches (or on first run).
@@ -11645,29 +11699,41 @@ class LongTermMemory:
             # ------------------------------------------------------------------
             # Region: Determine current model fingerprint
             # ------------------------------------------------------------------
-            current_model: str = str(
-                getattr(self._f.valves, "embedding_model_name", "unknown")
-            )
+            current_model: str = self._runtime_embedding_model_name()
             current_dim: int = int(self._get_embedding_dimension() or 0)
+            coll_id: str = str(getattr(self._f.memory_collection, "id", "") or "")
 
             # ------------------------------------------------------------------
-            # Region: Read stored fingerprint from ChromaDB collection metadata
+            # Region: Read stored fingerprint (sidecar JSON, keyed by UUID)
             # ------------------------------------------------------------------
-            coll_meta: dict = self._f.memory_collection.metadata or {}
-            stored_model: str = str(coll_meta.get("_codeaware_embedding_model", ""))
-            stored_dim: int = int(coll_meta.get("_codeaware_embedding_dim", 0) or 0)
+            stored: dict = {}
+            fp_path = self._fingerprint_path()
+            if os.path.exists(fp_path):
+                with open(fp_path, "r", encoding="utf-8") as fh:
+                    stored = json.load(fh) or {}
+            if stored.get("collection_id") != coll_id:
+                # No fingerprint, or one left behind by a collection that no
+                # longer exists (recreated after a directory wipe or an API
+                # delete): either way this collection has never been stamped.
+                stored = {}
+            stored_model: str = str(stored.get("model", ""))
+            stored_dim: int = int(stored.get("dim", 0) or 0)
 
             # ------------------------------------------------------------------
             # Region: First run — persist fingerprint and clear any stale flags
             # ------------------------------------------------------------------
             if not stored_model:
-                self._f.memory_collection.modify(
-                    metadata={
-                        **coll_meta,
-                        "_codeaware_embedding_model": current_model,
-                        "_codeaware_embedding_dim": current_dim,
-                    }
-                )
+                _tmp = fp_path + ".tmp"
+                with open(_tmp, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "collection_id": coll_id,
+                            "model": current_model,
+                            "dim": current_dim,
+                        },
+                        fh,
+                    )
+                os.replace(_tmp, fp_path)
                 self._retrieval_disabled_reason = None
                 self._write_disabled_reason = None
                 self._f._log_debug(
@@ -11679,7 +11745,16 @@ class LongTermMemory:
             # ------------------------------------------------------------------
             # Region: Mismatch — disable both reads and writes
             # ------------------------------------------------------------------
-            if stored_model != current_model or stored_dim != current_dim:
+            # "unknown" on either side means the NAME was unavailable, not
+            # that the model is one called unknown; a real-vs-unavailable
+            # pairing must fall back to the dimension check alone instead of
+            # bricking the LTM over a name nobody has.
+            _name_comparable = (
+                stored_model != "unknown" and current_model != "unknown"
+            )
+            if (
+                _name_comparable and stored_model != current_model
+            ) or stored_dim != current_dim:
                 reason = (
                     f"LTM embedding mismatch — collection built with "
                     f"'{stored_model}' (dim={stored_dim}), "
@@ -11857,7 +11932,8 @@ class LLMOrchestrator:
         response_format: Optional[Dict[str, Any]] = None,
         enable_thinking: bool = True,
         log_raw_response: bool = False,
-    ) -> Optional[str]:
+        return_meta: bool = False,
+    ) -> Optional[Union[str, "LLMResult"]]:
         """
         Call the LLM with in-memory response cache and call deduplication.
 
@@ -11869,6 +11945,27 @@ class LLMOrchestrator:
         consumer (is_producer=False) that is awaiting it. This matters now that
         the underlying streaming call is genuinely cancellable — a cancel that
         actually reaches the socket must also unblock any waiters.
+
+        Metadata: the cache and the deduplication future both carry the full
+        LLMResult, and the string every existing caller receives is a
+        projection of it. Keeping the richer object as the internal currency
+        is what lets a caller ask for return_meta=True and get an answer that
+        survives a cache hit or a deduplicated wait — the shared library
+        computes finish_reason/truncated exactly, and throwing that away at
+        this boundary left the agentic ledger unable to tell a step that chose
+        to emit no claims from one that was cut off before it could. Since the
+        metadata does not depend on who is asking, return_meta is deliberately
+        NOT part of the dedup key: two callers wanting different shapes of the
+        same call still share one inference.
+
+        Args:
+            return_meta: True returns the LLMResult (content plus
+                finish_reason, truncated, token counts, attempts, latency);
+                False (default) returns just the content string.
+
+        Returns:
+            The response string, the LLMResult when return_meta is True, or
+            None when the call produced nothing.
         """
         if getattr(self._f, "_is_silent_ingestion", False) and label not in (
             "bg_docstring",
@@ -11935,7 +12032,10 @@ class LLMOrchestrator:
                 is_producer = True
 
         if not is_producer:
-            return await future
+            _shared = await future
+            if _shared is None or return_meta:
+                return _shared
+            return _shared.content
 
         t_start = time.monotonic()
         label_str = f" ({label})" if label else ""
@@ -11960,7 +12060,7 @@ class LLMOrchestrator:
                         f"[LLM] {model}{label_str} (cached) "
                         f"took {time.monotonic() - t_start:.3f}s"
                     )
-                    return cached
+                    return cached if return_meta else cached.content
 
                 if endpoint_type is not None:
                     ep_type = endpoint_type
@@ -11981,7 +12081,7 @@ class LLMOrchestrator:
                     self._f._active_llm_tasks.add(task)
 
                 try:
-                    content = await _shared_call_llm(
+                    result = await _shared_call_llm(
                         prompt=prompt,
                         system=system_prompt,
                         base_url=self._f.valves.LLM_BASE_URL,
@@ -12000,11 +12100,13 @@ class LLMOrchestrator:
                         enable_thinking=enable_thinking,
                         log_raw_response=log_raw_response,
                         label=label,
+                        return_meta=True,
                     )
 
+                    content = result.content if result else ""
                     if content:
-                        await self._f._llm_cache.set(cache_key, content)
-                        future.set_result(content)
+                        await self._f._llm_cache.set(cache_key, result)
+                        future.set_result(result)
                         async with self._f._model_lock:
                             self._f._last_used_model = model
                         in_tokens = (
@@ -12021,8 +12123,9 @@ class LLMOrchestrator:
                             f"[LLM] {model}{label_str} – "
                             f"in:{in_tokens} out:{out_tokens} "
                             f"took {time.monotonic() - t_start:.3f}s"
+                            f"{' [TRUNCATED]' if result.truncated else ''}"
                         )
-                        return content
+                        return result if return_meta else content
                     else:
                         future.set_result(None)
                         return None
@@ -12281,6 +12384,7 @@ class AgenticStep:
     symbols: List[str] = field(default_factory=list)
     cached: bool = False
     skip_reason: str = ""
+    truncated: bool = False  # generation hit max_tokens: output is incomplete
     display_no: int = (
         0  # 1-based execution position for user-facing labels; id stays the stable cache/ledger key
     )
@@ -12467,10 +12571,23 @@ class AgenticEvidenceLedger:
                     break
         if data is None:
             _tail = (step.output or "")[-180:].replace("\n", "⏎")
-            self._f._log_debug(
-                f"🤖 Ledger: step {step.id} has no parseable claims tail — "
-                f"prose kept, no claims recorded; output ends: {_tail!r}"
-            )
+            if getattr(step, "truncated", False):
+                # Not a contract violation: the generation hit
+                # agentic_step_max_tokens before it could emit the tail, which
+                # this parser is therefore powerless to recover. Say so, so
+                # the cause is legible and the verify report can declare its
+                # evidence incomplete instead of silently passing.
+                self._f._log_debug(
+                    f"🤖 Ledger: step {step.id} was TRUNCATED at "
+                    f"agentic_step_max_tokens before emitting its claims "
+                    f"tail — prose kept, no claims recorded (raise the cap "
+                    f"or tighten the step goal); output ends: {_tail!r}"
+                )
+            else:
+                self._f._log_debug(
+                    f"🤖 Ledger: step {step.id} has no parseable claims tail — "
+                    f"prose kept, no claims recorded; output ends: {_tail!r}"
+                )
             return control
         step.output = step.output[:tail_start].rstrip()
 
@@ -13152,6 +13269,7 @@ class AgenticStaticVerifier:
         project_id: str,
         aligned_prefix: str,
         timeout_s: float,
+        truncated_steps: Optional[List[AgenticStep]] = None,
     ) -> None:
         """
         Execute a verify step in place: elicit checks, run them, stamp
@@ -13165,12 +13283,39 @@ class AgenticStaticVerifier:
             project_id: Current project identifier.
             aligned_prefix: Head-capped preliminary system prompt.
             timeout_s: Remaining wall-clock budget.
+            truncated_steps: Steps whose generation hit the token cap. Used
+                only to explain an empty ledger: their claims were cut off,
+                not withheld, so the verdict is "degraded", not "done".
         """
         started = time.monotonic()
         claims = list(ledger.claims)
         if not claims:
+            # An empty ledger has two very different causes and they must not
+            # read alike. If earlier steps were truncated, their claims were
+            # never emitted and the falsification net simply did not run —
+            # reporting "done" there told the synthesis, the pre-mortem and
+            # the user that the evidence had been checked. It had not.
+            # The status stays "done" — the step ran to completion and its
+            # report is the output below. Encoding the degradation as a new
+            # status value would teach a fourth word to eight call sites, and
+            # the nearest one gates digest generation on == "done", so the
+            # warning would never reach the workspace the synthesis reads.
+            # The honest signal belongs in the output, which is exactly what
+            # later steps and the user see.
+            _lost = [s.id for s in (truncated_steps or []) if s.kind != "verify"]
             step.status = "done"
-            step.output = "(no claims to verify)"
+            if _lost:
+                step.output = (
+                    "⚠️ VERIFICATION DID NOT RUN. Step(s) "
+                    + ", ".join(str(i) for i in _lost)
+                    + " hit the generation cap before emitting their claims, "
+                    "so the ledger is empty and NOTHING has been checked "
+                    "against the SymbolGraph. Their findings are UNVERIFIED: "
+                    "treat any conclusion resting on them as unchecked, and "
+                    "say so in the answer."
+                )
+            else:
+                step.output = "(no claims to verify)"
             step.seconds = time.monotonic() - started
             return
 
@@ -15318,7 +15463,12 @@ class AgenticStepExecutor:
                 step.output = "(step timed out)"
                 return
             try:
-                response = await asyncio.wait_for(
+                # return_meta: the claims contract lives at the very END of
+                # the step output, so a generation that hits the cap loses it
+                # entirely. Without the library's exact finish_reason the
+                # ledger cannot tell that from a step that legitimately had
+                # nothing to claim, and reports both as "no claims recorded".
+                _meta = await asyncio.wait_for(
                     self._f._llm_orchestrator.call_llm(
                         prompt=prompt,
                         system_prompt=aligned_prefix,
@@ -15327,9 +15477,13 @@ class AgenticStepExecutor:
                         temperature=0.3,
                         label="agentic_step",
                         enable_thinking=False,
+                        return_meta=True,
                     ),
                     timeout=remaining,
                 )
+                response = _meta.content if _meta else None
+                if _meta is not None and _meta.truncated:
+                    step.truncated = True
             except asyncio.TimeoutError:
                 step.seconds = time.monotonic() - started
                 step.status = "failed"
@@ -16069,6 +16223,7 @@ class AgenticOrchestrator:
                     hyps,
                     project_id,
                     max_iters=self._f.valves.agentic_metacog_max_iters,
+                    threshold=self._f.valves.agentic_metacog_threshold,
                     label=f"agentic_hypothesize_step_{step.id}",
                 )
             )
@@ -16881,7 +17036,12 @@ class AgenticOrchestrator:
                     f"(verify): checking workspace claims"
                 )
                 await self._verifier.run_verify_step(
-                    step, self._ledger, project_id, aligned_prefix, remaining
+                    step,
+                    self._ledger,
+                    project_id,
+                    aligned_prefix,
+                    remaining,
+                    truncated_steps=[s for s in plan.steps if s.truncated],
                 )
                 if step.status == "done":
                     step.digest = self._digest(step.output)
@@ -17867,6 +18027,11 @@ class CommandRouter:
     def __init__(self, filter_ref: "Filter") -> None:
         """Store a reference to the parent Filter for shared state."""
         self._f = filter_ref
+        # Latched once the CrossEncoder is proven to return raw logits; see
+        # _normalize_cross_encoder_score for why the verdict is per model
+        # rather than per score.
+        self._ce_returns_logits: bool = False
+        self._ce_range_logged: bool = False
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2. CrossEncoder & ML helpers
@@ -17904,23 +18069,91 @@ class CommandRouter:
         async with self._f._cross_encoder_lock:
             preds = await anyio.to_thread.run_sync(_predict_safely)
 
-        if preds is not None and not getattr(self, "_ce_range_logged", False):
+        # Region: single normalization point. Every threshold downstream reads
+        # a probability, so the [0,1] coercion belongs here rather than at the
+        # call sites — where three of them had already fossilised the opposite
+        # assumption in a comment and compared logits against 0.3/0.85
+        # directly. Sole owner: no caller ever sees a raw logit again.
+        if preds is None:
+            return None
+        try:
+            normalized = self._normalize_cross_encoder_score(list(preds))
+        except (TypeError, ValueError) as e:
+            self._f._log_debug(
+                f"CrossEncoder scores not scalar (shape/type unexpected): "
+                f"{e} — returning raw predictions"
+            )
+            return preds
+
+        if not self._ce_range_logged:
             self._ce_range_logged = True
-            try:
-                _vals = [float(v) for v in list(preds)[:8]]
-                if _vals:
-                    self._f._log_debug(
-                        f"CrossEncoder first-call score sample: "
-                        f"min={min(_vals):.4f} max={max(_vals):.4f} "
-                        f"n={len(_vals)} (expected within [0,1] via the "
-                        f"default sigmoid activation for num_labels=1)"
-                    )
-            except Exception as e:
+            _raw = [float(v) for v in list(preds)[:8]]
+            if _raw:
+                _norm = normalized[: len(_raw)]
+                _identity = any(v < 0.0 or v > 1.0 for v in _raw)
                 self._f._log_debug(
-                    f"CrossEncoder score sample not scalar (shape/type "
-                    f"unexpected): {e}"
+                    f"CrossEncoder first-call score sample: raw "
+                    f"min={min(_raw):.4f} max={max(_raw):.4f} → normalized "
+                    f"min={min(_norm):.4f} max={max(_norm):.4f} "
+                    f"n={len(_raw)} — model activation: "
+                    f"{'Identity (raw logits, sigmoid applied here)' if _identity else 'sigmoid (passed through)'}"
                 )
-        return preds
+        return normalized
+
+    @staticmethod
+    def _sigmoid(x: float) -> float:
+        """
+        Logistic squash, clamped to the range where it is numerically safe.
+
+        math.exp overflows past ~709 and the resulting NaN would poison every
+        comparison downstream; at +/-60 the sigmoid has already saturated to
+        within float epsilon of 0 and 1, so the clamp costs no precision.
+        """
+        return 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, float(x)))))
+
+    def _normalize_cross_encoder_score(self, raw_scores: list) -> list:
+        """
+        Put a batch of CrossEncoder scores on the [0,1] probability scale that
+        every threshold in this file is written against.
+
+        Whether activation is needed is a property of the MODEL, not of each
+        individual score, and this method treats it as one. sentence-
+        transformers applies its default sigmoid only when the loaded model
+        exposes num_labels=1; a reranker resolving to Identity returns raw
+        logits instead, and the cascade then compares logits against
+        probability thresholds. Deciding per score — passing [0,1] values
+        through while squashing the rest — looks tempting and silently
+        corrupts ordering: a batch holding a logit of 2.0 and a value of 0.9
+        would rank 0.8808 below 0.9 and invert them, because a sigmoid-ed
+        number and an identity number are not comparable quantities. So the
+        verdict is taken once, latched for the process, and applied uniformly
+        to every score of every batch.
+
+        The latch trips on the first score seen outside [0,1] — unambiguous
+        proof of Identity activation, since a probability cannot be -8. Until
+        that proof arrives the scores are passed through, which is correct for
+        a self-activating model and self-correcting for the other: the first
+        out-of-range batch flips the latch and it never flips back.
+
+        Args:
+            raw_scores: Scores as returned by CrossEncoder.predict().
+
+        Returns:
+            The scores on the [0,1] scale, all transformed the same way.
+        """
+        vals = [float(v) for v in raw_scores]
+        if not self._ce_returns_logits and any(
+            v < 0.0 or v > 1.0 for v in vals
+        ):
+            self._ce_returns_logits = True
+            self._f._log_debug(
+                "CrossEncoder: score outside [0,1] observed — model resolves "
+                "to Identity activation, applying the sigmoid its thresholds "
+                "assume from here on."
+            )
+        if not self._ce_returns_logits:
+            return vals
+        return [self._sigmoid(v) for v in vals]
 
     @staticmethod
     def _truncate_pairs_for_cross_encoder(
@@ -25292,7 +25525,21 @@ class MetacognitiveReasoningEngine:
             # llm_conf excluded — self-reported by LLM, unreliable for convergence
             obj_score_history.append(best_scored.obj_score)
 
-            if best_scored.score >= threshold or iteration >= max_iters:
+            if best_scored.score >= threshold:
+                self._f._log_debug(
+                    f"compete_hypotheses: converged at iteration {iteration}/"
+                    f"{max_iters} — combined score {best_scored.score:.2f} "
+                    f">= threshold {threshold:.2f} "
+                    f"(obj={best_scored.obj_score:.2f}, "
+                    f"llm_conf={best_scored.llm_conf:.2f}) — no refinement"
+                )
+                break
+            if iteration >= max_iters:
+                self._f._log_debug(
+                    f"compete_hypotheses: iteration budget exhausted "
+                    f"({max_iters}) — best combined score "
+                    f"{best_scored.score:.2f} < threshold {threshold:.2f}"
+                )
                 break
 
             # ITERATION LEVEL: stagnation detection → diverge or refine
@@ -25316,6 +25563,11 @@ class MetacognitiveReasoningEngine:
                     best_scored, max_hypotheses, project_id, label
                 )
                 if not refined:
+                    self._f._log_debug(
+                        f"compete_hypotheses: stopped at iteration "
+                        f"{iteration}/{max_iters} — divergent generation "
+                        f"produced no parseable hypotheses"
+                    )
                     break
                 hypotheses = refined
                 obj_score_history = []  # reset — new direction, new baseline
@@ -25330,6 +25582,11 @@ class MetacognitiveReasoningEngine:
                     constraints=_constraints,
                 )
                 if not refined:
+                    self._f._log_debug(
+                        f"compete_hypotheses: stopped at iteration "
+                        f"{iteration}/{max_iters} — refinement produced no "
+                        f"parseable hypotheses"
+                    )
                     break
                 hypotheses = refined
 
@@ -26318,10 +26575,12 @@ Code context (recent symbols referenced):
                 pairs = [(current_query[:500], content[:500])]
                 scores = await self._f._commands._predict_cross_encoder(pairs)
                 if scores is not None and len(scores) > 0:
-                    # predict() output is already sigmoid-activated to [0,1];
-                    # re-applying sigmoid floored the score at 0.5, so the
-                    # < 0.3 compress vote below could never fire and this
-                    # stage could only ever preserve or abstain.
+                    # Already on the [0,1] scale — _predict_cross_encoder
+                    # normalizes. The comment removed here claimed the < 0.3
+                    # compress vote could never fire; with raw logits from an
+                    # Identity-activated reranker the exact opposite held —
+                    # every score sat below 0.3, so this stage voted to
+                    # compress unconditionally, whatever the real relevance.
                     semantic_score = float(scores[0])
                     if semantic_score < 0.3:
                         should_compress = True
@@ -31903,11 +32162,13 @@ class SystemPromptBuilder:
                                 [(norm[:500], w[:500])]
                             )
                             if scores is not None and len(scores) > 0:
-                                # predict() output is already sigmoid-activated
-                                # to [0,1]; the extra sigmoid floored prob at
-                                # 0.5, which made the >= 0.5 duplicate verdict
-                                # below unconditional whenever the model fired
-                                # and silently suppressed LTM injection.
+                                # Already on the [0,1] scale —
+                                # _predict_cross_encoder normalizes. The
+                                # comment removed here feared an unconditional
+                                # duplicate verdict; with raw logits the
+                                # inverse was true — no fragment ever reached
+                                # the threshold, so dedup never suppressed
+                                # anything.
                                 prob = float(scores[0])
                                 common_words = set(norm.split()) & set(w.split())
                                 if common_words:
@@ -38677,6 +38938,27 @@ class Filter:
                 "the context window are passed through unchanged. Turn OFF "
                 "to restore bare auxiliary prompts (focal but "
                 "pool-destroying)."
+            ),
+        )
+        agentic_metacog_threshold: float = Field(
+            default=0.75,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Combined score at which compete_hypotheses stops refining "
+                "early. Exiting on iteration 1 is the designed common case, "
+                "not a fault: the combined score is "
+                "obj_weight*obj_score + llm_weight*llm_conf (0.5/0.5), so a "
+                "self-reported llm_conf of 0.9 only needs obj_score >= 0.60 "
+                "to clear 0.75 on the first pass. Half the bar is set by the "
+                "model judging its own hypothesis; lower this valve to make "
+                "the loop lean harder on the deterministic SymbolGraph half, "
+                "raise it to converge sooner. The dead "
+                "scientific_confidence_threshold valve carried a calibration "
+                "note claiming 0.72 exits iteration 1 in ~58% of cases vs "
+                "~50% at 0.75 — that measurement predates this valve "
+                "existing, so treat it as a starting point, not a promise. "
+                "The default preserves the hardcoded value this replaces."
             ),
         )
         agentic_metacog_max_iters: int = Field(
