@@ -1395,7 +1395,6 @@ class ConversationState(BaseModel):
     wm_summary_ok: bool = False
     wm_emergency_cap: bool = False
     wm_batch_too_small: bool = False
-    wm_no_slot: bool = False
     wm_degradation_guard: bool = False
 
     # -- tokens freed by window manager compression --------------------
@@ -1426,7 +1425,6 @@ class ConversationState(BaseModel):
         self.wm_summary_ok = False
         self.wm_emergency_cap = False
         self.wm_batch_too_small = False
-        self.wm_no_slot = False
         self.wm_degradation_guard = False
         self.wm_tokens_freed = 0
 
@@ -1797,7 +1795,6 @@ class ConversationStateManager:
             wm_batch_too_small=data.get(
                 "wm_batch_too_small", data.get("_wm_batch_too_small", False)
             ),
-            wm_no_slot=data.get("wm_no_slot", data.get("_wm_no_slot", False)),
             wm_degradation_guard=data.get(
                 "wm_degradation_guard",
                 data.get("_wm_degradation_guard", False),
@@ -1869,7 +1866,6 @@ class ConversationStateManager:
             "wm_summary_ok": state.wm_summary_ok,
             "wm_emergency_cap": state.wm_emergency_cap,
             "wm_batch_too_small": state.wm_batch_too_small,
-            "wm_no_slot": state.wm_no_slot,
             "wm_degradation_guard": state.wm_degradation_guard,
             # ── Hub‑Bodies Tier tracker (cross‑restart) ──
             "hub_tier_last_modified": state.hub_tier_last_modified,
@@ -6606,7 +6602,9 @@ class ContextBuilder:
             project_id: Current project identifier.
             query: The user query.
             messages: The conversation messages.
-            slot_free: Whether the LLM slot is free.
+            slot_free: False on a cold start (no model resident yet),
+                meaning auxiliary LLM calls would each pay the model
+                load. Not a llama.cpp slot: that machinery is gone.
             intent_vector: Intent classification results.
             is_continuation: Whether this is a continuation turn.
             use_case_override: Pre-classified use case key; when provided,
@@ -9370,7 +9368,6 @@ class StateStore:
             "wm_summary_ok": state.wm_summary_ok,
             "wm_emergency_cap": state.wm_emergency_cap,
             "wm_batch_too_small": state.wm_batch_too_small,
-            "wm_no_slot": state.wm_no_slot,
             "wm_degradation_guard": state.wm_degradation_guard,
             "hub_tier_last_modified": state.hub_tier_last_modified,
             "hub_tier_body_hashes": state.hub_tier_body_hashes,
@@ -10633,7 +10630,9 @@ class LongTermMemory:
             query: The user query.
             project_id: Current project identifier.
             use_case_label: Label for the active use case (logging only).
-            slot_free: Whether the LLM slot is free (governs query expansion).
+            slot_free: False on a cold start, where the model load makes
+                auxiliary calls expensive; governs query expansion.
+                Not a llama.cpp slot: that machinery is gone.
             is_continuation: Whether this is a continuation turn.
 
         Returns:
@@ -16809,12 +16808,20 @@ class AgenticOrchestrator:
                 f"“{claim.text[:48]}”"
             )
             try:
+                # Evidence first (free), so the design is bounded by what
+                # this graph can settle rather than labelled blind; and the
+                # guard is fed the measured coverage, not the classifier's
+                # self-report. Same ordering as compete_hypotheses.
+                evidence = meta.gather_evidence(claim.text, project_id)
                 design = await asyncio.wait_for(
-                    meta.design_critical_experiment(claim.text, project_id),
+                    meta.design_critical_experiment(
+                        claim.text, project_id, evidence=evidence
+                    ),
                     timeout=per_claim,
                 )
-                evidence = meta.gather_evidence(claim.text, project_id)
-                coverage = meta._compute_coverage_score(design)
+                coverage, _cres, _ctot = meta._compute_effective_coverage(
+                    design, evidence, project_id
+                )
                 falsified, reason = meta.is_falsified(
                     evidence, design, coverage, project_id=project_id
                 )
@@ -17172,6 +17179,10 @@ class AgenticOrchestrator:
           resolved with confidence ≥ agentic_early_exit_confidence marks
           every remaining pending step (except future "verify" kinds) as
           skipped — hard evidence is never traded for speed, reasoning is.
+          A step that was TRUNCATED at the token cap can never authorise
+          this, however confident its recovered tail sounds: its reasoning
+          stopped mid-sentence, so the self-assessment describes an
+          analysis that does not exist.
         - NEEDS insertion: a step reporting a concrete gap inserts ONE
           extra investigate step right after itself (insertion only, never
           reordering), bounded by agentic_max_steps, two insertions per
@@ -17183,7 +17194,8 @@ class AgenticOrchestrator:
             question: The question driving the pipeline.
             prelim_system: Preliminary system prompt (aligned prefix source).
             project_id: Current project identifier.
-            slot_free: Whether the inference slot is available.
+            slot_free: False on a cold start, where auxiliary LLM calls
+                would each pay the model load. Not a llama.cpp slot.
             dynamic_injections: Injection list for the main call.
             trigger: "command" or the auto-trigger reason, for logging.
         """
@@ -17421,6 +17433,7 @@ class AgenticOrchestrator:
         use_cache = bool(self._f.valves.agentic_step_cache)
         inserted = 0
         idx = 0
+        _budget_skipped: List[int] = []
         while idx < len(plan.steps):
             step = plan.steps[idx]
             if step.status != "pending":
@@ -17428,8 +17441,22 @@ class AgenticOrchestrator:
                 continue
             remaining = budget - (time.monotonic() - started)
             if remaining <= 0:
+                # Silently dropping planned work is the one thing this loop
+                # must never do quietly: live, the competition on step 3 ate
+                # the budget and steps 4 (verify) and 5 (analyze) vanished
+                # with no log line and no status — the chat showed
+                # "step 3/5" and then simply stopped, and the only trace
+                # was a skip:"budget" buried in the closing AGENTIC-RUN
+                # JSON. The reader deserves to know the plan was cut, and
+                # by what.
                 step.status = "skipped"
                 step.skip_reason = "budget"
+                _budget_skipped.append(step.display_no)
+                self._f._log_debug(
+                    f"🤖 Agentic step {step.display_no} ({step.kind}): "
+                    f"skipped — pipeline budget exhausted "
+                    f"({budget:.0f}s spent)"
+                )
                 idx += 1
                 continue
 
@@ -17699,6 +17726,29 @@ class AgenticOrchestrator:
             # non-existent symbol skipped the two steps that would have
             # corrected it. A resolution with no claims at all keeps running
             # too: an exit that skips verification must be backed.
+            #
+            # Truncation is a separate, structural veto. A step that hit
+            # agentic_step_max_tokens stopped mid-sentence: its reasoning is
+            # incomplete BY CONSTRUCTION, whatever it says about itself.
+            # Before claims-tail recovery (0024) such a step simply had no
+            # tail, so control stayed at the defaults and the plan carried
+            # on — truncation vetoed the early exit by accident. Recovery
+            # removed the accident: it re-asks for the tail and the model
+            # dutifully fills in "resolved": true over an analysis it never
+            # finished. Measured live (19:37): step 1 was cut off mid-
+            # sentence, recovered 8 claims, and exited at confidence 0.85,
+            # skipping the hypothesize and analyze steps that existed to
+            # challenge it. Recovering EVIDENCE is the point; inheriting a
+            # self-assessment made over a severed reasoning chain is not.
+            if getattr(step, "truncated", False) and control.get("resolved"):
+                self._f._log_debug(
+                    f"🤖 Agentic: early-exit vetoed at step {step.id} — the "
+                    f"step was TRUNCATED at the token cap, so its reasoning "
+                    f"is incomplete by construction; a recovered "
+                    f"'resolved' cannot authorise skipping the rest of the "
+                    f"plan (claims kept, plan continues)"
+                )
+                control["resolved"] = False
             _exit_ok = False
             if (
                 control["resolved"]
@@ -17760,6 +17810,23 @@ class AgenticOrchestrator:
                 return
 
             idx += 1
+
+        # Region: report a truncated plan once, after the loop
+        # One line for the whole cut rather than one per step: the reader
+        # needs to know the plan did not run in full and why, not a
+        # countdown of casualties.
+        if _budget_skipped:
+            _plural = "s" if len(_budget_skipped) > 1 else ""
+            await self._f._emit_status(
+                f"⏱️ Agentic: budget spent — step{_plural} "
+                f"{', '.join(str(n) for n in _budget_skipped)} of "
+                f"{len(plan.steps)} not run"
+            )
+            self._f._log_debug(
+                f"🤖 Agentic: plan cut short by budget — "
+                f"{len(_budget_skipped)}/{len(plan.steps)} step(s) skipped "
+                f"({_budget_skipped})"
+            )
 
         # Region: generative evaluation + re-plan waves (Fase 9, Nivel 2)
         # The epistemic axis (is it correct?) closed with the verify step;
@@ -25616,6 +25683,7 @@ class MetacognitiveReasoningEngine:
         self,
         hypothesis: str,
         project_id: str,
+        evidence: Optional["StaticEvidence"] = None,
     ) -> "ExperimentDesign":
         """
         Classify hypothesis claims BEFORE gathering evidence.
@@ -25627,8 +25695,26 @@ class MetacognitiveReasoningEngine:
             SUPPORTIVE — score penalty only if false
             UNKNOWN    — not directly verifiable in SymbolGraph
 
+        The evidence argument is what makes the classification honest.
+        Without it the model is asked which of its claims are "verifiable
+        in a symbol graph" while being told nothing about what this graph
+        contains or what shape of statement it can settle — so it labels
+        by intuition, and its intuition is that whatever matters most to
+        the hypothesis must be CRITICAL. Measured live (16-jul 19:33):
+        7 designs, 44 claims, of which ZERO were resolvable; one design
+        filed all 12 of its claims as critical and none as unknown, and
+        the engine paid 119s of LLM time (65% of the whole competition)
+        to produce claims it could not check. Since gather_evidence is
+        free — no LLM, no GPU, instant — the caller can now run it first
+        and hand the result here, turning an unconstrained labelling task
+        into a bounded one: these are the symbols the graph knows, these
+        are the relations it can settle, phrase the checkable claims in
+        that vocabulary and file everything else as unknown.
+
         Results are cached by hypothesis MD5 to avoid re-designing on
-        iterations where the hypothesis text hasn't changed.
+        iterations where the hypothesis text hasn't changed; the cache key
+        also covers the evidence fingerprint, since the same hypothesis
+        against a different graph is a different design.
         """
         _empty = ExperimentDesign(
             critical_claims=[], supportive_claims=[], unknown_claims=[]
@@ -25637,13 +25723,49 @@ class MetacognitiveReasoningEngine:
         if not self._f.valves.enable_experiment_design:
             return _empty
 
-        h_hash = hashlib.md5(hypothesis.encode()).hexdigest()[:16]
+        # ── Step 1: fingerprint hypothesis + the evidence it is judged on ──
+        _ev_fp = ""
+        if evidence is not None:
+            _ev_fp = "|".join(
+                sorted(evidence.symbols_found)
+                + sorted(evidence.call_relations_valid)
+            )
+        h_hash = hashlib.md5(
+            (hypothesis + "\x00" + _ev_fp).encode()
+        ).hexdigest()[:16]
         if h_hash in self._design_cache:
             self._f._log_debug(f"design_critical_experiment: cache hit ({h_hash})")
             return self._design_cache[h_hash]
 
+        # ── Step 2: bound the vocabulary when evidence is available ──
+        _bounds = ""
+        if evidence is not None:
+            _syms = sorted(evidence.symbols_found)
+            _rels = sorted(evidence.call_relations_valid)
+            _bounds = (
+                "\nA symbol graph can settle exactly two kinds of "
+                "statement, and nothing else:\n"
+                "  (a) a relation between two indexed symbols — "
+                "'X calls Y' (also invokes / uses / reads / writes)\n"
+                "  (b) the existence of an indexed symbol\n\n"
+                f"Symbols this hypothesis names that ARE indexed: "
+                f"{_syms if _syms else 'none'}\n"
+                f"Relations detectable in its text: "
+                f"{_rels if _rels else 'none'}\n\n"
+                "Write every CRITICAL and SUPPORTIVE claim in that "
+                "vocabulary, reusing those exact names. Anything the two "
+                "forms above cannot express — behaviour, ordering, "
+                "timing, runtime state, 'is stale', 'is served without "
+                "revalidation' — belongs in UNKNOWN no matter how "
+                "central it is to the hypothesis. A claim filed as "
+                "critical that the graph cannot check is worse than "
+                "useless: it is counted as covered and verified without "
+                "ever being tested.\n"
+            )
+
         prompt = (
-            f"Hypothesis:\n{hypothesis}\n\n"
+            f"Hypothesis:\n{hypothesis}\n"
+            f"{_bounds}\n"
             f"Extract all structural claims this hypothesis makes about the code. "
             f"Classify each claim:\n"
             f"  CRITICAL   — if false, the hypothesis cannot be correct "
@@ -26431,16 +26553,23 @@ class MetacognitiveReasoningEngine:
                     )
                     break
 
-                # ① Design experiment (cached after first occurrence)
-                design = await self.design_critical_experiment(hyp_text, project_id)
+                # ① Gather evidence FIRST — it is free (no LLM, no GPU) and
+                # it is what lets the design step below know which claims
+                # this graph can actually settle. Designing blind and then
+                # gathering was the original order, and it produced 44
+                # claims across 7 designs with zero of them resolvable.
+                evidence = self.gather_evidence(hyp_text, project_id)
 
-                # ② Generate predictions (first iteration only — costly LLM call)
+                # ② Design experiment, bounded by that evidence (cached
+                # after first occurrence, keyed on hypothesis + evidence)
+                design = await self.design_critical_experiment(
+                    hyp_text, project_id, evidence=evidence
+                )
+
+                # ③ Generate predictions (first iteration only — costly LLM call)
                 predictions: List[str] = []
                 if iteration == 1:
                     predictions = await self.generate_predictions(hyp_text, project_id)
-
-                # ③ Gather primary evidence
-                evidence = self.gather_evidence(hyp_text, project_id)
 
                 # ④ Verify predictions via secondary evidence pass
                 pred_verified = 0
@@ -33159,7 +33288,9 @@ class SystemPromptBuilder:
             user_question (str): The cleaned user question.
             user_query (str): The raw user query.
             is_code_session (bool): Whether the session is code-aware.
-            slot_free (bool): Whether the LLM slot is free.
+            slot_free (bool): False on a cold start, where each auxiliary
+                LLM call would pay the model load. Not a llama.cpp slot:
+                that machinery is gone.
             use_case_label (str): The use case label for retrieval.
             is_continuation (bool): Whether this is a continuation turn.
             current_messages (list, optional): The current conversation messages
@@ -34305,7 +34436,9 @@ class WindowManager:
             history:      Full history list (system messages excluded).
             state:        ConversationState to update.
             project_id:   Current project identifier.
-            slot_free:    Whether the LLM slot is free (governs consolidation).
+            slot_free:    False on a cold start, where auxiliary LLM calls
+                          are expensive; governs consolidation. Not a
+                          llama.cpp slot: that machinery is gone.
 
         Returns:
             The formatted ``pending_summary`` string for injection into the
@@ -34545,7 +34678,8 @@ class MessageAssembler:
             __user__:           User context from OpenWebUI.
             user_question:      Extracted question from the user message.
             has_code_blocks:    Whether the user message contained code fences.
-            slot_busy:          Whether the LLM slot is busy.
+            slot_busy:          True on a cold start only — auxiliary LLM
+                                calls are expensive. Not a llama.cpp slot.
             is_continuation:    True only for genuine AutoContinue turns.
 
         Returns:
@@ -36360,7 +36494,6 @@ class ContextDumper:
             wm_summary_ok = state.wm_summary_ok
             wm_emergency_cap = state.wm_emergency_cap
             wm_batch_too_small = state.wm_batch_too_small
-            wm_no_slot = state.wm_no_slot
             wm_degradation_guard = state.wm_degradation_guard
             frontier_hwm = state.summarized_turn_hwm
             summaries = state.conversation_summaries
@@ -36368,7 +36501,7 @@ class ContextDumper:
             n_summaries_l2 = sum(1 for s in summaries if s.get("level", 1) >= 2)
         except Exception:
             wm_fired = wm_summary_ok = wm_emergency_cap = False
-            wm_batch_too_small = wm_no_slot = wm_degradation_guard = False
+            wm_batch_too_small = wm_degradation_guard = False
             wm_msgs_evicted = wm_turns_evicted = 0
             frontier_hwm = n_summaries_l1 = n_summaries_l2 = 0
 
@@ -36406,7 +36539,6 @@ class ContextDumper:
             "wm_summary_ok": wm_summary_ok,
             "wm_emergency_cap": wm_emergency_cap,
             "wm_batch_too_small": wm_batch_too_small,
-            "wm_no_slot": wm_no_slot,
             "wm_degradation_guard": wm_degradation_guard,
             "frontier_hwm": frontier_hwm,
             "n_summaries_l1": n_summaries_l1,
@@ -36529,7 +36661,6 @@ class ContextDumper:
                 "wm_summary_ok": payload.get("wm_summary_ok", False),
                 "wm_emergency_cap": payload.get("wm_emergency_cap", False),
                 "wm_batch_too_small": payload.get("wm_batch_too_small", False),
-                "wm_no_slot": payload.get("wm_no_slot", False),
                 "wm_degradation_guard": payload.get("wm_degradation_guard", False),
                 "frontier_hwm": payload.get("frontier_hwm", 0),
                 "n_summaries_l1": payload.get("n_summaries_l1", 0),
@@ -36662,7 +36793,6 @@ class ContextDumper:
         )
         lines.append(
             f"- batch_too_small={payload.get('wm_batch_too_small', False)}"
-            f"  no_slot={payload.get('wm_no_slot', False)}"
             f"  degradation_guard={payload.get('wm_degradation_guard', False)}"
         )
         lines.append(
@@ -38816,7 +38946,8 @@ class SemanticSeedInferencer:
             project_id: Current project identifier.
             intent_vector: Intent probabilities.
             use_case: Detected use case.
-            slot_free: Whether the LLM slot is free.
+            slot_free: False on a cold start, where each auxiliary LLM
+                call would pay the model load. Not a llama.cpp slot.
 
         Returns:
             Dictionary mapping qualified symbol ids to seed scores.
@@ -42338,6 +42469,18 @@ class Filter:
             # ------------------------------------------------------------------
             # Region: determine slot_busy and is_continuation
             # ------------------------------------------------------------------
+            # Historical name, current meaning: this flag has nothing to do
+            # with llama.cpp slots any more. The KV slot save/restore
+            # machinery it was named after is gone — KV continuity is a
+            # snapshot concern now — and the only condition that still sets
+            # it is a COLD START: no model resident yet and no history to
+            # imply one. What it actually gates is whether auxiliary LLM
+            # calls (query expansion, seed inference, summarisation) are
+            # affordable this turn, because on a cold start each of them
+            # would pay the model load. Read slot_busy as "auxiliary LLM
+            # calls are expensive right now"; the name survives only
+            # because it is threaded through ~80 call sites and renaming it
+            # would be churn with no behavioural gain.
             slot_busy = False
             if self._last_used_model is None and state.message_count <= 1:
                 slot_busy = True
