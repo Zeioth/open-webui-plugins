@@ -25526,6 +25526,18 @@ class MetacognitiveReasoningEngine:
             obj_score_history.append(best_scored.obj_score)
 
             if best_scored.score >= threshold:
+                # Surfaced to the chat, not only the debug log: from the UI a
+                # first-iteration exit is indistinguishable from a stall, and
+                # converging on iteration 1 is the designed COMMON case — the
+                # combined score is half self-reported confidence, so a
+                # winner at llm_conf 0.9 clears 0.75 with obj at just 0.60.
+                # One status line turns "why does it stop at 1/N" into a
+                # statement instead of a support question.
+                await self._f._emit_status(
+                    f"🔬 Converged on iteration {iteration}/{max_iters} — "
+                    f"score {best_scored.score:.2f} ≥ {threshold:.2f}, no "
+                    f"further refinement needed"
+                )
                 self._f._log_debug(
                     f"compete_hypotheses: converged at iteration {iteration}/"
                     f"{max_iters} — combined score {best_scored.score:.2f} "
@@ -25535,6 +25547,11 @@ class MetacognitiveReasoningEngine:
                 )
                 break
             if iteration >= max_iters:
+                await self._f._emit_status(
+                    f"🔬 Iteration budget exhausted ({max_iters}) — best "
+                    f"score {best_scored.score:.2f} < {threshold:.2f}, "
+                    f"keeping the leading hypothesis"
+                )
                 self._f._log_debug(
                     f"compete_hypotheses: iteration budget exhausted "
                     f"({max_iters}) — best combined score "
