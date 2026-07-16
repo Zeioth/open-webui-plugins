@@ -14669,7 +14669,17 @@ class AgenticPreplanner:
         '{"framings": ["...", "..."], "chosen": "<the framing '
         'you pick, verbatim>", "rationale": "<one sentence, '
         'evidence-based>", "memory_findings": "<one short line on '
-        'what memory contributed, or empty>", "ask": ""}\n\n'
+        'what memory contributed, or empty>", '
+        '"difficulty": "<low|medium|high>", "ask": ""}\n\n'
+        "difficulty grades how much investigative work the CHOSEN framing "
+        "needs — judge the work, not the topic: low = a single clear "
+        "framing answerable by direct lookup or explanation of code already "
+        "in view; medium = ordinary multi-step work (trace a flow, compare "
+        "implementations, assess a change); high = genuine uncertainty that "
+        "will need competing hypotheses — an intermittent or "
+        "non-deterministic bug, contradictory evidence, obvious causes "
+        "already ruled out, or the blast radius of an architectural "
+        "change.\n\n"
         "{tool_results}"
         "Request:\n{question}"
     )
@@ -14890,11 +14900,19 @@ class AgenticPreplanner:
         brief = self._render_brief(data)
         n_framings = len(data.get("framings") or [])
         chosen = str(data.get("chosen", "") or "").strip()
+        # difficulty is the pre-planner's semantic judgment of how much
+        # investigative work the chosen framing needs; anything outside the
+        # three-value vocabulary degrades to "" (auto sizing then stands
+        # down and the planner keeps the full valve ceiling).
+        difficulty = str(data.get("difficulty", "") or "").strip().lower()
+        if difficulty not in ("low", "medium", "high"):
+            difficulty = ""
         self.last_stats = {
             "used": True,
             "framings": n_framings,
             "memory_rounds": memory_rounds,
             "asked": bool(ask and not chosen),
+            "difficulty": difficulty,
         }
         if ask and not chosen:
             self._f._log_debug(
@@ -15004,6 +15022,7 @@ class AgenticPlanner:
         slot_free: bool,
         project_id: str = "",
         preplan_brief: str = "",
+        difficulty: str = "",
     ) -> AgenticPlan:
         """
         Build a plan for the question.
@@ -15015,6 +15034,12 @@ class AgenticPlanner:
             slot_free: When False the LLM call is skipped and the fixed
                 plan is returned immediately.
             project_id: Current project (for the #2 seed/intent enrichment).
+            difficulty: Optional pre-planner verdict ("low"/"medium"/"high")
+                that sizes the step budget SUGGESTED in the contract when
+                agentic_steps_auto is on. Empty keeps the full valve
+                ceiling. The parser always accepts up to the valve ceiling,
+                so the suggestion can never reject a plan the hard bound
+                would allow.
 
         Returns:
             An AgenticPlan; source is "planner_llm" on success, otherwise
@@ -15029,6 +15054,24 @@ class AgenticPlanner:
 
         # Region: single JSON-contract call (prefix-aligned)
         max_steps = max(2, self._f.valves.agentic_max_steps)
+        # Auto step budget: the difficulty verdict shapes what the contract
+        # OFFERS, the valve stays the hard bound the parser enforces. The
+        # mapping is deliberately a fixed table — the semantic judgment
+        # already happened in the pre-planner; here the code only bounds it.
+        # medium's 5 mirrors the valve default's rationale (a hypothesize
+        # plan fills 4, plus one NEEDS slot).
+        effective_max = max_steps
+        if getattr(self._f.valves, "agentic_steps_auto", False) and difficulty:
+            _budget = {"low": 3, "medium": 5, "high": max_steps}.get(difficulty)
+            if _budget:
+                effective_max = max(2, min(_budget, max_steps))
+                if effective_max != max_steps:
+                    self._f._log_debug(
+                        f"🤖 Planner: auto step budget — difficulty="
+                        f"{difficulty} → contract offers 2..{effective_max} "
+                        f"(valve ceiling {max_steps} still enforced by the "
+                        f"parser and NEEDS insertion)"
+                    )
         # Defensive cap: {question} is substituted raw into the contract;
         # a caller that bypasses the gate must not be able to inflate the
         # planner prompt with a full paste (see the gate cap in
@@ -15048,7 +15091,7 @@ class AgenticPlanner:
             else ""
         )
         prompt = (
-            self._CONTRACT.replace("{max_steps}", str(max_steps))
+            self._CONTRACT.replace("{max_steps}", str(effective_max))
             .replace("{memory_hint}", memory_hint)
             .replace("{seed_hint}", seed_hint)
             .replace("{preplan_brief}", preplan_brief or "")
@@ -16884,6 +16927,10 @@ class AgenticOrchestrator:
             slot_free,
             project_id,
             preplan_brief=preplan_brief,
+            difficulty=str(
+                getattr(self._preplanner, "last_stats", {}).get("difficulty", "")
+                or ""
+            ),
         )
         self._f._log_debug(
             f"🤖 Agentic: plan ready ({len(plan.steps)} steps, "
@@ -38780,7 +38827,29 @@ class Filter:
                 "hypothesize plan (investigate + hypothesize + verify + "
                 "analyze) fills 4 exactly, so at 4 there was no room for a "
                 "NEEDS-inserted follow-up step on precisely the turns that "
-                "investigate the hardest questions."
+                "investigate the hardest questions. This is the HARD ceiling "
+                "in every mode: agentic_steps_auto only shapes the budget "
+                "SUGGESTED to the planner within it."
+            ),
+        )
+        agentic_steps_auto: bool = Field(
+            default=True,
+            description=(
+                "Size the step budget from the pre-planner's difficulty "
+                "verdict instead of always offering the full ceiling. The "
+                "pre-planner — which just explored the framings and possibly "
+                "consulted memory — grades the chosen framing low/medium/"
+                "high as one extra field in its existing JSON (zero extra "
+                "LLM calls), and the planner's contract range becomes 2..3, "
+                "2..5 or 2..agentic_max_steps respectively. The code bounds, "
+                "the model proposes within limits: the verdict never raises "
+                "the ceiling above agentic_max_steps, an unparseable or "
+                "missing verdict keeps the full ceiling (today's behavior "
+                "verbatim, also when the pre-planner is disabled), and the "
+                "parser accepts up to the VALVE ceiling regardless of the "
+                "suggestion. A misjudged 'low' is recoverable mid-run: "
+                "NEEDS-inserted follow-up steps check the valve ceiling, not "
+                "the suggested budget."
             ),
         )
         agentic_planner_max_tokens: int = Field(
