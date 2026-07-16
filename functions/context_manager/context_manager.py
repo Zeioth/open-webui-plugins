@@ -11891,6 +11891,23 @@ class LLMOrchestrator:
         elif _think_mode in ("on", "true", "1", "yes"):
             enable_thinking = True
 
+        # Region: uncapped-generation guard — every auxiliary call must carry
+        # a finite n_predict. The shared library treats max_tokens None/0 as
+        # "no limit", and dozens of small call sites (classifiers, one-line
+        # summarisers) rely on EOS alone to stop. That was survivable with
+        # bare 200-token prompts; behind an aligned ~70k prefix a temp-0.1
+        # sampler with no anti-repetition occasionally misses EOS and
+        # free-runs until the HTTP timeout — and timeouts are retryable, so
+        # the identical runaway re-posts. Coerced before the dedup/cache keys
+        # so producer and deduplicated consumers agree on the effective cap.
+        # Explicit positive caps from the call site always win.
+        if not max_tokens or max_tokens <= 0:
+            _default_cap = int(
+                getattr(self._f.valves, "llm_uncapped_max_tokens", 2048) or 0
+            )
+            if _default_cap > 0:
+                max_tokens = _default_cap
+
         # Region: KV prefix alignment — must precede dedup/cache keys so the
         # aligned system prompt is part of the call's identity. The guard
         # compares the call's EFFECTIVE model (override or default) with the
@@ -27429,13 +27446,17 @@ class EnrichmentTasks:
             f"New:\n```\n{new_content[:1000]}\n```\n\n"
             f"Change summary:"
         )
+        # A one-sentence summary needs tens of tokens; the cap is the
+        # structural stop for the observed failure mode where this call,
+        # aligned behind the full system prefix, missed EOS and free-ran to
+        # 36k+ tokens until the HTTP timeout cancelled it.
         summary = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
                 "You are a code change summariser. " "Output only one short sentence."
             ),
             model_override=model,
-            max_tokens=0,
+            max_tokens=80,
             temperature=0.1,
             label="change_summary",
             enable_thinking=False,
@@ -37785,6 +37806,30 @@ class Filter:
             default=900,
             ge=1,
             description="Per-call timeout in seconds passed to the HTTP session.",
+        )
+        llm_uncapped_max_tokens: int = Field(
+            default=2048,
+            ge=0,
+            description=(
+                "Generation cap applied to any auxiliary LLM call that does "
+                "not set its own positive max_tokens. The shared library "
+                "treats max_tokens None/0 as 'no limit' (n_predict omitted), "
+                "and 25 call sites relied on that — most are classifiers and "
+                "one-sentence summarisers that normally stop at EOS within a "
+                "few tokens. With prefix alignment their tiny instruction now "
+                "rides behind a ~70k-token system prefix, and a sampler with "
+                "no anti-repetition (repeat_penalty 1.0, dry 0) occasionally "
+                "misses EOS and free-runs: observed live as a change_summary "
+                "generating 36k+ tokens until the 900s HTTP timeout, then "
+                "being retried byte-identically (timeouts are retryable), "
+                "pinning the --parallel 1 slot for up to 45 minutes on the "
+                "inlet critical path. This cap turns that worst case into a "
+                "~50s bounded truncation the finish_reason=length warning "
+                "already logs. Calls that pass an explicit positive "
+                "max_tokens (agentic steps, CoT synthesis) are unaffected. "
+                "0 disables the guard and restores the old no-limit "
+                "semantics."
+            ),
         )
         # ── 2.3 LLM response cache ────────────────────────────────────────────
         LLM_CACHE_TTL: int = Field(
