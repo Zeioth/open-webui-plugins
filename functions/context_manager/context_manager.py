@@ -16605,6 +16605,17 @@ class AgenticOrchestrator:
                     n_found = len(hyps)
             except Exception as e:
                 self._f._log_debug(f"🤖 Agentic: divergent pool failed ({e})")
+        # The entry gate above only proves the clock was alive when we
+        # arrived; the ceiling below is what stops the competition from
+        # spending everything the stages behind it still need. The elapsed
+        # time is folded into step.seconds because the competition IS this
+        # step's work (it rewrites step.output) — without that, the
+        # AGENTIC-RUN telemetry reported a 16.0s hypothesize step for a
+        # competition that had just burned 199 seconds, and the budget
+        # skips downstream looked unexplained.
+        _cap = float(getattr(self._f.valves, "agentic_metacog_max_compete_s", 0))
+        _compete_budget = min(remaining, _cap) if _cap > 0 else remaining
+        _t_compete = time.monotonic()
         try:
             best, score, _evidence, peer = (
                 await self._f._meta_reasoning.compete_hypotheses(
@@ -16613,11 +16624,21 @@ class AgenticOrchestrator:
                     max_iters=self._f.valves.agentic_metacog_max_iters,
                     threshold=self._f.valves.agentic_metacog_threshold,
                     label=f"agentic_hypothesize_step_{step.id}",
+                    deadline_s=_compete_budget,
                 )
             )
         except Exception as e:
             self._f._log_debug(f"🤖 Agentic: competition failed ({e})")
             return True
+        finally:
+            _compete_s = time.monotonic() - _t_compete
+            step.seconds = (step.seconds or 0.0) + _compete_s
+            self._f._log_debug(
+                f"🤖 Agentic: step {step.id} competition took "
+                f"{_compete_s:.1f}s of its {_compete_budget:.0f}s ceiling "
+                f"(remaining budget was {remaining:.0f}s) — folded into "
+                f"step time"
+            )
         if best:
             _peer = ""
             if peer is not None and getattr(peer, "verdict", ""):
@@ -24822,12 +24843,18 @@ class MetacognitiveReasoningEngine:
         design: "ExperimentDesign",
     ) -> float:
         """
-        Coverage = verifiable_claims / total_claims.
+        DECLARED coverage = labelled_verifiable_claims / total_claims.
 
-        Unknown claims represent epistemic blind spots — claims the LLM
-        made that we cannot check structurally. A high obj_score with
-        low coverage is unreliable (availability bias): the engine scored
-        well on the 20% it could check, ignoring the 80% it couldn't.
+        This reads the classifier's LABELS, not reality: a claim counts as
+        covered because design_critical_experiment filed it under critical
+        or supportive, which is a promise that it can be checked — not a
+        demonstration. Use _compute_effective_coverage for anything that
+        weighs how much was actually verified.
+
+        The one place the declared number is the right one is the Active
+        Learning gate, which reasons about the unknown BUCKET itself
+        ("the classifier admits it cannot check most of this, try to
+        reclassify"). There the label is the subject, not the evidence.
 
         Returns 1.0 when no claims exist (vacuously covered).
         """
@@ -24840,6 +24867,52 @@ class MetacognitiveReasoningEngine:
             return 1.0
         verifiable = len(design.critical_claims) + len(design.supportive_claims)
         return verifiable / total
+
+    def _compute_effective_coverage(
+        self,
+        design: "ExperimentDesign",
+        evidence: "StaticEvidence",
+        project_id: str = "",
+    ) -> Tuple[float, int, int]:
+        """
+        MEASURED coverage = resolvable_claims / total_claims.
+
+        A claim counts here only when _claim_verdict can actually reach a
+        True or False on it against the evidence and the live SymbolGraph.
+        Abstentions do not count, whatever label they carry.
+
+        Why this exists: coverage is the engine's own estimate of how much
+        of a hypothesis it managed to inspect, and it drives five separate
+        mechanisms — the falsification coverage guard, the combined-score
+        penalty, half the weight of _compute_epistemic_uncertainty, the
+        honest-abstention floor, and the project debrief. All five were
+        being fed the classifier's self-report. Live (16-jul 19:33): a
+        design of 12 critical / 0 supportive / 0 unknown reported
+        coverage 1.00 — "everything is checkable" — while every one of
+        those 12 claims abstained. Real coverage was 0.00. The engine
+        believed it had inspected a hypothesis completely without having
+        resolved a single claim about it, and reported low uncertainty on
+        that basis.
+
+        Unknown claims stay in the denominator and out of the numerator:
+        they are part of what the hypothesis asserted and part of what was
+        not checked. Only critical and supportive claims are resolved,
+        matching exactly the set compute_weighted_score scores.
+
+        Returns (coverage, n_resolved, n_total).
+        """
+        total = (
+            len(design.critical_claims)
+            + len(design.supportive_claims)
+            + len(design.unknown_claims)
+        )
+        if total == 0:
+            return 1.0, 0, 0
+        resolved = 0
+        for claim in list(design.critical_claims) + list(design.supportive_claims):
+            if self._claim_verified(claim, evidence, project_id) is not None:
+                resolved += 1
+        return resolved / total, resolved, total
 
     def _compute_epistemic_uncertainty(
         self,
@@ -25132,7 +25205,10 @@ class MetacognitiveReasoningEngine:
            coverage machinery separately reports how much was checkable.
            When nothing is checkable, obj falls back to the neutral 0.5.
         2. Downgrade penalty: if is_falsified() was coverage-guarded.
-        3. Prediction bonus: verified predictions +10% max.
+        3. Prediction bonus: verified predictions +10% max — applied ONLY
+           when obj is a measured score. When every claim abstained, obj
+           is the neutral 0.5 ("unknown") and a bonus on top of it would
+           manufacture structural support that was never observed.
         4. Coverage penalty: low coverage penalizes combined proportionally.
 
         project_id enables live SymbolGraph resolution of relation claims
@@ -25144,7 +25220,18 @@ class MetacognitiveReasoningEngine:
         CRITICAL_WEIGHT = 10.0
         SUPPORTIVE_WEIGHT = 1.0
 
-        coverage_score = self._compute_coverage_score(design)
+        coverage_score, _n_resolved, _n_total = self._compute_effective_coverage(
+            design, evidence, project_id
+        )
+        _declared = self._compute_coverage_score(design)
+        if _n_total and (_declared - coverage_score) > 0.01:
+            self._f._log_debug(
+                f"compute_weighted_score: coverage MEASURED "
+                f"{coverage_score:.2f} ({_n_resolved}/{_n_total} claims "
+                f"resolvable against the SymbolGraph) vs {_declared:.2f} "
+                f"declared by the classifier — the labels promised more "
+                f"than the evidence can check"
+            )
 
         if not self._f.valves.enable_weighted_scoring or not design.critical_claims:
             verifiable = len(evidence.symbols_found) + len(
@@ -25152,17 +25239,21 @@ class MetacognitiveReasoningEngine:
             )
             if verifiable == 0:
                 obj_score = 0.5
+                obj_measured = False
             else:
                 verified = sum(1 for v in evidence.symbols_found.values() if v) + sum(
                     1 for v in evidence.call_relations_valid.values() if v
                 )
                 obj_score = verified / verifiable
+                obj_measured = True
         else:
             total_weight = 0.0
             verified_weight = 0.0
+            _n_abstained = 0
             for claim in design.critical_claims:
                 verdict = self._claim_verified(claim, evidence, project_id)
                 if verdict is None:
+                    _n_abstained += 1
                     continue
                 total_weight += CRITICAL_WEIGHT
                 if verdict:
@@ -25170,11 +25261,25 @@ class MetacognitiveReasoningEngine:
             for claim in design.supportive_claims:
                 verdict = self._claim_verified(claim, evidence, project_id)
                 if verdict is None:
+                    _n_abstained += 1
                     continue
                 total_weight += SUPPORTIVE_WEIGHT
                 if verdict:
                     verified_weight += SUPPORTIVE_WEIGHT
-            obj_score = verified_weight / total_weight if total_weight > 0 else 0.5
+            obj_measured = total_weight > 0
+            obj_score = verified_weight / total_weight if obj_measured else 0.5
+            if not obj_measured:
+                # The single most diagnostic line this engine can emit, and
+                # it did not exist: a competition where every claim abstains
+                # is reporting "I know nothing", and without saying so the
+                # neutral 0.5 is indistinguishable in the logs from a
+                # measured half-verified score.
+                self._f._log_debug(
+                    f"compute_weighted_score: ALL {_n_abstained} claim(s) "
+                    f"abstained — nothing in this hypothesis is resolvable "
+                    f"against the SymbolGraph; obj is the neutral 0.5, not "
+                    f"measured evidence"
+                )
 
         # Downgrade penalty — coverage-guarded falsification
         if downgraded_reason:
@@ -25184,10 +25289,25 @@ class MetacognitiveReasoningEngine:
                 f"({downgraded_reason[:60]})"
             )
 
-        # Prediction bonus
-        if predictions_total > 0:
+        # Prediction bonus — only ever on a MEASURED score
+        if predictions_total > 0 and obj_measured:
             prediction_ratio = predictions_verified / predictions_total
             obj_score = min(1.0, obj_score + 0.1 * prediction_ratio)
+        elif predictions_total > 0:
+            # A bonus on the abstention neutral fabricates evidence out of
+            # "I don't know". Live: four of seven evaluations in one run
+            # scored obj 0.600/0.583 with EVERY claim abstaining — the
+            # numbers were 0.5 plus this bonus, read downstream as partial
+            # structural support and, through _compute_epistemic_uncertainty
+            # (which peaks exactly at 0.5), as lower uncertainty than the
+            # engine actually had, gating peer review off the very cases
+            # that needed it most.
+            self._f._log_debug(
+                f"compute_weighted_score: prediction bonus WITHHELD "
+                f"({predictions_verified}/{predictions_total} verified) — "
+                f"obj is the abstention neutral; a bonus on 'unknown' "
+                f"would fabricate evidence"
+            )
 
         # Coverage penalty on combined score
         low_cov = self._f.valves.low_coverage_threshold
@@ -26195,6 +26315,7 @@ class MetacognitiveReasoningEngine:
         label: str = "",
         obj_weight: float = 0.5,
         llm_weight: float = 0.5,
+        deadline_s: Optional[float] = None,
     ) -> Tuple[str, float, "StaticEvidence", Optional["PeerReviewResult"]]:
         """
         Full scientific hypothesis competition loop.
@@ -26224,9 +26345,34 @@ class MetacognitiveReasoningEngine:
             0.5/0.5 default — verification: evidence and LLM equally weighted
             0.4/0.6 for architecture — proposing changes, design judgment > evidence
 
+        deadline_s:
+            Wall-clock ceiling for the whole competition. The cost here is
+            N hypotheses × M iterations × several LLM calls each, and the
+            caller's budget gate can only check the clock BEFORE entering —
+            once inside, an unbounded competition eats the pipeline's
+            remaining time and the stages queued behind it. Live: 199s
+            consumed by one competition, after which the verify and analyze
+            steps were skipped with reason "budget" — hard evidence traded
+            for reasoning, the exact swap the step loop refuses to make.
+            None means unbounded (the previous behaviour).
+
+            Exhaustion is a stop, never a verdict: the best hypothesis
+            scored so far is kept, and a deadline that lands before any
+            hypothesis is scored is explicitly NOT read as epistemic
+            bankruptcy — that path would fire the abductive escape and
+            spend MORE budget reacting to a clock that already ran out.
+
         Returns (best_hypothesis_text, best_score, best_evidence, peer_review).
         """
         max_hypotheses = len(hypotheses)
+
+        _t_compete_start = time.monotonic()
+        _deadline = (
+            _t_compete_start + deadline_s
+            if deadline_s is not None and deadline_s > 0
+            else None
+        )
+        _budget_hit = False
 
         # Null hypothesis baseline — always included as floor comparison
         null_hyp = (
@@ -26273,6 +26419,18 @@ class MetacognitiveReasoningEngine:
             # TURN LEVEL: evaluate each hypothesis
             for hyp_text, llm_conf in hypotheses:
 
+                # ⓪ Budget: each hypothesis costs several LLM calls, so the
+                # clock is checked per hypothesis rather than per iteration.
+                if _deadline is not None and time.monotonic() >= _deadline:
+                    _budget_hit = True
+                    self._f._log_debug(
+                        f"compete_hypotheses: deadline ({deadline_s:.0f}s) "
+                        f"reached during iteration {iteration} — "
+                        f"{len(current_scored)}/{len(hypotheses)} hypotheses "
+                        f"evaluated, keeping what is scored"
+                    )
+                    break
+
                 # ① Design experiment (cached after first occurrence)
                 design = await self.design_critical_experiment(hyp_text, project_id)
 
@@ -26316,7 +26474,14 @@ class MetacognitiveReasoningEngine:
                         )
 
                 # ⑦ Falsification with coverage guard
-                current_coverage = self._compute_coverage_score(design)
+                # The guard asks "did we inspect enough of this hypothesis
+                # to trust a refutation?", so it must be fed what was
+                # actually resolved, not what the classifier promised was
+                # resolvable. Active Learning above keeps the DECLARED
+                # number on purpose: it reasons about the unknown bucket.
+                current_coverage, _cov_res, _cov_tot = (
+                    self._compute_effective_coverage(design, evidence, project_id)
+                )
                 falsified, reason = self.is_falsified(
                     evidence,
                     design,
@@ -26400,6 +26565,19 @@ class MetacognitiveReasoningEngine:
             valid_scored.sort(key=lambda x: x.score, reverse=True)
 
             if not valid_scored:
+                # A clock that ran out is not a refutation. Falling into the
+                # bankruptcy path here would fire the abductive escape and
+                # spend MORE budget reacting to an exhausted budget — and
+                # would record a total-failure debrief that teaches
+                # _get_adaptive_strategy a failure mode the evidence never
+                # showed.
+                if _budget_hit:
+                    self._f._log_debug(
+                        f"compete_hypotheses: iteration {iteration} reached "
+                        f"the deadline before scoring any hypothesis — "
+                        f"stopping (budget, NOT epistemic bankruptcy)"
+                    )
+                    break
                 # COMPETITION LEVEL — epistemic bankruptcy: every hypothesis
                 # died this iteration. Before surrendering, try one abductive
                 # escape that negates the assumption they all shared. Fires at
@@ -26436,6 +26614,18 @@ class MetacognitiveReasoningEngine:
             # ITERATION LEVEL: track obj_score ONLY (deterministic SymbolGraph signal)
             # llm_conf excluded — self-reported by LLM, unreliable for convergence
             obj_score_history.append(best_scored.obj_score)
+
+            if _budget_hit:
+                await self._f._emit_status(
+                    f"🔬 Competition budget spent — keeping the leading "
+                    f"hypothesis (score {best_scored.score:.2f})"
+                )
+                self._f._log_debug(
+                    f"compete_hypotheses: stopped at iteration {iteration}/"
+                    f"{max_iters} — deadline ({deadline_s:.0f}s) reached; "
+                    f"winner so far scores {best_scored.score:.2f}"
+                )
+                break
 
             if best_scored.score >= threshold:
                 # Surfaced to the chat, not only the debug log: from the UI a
@@ -26521,9 +26711,14 @@ class MetacognitiveReasoningEngine:
 
         # ── Post-loop guard ───────────────────────────────────────────────
         if best_scored is None:
+            _why_none = (
+                "deadline reached before any could be scored"
+                if _budget_hit
+                else "all falsified across all iterations"
+            )
             self._f._log_debug(
-                "compete_hypotheses: no valid hypothesis survived — "
-                "all falsified across all iterations"
+                f"compete_hypotheses: no valid hypothesis survived — "
+                f"{_why_none}"
             )
             # Record total-failure in performance history so
             # _get_adaptive_strategy can learn from this failure mode.
@@ -26553,7 +26748,27 @@ class MetacognitiveReasoningEngine:
             ) and _avg_cov < float(
                 getattr(self._f.valves, "abstention_coverage_floor", 0.35)
             )
-            if _abstain:
+            if _budget_hit:
+                # Neither refuted nor untestable: never evaluated. Saying
+                # "unable to validate" here would report a structural
+                # verdict the engine never reached.
+                await self._f._emit_status(
+                    "⏱️ Competition budget spent before any verdict"
+                )
+                self._f._log_debug(
+                    "compete_hypotheses: deadline reached before any "
+                    "hypothesis was scored — reporting a budget stop, not "
+                    "a refutation"
+                )
+                _msg = (
+                    "The hypothesis competition ran out of time before any "
+                    "hypothesis could be evaluated against the codebase "
+                    "structure. This is a budget limit, not a refutation: "
+                    "no structural conclusion was reached either way. State "
+                    "this honestly rather than presenting an unverified "
+                    "cause."
+                )
+            elif _abstain:
                 await self._f._emit_status("🤔 Insufficient evidence — abstaining")
                 self._f._log_debug(
                     f"compete_hypotheses: abstaining (avg coverage "
@@ -40045,6 +40260,22 @@ class Filter:
                 "observed live: a gap-inserted step started with ~42s left, "
                 "died at '(step timed out)', and the generative evaluation "
                 "was then skipped at '-0s remain'."
+            ),
+        )
+        agentic_metacog_max_compete_s: int = Field(
+            default=120,
+            ge=0,
+            description=(
+                "Wall-clock ceiling for one hypothesis competition on a "
+                "hypothesize step. The competition costs N hypotheses × M "
+                "iterations × several LLM calls each, and "
+                "agentic_metacog_min_remaining_s can only gate the ENTRY — "
+                "once inside, an unbounded competition eats what the "
+                "pipeline stages behind it need. Measured live: 199s spent "
+                "competing 7 hypotheses, after which verify and analyze "
+                "were skipped with reason 'budget'. Hitting the ceiling is "
+                "a stop, not a verdict: the leading hypothesis is kept. "
+                "0 disables the ceiling (unbounded, pre-0027 behaviour)."
             ),
         )
         agentic_claims_tail_recovery: bool = Field(
