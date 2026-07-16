@@ -18039,267 +18039,6 @@ class AgenticOrchestrator:
                 pass
 
 
-class ReasoningHelper:
-    """
-    Stateless reasoning primitives shared across the system.
-
-    ============================================================================
-    RESPONSIBILITY
-    ============================================================================
-    Holds the *generation* primitives for reasoning that survive the
-    agentic-first cleanup: linear chain-of-thought text and the step-back
-    context that precedes it. The one remaining consumer is the metacognitive
-    engine's focal-reasoning path (which calls generate_cot_reasoning), so
-    these live in a neutral helper rather than inside a caller.
-
-    This class deliberately contains NO level-detection logic. Deciding "how
-    much reasoning to apply" belonged to the old CoT-tier model; under the
-    agentic-first model there are no tiers to detect. What remains here is the
-    act of generating reasoning when something upstream has decided it is
-    wanted.
-
-    Its remaining consumer is the metacognitive engine's focal path
-    (generate_cot_reasoning); the reasoning dispatcher no longer injects CoT
-    for ordinary turns, and architecture queries now flow through the agentic
-    pipeline (planned as impact investigation) rather than a specialized
-    skeleton-reasoning path.
-    """
-
-    def __init__(self, filter_ref: "Filter") -> None:
-        self._f = filter_ref
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Step-back architectural framing (support for generate_cot_reasoning)
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def _should_step_back(self, question: str) -> bool:
-        """
-        Decide whether step-back architectural framing applies to a question.
-
-        Mirrors the gating inside _generate_step_back_context (valve, minimum
-        length, debug-signal keywords or step_back_always) so the aligned CoT
-        path can fold the step-back ask into the single reasoning call without
-        paying a separate LLM round-trip that would dirty the KV slot right
-        before the prefix-aligned call.
-
-        Args:
-            question: The user's question.
-
-        Returns:
-            True when a step-back framing should be requested.
-        """
-        # Region: valve and length gates
-        if not self._f.valves.enable_step_back_prompting:
-            return False
-        if len(question.strip()) < 15:
-            return False
-
-        # Region: debug-signal gate (or unconditional via step_back_always)
-        debug_signals = (
-            "error",
-            "fail",
-            "bug",
-            "wrong",
-            "exception",
-            "traceback",
-            "falla",
-            "excepción",
-            "no funciona",
-        )
-        question_lower = question.lower()
-        if any(signal in question_lower for signal in debug_signals):
-            return True
-        return bool(self._f.valves.step_back_always)
-
-    async def _generate_step_back_context(
-        self, question: str, code_context: str
-    ) -> str:
-        """
-        Generate an architectural step-back for better CoT hypothesis quality.
-
-        Asks: "What high-level principle governs this code?" before diving
-        into the specific bug/question.
-
-        Returns a formatted string to prepend to the CoT context,
-        or empty string if disabled or the LLM call fails.
-        """
-        if not self._f.valves.enable_step_back_prompting:
-            return ""
-        if len(question.strip()) < 15:
-            return ""
-
-        debug_signals = (
-            "error",
-            "fail",
-            "bug",
-            "wrong",
-            "exception",
-            "traceback",
-            "falla",
-            "error",
-            "excepción",
-            "no funciona",
-        )
-        question_lower = question.lower()
-        if not any(signal in question_lower for signal in debug_signals):
-            if not self._f.valves.step_back_always:
-                return ""
-
-        step_back_prompt = (
-            f"A programmer is debugging this specific issue:\n{question[:300]}\n\n"
-            "What is the underlying architectural principle, design invariant, or "
-            "general concept that governs correct behavior here? "
-            "State it as an abstract question and answer it in 2-3 sentences. "
-            "Focus on system-level understanding, not the specific bug."
-        )
-
-        step_back_response = await self._f._llm_orchestrator.call_llm(
-            prompt=step_back_prompt,
-            system_prompt=(
-                "You are a senior software architect. "
-                "Answer the abstract question concisely (2-3 sentences). "
-                "Focus on principles, not the specific implementation."
-            ),
-            model_override=self._f.valves.cot_model_level2,
-            max_tokens=self._f.valves.step_back_max_tokens,
-            temperature=0.3,
-            label="step_back",
-        )
-
-        if step_back_response and step_back_response.strip():
-            self._f._log_debug(
-                "Step-back context generated "
-                f"({len(step_back_response.split())} words)"
-            )
-            return (
-                "## Architectural Context (Step-Back)\n"
-                f"{step_back_response.strip()}\n\n"
-                "---\n\n"
-            )
-        return ""
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 4. Level 2 reasoning generation (standard CoT + architecture mode)
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    async def generate_cot_reasoning(
-        self,
-        question: str,
-        context: str,
-        label: str = "",
-        project_id: str = "",
-        focus_context: str = "",
-    ) -> str:
-        """
-        Generate a Chain-of-Thought reasoning chain for the given question.
-
-        With cot_prefix_aligned (default), the context is sent verbatim as the
-        system prompt — a byte-prefix of the main call's system prompt — so
-        llama.cpp reuses the static-prefix KV across this call and the main
-        inference. In legacy mode the context is inlined in the user turn;
-        the server's native context checkpoints recover the main prefix.
-
-        Args:
-            question:      The user's question to reason about.
-            context:       Code or system context to reason on. In aligned
-                           mode this must be a byte-prefix of the main call's
-                           system prompt (the caller guarantees it).
-            label:         Optional label for LLM call logging.
-            project_id:    Current project identifier.
-            focus_context: Optional per-question focused material (aligned
-                           mode only) rendered in the user turn, e.g. the
-                           volatile activation context from FocalReasoning.
-
-        Returns:
-            A formatted reasoning chain with a header, or
-            ``"Unable to generate reasoning."`` on failure.
-        """
-        # ------------------------------------------------------------------
-        # Region: Configure token limits
-        # ------------------------------------------------------------------
-        effective_max_tokens = (
-            self._f.valves.cot_max_tokens if self._f.valves.cot_max_tokens > 0 else None
-        )
-
-        # ------------------------------------------------------------------
-        # Region: Optionally generate step-back architectural context
-        #
-        # Aligned mode folds the step-back ask into the single reasoning call
-        # (the same model answers both), so no extra LLM round-trip dirties
-        # the slot right before the prefix-aligned call reuses the static
-        # prefix. Legacy mode keeps the separate call and prepends its output.
-        # ------------------------------------------------------------------
-        aligned = self._f.valves.cot_prefix_aligned and bool(context)
-        step_back = ""
-        inline_step_back = ""
-        if aligned:
-            if self._should_step_back(question):
-                inline_step_back = (
-                    "First, state in 2-3 sentences the underlying architectural "
-                    "principle or design invariant that governs correct behavior "
-                    "here. Then continue.\n\n"
-                )
-        else:
-            step_back = await self._generate_step_back_context(question, context)
-        enriched_context = step_back + context if step_back else context
-
-        # ------------------------------------------------------------------
-        # Region: Build the reasoning prompt
-        #
-        # Aligned: the context (a byte-prefix of the main call's system
-        # prompt) IS the system prompt, and everything call-specific lives in
-        # the user turn — llama.cpp reuses the static-prefix KV across this
-        # call and the main inference. Legacy: fixed assistant persona as
-        # system, context inlined in the user turn (pre-alignment behavior).
-        # ------------------------------------------------------------------
-        if aligned:
-            system_for_call = context
-            focus_block = (
-                f"Focused context for this question:\n{focus_context}\n\n"
-                if focus_context
-                else ""
-            )
-            prompt = (
-                f"{focus_block}"
-                f"{inline_step_back}"
-                f"Question:\n{question}\n\n"
-                "Think step by step and provide your reasoning:"
-            )
-        else:
-            system_for_call = (
-                "You are a helpful assistant that thinks step by step before answering."
-            )
-            prompt = (
-                f"Context:\n{enriched_context}\n\n"
-                f"Question:\n{question}\n\n"
-                "Think step by step and provide your reasoning:"
-            )
-
-        # ------------------------------------------------------------------
-        # Region: Call the LLM
-        # ------------------------------------------------------------------
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=system_for_call,
-            model_override=self._f.valves.cot_model_level2,
-            max_tokens=effective_max_tokens,
-            temperature=0.4,
-            label=label,
-        )
-
-        # ------------------------------------------------------------------
-        # Region: Format and return
-        # ------------------------------------------------------------------
-        if response:
-            prefix = (
-                "## 🔎 Automated Chain-of-Thought Reasoning (Level 2)\n"
-                f"*Generated by {self._f.valves.cot_model_level2}.*"
-            )
-            if step_back or inline_step_back:
-                prefix += " *Includes step-back architectural context.*"
-            return f"{prefix}\n\n{response}"
-
-        return "Unable to generate reasoning."
 
 
 class MultiPhasePlanner:
@@ -39254,10 +38993,6 @@ class Filter:
             default=6000,
             description="Maximum tokens for LTM retrieved per request. 0 = unlimited.",
         )
-        cot_max_tokens: int = Field(
-            default=0,
-            description="Maximum tokens for CoT reasoning responses. 0 = unlimited.",
-        )
 
         # ── 1.2 Code block overflow ───────────────────────────────────────────
         max_code_block_tokens: int = Field(
@@ -41101,17 +40836,6 @@ class Filter:
             default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
             description="Model used for CoT level 3 (scientific multi‑hypothesis).",
         )
-        cot_prefix_aligned: bool = Field(
-            default=True,
-            description=(
-                "Auxiliary CoT calls send the preliminary system prompt as a "
-                "byte-identical prefix (context as system, instructions in the "
-                "user turn), so llama.cpp reuses the static-prefix KV across "
-                "reasoning calls and the main inference — replacing the ~100k "
-                "re-prefill the legacy truncated-context calls caused. "
-                "Off = pre-alignment behavior."
-            ),
-        )
 
         # ── 8.13 Architecture mode ───────────────────────────────────────────
         skeleton_cot_max_tokens: int = Field(
@@ -41122,20 +40846,6 @@ class Filter:
         )
 
         # ── 8.14 Complementary features ─────────────────────────────────────
-        enable_step_back_prompting: bool = Field(
-            default=True,
-            description="Generate step‑back architectural context before CoT reasoning.",
-        )
-        step_back_always: bool = Field(
-            default=False,
-            description="Always use step‑back prompting, even for non‑debug queries.",
-        )
-        step_back_max_tokens: int = Field(
-            default=150,
-            ge=50,
-            le=400,
-            description="Maximum tokens for step‑back context generation.",
-        )
         enable_contradiction_detection: bool = Field(
             default=True,
             description="Detect if the last user message contradicts the conversation history.",
@@ -41885,7 +41595,6 @@ class Filter:
 
         self._ltm = LongTermMemory(self)
         self._llm_orchestrator = LLMOrchestrator(self)
-        self._reasoning_helper = ReasoningHelper(self)
         self._multi_phase = MultiPhasePlanner(self)
         self._commands = CommandRouter(self)
         self._code_blocks = CodeBlockManager(self)
