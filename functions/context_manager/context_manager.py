@@ -599,6 +599,18 @@ class SymbolIndex:
         # Centrality cache (v8), now keyed by qualified id.
         self._centrality_cache: Dict[str, Dict[str, float]] = {}
 
+        # Monotonic per-project edge-graph generation. Bumped by every
+        # mutation of the typed-edge graph — additions, removals, project
+        # clears, and in-place confidence changes (resolve_dangling_edges
+        # raises 0.3→1.0 and demotes 1.0→0.3 without touching a single
+        # block). PPR propagation weighs edges by weight*confidence, so any
+        # of those mutations changes the scores; folding this counter into
+        # the PPR cache key makes the key move exactly when the answer
+        # would. Volatile on purpose: the PPR cache it guards is in-memory
+        # too, so both reset together on restart and the counter never
+        # needs persistence.
+        self._edges_generation: Dict[str, int] = defaultdict(int)
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Symbol registration & removal (qualified id + bare index)
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1059,6 +1071,14 @@ class SymbolIndex:
     # 4. Typed edges (v7+)
     # ═══════════════════════════════════════════════════════════════════════════
 
+    def bump_edges_generation(self, project_id: str) -> None:
+        """Advance the edge-graph generation after any edge mutation."""
+        self._edges_generation[project_id] += 1
+
+    def get_edges_generation(self, project_id: str) -> int:
+        """Current edge-graph generation for the project (0 = untouched)."""
+        return self._edges_generation.get(project_id, 0)
+
     def add_edge(self, edge: "Edge", project_id: str) -> None:
         """Register a typed edge.  `edge.src` is expected to be the
         qualified id of the symbol whose body contains the call (the caller
@@ -1074,22 +1094,28 @@ class SymbolIndex:
                 return
         self._edges_out[src_key].append(edge)
         self._edges_in[dst_key].append(edge)
+        self.bump_edges_generation(project_id)
 
     def remove_edges_for_symbol(self, symbol_id: str, project_id: str) -> None:
         """Remove edges where `symbol_id` (qualified id for a class‑scoped
         symbol, bare name for a module‑level one) is source or destination."""
         src_key = f"{project_id}:{symbol_id}"
+        _removed = False
         for edge in self._edges_out.pop(src_key, []):
+            _removed = True
             dst_key = f"{project_id}:{edge.dst}"
             self._edges_in[dst_key] = [
                 e for e in self._edges_in.get(dst_key, []) if e.src != symbol_id
             ]
         dst_key = f"{project_id}:{symbol_id}"
         for edge in self._edges_in.pop(dst_key, []):
+            _removed = True
             src_key_in = f"{project_id}:{edge.src}"
             self._edges_out[src_key_in] = [
                 e for e in self._edges_out.get(src_key_in, []) if e.dst != symbol_id
             ]
+        if _removed:
+            self.bump_edges_generation(project_id)
 
     def get_edges_out(self, symbol_id: str, project_id: str) -> List["Edge"]:
         """Outgoing edges.  Pass a method's qualified id for precisely its
@@ -1306,6 +1332,10 @@ class SymbolIndex:
         for k in list(self._edges_in.keys()):
             if k.startswith(prefix):
                 del self._edges_in[k]
+        # Bump rather than reset: deleting the counter would return the
+        # project to generation 0, colliding with keys minted before the
+        # clear in the same process lifetime.
+        self.bump_edges_generation(project_id)
 
         self._centrality_cache.pop(project_id, None)
 
@@ -12018,9 +12048,26 @@ class LLMOrchestrator:
             prompt=prompt,
         )
 
+        # Region: anti-repetition for JSON contracts. Built before the dedup
+        # and cache keys because it changes what the sampler produces —
+        # valves are live-editable in the UI, so two calls with different
+        # DRY settings must not share an inference or a cached response.
+        _extra_body: Optional[Dict[str, Any]] = None
+        if response_format is not None:
+            _dry = float(
+                getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0
+            )
+            if _dry > 0:
+                _extra_body = {
+                    "dry_multiplier": _dry,
+                    "dry_base": 1.75,
+                    "dry_allowed_length": 8,
+                    "dry_penalty_last_n": 1024,
+                }
+
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}"
-            f"|{response_format}|{enable_thinking}".encode()
+            f"|{response_format}|{enable_thinking}|{_extra_body}".encode()
         ).hexdigest()
         async with self._f._pending_llm_lock:
             if dedup_key in self._f._pending_llm:
@@ -12032,7 +12079,25 @@ class LLMOrchestrator:
                 is_producer = True
 
         if not is_producer:
-            _shared = await future
+            # Region: bystander isolation. A task cancelled while awaiting a
+            # future CANCELS that future (asyncio.Task semantics) — and this
+            # future is SHARED. Without the shield, one cancelled consumer
+            # (wait_for timeout in the agentic executor, stop_all() on a
+            # background task) poisons everyone: the future flips to
+            # cancelled, the producer's set_result raises InvalidStateError
+            # inside its own success path, its except handler's
+            # set_exception raises a second one, and every other consumer is
+            # cancelled without anyone having cancelled it. shield() keeps
+            # this consumer's cancellation to itself. The except then
+            # distinguishes the two directions: a cancelled FUTURE means the
+            # producer died — degrade to None like any failed aux call — while
+            # our own cancellation must keep propagating.
+            try:
+                _shared = await asyncio.shield(future)
+            except asyncio.CancelledError:
+                if future.cancelled():
+                    return None
+                raise
             if _shared is None or return_meta:
                 return _shared
             return _shared.content
@@ -12045,17 +12110,19 @@ class LLMOrchestrator:
                 model = model_override or self._f.valves.llm_model
                 if not model:
                     logger.warning(f"[LLM]{label_str} No model configured")
-                    future.set_result(None)
+                    if not future.done():
+                        future.set_result(None)
                     return None
 
                 cache_key = hashlib.md5(
                     f"{model}|{prompt}|{system_prompt}|{temperature}|{max_tokens}"
-                    f"|{response_format}|{enable_thinking}".encode()
+                    f"|{response_format}|{enable_thinking}|{_extra_body}".encode()
                 ).hexdigest()
 
                 cached = await self._f._llm_cache.get(cache_key)
                 if cached is not None:
-                    future.set_result(cached)
+                    if not future.done():
+                        future.set_result(cached)
                     self._f._log_debug(
                         f"[LLM] {model}{label_str} (cached) "
                         f"took {time.monotonic() - t_start:.3f}s"
@@ -12101,12 +12168,60 @@ class LLMOrchestrator:
                         log_raw_response=log_raw_response,
                         label=label,
                         return_meta=True,
+                        extra_body=_extra_body,
                     )
 
                     content = result.content if result else ""
+                    # Region: JSON-contract normalization, one owner for all
+                    # consumers. An AST audit found SEVENTEEN call sites doing
+                    # a strict json.loads on json_object responses — every
+                    # classifier, arbiter and metacog stage — while this
+                    # serving stack demonstrably returns fenced JSON on those
+                    # calls (the response_format constraint is not reaching
+                    # sampling; the router is the suspect). Each site failed
+                    # silently to its fallback. Rather than teach seventeen
+                    # parsers the tolerant ladder, the producer normalizes
+                    # once: if the ladder (fence strip → clean parse →
+                    # truncation repair) yields an object, the content
+                    # becomes its canonical serialization and every consumer
+                    # parses clean JSON; if it yields nothing, the original
+                    # text passes through untouched so per-site error logs
+                    # keep their raw previews. Runs before the cache write
+                    # and the future resolution so cached copies and
+                    # deduplicated consumers see the same normalized text.
+                    if content and response_format is not None:
+                        # Intervene only when a strict consumer would fail:
+                        # a response that already parses passes through
+                        # byte-identical (no cache churn, no log noise on
+                        # every healthy classifier call).
+                        _needs_rescue = False
+                        try:
+                            json.loads(content)
+                        except Exception:
+                            _needs_rescue = True
+                        if _needs_rescue:
+                            try:
+                                _norm, _how = (
+                                    self._f._meta_reasoning._parse_json_contract(
+                                        content
+                                    )
+                                )
+                            except Exception:
+                                _norm, _how = None, ""
+                            if _norm is not None:
+                                self._f._log_debug(
+                                    f"[LLM]{label_str} json contract "
+                                    f"normalized ({_how}: fence/truncation "
+                                    f"handled at the producer)"
+                                )
+                                result.content = json.dumps(
+                                    _norm, ensure_ascii=False
+                                )
+                                content = result.content
                     if content:
                         await self._f._llm_cache.set(cache_key, result)
-                        future.set_result(result)
+                        if not future.done():
+                            future.set_result(result)
                         async with self._f._model_lock:
                             self._f._last_used_model = model
                         in_tokens = (
@@ -12127,7 +12242,8 @@ class LLMOrchestrator:
                         )
                         return result if return_meta else content
                     else:
-                        future.set_result(None)
+                        if not future.done():
+                            future.set_result(None)
                         return None
 
                 finally:
@@ -12143,7 +12259,8 @@ class LLMOrchestrator:
                     future.cancel()
                 raise
             except Exception as exc:
-                future.set_exception(exc)
+                if not future.done():
+                    future.set_exception(exc)
                 raise
             finally:
                 async with self._f._pending_llm_lock:
@@ -12645,10 +12762,44 @@ class AgenticEvidenceLedger:
 
     def restore(self, step: AgenticStep, claims_json: str) -> None:
         """Rehydrate cached claims (validity was computed at write time and
-        the cache key guarantees an unchanged structure_hash)."""
+        the cache key guarantees an unchanged structure_hash).
+
+        Two corrections the orphan mid-run reset used to mask, back when it
+        wiped every restored claim before execution:
+
+        The stored step_id is remapped to the CURRENT step's id. The cache
+        key is (kind, goal, mode) — deliberately not the id — so a hit can
+        come from a run where the same goal sat at a different position;
+        claims carrying the original id would be invisible to every
+        claims_for(step.id) consumer (per-step digests, the NEEDS gap
+        accounting) and misattributed in the verify report.
+
+        Restoration also dedupes against claims already present: on a
+        continuation turn the persisted-snapshot restore may have loaded
+        this very claim before the cache hit fires, and appending it twice
+        inflates counts() and makes the verify step check it twice. The
+        identity is the normalized claim text — the id was just remapped,
+        so it cannot disambiguate.
+        """
         try:
+            existing = {
+                " ".join(c.text.casefold().split()) for c in self.claims
+            }
+            restored = 0
             for d in json.loads(claims_json):
+                d = dict(d)
+                d["step_id"] = step.id
+                key = " ".join(str(d.get("text", "")).casefold().split())
+                if not key or key in existing:
+                    continue
+                existing.add(key)
                 self.claims.append(LedgerClaim(**d))
+                restored += 1
+            if restored:
+                self._f._log_debug(
+                    f"🤖 Ledger: {restored} cached claim(s) rehydrated for "
+                    f"step {step.id}"
+                )
         except Exception:
             self._f._log_debug(
                 f"🤖 Ledger: cached claims for step {step.id} unreadable — skipped"
@@ -16985,7 +17136,21 @@ class AgenticOrchestrator:
             _s.display_no = _pos
 
         # Region: sequential execution — cache, tools, control signals
-        self._ledger.reset()
+        # No ledger reset here, and none may return. The per-run reset (and
+        # the continuation-gated restore that agentic_ledger_persist builds
+        # on top of it) happens once at the top of this function; this spot
+        # used to carry the OLDER generation of the same #11 fix, an
+        # unconditional reset() that survived the restore-aware block
+        # landing upstream and wiped the freshly restored claims before a
+        # single step ran. Net effect: the persist feature was dead on
+        # arrival — continuation turns logged "restored N ledger claim(s)"
+        # and then executed on an empty ledger, verify and synthesis never
+        # saw the prior turn's evidence, and the end-of-run snapshot could
+        # only ever hold one turn, so the multi-turn accumulation the valve
+        # promises never happened. Nothing between the top-of-run
+        # reset/restore and this point touches the ledger (pre-planner,
+        # planner and display_no stamping are claim-free), so there is
+        # nothing here to clear.
         structure_hash = ""
         try:
             structure_hash = (
@@ -22877,9 +23042,23 @@ Output only the symbol name.
             fallback can be found.
         """
         # ── Resolve the cache key ─────────────────────────────────────────────────
+        # Neither component of the base key sees the edge graph:
+        # structure_hash covers signatures, code_state_hash covers the set
+        # of active blocks. PPR, however, propagates over
+        # Edge.effective_weight() = weight * confidence, and
+        # resolve_dangling_edges rewrites confidences in place without any
+        # block changing — the exact recipe for "same key, different
+        # scores". The edge-graph generation is the missing ingredient:
+        # O(1) to read, bumped by every edge mutation, and volatile in
+        # step with the cache it keys.
         psm = self._f._project_state_manager
         structure_hash = psm.get_structure_hash_for_cache(project_id)
-        cache_key_hash = structure_hash if structure_hash else code_state_hash
+        _base_key = structure_hash if structure_hash else code_state_hash
+        cache_key_hash = (
+            f"{_base_key}|e{self._f._symbol_index.get_edges_generation(project_id)}"
+            if _base_key
+            else ""
+        )
         if seed_weights:
             # Weighted personalization: fold the weights into the seed part of
             # the key (rounded for float stability). The same qid set with
@@ -23885,6 +24064,7 @@ Output only the symbol name.
         """
         all_names = self._f._symbol_index.get_all_names(project_id)
         resolved = 0
+        demoted = 0
 
         for sym_name in all_names:
             has_definition = bool(
@@ -23898,11 +24078,21 @@ Output only the symbol name.
                     resolved += 1
                 elif not has_definition and edge.confidence == 1.0:
                     edge.confidence = 0.3
+                    demoted += 1
 
-        if resolved > 0:
+        # Both branches rewrite edge.confidence in place, and PPR weighs
+        # edges by weight*confidence — so both must move the edge-graph
+        # generation or a cached PPR entry keeps serving scores computed
+        # with the old weights under an unchanged key (the reported
+        # symptom: same query, code untouched, different scores depending
+        # on whether a background resolution ran in between). The demotion
+        # branch previously mutated without even being counted.
+        if resolved or demoted:
+            self._f._symbol_index.bump_edges_generation(project_id)
             self._f._log_debug(
-                f"Cross-chunk resolution: {resolved} edge(s) resolved "
-                f"(references confirmed with definitions)"
+                f"Cross-chunk resolution: {resolved} edge(s) resolved, "
+                f"{demoted} demoted — edge generation bumped "
+                f"(PPR cache keys move with it)"
             )
         return resolved
 
@@ -24635,6 +24825,140 @@ class MetacognitiveReasoningEngine:
     # 2. Pre-evidence design and prediction generation
     # ═══════════════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _repair_truncated_json(text: str) -> Optional[dict]:
+        """
+        Recover the parseable prefix of a JSON object cut off mid-generation.
+
+        A single scan tracks string state and the bracket stack, remembering
+        the last position that ended a COMPLETE element (a closed string or a
+        closing bracket). The text is cut there — dropping any half-emitted
+        string the truncation left dangling — and the stack is unwound with
+        the matching closers. The result either parses or the whole attempt
+        returns None; no partially-guessed content is ever fabricated.
+
+        Args:
+            text: Candidate JSON starting at its opening brace.
+
+        Returns:
+            The parsed dict, or None when nothing salvageable remains.
+        """
+        stack: List[str] = []
+        in_str = False
+        esc = False
+        last_safe = -1
+        last_stack: Optional[List[str]] = None
+        for i, ch in enumerate(text):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                    last_safe = i
+                    last_stack = list(stack)
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch in "{[":
+                    stack.append(ch)
+                elif ch in "}]":
+                    if stack:
+                        stack.pop()
+                    last_safe = i
+                    last_stack = list(stack)
+        if last_safe < 0 or last_stack is None:
+            return None
+        repaired = text[: last_safe + 1] + "".join(
+            "}" if c == "{" else "]" for c in reversed(last_stack)
+        )
+        try:
+            data = json.loads(repaired)
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    @classmethod
+    def _parse_json_contract(cls, response: str) -> Tuple[Optional[dict], str]:
+        """
+        Tolerant parse for the metacog JSON contracts, mirroring the ledger's
+        parse-or-nothing ladder.
+
+        Production shows two failure shapes the strict json.loads lost
+        entirely, nine times in one session: a markdown fence wrapping the
+        object (emitted despite response_format=json_object — the constraint
+        is not reaching sampling on this serving stack), and truncation
+        mid-array when a repetition loop rode the generation into the token
+        cap. Both leave a perfectly good prefix that the strict parser threw
+        away, starving the falsification machinery of the very evidence it
+        exists to collect.
+
+        Ladder: strip one wrapping fence if present, start at the first
+        brace, try a clean parse, then the truncation repair. The second
+        element of the returned tuple names which rung succeeded ("clean",
+        "salvaged") so the caller's log can distinguish a healthy response
+        from a rescued one.
+
+        Args:
+            response: Raw LLM response text.
+
+        Returns:
+            (parsed dict or None, how): how is "clean", "salvaged" or "".
+        """
+        if not response:
+            return None, ""
+        text = response.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.rstrip().endswith("```"):
+                text = text.rstrip()[:-3]
+        start = text.find("{")
+        if start < 0:
+            return None, ""
+        text = text[start:]
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data, "clean"
+        except Exception:
+            pass
+        data = cls._repair_truncated_json(text)
+        return (data, "salvaged") if data is not None else (None, "")
+
+    @staticmethod
+    def _dedupe_claims(items: list, cap: int) -> List[str]:
+        """
+        Order-preserving dedupe with a hard cap.
+
+        The observed degeneration emits the SAME claim over and over inside
+        the array, so after the truncation repair the salvaged list is
+        mostly duplicates of the pre-loop prefix; normalising on casefolded,
+        whitespace-collapsed text collapses the loop's contribution to one
+        entry and the cap bounds whatever survives (el código acota).
+
+        Args:
+            items: Raw claim strings from the parsed contract.
+            cap: Maximum entries kept.
+
+        Returns:
+            Unique claims in first-seen order, at most cap of them.
+        """
+        seen: Set[str] = set()
+        out: List[str] = []
+        for it in items:
+            s = str(it).strip()
+            if not s:
+                continue
+            key = " ".join(s.casefold().split())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+            if len(out) >= cap:
+                break
+        return out
+
     async def design_critical_experiment(
         self,
         hypothesis: str,
@@ -24698,28 +25022,30 @@ class MetacognitiveReasoningEngine:
         if not response:
             return _empty
 
-        try:
-            data = json.loads(response)
-            design = ExperimentDesign(
-                critical_claims=[str(c) for c in data.get("critical", []) if c],
-                supportive_claims=[str(c) for c in data.get("supportive", []) if c],
-                unknown_claims=[str(c) for c in data.get("unknown", []) if c],
-                hypothesis_hash=h_hash,
-            )
-            if len(self._design_cache) >= 50:
-                self._design_cache.clear()
-            self._design_cache[h_hash] = design
-            self._f._log_debug(
-                f"design_critical_experiment: {len(design.critical_claims)} critical, "
-                f"{len(design.supportive_claims)} supportive, "
-                f"{len(design.unknown_claims)} unknown"
-            )
-            return design
-        except (json.JSONDecodeError, Exception):
+        data, how = self._parse_json_contract(response)
+        if data is None:
             self._f._log_debug(
                 f"design_critical_experiment: parse error — {response[:200]!r}"
             )
             return _empty
+        # The 12-claim cap mirrors _CHECKS_CONTRACT ("at most 12 checks"):
+        # anything past it could never be verified anyway.
+        design = ExperimentDesign(
+            critical_claims=self._dedupe_claims(data.get("critical", []) or [], 12),
+            supportive_claims=self._dedupe_claims(data.get("supportive", []) or [], 12),
+            unknown_claims=self._dedupe_claims(data.get("unknown", []) or [], 12),
+            hypothesis_hash=h_hash,
+        )
+        if len(self._design_cache) >= 50:
+            self._design_cache.clear()
+        self._design_cache[h_hash] = design
+        self._f._log_debug(
+            f"design_critical_experiment: {len(design.critical_claims)} critical, "
+            f"{len(design.supportive_claims)} supportive, "
+            f"{len(design.unknown_claims)} unknown"
+            + (" (salvaged from a truncated/fenced response)" if how == "salvaged" else "")
+        )
+        return design
 
     async def generate_predictions(
         self,
@@ -24793,19 +25119,21 @@ class MetacognitiveReasoningEngine:
         if not response:
             return []
 
-        try:
-            data = json.loads(response)
-            predictions = [str(p) for p in data.get("predictions", []) if p]
-            self._f._log_debug(
-                f"generate_predictions: {len(predictions)} prediction(s) "
-                f"(skeleton_ctx={'yes' if skeleton_ctx else 'no'})"
-            )
-            return predictions
-        except (json.JSONDecodeError, Exception):
+        data, how = self._parse_json_contract(response)
+        if data is None:
             self._f._log_debug(
                 f"generate_predictions: parse error — {response[:200]!r}"
             )
             return []
+        # The prompt asks for 2-3; 5 tolerates enthusiasm, the dedupe kills
+        # the repetition loop's copies.
+        predictions = self._dedupe_claims(data.get("predictions", []) or [], 5)
+        self._f._log_debug(
+            f"generate_predictions: {len(predictions)} prediction(s) "
+            f"(skeleton_ctx={'yes' if skeleton_ctx else 'no'})"
+            + (" (salvaged from a truncated/fenced response)" if how == "salvaged" else "")
+        )
+        return predictions
 
     # ═══════════════════════════════════════════════════════════════════════
     # 3. Active Learning (H4)
@@ -27772,39 +28100,54 @@ class EnrichmentTasks:
         # A one-sentence summary needs tens of tokens; the cap is the
         # structural stop for the observed failure mode where this call,
         # aligned behind the full system prefix, missed EOS and free-ran to
-        # 36k+ tokens until the HTTP timeout cancelled it.
-        summary = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=(
-                "You are a code change summariser. " "Output only one short sentence."
-            ),
-            model_override=model,
-            max_tokens=80,
-            temperature=0.1,
-            label="change_summary",
-            enable_thinking=False,
-        )
-        if summary:
-            now = time.time()
-            self._f._block_change_summaries[block_hash] = (summary.strip(), now)
-            if len(self._f._block_change_summaries) > self._f._MAX_CHANGE_SUMMARIES:
-                self._f._block_change_summaries.popitem(last=False)
+        # 36k+ tokens until the HTTP timeout cancelled it. The whole LLM +
+        # store region is additionally total — a summary is decoration, and
+        # this exact call is the one whose exhausted-retries exception once
+        # travelled all the way up and aborted the user's turn; with the
+        # guard, a failure here costs precisely one missing summary (the raw
+        # NapMem diff was already persisted in Step 0, before this point).
+        try:
+            summary = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=(
+                    "You are a code change summariser. "
+                    "Output only one short sentence."
+                ),
+                model_override=model,
+                max_tokens=160,
+                temperature=0.1,
+                label="change_summary",
+                enable_thinking=False,
+            )
+            if summary:
+                now = time.time()
+                self._f._block_change_summaries[block_hash] = (summary.strip(), now)
+                if (
+                    len(self._f._block_change_summaries)
+                    > self._f._MAX_CHANGE_SUMMARIES
+                ):
+                    self._f._block_change_summaries.popitem(last=False)
 
-            def _write():
-                self._f._db_conn.execute(
-                    "INSERT OR REPLACE INTO block_change_summaries "
-                    "(block_hash, summary, created_at) VALUES (?, ?, ?)",
-                    (block_hash, summary.strip(), now),
-                )
-                self._f._db_conn.execute(
-                    "DELETE FROM block_change_summaries WHERE block_hash NOT IN "
-                    "(SELECT block_hash FROM block_change_summaries "
-                    "ORDER BY created_at DESC LIMIT ?)",
-                    (self._f._MAX_CHANGE_SUMMARIES,),
-                )
-                self._f._db_conn.commit()
+                def _write():
+                    self._f._db_conn.execute(
+                        "INSERT OR REPLACE INTO block_change_summaries "
+                        "(block_hash, summary, created_at) VALUES (?, ?, ?)",
+                        (block_hash, summary.strip(), now),
+                    )
+                    self._f._db_conn.execute(
+                        "DELETE FROM block_change_summaries WHERE block_hash NOT IN "
+                        "(SELECT block_hash FROM block_change_summaries "
+                        "ORDER BY created_at DESC LIMIT ?)",
+                        (self._f._MAX_CHANGE_SUMMARIES,),
+                    )
+                    self._f._db_conn.commit()
 
-            await self._f._state_store._db_enqueue(_write)
+                await self._f._state_store._db_enqueue(_write)
+        except Exception as _cs_err:
+            self._f._log_debug(
+                f"change_summary failed for {block_hash[:8]} — continuing "
+                f"without a summary ({type(_cs_err).__name__}: {_cs_err})"
+            )
 
     async def run_session_summary_task(
         self,
@@ -32896,8 +33239,17 @@ class WindowManager:
 
         # ------------------------------------------------------------------
         # Region: minimum batch guard — skip when too few turns to summarise
+        #
+        # Membership is by identity, not equality: `m in old_msgs` compares
+        # dicts by content, and identical messages are the NOMINAL case in
+        # this history (AutoContinue emits the same marker turn after turn,
+        # short "ok"/"continua" replies repeat verbatim). A live message
+        # whose twin was evicted would count its turn as old and skew the
+        # guard. kept/old_msgs hold the very same dict objects as history —
+        # both are comprehensions over it — so id() is exact here.
         # ------------------------------------------------------------------
-        old_turn_nums = {t for m, t in zip(history, turns) if m in old_msgs}
+        _old_ids = {id(m) for m in old_msgs}
+        old_turn_nums = {t for m, t in zip(history, turns) if id(m) in _old_ids}
         if len(old_turn_nums) < v.summarize_batch_turns:
             self._f._log_debug(
                 f"WindowManager: batch too small "
@@ -33118,7 +33470,14 @@ class WindowManager:
         # Region: scan kept turns for a giant turn
         # ------------------------------------------------------------------
         emergency_threshold = budget * 0.8
-        kept_turn_set = {t for m, t in zip(history, turns) if m in kept}
+        # Identity, not equality: with duplicate message contents (the
+        # AutoContinue marker being the canonical case), `m in kept` matches
+        # a kept message's evicted twin, dragging an already-evicted turn
+        # into kept_turn_set — from which turns_to_keep is drawn, so the cap
+        # could RESURRECT evicted turns into the window and push newer ones
+        # out. The dict objects are shared with history, so id() is exact.
+        _kept_ids = {id(m) for m in kept}
+        kept_turn_set = {t for m, t in zip(history, turns) if id(m) in _kept_ids}
 
         giant_found = False
         for turn_num in kept_turn_set:
@@ -33205,8 +33564,16 @@ class WindowManager:
 
         # ------------------------------------------------------------------
         # Region: compute new high-water mark from evicted turn numbers
+        #
+        # Identity, not equality — the gravest of the three sites this
+        # membership pattern occupied: a live message whose evicted twin
+        # matched by content pushed its turn number into old_turn_nums, and
+        # max() then advanced the HWM PAST the real frontier, declaring
+        # still-live turns summarized. covers_turns bands and every consumer
+        # of summarized_turn_hwm inherited the lie.
         # ------------------------------------------------------------------
-        old_turn_nums = [t for m, t in zip(history, turns) if m in old_msgs]
+        _old_ids = {id(m) for m in old_msgs}
+        old_turn_nums = [t for m, t in zip(history, turns) if id(m) in _old_ids]
         new_hwm = max(old_turn_nums) if old_turn_nums else old_hwm
 
         # ------------------------------------------------------------------
@@ -33220,36 +33587,6 @@ class WindowManager:
             "level": 1,
         }
         state.conversation_summaries.append(summary_entry)
-
-        # ------------------------------------------------------------------
-        # Region: apply L1 cap
-        # ------------------------------------------------------------------
-        max_l1 = v.max_conversation_summaries
-        if max_l1 > 0:
-            l1 = [s for s in state.conversation_summaries if s.get("level", 1) == 1]
-            if len(l1) > max_l1:
-                keep_keys = {
-                    (tuple(s.get("covers_turns", [])), s.get("created_at", 0.0))
-                    for s in l1[-max_l1:]
-                }
-                state.conversation_summaries = [
-                    s
-                    for s in state.conversation_summaries
-                    if s.get("level", 1) != 1
-                    or (
-                        tuple(s.get("covers_turns", [])),
-                        s.get("created_at", 0.0),
-                    )
-                    in keep_keys
-                ]
-
-            l1_after = [
-                s for s in state.conversation_summaries if s.get("level", 1) == 1
-            ]
-            self._f._log_debug(
-                f"WindowManager: L1 cap applied — {len(l1_after)}/{max_l1} "
-                f"summaries retained"
-            )
 
         # ------------------------------------------------------------------
         # Region: advance the high-water mark
@@ -33293,6 +33630,51 @@ class WindowManager:
         ):
             await self._f._message_assembler._consolidate_summaries(
                 state, project_id, slot_free
+            )
+
+        # ------------------------------------------------------------------
+        # Region: apply L1 cap — ORDER IS LOAD-BEARING: after consolidation
+        #
+        # This cap used to run right after the append, before the
+        # consolidation trigger ever counted. With the DEFAULT valves —
+        # max_conversation_summaries=3, hierarchical_summary_group_size=4 —
+        # the count was trimmed to 3 before the >=4 check could see it, so
+        # the fold never fired: the entire hierarchical subsystem
+        # (_consolidate_summaries, _merge_summaries, the L2 cap, three
+        # valves) was dead on defaults, and worse, the oldest L1 summaries
+        # were silently DELETED by this cap instead of folded into the L2
+        # whose whole purpose is preserving them. Running the cap after the
+        # consolidation lets the fold see the true accumulated count first;
+        # when the hierarchy is disabled or the slot is busy, the cap still
+        # bounds memory exactly as before. _consolidate_summaries applies
+        # its own level-aware caps at the end, so on the fold path this
+        # block is a harmless re-trim.
+        # ------------------------------------------------------------------
+        max_l1 = v.max_conversation_summaries
+        if max_l1 > 0:
+            l1 = [s for s in state.conversation_summaries if s.get("level", 1) == 1]
+            if len(l1) > max_l1:
+                keep_keys = {
+                    (tuple(s.get("covers_turns", [])), s.get("created_at", 0.0))
+                    for s in l1[-max_l1:]
+                }
+                state.conversation_summaries = [
+                    s
+                    for s in state.conversation_summaries
+                    if s.get("level", 1) != 1
+                    or (
+                        tuple(s.get("covers_turns", [])),
+                        s.get("created_at", 0.0),
+                    )
+                    in keep_keys
+                ]
+
+            l1_after = [
+                s for s in state.conversation_summaries if s.get("level", 1) == 1
+            ]
+            self._f._log_debug(
+                f"WindowManager: L1 cap applied — {len(l1_after)}/{max_l1} "
+                f"summaries retained"
             )
 
         # ------------------------------------------------------------------
@@ -38132,6 +38514,33 @@ class Filter:
             ge=1,
             description="Per-call timeout in seconds passed to the HTTP session.",
         )
+        llm_json_dry_multiplier: float = Field(
+            default=0.8,
+            ge=0.0,
+            description=(
+                "Per-request DRY multiplier applied ONLY to calls that carry "
+                "response_format (the JSON contracts: experiment design, "
+                "predictions, peer review, commit summaries…). The server "
+                "runs repeat_penalty 1.000 / dry 0.000 globally — correct "
+                "for code generation, where repetition is legitimate — but a "
+                "json_object grammar constrains STRUCTURE, not CONTENT, and "
+                "production shows these calls riding a verbatim-repeated "
+                "claim into the token cap (nine truncated experiment designs "
+                "in one session). The companion constants are chosen for "
+                "this domain: dry_allowed_length=8 leaves every identifier "
+                "untouched (repeating `_get_or_compute_ppr_scores` across "
+                "claims is the JOB, and identifiers stay under 8 tokens) "
+                "while sentence-length verbatim runs — the loop's signature "
+                "— are penalised; dry_penalty_last_n=1024 confines the "
+                "window to recent generation instead of the server default "
+                "131072, which would penalise echoing the 70k-token aligned "
+                "prompt itself. Folded into the dedup and cache keys. 0 "
+                "disables. Caveat: per-request sampler fields travel the "
+                "same road as response_format, which this stack's router is "
+                "already suspected of dropping — if the fences persist, "
+                "verify the router forwards dry_* before judging this valve."
+            ),
+        )
         llm_uncapped_max_tokens: int = Field(
             default=2048,
             ge=0,
@@ -39027,7 +39436,7 @@ class Filter:
             ),
         )
         agentic_metacog_threshold: float = Field(
-            default=0.75,
+            default=0.85,
             ge=0.0,
             le=1.0,
             description=(
@@ -39044,7 +39453,14 @@ class Filter:
                 "note claiming 0.72 exits iteration 1 in ~58% of cases vs "
                 "~50% at 0.75 — that measurement predates this valve "
                 "existing, so treat it as a starting point, not a promise. "
-                "The default preserves the hardcoded value this replaces."
+                "The default is 0.85 so the refinement machinery — "
+                "stagnation detection, the divergent pool, experimentum "
+                "crucis between survivors — actually gets exercised: at the "
+                "old hardcoded 0.75, a self-reported llm_conf of 0.9 ended "
+                "the competition on iteration 1 with obj_score as low as "
+                "0.60, and the deeper stages effectively never ran. Set "
+                "0.75 to restore the historical exit rate once the full "
+                "pipe has been observed."
             ),
         )
         agentic_metacog_max_iters: int = Field(
@@ -41657,6 +42073,34 @@ class Filter:
             )
             return body
 
+        except Exception as _inlet_err:
+            # Region: fail-open safety net. This try/finally had no except at
+            # all — the outlet has had one for ages — so any exception raised
+            # by the six steps escaped Filter.inlet into the host and KILLED
+            # the user's turn. The shared library raises typed errors after
+            # exhausting retries (LLMTimeoutError, LLMHTTPError,
+            # LLMEmptyResponseError), call_llm re-raises them by design, and
+            # most auxiliary call sites hold no try of their own: one failed
+            # enrichment call was enough. The production incident that
+            # exposed it: a change_summary in the prologue free-ran into the
+            # HTTP timeout three times (retries), then its final
+            # LLMTimeoutError sailed through process_prev_assistant_turn and
+            # aborted the turn the user had by then been awaiting for 45
+            # minutes. Context enrichment must never outrank the message it
+            # exists to enrich: log loudly (logger.warning is not gated by
+            # the debug valve; _log_debug is) and hand the body onward, at
+            # worst partially assembled — a degraded turn instead of a dead
+            # one. CancelledError subclasses BaseException and rightly
+            # bypasses this net.
+            import traceback
+
+            logger.warning(
+                f"[CodeAware] inlet failed — passing the turn through "
+                f"fail-open ({type(_inlet_err).__name__}: {_inlet_err})"
+            )
+            self._log_debug(traceback.format_exc())
+            return body
+
         finally:
             # Region: per-request teardown — always execute regardless of exit path
             self._event_emitter = None
@@ -41739,7 +42183,12 @@ class Filter:
             await self._conversation_state_manager.save_if_dirty(project_id)
 
         except Exception as _outlet_err:
-            self._log_debug(f"❌ outlet error: {_outlet_err}")
+            # logger.warning is not gated behind valves.debug; _log_debug is.
+            # A swallowed outlet failure in a default config was invisible.
+            logger.warning(
+                f"[CodeAware] outlet failed — continuing "
+                f"({type(_outlet_err).__name__}: {_outlet_err})"
+            )
             import traceback
 
             self._log_debug(traceback.format_exc())
