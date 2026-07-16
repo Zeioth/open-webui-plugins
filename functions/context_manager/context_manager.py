@@ -22646,15 +22646,46 @@ Output only the symbol name.
             prompt=prompt,
             system_prompt="You are a symbol disambiguator. Output only the best matching symbol name.",
             model_override=self._f.valves.summarization_model,
-            max_tokens=10,
+            # 10 tokens could not hold the answer this prompt asks for: a
+            # qualified id like ActivationEngine._get_or_compute_ppr_scores
+            # is ~14 BPE tokens on its own, so the call truncated mid-name
+            # (three times in one production session) and returned a prefix
+            # that matches no symbol. 48 fits the longest id in a codebase
+            # of this shape plus the sign-off this model likes to append,
+            # and still bounds the call.
+            max_tokens=48,
             temperature=0.0,
             label="seed_disambiguate_llm",
             enable_thinking=False,
         )
 
         if response:
-            candidate = response.strip()
-            return candidate if isinstance(candidate, str) else None
+            # El código acota, el modelo propone dentro de límites: the
+            # prompt offers a closed list and asks the model to CHOOSE, so
+            # the answer is only usable if it is one of the options. The
+            # caller replaces the CrossEncoder's best candidate with this
+            # one outright (partial = [llm_choice]), so an unvalidated
+            # string is not a bad seed — it is a bad seed that EVICTED a
+            # good one. Returning None instead hands the caller back to its
+            # own fallback, scored[0][0].
+            _names = [name for name, _ in clean_candidates]
+            _clean = response.strip().strip("`\"' \n\t.")
+            if _clean in _names:
+                return _clean
+            # Decoration tolerance: a sign-off ("[Confidence: 95%]") or a
+            # lead-in ("The best match is X") should not cost a valid
+            # choice. Among candidates present in the response the longest
+            # wins, which resolves the one ambiguity this can have — `foo`
+            # is a substring of `Class.foo`, and the qualified id is the
+            # more specific reading.
+            _hits = [n for n in _names if n in response]
+            if _hits:
+                return max(_hits, key=len)
+            self._f._log_debug(
+                f"seed_disambiguate: response {response[:60]!r} names no "
+                f"offered candidate — falling back to the CrossEncoder's best"
+            )
+            return None
         return None
 
     def _extract_traceback_seeds(
@@ -24928,6 +24959,27 @@ class MetacognitiveReasoningEngine:
                         stack.pop()
                     last_safe = i
                     last_stack = list(stack)
+                    if not stack:
+                        # The top-level container just closed, so the object
+                        # is COMPLETE and everything after it is extra data.
+                        # Production found the hole: this model habitually
+                        # signs off with "[Confidence: 95%]", and those
+                        # brackets kept the scan going, dragging last_safe
+                        # past the JSON and out to the sign-off's own "]".
+                        # The repair then "fixed" the whole string back into
+                        # itself, json.loads failed on the trailing prose a
+                        # second time, and the contract was lost with a
+                        # perfectly good object sitting in the first line —
+                        # classify_turn fell back to its neutral default and
+                        # contradiction detection to none, silently. Cutting
+                        # at the top-level close is also strictly more
+                        # correct for the truncation case it was written
+                        # for: a complete object never needs repairing.
+                        try:
+                            data = json.loads(text[: i + 1])
+                        except Exception:
+                            break
+                        return data if isinstance(data, dict) else None
         if last_safe < 0 or last_stack is None:
             return None
         repaired = text[: last_safe + 1] + "".join(
