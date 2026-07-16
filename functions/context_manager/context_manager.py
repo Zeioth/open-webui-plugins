@@ -11852,7 +11852,11 @@ class LLMOrchestrator:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _align_system_to_prefix(
-        self, system_prompt: str, effective_model: str, prompt: str = ""
+        self,
+        system_prompt: str,
+        effective_model: str,
+        prompt: str = "",
+        response_format: Optional[Any] = None,
     ) -> str:
         """Prepend the turn's preliminary system prompt to an auxiliary call.
 
@@ -11959,7 +11963,37 @@ class LLMOrchestrator:
                     return system_prompt
             except Exception:
                 return system_prompt
-        return f"{_prelim}\n\n---\n\n{system_prompt}"
+        # ── Countermand the inherited confidence footer for JSON calls ─────
+        # Block A carries the confidence_prompt suffix ("After your response
+        # … output '[Confidence: XX%]'"), and the aligned prefix IS Block A,
+        # so every auxiliary call inherits that instruction. For a call
+        # carrying response_format it contradicts the role's own "reply ONLY
+        # with JSON": the model obeys the prefix, appends the footer after
+        # the object, and the trailing "[Confidence: 95%]" is exactly the
+        # extra-data that broke classify_turn and contradiction detection in
+        # the production run (0018 repairs that reactively; this removes the
+        # cause).
+        #
+        # The countermand is APPENDED after the role rather than cut from
+        # the prefix. The footer sits early in Block A — the class index and
+        # the full call graph, ~60k tokens, follow it — so excising it would
+        # shift the entire remainder and blow the KV checkpoint every JSON
+        # call shares. Appending leaves the prefix byte-identical (checkpoint
+        # intact) and lets the later, more specific instruction win, which is
+        # how the role already overrides Block A's general guidance.
+        _aligned = f"{_prelim}\n\n---\n\n{system_prompt}"
+        if response_format is not None:
+            _suffix = (
+                getattr(self._f.valves, "confidence_prompt", "") or ""
+            ).strip()
+            if _suffix and _suffix in _prelim:
+                _aligned += (
+                    "\n\nThis call returns ONLY the JSON object requested "
+                    "above. Do NOT append a '[Confidence: XX%]' line or any "
+                    "text after the closing brace; that instruction from the "
+                    "system prefix does not apply here."
+                )
+        return _aligned
 
     async def call_llm(
         self,
@@ -12058,6 +12092,7 @@ class LLMOrchestrator:
             system_prompt,
             model_override or self._f.valves.llm_model or "",
             prompt=prompt,
+            response_format=response_format,
         )
 
         # Region: anti-repetition for JSON contracts. Built before the dedup
