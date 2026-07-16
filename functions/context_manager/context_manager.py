@@ -24473,11 +24473,10 @@ class MetacognitiveReasoningEngine:
             for name in mentioned
         }
 
-        call_patterns = re.findall(
-            r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
-            hypothesis,
-            re.IGNORECASE,
-        )
+        # The same constant _claim_verified reads with: whatever verb this
+        # pattern accepts here becomes a "_calls_" key there, and one owner
+        # keeps the two sides from drifting apart again.
+        call_patterns = self._CALL_RELATION_RE.findall(hypothesis)
         call_relations_valid = {}
         for caller, callee in call_patterns:
             if caller not in all_names or callee not in all_names:
@@ -24620,32 +24619,61 @@ class MetacognitiveReasoningEngine:
         )
         return min(1.0, max(0.0, uncertainty))
 
+    _CALL_RELATION_RE = re.compile(
+        r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
+        re.IGNORECASE,
+    )
+
     def _claim_verified(self, claim: str, evidence: "StaticEvidence") -> bool:
         """
         Check if a textual claim is confirmed by the structural evidence.
 
-        Normalizes spaces→underscores before matching:
-            LLM claims use natural language: "foo calls bar"
-            Evidence keys use underscores:   "foo_calls_bar"
-        Both variants are tried to avoid false negatives caused by
-        format mismatch. Without normalization, is_falsified can never
-        detect call relation contradictions (critical bug D).
+        The match runs EVIDENCE-KEY-INSIDE-CLAIM, which is the only
+        direction the two shapes allow. Claims are sentences the design
+        step wrote ("build_activation_graph is called during continuation
+        turns"); evidence keys are compact identifiers built by
+        gather_evidence ("build_block_a_calls_compute_structure_hash", or a
+        bare symbol name). The short thing can be inside the long one; the
+        reverse cannot.
 
-        Unverifiable claims (no match in evidence) get benefit of the doubt
-        and return True.
+        The previous implementation tested `claim in key`, so it demanded
+        that an entire sentence be a substring of a short identifier. It
+        could only ever fire when a claim was verbatim identical to a
+        relation key — the literal string "foo calls bar" and nothing else
+        — and no design step writes those. Every real claim fell through to
+        the benefit-of-the-doubt return, which pinned obj_score at
+        verified/total = 1.0 and made combined_score a straight function of
+        self-reported confidence (0.5 + 0.5*llm_conf, hence the famously
+        constant 0.85/0.90). is_falsified, which asks this same question of
+        every critical claim, could never answer no: the Popperian half of
+        the engine was structurally unable to falsify anything.
+
+        Relations are read with the same pattern that WROTE the keys —
+        one constant now owns both sides, so they cannot drift, and a
+        claim phrased with "invokes" or "depends on" resolves to the
+        "_calls_" key exactly as gather_evidence intended. Symbols are
+        matched on word boundaries, longest first, so a claim naming
+        `build_block_a` cannot be answered by an unrelated `block`.
+
+        Unverifiable claims (nothing in evidence speaks to them) keep the
+        benefit of the doubt and return True.
         """
         claim_lower = claim.lower()
-        claim_normalized = claim_lower.replace(" ", "_")
-        claim_variants = {claim_lower, claim_normalized}
 
-        for relation, valid in evidence.call_relations_valid.items():
-            relation_lower = relation.lower()
-            if any(v in relation_lower for v in claim_variants):
-                return valid
-        for symbol, found in evidence.symbols_found.items():
-            symbol_lower = symbol.lower()
-            if any(v in symbol_lower for v in claim_variants):
-                return found
+        # ── Step 1: call relations — parse the claim exactly as the keys
+        # were parsed from the hypothesis, then look one up ──
+        _relations = {k.lower(): v for k, v in evidence.call_relations_valid.items()}
+        for caller, callee in self._CALL_RELATION_RE.findall(claim):
+            key = f"{caller}_calls_{callee}".lower()
+            if key in _relations:
+                return _relations[key]
+
+        # ── Step 2: symbols — the key is the short side; require a whole
+        # word so substrings of longer identifiers cannot answer ──
+        for symbol in sorted(evidence.symbols_found, key=len, reverse=True):
+            if re.search(rf"\b{re.escape(symbol.lower())}\b", claim_lower):
+                return evidence.symbols_found[symbol]
+
         return True  # unverifiable → benefit of doubt
 
     def is_falsified(
