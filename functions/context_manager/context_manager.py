@@ -12347,6 +12347,22 @@ class LLMOrchestrator:
             except Exception as exc:
                 if not future.done():
                     future.set_exception(exc)
+                    # asyncio reports "Future exception was never
+                    # retrieved" when a future carrying an exception is
+                    # garbage-collected unread. Deduplicated consumers DO
+                    # read it — but the common case is that there are
+                    # none, and then nobody does: the caller learns of the
+                    # failure through the `raise` below, not through this
+                    # future. The result is a stray traceback logged at
+                    # GC time, detached from its cause and attributed to
+                    # whatever module the collector happened to run under
+                    # (live: it surfaced under sqlalchemy.engine.result,
+                    # a library this failure has nothing to do with).
+                    # Retrieving the exception marks it handled without
+                    # taking it away from any consumer that is waiting.
+                    future.add_done_callback(
+                        lambda f: not f.cancelled() and f.exception()
+                    )
                 raise
             finally:
                 async with self._f._pending_llm_lock:
