@@ -11955,10 +11955,14 @@ class LLMOrchestrator:
         caller inside a budgeted pipeline has: llm_request_timeout is a
         global 900s backstop against a hung connection, not a deadline.
         The producer passes min(global, total_timeout) down as the HTTP
-        total; a deduplicated consumer waits at most total_timeout on the
-        shared future and then degrades to None WITHOUT cancelling it, so
-        one impatient caller can never cut the answer out from under the
-        others.
+        total AND forces a single attempt — the shared client's timeout
+        applies per attempt with up to 3 retries, so without that a 30s
+        deadline could hold the producer for ~90s+ of attempts; a caller
+        that sets a deadline has a fallback ready, and one bounded
+        attempt honours the ceiling exactly. A deduplicated consumer
+        waits at most total_timeout on the shared future and then
+        degrades to None WITHOUT cancelling it, so one impatient caller
+        can never cut the answer out from under the others.
 
         Cancellation safety: because CancelledError subclasses BaseException it
         bypasses the `except Exception` clause below, so the producer's future
@@ -12203,8 +12207,19 @@ class LLMOrchestrator:
                     # hypothesize step into failure and cost the run its
                     # verify and analyze steps.
                     _http_timeout = self._f.valves.llm_request_timeout
+                    _retries = 3
                     if total_timeout is not None and total_timeout > 0:
                         _http_timeout = min(_http_timeout, int(total_timeout))
+                        # The shared client's timeout applies PER ATTEMPT and
+                        # it retries up to 3 times with backoff, so a 30s
+                        # deadline could hold this producer for ~90s+ of
+                        # attempts — occupying the --parallel 1 server long
+                        # after the consumer side of this same deadline gave
+                        # up and returned None. A deadline means the caller
+                        # has a fallback ready; one bounded attempt honours
+                        # the ceiling exactly, and losing the transient-error
+                        # retry costs less than tripling the deadline.
+                        _retries = 1
                     result = await _shared_call_llm(
                         prompt=prompt,
                         system=system_prompt,
@@ -12214,6 +12229,7 @@ class LLMOrchestrator:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         timeout=_http_timeout,
+                        max_retries=_retries,
                         sock_read=(
                             self._f.valves.llm_sock_read_timeout
                             if self._f.valves.llm_sock_read_timeout > 0
@@ -12723,17 +12739,25 @@ class AgenticEvidenceLedger:
         remaining: float,
     ) -> bool:
         """
-        Re-ask for the claims JSON tail a truncated step never emitted.
+        Re-ask for the claims JSON tail a step never emitted.
 
-        The step contract puts the claims block at the very END of the
-        output — after the prose — so a generation that hits
-        agentic_step_max_tokens loses exactly the structured part while
-        the analysis it summarizes sits complete above the cut (live:
+        Two entry cases, same repair. The step contract puts the claims
+        block at the very END of the output — after the prose — so a
+        generation that hits agentic_step_max_tokens loses exactly the
+        structured part while the analysis it summarizes sits complete
+        above the cut (live:
         three steps in one validation run lost every claim this way,
         leaving the verify report and the difficulty gate evidence-blind
-        for those steps). The prose already paid for is not re-generated:
-        a single short follow-up call hands it back and asks for ONLY the
-        JSON block, grounded in that analysis.
+        for those steps). The second case is a COMPLETE step that ended
+        its prose and never emitted the block at all — a contract
+        violation, since a step with nothing to claim must still output
+        '{"claims": []}' — with the same downstream cost (live: a clean
+        1149-token investigate registered zero claims and the verify
+        behind it found no targets). Either way, the prose already paid
+        for is not re-generated: a single short follow-up call hands it
+        back — labelled truncated or complete so the model is not told a
+        false cause — and asks for ONLY the JSON block, grounded in that
+        analysis.
 
         The response is normalized through the tolerant contract ladder
         and appended (as a fenced block, re-serialized from the parsed
@@ -12775,10 +12799,16 @@ class AgenticEvidenceLedger:
                 f"(< {self._RECOVERY_MIN_REMAINING_S:.0f}s)"
             )
             return False
+        _cause = (
+            "was cut off by a token limit BEFORE it could emit"
+            if getattr(step, "truncated", False)
+            else "finished WITHOUT emitting"
+        )
+        _tag = "truncated" if getattr(step, "truncated", False) else "complete"
         prompt = (
-            "The analysis below was cut off by a token limit BEFORE it "
-            "could emit its final claims JSON block.\n\n"
-            "--- ANALYSIS (truncated) ---\n"
+            f"The analysis below {_cause} "
+            "its required final claims JSON block.\n\n"
+            f"--- ANALYSIS ({_tag}) ---\n"
             f"{prose}\n"
             "--- END ANALYSIS ---\n"
             f"{AgenticStepExecutor._JSON_CONTRACT}\n\n"
@@ -14187,8 +14217,22 @@ if __name__ == "__main__":
 
         targets = self._pick_targets(step, ledger)
         if not targets:
-            step.status = "done"
+            # A verify with nothing to verify must not report success.
+            # Measured live: step 1 lost its claims tail (unparseable), so
+            # the ledger had zero citations, and this step completed as
+            # "done in 0.0s" — indistinguishable in the run telemetry and
+            # in the chat from a verification that actually ran and
+            # passed. Worse, the empty "done" masked the upstream break:
+            # the investigate→verify chain had already snapped one step
+            # earlier. A skip with a named reason surfaces both.
+            step.status = "skipped"
+            step.skip_reason = "no_targets"
             step.output = "(no verifiable targets among the ledger citations)"
+            self._f._log_debug(
+                f"🤖 Agentic step {step.display_no} (verify): skipped — "
+                f"no verifiable targets in the ledger (upstream steps "
+                f"recorded no citable claims)"
+            )
             step.seconds = time.monotonic() - started
             return
 
@@ -16712,19 +16756,32 @@ class AgenticOrchestrator:
         remaining: float,
     ) -> Dict[str, Any]:
         """
-        Extract a step's claims tail, re-asking for it once when the
-        generation was truncated before emitting it.
+        Extract a step's claims tail, re-asking for it once when the block
+        is absent.
 
         Wraps AgenticEvidenceLedger.extract_and_validate with the tail
-        recovery path: a step that hits agentic_step_max_tokens loses its
-        end-positioned claims block while its prose survives intact above
-        the cut, so one short grounded follow-up call (recover_claims_tail)
-        re-asks for the block and extraction is retried on the
-        reconstructed output. The recovery only fires when the tail was
-        genuinely absent (tail_missing), the step was truncated, and no
-        claims were registered — a legitimate '{"claims": []}' tail never
-        triggers it. Applied identically to main-loop and re-plan wave
-        steps so both feed the ledger.
+        recovery path (recover_claims_tail). Two ways a step arrives here
+        with no parseable block, and both are recoverable:
+
+        * TRUNCATED: the step hit agentic_step_max_tokens and lost its
+          end-positioned block while the prose above the cut survived.
+        * COMPLETE BUT NON-COMPLIANT: the step finished its prose and
+          simply never emitted the block. The contract makes this a
+          format violation, not a choice — a step with nothing to claim
+          must still output '{"claims": []}' — and measured live it has
+          real cost: an investigate ended clean at 1149 tokens with
+          usable findings and zero claims, so the verify behind it found
+          no targets and was skipped. One short grounded follow-up call
+          would have produced the citations the verify existed to check.
+
+        The recovery only fires when the tail was genuinely absent
+        (tail_missing) and no claims were registered — a legitimate
+        '{"claims": []}' tail never triggers it. Note the asymmetry with
+        the early-exit veto: a recovered "resolved" is neutralised only
+        for TRUNCATED steps, whose reasoning stopped mid-sentence; a
+        complete step ended by its own decision, so its recovered
+        self-assessment keeps its authority. Applied identically to
+        main-loop and re-plan wave steps so both feed the ledger.
 
         Args:
             step: A step with status "done".
@@ -16737,7 +16794,6 @@ class AgenticOrchestrator:
         control = self._ledger.extract_and_validate(step, project_id)
         if (
             control.get("tail_missing")
-            and getattr(step, "truncated", False)
             and not self._ledger.claims_for(step.id)
             and await self._ledger.recover_claims_tail(
                 step, project_id, remaining
@@ -22572,6 +22628,14 @@ Output only the symbol name.
             temperature=0.0,
             label="seed_disambiguate_llm",
             enable_thinking=False,
+            # This runs in the inlet: the whole turn waits on it. The work
+            # is seconds (in:125/out:49), but on a --parallel 1 server the
+            # call can queue behind a long generation — measured live at
+            # 95.209s for those same 49 tokens. total_timeout degrades to
+            # None on expiry, and None hands the caller back to its own
+            # CrossEncoder fallback (scored[0][0]), which is exactly the
+            # answer this call was trying to improve on.
+            total_timeout=30.0,
         )
 
         if response:
