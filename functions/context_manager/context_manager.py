@@ -31478,8 +31478,19 @@ class InletOrchestrator:
             return messages
 
         # ── Step 3: replace indexed oversized spans, back to front ──────────
-        state = self._f._conversation_state_manager.get(project_id)
-        blocks_by_hash = {b.hash: b for b in state.active_blocks}
+        # active_blocks is Dict[hash -> CodeBlock] and is ALREADY keyed by
+        # exactly the lookup this loop needs (see the writers:
+        # state.active_blocks[new_block.hash] = new_block). The dict
+        # comprehension that used to be here rebuilt it from `for b in
+        # state.active_blocks`, which iterates the KEYS — so `b` was the
+        # hash string and `b.hash` raised AttributeError: 'str' object has
+        # no attribute 'hash'. Live: the first turn after a fresh paste
+        # died here every time, and the fail-open reported it as a
+        # context-size problem. Every other consumer in the file reads this
+        # dict through .values() or .items(); this was the one that did not.
+        blocks_by_hash = self._f._conversation_state_manager.get(
+            project_id
+        ).active_blocks
         replaced = 0
         saved_chars = 0
         new_content = content
@@ -42098,236 +42109,270 @@ class Filter:
             # 🔥 STATE MANAGEMENT
             #   Silent ingestion (Modo B: large code-only paste)
             # ----------------------------------------------------------------
+            # Region: the optional mode cannot veto the main path.
+            # Silent ingestion is an OPTIMISATION — it indexes a bare paste
+            # without spending a reasoning turn on it. But it sits at line
+            # ~307 of a 732-line inlet, so anything it raises takes the
+            # remaining 58% with it: build_block_a, build_block_b, the
+            # window manager, the whole assembly. The turn then reaches the
+            # model with no code context at all and answers from memory,
+            # which reads to the user as a fast, confidently wrong reply.
+            #
+            # Measured live (17-jul 20:03-20:22, every single turn): a
+            # TypeError in the detector — one missing argument at its call
+            # site — silenced a plugin whose index was fully intact
+            # underneath (781 symbols, 6281 edges, 699 docstrings all
+            # harvested seconds earlier in the same inlet).
+            #
+            # A detector that cannot decide is not a reason to skip
+            # assembly; it is a reason to take the normal path, which is
+            # what a False verdict means anyway. The failure is logged
+            # loudly, once per turn, so a broken detector stays visible
+            # instead of quietly degrading every future turn.
+            _is_code_only = False
             if (
                 self.valves.enable_silent_ingestion
                 and last_user_msg is not None
                 and not is_explicit_command
             ):
-                if await self._commands.is_code_only_message(user_query, project_id):
-                    self._log_section("SILENT INGESTION MODE")
+                try:
+                    _is_code_only = await self._commands.is_code_only_message(
+                        user_query, project_id
+                    )
+                except Exception as _det_err:
+                    logger.warning(
+                        f"[CodeAware] silent-ingestion detector failed "
+                        f"({type(_det_err).__name__}: {_det_err}) — treating "
+                        f"the turn as a normal request; context assembly "
+                        f"continues"
+                    )
+                    _is_code_only = False
 
-                    pstate_local = self._project_state_manager.get_pstate(project_id)
+            if _is_code_only:
+                self._log_section("SILENT INGESTION MODE")
 
-                    # -- extract symbols onto the unified pre-extraction channel
-                    # Both attachments and inline pastes end up as one or more
-                    # blocks on pstate["merged_file_blocks"], which Section 0 of
-                    # extract_code_blocks turns into aligned blocks. This keeps
-                    # file ingestion and chat ingestion identical: a block's code
-                    # is always the clean source its symbols were parsed from,
-                    # never the fenced/prefixed message.
-                    _merged = pstate_local.get("merged_file_blocks")
-                    if _merged:
-                        # File path: merge_pasted_files already populated the
-                        # channel. raw_symbols is only needed for the abort check.
-                        raw_symbols = [
-                            s for mfb in _merged for s in mfb.get("symbols", [])
-                        ]
-                    else:
-                        # Inline path: strip fences, parse the clean source, and
-                        # publish it on the same channel as a single block.
+                pstate_local = self._project_state_manager.get_pstate(project_id)
+
+                # -- extract symbols onto the unified pre-extraction channel
+                # Both attachments and inline pastes end up as one or more
+                # blocks on pstate["merged_file_blocks"], which Section 0 of
+                # extract_code_blocks turns into aligned blocks. This keeps
+                # file ingestion and chat ingestion identical: a block's code
+                # is always the clean source its symbols were parsed from,
+                # never the fenced/prefixed message.
+                _merged = pstate_local.get("merged_file_blocks")
+                if _merged:
+                    # File path: merge_pasted_files already populated the
+                    # channel. raw_symbols is only needed for the abort check.
+                    raw_symbols = [
+                        s for mfb in _merged for s in mfb.get("symbols", [])
+                    ]
+                else:
+                    # Inline path: strip fences, parse the clean source, and
+                    # publish it on the same channel as a single block.
+                    _code_for_extraction = user_query
+                    try:
+                        _spans = await self._code_blocks.get_code_spans(user_query)
+                        if _spans:
+                            _code_for_extraction = "\n\n".join(
+                                CodeBlockManager._strip_fence_markers(
+                                    user_query[s:e]
+                                )
+                                for s, e in _spans
+                            )
+                    except Exception:
                         _code_for_extraction = user_query
+
+                    _guessed_lang = SignatureExtractor._guess_language(
+                        None, _code_for_extraction
+                    )
+                    _lang = (
+                        _guessed_lang if _guessed_lang != "unknown" else "python"
+                    )
+
+                    raw_symbols = []
+                    if HAS_TREE_SITTER:
                         try:
-                            _spans = await self._code_blocks.get_code_spans(user_query)
-                            if _spans:
-                                _code_for_extraction = "\n\n".join(
-                                    CodeBlockManager._strip_fence_markers(
-                                        user_query[s:e]
-                                    )
-                                    for s, e in _spans
-                                )
+                            raw_symbols = await SignatureExtractor.extract_async(
+                                _code_for_extraction, None, language=_lang
+                            )
                         except Exception:
-                            _code_for_extraction = user_query
-
-                        _guessed_lang = SignatureExtractor._guess_language(
-                            None, _code_for_extraction
-                        )
-                        _lang = (
-                            _guessed_lang if _guessed_lang != "unknown" else "python"
-                        )
-
-                        raw_symbols = []
-                        if HAS_TREE_SITTER:
-                            try:
-                                raw_symbols = await SignatureExtractor.extract_async(
-                                    _code_for_extraction, None, language=_lang
-                                )
-                            except Exception:
-                                raw_symbols = []
-                        if raw_symbols:
-                            raw_symbols = (
-                                SignatureExtractor.enrich_symbols_with_parent_info(
-                                    raw_symbols, _code_for_extraction
-                                )
+                            raw_symbols = []
+                    if raw_symbols:
+                        raw_symbols = (
+                            SignatureExtractor.enrich_symbols_with_parent_info(
+                                raw_symbols, _code_for_extraction
                             )
-                            pstate_local["merged_file_blocks"] = [
-                                {
-                                    "file_path": self._code_blocks._guess_file_path(
-                                        user_query
-                                    ),
-                                    "raw_code": _code_for_extraction,
-                                    "symbols": raw_symbols,
-                                    "language": _lang,
-                                }
-                            ]
+                        )
+                        pstate_local["merged_file_blocks"] = [
+                            {
+                                "file_path": self._code_blocks._guess_file_path(
+                                    user_query
+                                ),
+                                "raw_code": _code_for_extraction,
+                                "symbols": raw_symbols,
+                                "language": _lang,
+                            }
+                        ]
 
-                    # -- safety net: is_code_only_message() can misclassify
-                    #    ordinary prose as code-only. If symbol extraction found
-                    #    nothing, this was never a code paste — abandon silent
-                    #    ingestion and fall through to the normal pipeline.
-                    if not raw_symbols:
+                # -- safety net: is_code_only_message() can misclassify
+                #    ordinary prose as code-only. If symbol extraction found
+                #    nothing, this was never a code paste — abandon silent
+                #    ingestion and fall through to the normal pipeline.
+                if not raw_symbols:
+                    self._log_debug(
+                        "Silent ingestion aborted: is_code_only_message "
+                        "classified this as code, but symbol extraction "
+                        "found nothing — falling through to normal pipeline"
+                    )
+                else:
+                    # -- index the pasted code --------------------------------
+                    # Section 0 of extract_code_blocks consumes
+                    # merged_file_blocks (populated above for both paths).
+                    _msg_to_index = last_user_msg
+                    self._is_silent_ingestion = True
+                    self._log_debug(
+                        "[TURN-PATH] is_code_session=True → silent-ingestion "
+                        "(code-only paste indexed, no reasoning)"
+                    )
+                    try:
+                        await self._update_active_code(_msg_to_index, project_id)
+                    finally:
+                        pass
+
+                    # -- resolve cross-chunk edges (cheap; needed before Block A)
+                    # The path-index rebuild that used to run here is the
+                    # dominant cost on a large ingestion (a build_activation_graph
+                    # per entry point). It now runs off the critical path as the
+                    # 'path_index' background task, with a lazy fallback on the
+                    # next turn — see TaskRegistry._build_tasks. Block A keeps its
+                    # correct centrality via invalidate_block_a_cache below, which
+                    # recomputes it independently of the path index.
+                    await self._activation.resolve_dangling_edges(project_id)
+
+                    # -- invalidate and rebuild Block A eagerly ----------------
+                    if self.valves.block_a_freeze_break_on_ingestion:
+                        _pstate_freeze = psm.get_pstate(project_id)
+                        _pstate_freeze["block_a_freeze_active"] = False
+                        _pstate_freeze["block_a_frozen_structure_hash"] = None
+                        _pstate_freeze["block_a_frozen_profile_hash"] = None
+                        _pstate_freeze["block_a_freeze_edits_used"] = 0
                         self._log_debug(
-                            "Silent ingestion aborted: is_code_only_message "
-                            "classified this as code, but symbol extraction "
-                            "found nothing — falling through to normal pipeline"
+                            "Block A freeze: broken by silent ingestion "
+                            "(structure changed wholesale)"
                         )
-                    else:
-                        # -- index the pasted code --------------------------------
-                        # Section 0 of extract_code_blocks consumes
-                        # merged_file_blocks (populated above for both paths).
-                        _msg_to_index = last_user_msg
-                        self._is_silent_ingestion = True
+                    await self._ctx_builder.invalidate_block_a_cache(
+                        project_id, "new chunk ingested", recompute_centrality=True
+                    )
+                    try:
+                        static_block = await self._ctx_builder.build_block_a(
+                            project_id, is_code_session=True, is_continuation=False
+                        )
                         self._log_debug(
-                            "[TURN-PATH] is_code_session=True → silent-ingestion "
-                            "(code-only paste indexed, no reasoning)"
+                            "Block A scaffold (hub symbols + skeleton tier) "
+                            "pre-built after silent ingestion"
                         )
+                    except Exception as _scaffold_err:
+                        static_block = ""
+                        self._log_debug(
+                            f"Eager Block A scaffold build failed (non-fatal): "
+                            f"{_scaffold_err}"
+                        )
+
+                    # A silent-ingestion turn never reaches
+                    # _assemble_final_system_and_log, so last_system_tokens
+                    # would otherwise stay at its previous value (0 on a cold
+                    # start) and the next turn's WindowManager would budget
+                    # against a phantom system. The effective system of this
+                    # turn IS the freshly built Block A scaffold.
+                    if self.tokenizer and static_block:
+                        psm.set_last_system_tokens(
+                            project_id,
+                            len(self.tokenizer.encode(static_block)),
+                        )
+
+                    # -- persist state ----------------------------------------
+                    self._conversation_state_manager.mark_dirty(project_id)
+                    await self._conversation_state_manager.save_if_dirty(project_id)
+
+                    # -- re-stub earlier user messages OpenWebUI re-supplied
+                    #    with their original, uncompressed content ----------
+                    if len(messages) > 1:
+                        messages[:-1] = (
+                            self._history_compressor.ensure_compressed_user_messages(
+                                messages[:-1], state, project_id
+                            )
+                        )
+
+                    # -- build user-facing stub and acknowledgement -----------
+                    state = self._conversation_state_manager.get(project_id)
+                    num_blocks = len(state.active_blocks)
+                    num_symbols = len(self._symbol_index.get_all_names(project_id))
+                    num_classes = len(self._symbol_index.get_classes(project_id))
+
+                    stub = self._history_compressor._build_user_stub(num_symbols)
+                    content_hash = hashlib.md5(user_query.encode()).hexdigest()[:16]
+                    state.compressed_user_messages[content_hash] = stub
+                    self._conversation_state_manager.mark_dirty(project_id)
+
+                    messages[-1] = {**messages[-1], "content": stub}
+                    response = (
+                        f"✅ {num_symbols} symbols in {num_classes} classes "
+                        f"({num_blocks} active blocks). Code is in the SymbolGraph. "
+                        f"Use `/expand <Class>` or `/expand <Class>.<method>` to see "
+                        f"implementations."
+                    )
+
+                    # -- record the ack hash so next turn's prologue skips
+                    #    it: the code is already indexed, and caching the ack
+                    #    would let an identical future paste replay it -------
+                    pstate_local["_last_silent_ack_hash"] = hashlib.md5(
+                        response.encode()
+                    ).hexdigest()[:12]
+
+                    messages.append({"role": "assistant", "content": response})
+                    messages[:] = self._inlet_orch.ensure_last_message_is_user(
+                        messages
+                    )
+
+                    # -- record the ack hash so next turn's prologue skips
+                    #    it: the code is already indexed, and caching the ack
+                    #    would let an identical future paste replay it -------
+                    pstate_local["_last_silent_ack_hash"] = hashlib.md5(
+                        response.encode()
+                    ).hexdigest()[:12]
+
+                    # The model generates its own wording for the ack, so the
+                    # hash guard above cannot recognise it next turn. This
+                    # explicit pending flag is the authoritative signal: the
+                    # very next prev-assistant pass skips indexing/LTM for the
+                    # ack regardless of its text.
+                    pstate_local["_silent_ack_pending"] = True
+
+                    # -- optional context dump --------------------------------
+                    if self.valves.enable_context_dump:
                         try:
-                            await self._update_active_code(_msg_to_index, project_id)
-                        finally:
-                            pass
-
-                        # -- resolve cross-chunk edges (cheap; needed before Block A)
-                        # The path-index rebuild that used to run here is the
-                        # dominant cost on a large ingestion (a build_activation_graph
-                        # per entry point). It now runs off the critical path as the
-                        # 'path_index' background task, with a lazy fallback on the
-                        # next turn — see TaskRegistry._build_tasks. Block A keeps its
-                        # correct centrality via invalidate_block_a_cache below, which
-                        # recomputes it independently of the path index.
-                        await self._activation.resolve_dangling_edges(project_id)
-
-                        # -- invalidate and rebuild Block A eagerly ----------------
-                        if self.valves.block_a_freeze_break_on_ingestion:
-                            _pstate_freeze = psm.get_pstate(project_id)
-                            _pstate_freeze["block_a_freeze_active"] = False
-                            _pstate_freeze["block_a_frozen_structure_hash"] = None
-                            _pstate_freeze["block_a_frozen_profile_hash"] = None
-                            _pstate_freeze["block_a_freeze_edits_used"] = 0
+                            self._context_dumper.schedule_inlet_snapshot(
+                                project_id=project_id,
+                                static_block=static_block,
+                                dynamic_block="",
+                                final_system=static_block,
+                                messages=messages,
+                                dump_kind="silent_ingestion",
+                            )
+                        except Exception as _dump_err:
                             self._log_debug(
-                                "Block A freeze: broken by silent ingestion "
-                                "(structure changed wholesale)"
-                            )
-                        await self._ctx_builder.invalidate_block_a_cache(
-                            project_id, "new chunk ingested", recompute_centrality=True
-                        )
-                        try:
-                            static_block = await self._ctx_builder.build_block_a(
-                                project_id, is_code_session=True, is_continuation=False
-                            )
-                            self._log_debug(
-                                "Block A scaffold (hub symbols + skeleton tier) "
-                                "pre-built after silent ingestion"
-                            )
-                        except Exception as _scaffold_err:
-                            static_block = ""
-                            self._log_debug(
-                                f"Eager Block A scaffold build failed (non-fatal): "
-                                f"{_scaffold_err}"
+                                f"Context dump scheduling failed (silent ingestion): "
+                                f"{_dump_err}"
                             )
 
-                        # A silent-ingestion turn never reaches
-                        # _assemble_final_system_and_log, so last_system_tokens
-                        # would otherwise stay at its previous value (0 on a cold
-                        # start) and the next turn's WindowManager would budget
-                        # against a phantom system. The effective system of this
-                        # turn IS the freshly built Block A scaffold.
-                        if self.tokenizer and static_block:
-                            psm.set_last_system_tokens(
-                                project_id,
-                                len(self.tokenizer.encode(static_block)),
-                            )
-
-                        # -- persist state ----------------------------------------
-                        self._conversation_state_manager.mark_dirty(project_id)
-                        await self._conversation_state_manager.save_if_dirty(project_id)
-
-                        # -- re-stub earlier user messages OpenWebUI re-supplied
-                        #    with their original, uncompressed content ----------
-                        if len(messages) > 1:
-                            messages[:-1] = (
-                                self._history_compressor.ensure_compressed_user_messages(
-                                    messages[:-1], state, project_id
-                                )
-                            )
-
-                        # -- build user-facing stub and acknowledgement -----------
-                        state = self._conversation_state_manager.get(project_id)
-                        num_blocks = len(state.active_blocks)
-                        num_symbols = len(self._symbol_index.get_all_names(project_id))
-                        num_classes = len(self._symbol_index.get_classes(project_id))
-
-                        stub = self._history_compressor._build_user_stub(num_symbols)
-                        content_hash = hashlib.md5(user_query.encode()).hexdigest()[:16]
-                        state.compressed_user_messages[content_hash] = stub
-                        self._conversation_state_manager.mark_dirty(project_id)
-
-                        messages[-1] = {**messages[-1], "content": stub}
-                        response = (
-                            f"✅ {num_symbols} symbols in {num_classes} classes "
-                            f"({num_blocks} active blocks). Code is in the SymbolGraph. "
-                            f"Use `/expand <Class>` or `/expand <Class>.<method>` to see "
-                            f"implementations."
-                        )
-
-                        # -- record the ack hash so next turn's prologue skips
-                        #    it: the code is already indexed, and caching the ack
-                        #    would let an identical future paste replay it -------
-                        pstate_local["_last_silent_ack_hash"] = hashlib.md5(
-                            response.encode()
-                        ).hexdigest()[:12]
-
-                        messages.append({"role": "assistant", "content": response})
-                        messages[:] = self._inlet_orch.ensure_last_message_is_user(
-                            messages
-                        )
-
-                        # -- record the ack hash so next turn's prologue skips
-                        #    it: the code is already indexed, and caching the ack
-                        #    would let an identical future paste replay it -------
-                        pstate_local["_last_silent_ack_hash"] = hashlib.md5(
-                            response.encode()
-                        ).hexdigest()[:12]
-
-                        # The model generates its own wording for the ack, so the
-                        # hash guard above cannot recognise it next turn. This
-                        # explicit pending flag is the authoritative signal: the
-                        # very next prev-assistant pass skips indexing/LTM for the
-                        # ack regardless of its text.
-                        pstate_local["_silent_ack_pending"] = True
-
-                        # -- optional context dump --------------------------------
-                        if self.valves.enable_context_dump:
-                            try:
-                                self._context_dumper.schedule_inlet_snapshot(
-                                    project_id=project_id,
-                                    static_block=static_block,
-                                    dynamic_block="",
-                                    final_system=static_block,
-                                    messages=messages,
-                                    dump_kind="silent_ingestion",
-                                )
-                            except Exception as _dump_err:
-                                self._log_debug(
-                                    f"Context dump scheduling failed (silent ingestion): "
-                                    f"{_dump_err}"
-                                )
-
-                        body["messages"] = messages
-                        _inlet_timing("total_inlet (end-to-end)", inlet_start)
-                        self._log_section(
-                            "CONTEXT MANAGER - INLET END",
-                            duration=time.monotonic() - inlet_start,
-                        )
-                        return body
+                    body["messages"] = messages
+                    _inlet_timing("total_inlet (end-to-end)", inlet_start)
+                    self._log_section(
+                        "CONTEXT MANAGER - INLET END",
+                        duration=time.monotonic() - inlet_start,
+                    )
+                    return body
 
             # 🔥 STATE MANAGEMENT
             #   5. Prepare code session (classify, update active code blocks)
@@ -42501,6 +42546,27 @@ class Filter:
                     f"failed ({type(_lean_err).__name__}: {_lean_err}) — "
                     f"passing the body through untouched"
                 )
+
+            # Region: tell the USER the turn is degraded.
+            # Everything above this point talks to the log. The person
+            # waiting for an answer sees none of it — they see a reply
+            # that arrives fast and reads like the model never saw their
+            # code, because it did not: the failure skipped the assembly
+            # steps, so no Block A, no Block B, no symbol context. Without
+            # a word here, a broken enrichment layer is indistinguishable
+            # from a bad model, and the incident that produced this patch
+            # cost several turns of confusion before the traceback was
+            # read. The emitter is still bound (the finally below clears
+            # it), and _emit_status swallows its own failures, so this
+            # cannot re-break the net.
+            try:
+                await self._emit_status(
+                    "⚠️ Context enrichment failed — answering without code "
+                    "context (see server log)",
+                    done=True,
+                )
+            except Exception:
+                pass
             return body
 
         finally:
