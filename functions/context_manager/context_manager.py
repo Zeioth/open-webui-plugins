@@ -565,7 +565,7 @@ class SymbolIndex:
     * Per‑symbol metadata: signature, docstring, kind, file path, line span.
     * PageRank centrality over the qualified call graph.
 
-    Use ``get_all_names()`` for coarse text matching, ``get_all_qualified_names()``
+    Use ``get_all_names(project_id)`` for coarse text matching, ``get_all_qualified_names(project_id)``
     when every distinct symbol must be visible (inventories, hashes, centrality).
     """
 
@@ -1224,7 +1224,7 @@ class SymbolIndex:
     ) -> List[Tuple[str, float]]:
         """Top‑N symbols by centrality, sorted by descending score.
         Falls back to the cached scores from the last
-        ``precompute_centrality()`` call if *centrality* is empty."""
+        ``precompute_centrality(project_id, ...)`` call if *centrality* is empty."""
         if not centrality:
             centrality = getattr(self, "_centrality_cache", {}).get(project_id, {})
         if not centrality or top_n <= 0:
@@ -1233,7 +1233,7 @@ class SymbolIndex:
         return ranked[:top_n]
 
     def _store_centrality(self, project_id: str, scores: Dict[str, float]) -> None:
-        """Cache centrality scores for cheap re-reads by ``get_hub_symbols()``."""
+        """Cache centrality scores for cheap re-reads by ``get_hub_symbols(project_id, centrality, top_n)``."""
         self._centrality_cache[project_id] = scores
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1967,7 +1967,7 @@ class ActivationGraph:
     """Personalised PageRank (PPR) engine for the symbol call graph.
 
     Seeds are set from user-query terms, tracebacks, and recent history.
-    ``propagate()`` runs the PPR power iteration over the directed edges
+    ``propagate(edges_out, ...)`` runs the PPR power iteration over the directed edges
     stored in ``SymbolIndex``, spreading activation to related symbols.
     The resulting scores determine the LOD tiers in Block B.
     """
@@ -1984,7 +1984,7 @@ class ActivationGraph:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def seed(self, node_ids: List[str], initial_score: float = 1.0):
-        """Insert activation seeds.  Called once before ``propagate()``."""
+        """Insert activation seeds.  Called once before ``propagate(edges_out, ...)``."""
         for nid in node_ids:
             self._activations[nid] = ActivationState(
                 node_id=nid,
@@ -3745,7 +3745,7 @@ class ContextPager:
 
         Cold-restart resilience: ``_paged_hashes`` is an in-memory dict reset
         on every process restart.  Blocks paged in a previous session exist
-        in ChromaDB but are unreachable via ``is_paged()``.  This method
+        in ChromaDB but are unreachable via ``is_paged(block_hash, project_id)``.  This method
         therefore attempts a ChromaDB lookup regardless of ``_paged_hashes``
         state and re-registers the hash on a successful cold lookup so
         subsequent calls within the same session use the fast registry path.
@@ -18198,16 +18198,28 @@ class CommandRouter:
       assistant's response for ``/expand`` commands and replaces them inline
       with the actual symbol bodies from the SymbolIndex, so the user sees
       the code immediately.
-    * ``classify_intent(query)`` — returns a probability distribution over
-      explain / modify / debug / refactor using the CrossEncoder.
+    * ``classify_intent(query, project_id)`` — returns a probability
+      distribution over explain / modify / debug / refactor using the
+      CrossEncoder.
     * ``suggest_commands(project_id, state)`` — returns context‑management
       tips (``/forget``, ``/status``, ``/clean``) after the conversation
       reaches a threshold, with a cooldown between suggestions.
-    * ``is_code_only_message(content)`` — detects messages that contain only
-      code without a question, used by the inlet to trigger silent ingestion.
+    * ``is_code_only_message(content, project_id)`` — detects messages
+      that contain only code without a question, used by the inlet to
+      trigger silent ingestion.
     """
 
     # ── Class constants ────────────────────────────────────────────────────
+
+    # The sentinel _extract_text_for_classification returns when a message
+    # carries no natural language at all. It is not decoration: it is the
+    # structural FACT that the message cannot contain a question, and the
+    # only honest way to consume it is as a fact. Shipped as a constant so
+    # its two readers cannot drift from its writer — they did: the
+    # classifier was handed this string as if it were the user's message
+    # and asked whether the message was "a bare code paste", which it
+    # plainly is not: it is a marker. The model answered accordingly.
+    CODE_ONLY_MARKER = "[CODE ONLY — no natural language text]"
 
     _EXPAND_DOTTED = re.compile(r"^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$")
 
@@ -18716,6 +18728,40 @@ class CommandRouter:
             return default
 
         # ------------------------------------------------------------------
+        # Region: structural certainty — no prose means no question
+        # ------------------------------------------------------------------
+        # El código acota, el modelo propone dentro de límites. Whether a
+        # message is a REQUEST is a pragmatic judgement and belongs to the
+        # LLM. Whether it contains any natural language at all is a fact,
+        # already established deterministically by
+        # _extract_text_for_classification: when it returns the marker,
+        # every fenced block, every indented run and every synthetic
+        # reference line has been stripped and NOTHING remained. A message
+        # with no prose cannot ask a question — there is nothing to ask it
+        # with.
+        #
+        # Asking the LLM anyway does not merely waste a call; it produces a
+        # WRONG answer, because the model is not shown the paste. It is
+        # shown the marker, under a rule that says "is_code_only: true only
+        # if the message is a bare code paste" — and the marker is not a
+        # bare code paste, it is a marker. Measured live (17-jul 20:51): a
+        # pure paste with no accompanying text classified as
+        # code_only=False, has_request=True, intent=explain, and silent
+        # ingestion never fired for a message that was nothing but code.
+        if cleaned == self.CODE_ONLY_MARKER:
+            default["is_code_only"] = True
+            default["has_request"] = False
+            default["is_code_session"] = True
+            default["_source"] = "structural"
+            pstate["turn_classification"] = default
+            self._f._log_debug(
+                "classify_turn [structural]: message carries no natural "
+                "language after code extraction — code_only=True, "
+                "has_request=False decided locally (no LLM call)"
+            )
+            return default
+
+        # ------------------------------------------------------------------
         # Region: symbol vocabulary so the LLM knows names are not commands
         # (e.g. 'build_block_b' is a symbol, not 'build something')
         # ------------------------------------------------------------------
@@ -18858,6 +18904,17 @@ class CommandRouter:
         first: they are plugin-generated text riding inside the user message,
         and their vocabulary both partial-matches the symbol index and skews
         the intent classifiers.
+
+        Scope: this strips code that ANNOUNCES itself (fences, indented
+        runs). An unfenced source file does not, and its module-level
+        lines survive as apparent prose — that case is settled upstream
+        by is_code_only_message's ast.parse fast path, which runs in a
+        worker thread because the paste can be megabytes.
+
+        Returns CODE_ONLY_MARKER when nothing but code was there. That
+        marker is a structural FACT (no prose ⇒ no question) and must be
+        consumed as one — see classify_turn, which decides on it locally
+        rather than asking the LLM about a string the user never wrote.
         """
         if not message:
             return ""
@@ -18869,7 +18926,7 @@ class CommandRouter:
         text = self._EXCESS_NEWLINES_RE.sub("\n\n", text).strip()
 
         if not text or text == "[CODE]":
-            return "[CODE ONLY — no natural language text]"
+            return self.CODE_ONLY_MARKER
 
         return text
 
@@ -20438,8 +20495,6 @@ class CommandRouter:
         if "?" in text or "¿" in text:
             return True
         return CommandRouter._has_request_lead(text)
-
-    @staticmethod
 
     async def is_code_only_message(self, content: str, project_id: str) -> bool:
         """Decide whether a message is a bare code paste with no question.
@@ -27939,7 +27994,7 @@ Code context (recent symbols referenced):
             prose = self._f._commands._extract_text_for_classification(content)
             if (
                 prose
-                and prose != "[CODE ONLY — no natural language text]"
+                and prose != CommandRouter.CODE_ONLY_MARKER
                 and len(prose.strip()) >= 3
             ):
                 stub = f"{prose.strip()}\n\n{stub}"
@@ -31223,7 +31278,7 @@ class ActiveCodeUpdater:
         """
         Run post-update maintenance tasks after new blocks have been indexed.
 
-        Called from ``process()`` while the project lock is held and ``state``
+        Called from ``process(message, project_id, ...)`` while the project lock is held and ``state``
         already contains all in-flight mutations for this turn.  Performs:
           - Message-count increment
           - Duplicate block removal
@@ -38643,7 +38698,7 @@ class Filter:
     manager.  Owns all configuration valves, persistent state, long‑term
     memory, and every subsystem class.
 
-    The ``inlet()`` and ``outlet()`` methods are the entry points called by
+    The ``inlet(body, ...)`` and ``outlet(body, ...)`` methods are the entry points called by
     the OpenWebUI runtime at the start and end of each request.
     """
 
