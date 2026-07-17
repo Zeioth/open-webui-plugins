@@ -26274,7 +26274,7 @@ class MetacognitiveReasoningEngine:
 
             # ITERATION LEVEL: stagnation detection → diverge or refine
             # Note: requires len(obj_score_history) >= stagnation_window + 1.
-            # Only effective when scientific_max_iterations >= stagnation_window + 2.
+            # Only effective when agentic_metacog_max_iters >= stagnation_window + 2.
             # See _validate_valve_coherence for the coherence warning (Bug C).
             if self._f.valves.enable_stagnation_detection and self._detect_stagnation(
                 obj_score_history,
@@ -28349,7 +28349,6 @@ class EnrichmentTasks:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
         self._lazy_docstrings_generated_this_turn: int = 0
-        self._bg_docstring_count: int = 0
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 1. Change & session summaries
@@ -33447,9 +33446,6 @@ class WindowManager:
     Complexity guarantee:
         Context history: O(K) bounded by history_max_tokens.
         Total session (T turns): O(T) linear — same as v9.0.0.
-
-    Seams for future phases:
-        _frontier_c_turn                        → Phase 3 (LLMLingua)
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -33462,7 +33458,6 @@ class WindowManager:
         self._f = filter_ref
         # Phase 3 seam: turn that separates raw band from compressible band.
         # In Phase 1 it is updated but nobody reads it.
-        self._frontier_c_turn: int = 0
 
     # ═══════════════════════════════════════════════════════════════════════
     # 1. Public entry point
@@ -33568,9 +33563,6 @@ class WindowManager:
             history, turns, budget
         )
 
-        # Update Phase 3 seam
-        self._frontier_c_turn = cut_turn
-
         # ------------------------------------------------------------------
         # Region: early return when history genuinely fits within the budget
         #
@@ -33596,9 +33588,17 @@ class WindowManager:
         # ------------------------------------------------------------------
         # Region: emergency cap for giant individual turns
         # ------------------------------------------------------------------
+        # The helper lives in the no-side-effects section, so the
+        # instrumentation flag is set out here by observing whether it
+        # actually moved anything: reset_wm_metrics() cleared the flag at
+        # the start of the turn, and the dump was reporting
+        # emergency_cap=False even on the turns where the cap fired.
+        _pre_cap_kept, _pre_cap_old = len(kept), len(old_msgs)
         kept, old_msgs = self._apply_emergency_cap(
             history, turns, kept, old_msgs, budget
         )
+        if len(kept) != _pre_cap_kept or len(old_msgs) != _pre_cap_old:
+            state.wm_emergency_cap = True
         if not old_msgs:
             return sys_msgs + history, ""
 
@@ -33616,6 +33616,7 @@ class WindowManager:
         _old_ids = {id(m) for m in old_msgs}
         old_turn_nums = {t for m, t in zip(history, turns) if id(m) in _old_ids}
         if len(old_turn_nums) < v.summarize_batch_turns:
+            state.wm_batch_too_small = True
             self._f._log_debug(
                 f"WindowManager: batch too small "
                 f"({len(old_turn_nums)} < {v.summarize_batch_turns} turns), "
@@ -33638,6 +33639,7 @@ class WindowManager:
         )
 
         if not summary_text or not summary_text.strip():
+            state.wm_degradation_guard = True
             self._f._log_debug(
                 "WindowManager: summary failed (no-degradation guard), "
                 "keeping raw history"
@@ -38638,20 +38640,14 @@ class Filter:
               7.5  Intent & use case
               7.6  Structural decisions (relevance, paging, purge)
               7.7  Quality & contradiction
-        8.  REASONING (Chain‑of‑Thought)
+        8.  REASONING (scientific method — agentic pipeline)
               8.1  Basic enabling
-              8.2  Detection cascade (Heuristic → CE → LLM)
-              8.3  SymbolGraph signal
-              8.4  QueryDecomposition (Metacognitive Layer 1)
-              8.5  FocalReasoning (Metacognitive Layer 2)
-              8.6  Scientific method — core
               8.7  Scientific method — epistemic toolkit
               8.8  Scientific method — peer review
               8.9  Scientific method — active learning & coverage
               8.10 Scientific method — stagnation detection
               8.11 Scientific method — project‑level metacognition
               8.12 Generation models
-              8.13 Architecture mode
               8.14 Complementary features
         9.  LONG‑TERM MEMORY (LTM)
               9.1  Storage & retrieval
@@ -39492,98 +39488,6 @@ class Filter:
             ),
         )
 
-        # ── 8.2 Detection cascade (Heuristic → CrossEncoder → LLM) ─────────
-        # Stage 1: heuristic → level estimate + feature hints (always, free).
-        # Stage 2: CE (6 pairs: [L0,L1,L2,L3] + [scientific,linear]).
-        #          Reinforced by stage 1 hints + stage 0 SymbolGraph signal.
-        # Stage 3: LLM with full context when CE uncertain on any dimension.
-        enable_cot_cascade: bool = Field(
-            default=True,
-            description="Use CrossEncoder as advisor to the LLM for CoT detection; if False, use LLM alone.",
-        )
-        cot_cascade_uncertainty_threshold: float = Field(
-            default=0.3,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff between top two CE level scores to trust CE; below this, call LLM.",
-        )
-        cot_scientific_ce_threshold: float = Field(
-            default=0.25,
-            ge=0.05,
-            le=1.0,
-            description=(
-                "Minimum score difference between the 'scientific' and 'linear' "
-                "CrossEncoder pairs to make a confident scientific/linear decision "
-                "without falling back to the LLM. Higher = stricter."
-            ),
-        )
-        enable_cot_heuristic_reinforcement: bool = Field(
-            default=True,
-            description="Apply keyword‑based heuristic reinforcement to CE scores before the confidence check.",
-        )
-
-        # ── 8.3 SymbolGraph signal ───────────────────────────────────────────
-        # Synchronous pre-scan before the parallel gather. Calls gather_evidence()
-        # on the user message to measure structural specificity. Used as
-        # reinforcement for CE scores and as context for the LLM classifier.
-        # Zero LLM cost. Self-calibrates: sparse graphs never fire; dense graphs
-        # fire on specific queries.
-        enable_symbol_graph_cot_signal: bool = Field(
-            default=True,
-            description=(
-                "Use a synchronous SymbolGraph pre-scan as reinforcement signal "
-                "for CoT feature detection. Zero LLM cost. "
-                "Boosts scientific mode detection when the query mentions "
-                "known symbols from the indexed codebase."
-            ),
-        )
-        auto_scientific_min_symbol_length: int = Field(
-            default=4,
-            ge=1,
-            le=10,
-            description=(
-                "Symbols shorter than this are excluded from the SymbolGraph "
-                "hit count. Prevents short generic names ('id', 'db', 'x') "
-                "from inflating the structural signal."
-            ),
-        )
-
-        # ── 8.4 QueryDecomposition (Metacognitive Layer 1) ──────────────────
-        query_decomposition_ce_threshold: float = Field(
-            default=0.3,
-            description=(
-                "CrossEncoder diff above which questions are confirmed independent. "
-                "Higher = stricter independence requirement."
-            ),
-        )
-        query_decomposition_llm_threshold: float = Field(
-            default=-0.2,
-            description=(
-                "CrossEncoder diff below which LLM fallback confirms independence. "
-                "Middle zone is conservative (no decomposition)."
-            ),
-        )
-        query_decomposition_max_questions: int = Field(
-            default=3,
-            description="Maximum independent questions to detect. Hard cap.",
-        )
-
-        # ── 8.5 FocalReasoning (Metacognitive Layer 2) ──────────────────────
-        # Disabled by default: N questions × (1 ActivationGraph + 1 CoT) = N× latency.
-        focal_reasoning_max_level: int = Field(
-            default=2,
-            description=(
-                "Maximum CoT level per question in FocalReasoning. "
-                "Hard cap at 2 — N×L3 calls are prohibitively expensive."
-            ),
-        )
-
-        # ── 8.6 Scientific method — core ────────────────────────────────────
-        # Multi-hypothesis competition validated against the SymbolGraph.
-        # ROI analysis: N=3 is the sweet spot (diminishing returns at N=4+).
-        # max_iters=2 gives the best ROI (iter 3+ has ROI ≈ 0.027, same
-        # as generate_predictions — both are the most optional features).
-        # threshold=0.72 vs 0.75: saves ~10% expected calls for -1% quality.
         # ── 8.16 Agentic pipeline (manual /agent — Fase 1) ──────────────────
         agentic_step_max_tokens: int = Field(
             default=2500,
@@ -40157,39 +40061,6 @@ class Filter:
                 "round is zero-LLM retrieval plus one short aligned re-call."
             ),
         )
-        scientific_hypotheses_count: int = Field(
-            default=3,  # ← sweet spot: N=2 loses 12% quality, N=4+ diminishing returns
-            ge=2,
-            le=6,
-            description=(
-                "Number of hypotheses generated per competition. "
-                "3 is the sweet spot: N=2 loses 12% quality, N=4+ shows "
-                "diminishing returns as the LLM struggles to generate truly "
-                "distinct hypotheses beyond 3."
-            ),
-        )
-        scientific_confidence_threshold: float = Field(
-            default=0.72,  # ← 0.72 vs 0.75: saves 10% time for -1% quality
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Minimum combined score to stop hypothesis refinement early. "
-                "0.72 exits iter 1 in ~58% of cases (vs 50% at 0.75), "
-                "saving ~10% expected calls for ~1% quality cost."
-            ),
-        )
-        scientific_max_iterations: int = Field(
-            default=2,  # ← best ROI; iter 3 ROI ≈ 0.027 (marginal)
-            ge=1,
-            le=4,
-            description=(
-                "Maximum refinement iterations. 2 is the best ROI point: "
-                "iter 1→2 gain is +15% quality at moderate cost, "
-                "iter 2→3 gain drops to +4% (same ROI as generate_predictions). "
-                "Set to 4 only when stagnation_detection is needed "
-                "(requires scientific_max_iterations >= stagnation_window + 2)."
-            ),
-        )
 
         # ── 8.7 Scientific method — epistemic toolkit ────────────────────────
         # ROI ranking of this block (from marginal analysis):
@@ -40347,8 +40218,8 @@ class Filter:
             description=(
                 "Detect local optima in hypothesis refinement and switch to "
                 "divergent thinking (high temperature, contrarian prompt). "
-                "Harmless with scientific_max_iterations=2 (cannot fire). "
-                "Set scientific_max_iterations=4 to enable effectively."
+                "Harmless with agentic_metacog_max_iters=2 (cannot fire). "
+                "Set agentic_metacog_max_iters=4 to enable effectively."
             ),
         )
         hypothesis_divergent_n: int = Field(
@@ -40592,7 +40463,7 @@ class Filter:
             default=2,
             description=(
                 "Iterations without obj_score improvement to trigger stagnation. "
-                "Requires scientific_max_iterations >= stagnation_window + 2 = 4."
+                "Requires agentic_metacog_max_iters >= stagnation_window + 2 = 4."
             ),
         )
         stagnation_min_delta: float = Field(
@@ -40623,14 +40494,6 @@ class Filter:
         cot_model_level3: str = Field(
             default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
             description="Model used for CoT level 3 (scientific multi‑hypothesis).",
-        )
-
-        # ── 8.13 Architecture mode ───────────────────────────────────────────
-        skeleton_cot_max_tokens: int = Field(
-            default=1600,
-            ge=200,
-            le=2000,
-            description="Token budget for the architecture reasoning chain.",
         )
 
         # ── 8.14 Complementary features ─────────────────────────────────────
@@ -41492,13 +41355,6 @@ class Filter:
         self._db_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="codeaware_db"
         )
-        self._chroma_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="codeaware_chroma"
-        )
-
-        # CoT heuristic feature flags
-        self.ENABLE_ACCENT_NORMALIZATION = True
-        self.ENABLE_KEYWORD_COUNT_WEIGHT = True
 
         # -- Write counter for periodic tasks --
         self._write_counter = 0
