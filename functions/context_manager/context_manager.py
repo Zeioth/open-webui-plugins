@@ -42448,6 +42448,25 @@ class Filter:
             # worst partially assembled — a degraded turn instead of a dead
             # one. CancelledError subclasses BaseException and rightly
             # bypasses this net.
+            #
+            # Region: emergency lean before surrendering the body.
+            # "Fail-open" is only open if what passes through can actually
+            # be served. When the failure lands BEFORE the assembly steps —
+            # anywhere in the six inlet phases — body["messages"] still
+            # holds the raw paste, and handing that to a 131k-context
+            # server is not a degraded turn, it is the same dead turn with
+            # the diagnosis thrown away. Measured live: a TypeError in the
+            # silent-ingestion gate produced "request (425350 tokens)
+            # exceeds the available context size", and the user saw a
+            # context-size error rather than anything pointing at the real
+            # exception two lines above it in the log.
+            #
+            # ensure_compressed_user_messages is the right tool for this
+            # last-ditch attempt: it is pure state + string work (no LLM,
+            # no GPU, no await), it is the same function the healthy path
+            # uses, and it degrades to a no-op when there is nothing to
+            # stub. Wrapped in its own try because a fail-open path that
+            # can itself raise is not a safety net.
             import traceback
 
             logger.warning(
@@ -42455,6 +42474,33 @@ class Filter:
                 f"fail-open ({type(_inlet_err).__name__}: {_inlet_err})"
             )
             self._log_debug(traceback.format_exc())
+            try:
+                # project_id is assigned inside the try above, so a failure
+                # in the first few lines can land here before it exists.
+                # Without a project there is no state to stub against and
+                # nothing to do — that is a clean no-op, not an error.
+                _pid = locals().get("project_id")
+                _msgs = body.get("messages") or []
+                _st = (
+                    self._conversation_state_manager.get(_pid) if _pid else None
+                )
+                if _msgs and _st is not None:
+                    _leaned = self._history_compressor.ensure_compressed_user_messages(
+                        _msgs, _st, _pid
+                    )
+                    if _leaned is not None and _leaned is not _msgs:
+                        body["messages"] = _leaned
+                        self._log_debug(
+                            "inlet fail-open: emergency lean applied to the "
+                            "outgoing body — the turn is degraded, not "
+                            "oversized"
+                        )
+            except Exception as _lean_err:
+                logger.warning(
+                    f"[CodeAware] inlet fail-open: emergency lean also "
+                    f"failed ({type(_lean_err).__name__}: {_lean_err}) — "
+                    f"passing the body through untouched"
+                )
             return body
 
         finally:
