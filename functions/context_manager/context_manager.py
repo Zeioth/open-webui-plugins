@@ -6011,64 +6011,6 @@ class ContextBuilder:
     # 2.5 — Resolve /expand hints in CoT output
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def _resolve_cot_expands(self, reasoning_text: str, project_id: str) -> str:
-        """Replace `/expand <symbol>` placeholders with actual symbol bodies."""
-        if not self._f.valves.enable_cot_expand_resolution:
-            return reasoning_text
-
-        pattern = re.compile(r"/expand\s+([A-Za-z_][\w.]*)")
-        max_expands = self._f.valves.cot_expand_max_symbols
-        max_tokens = self._f.valves.cot_expand_max_tokens
-
-        matches = pattern.findall(reasoning_text)
-        if not matches:
-            return reasoning_text
-
-        symbols = list(dict.fromkeys(matches))[:max_expands]
-        expanded = reasoning_text
-        total_chars_added = 0
-
-        for sym in symbols:
-            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
-            if not qids:
-                continue
-            qid = sorted(qids)[0]
-
-            block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
-            if not block_hashes:
-                continue
-            state = self._f._conversation_state_manager.get(project_id)
-            block = None
-            for bh in block_hashes:
-                blk = state.active_blocks.get(bh)
-                if blk and not blk.obsolete:
-                    block = blk
-                    break
-            if block is None:
-                continue
-
-            body = CodeBlockManager.extract_symbol_body(block, qid)
-            if not body:
-                continue
-
-            if max_tokens > 0:
-                est_tokens = self._f._tokens.estimate_code_tokens(body)
-                if total_chars_added + est_tokens * 4 > max_tokens * 4:
-                    truncated = (
-                        body[: (max_tokens * 4 - total_chars_added)]
-                        + "\n# ... [truncated]"
-                    )
-                    body = truncated
-                    expanded = expanded.replace(
-                        f"/expand {sym}", f"```\n{body}\n```", 1
-                    )
-                    break
-
-            replacement = f"```\n{body}\n```"
-            expanded = expanded.replace(f"/expand {sym}", replacement, 1)
-            total_chars_added += len(body)
-
-        return expanded
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2.6 — Docstring provider
@@ -11825,9 +11767,6 @@ class LLMOrchestrator:
       duplicate LLM requests.
     * A concurrency semaphore (``_llm_semaphore``) that serialises
       inference for llama.cpp's ``--parallel 1`` mode.
-    * ``infer_user_wants_full_code(query)`` — lightweight CrossEncoder call
-      that decides whether the user wants the full implementation or a
-      summary.
     * ``wait_for_llm_tasks()`` — coordination primitive used by the inlet
       and outlet to drain in-flight auxiliary LLM work.
     """
@@ -12012,6 +11951,15 @@ class LLMOrchestrator:
         """
         Call the LLM with in-memory response cache and call deduplication.
 
+        total_timeout caps THIS call end-to-end, and is the only knob a
+        caller inside a budgeted pipeline has: llm_request_timeout is a
+        global 900s backstop against a hung connection, not a deadline.
+        The producer passes min(global, total_timeout) down as the HTTP
+        total; a deduplicated consumer waits at most total_timeout on the
+        shared future and then degrades to None WITHOUT cancelling it, so
+        one impatient caller can never cut the answer out from under the
+        others.
+
         Cancellation safety: because CancelledError subclasses BaseException it
         bypasses the `except Exception` clause below, so the producer's future
         is resolved explicitly in a dedicated `except asyncio.CancelledError`
@@ -12094,22 +12042,55 @@ class LLMOrchestrator:
             response_format=response_format,
         )
 
-        # Region: anti-repetition for JSON contracts. Built before the dedup
-        # and cache keys because it changes what the sampler produces —
-        # valves are live-editable in the UI, so two calls with different
-        # DRY settings must not share an inference or a cached response.
+        # Region: anti-repetition. Built before the dedup and cache keys
+        # because it changes what the sampler produces — valves are
+        # live-editable in the UI, so two calls with different DRY settings
+        # must not share an inference or a cached response.
+        #
+        # Two domains, one mechanism. JSON contracts ride a verbatim-repeated
+        # claim into the token cap; long-prose steps ride a verbatim-repeated
+        # BULLET into it ("- Current implementation details of `set_pstate`⏎-
+        # Current implementation details of `get_pstate`⏎- ..." looping until
+        # agentic_step_max_tokens, three times in one run). The loop is the
+        # same failure and DRY is the right tool for both, which is why the
+        # long_dry valve exists alongside the json one: the steps carry no
+        # response_format, so the original gate skipped exactly the calls
+        # that truncate most.
+        #
+        # Why DRY and not repeat_penalty, which the server can already
+        # raise globally: repeat_penalty punishes TOKENS. Code repeats
+        # tokens as a matter of grammar — `self`, `def`, `return`, the
+        # indent, and the ``` of a fence — so every notch of global
+        # repeat_penalty pushes the model away from idiomatic code and away
+        # from closing a fence it has already opened. DRY punishes repeated
+        # SEQUENCES with a penalty exponential in their length, and
+        # dry_allowed_length draws the line exactly where this domain needs
+        # it: an identifier or a `return False` stays under 8 tokens and is
+        # never touched, while a repeated sentence — the loop's signature —
+        # is. That is what lets the temperature come down for format
+        # adherence without the loop coming back.
         _extra_body: Optional[Dict[str, Any]] = None
         if response_format is not None:
             _dry = float(
                 getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0
             )
-            if _dry > 0:
-                _extra_body = {
-                    "dry_multiplier": _dry,
-                    "dry_base": 1.75,
-                    "dry_allowed_length": 8,
-                    "dry_penalty_last_n": 1024,
-                }
+        else:
+            _dry = float(
+                getattr(self._f.valves, "llm_long_dry_multiplier", 0.0) or 0.0
+            )
+            if _dry > 0 and (max_tokens or 0) < int(
+                getattr(self._f.valves, "llm_long_dry_min_tokens", 1200)
+            ):
+                # Short auxiliary calls cannot loop their way into a cap they
+                # would never reach; leave their sampling alone.
+                _dry = 0.0
+        if _dry > 0:
+            _extra_body = {
+                "dry_multiplier": _dry,
+                "dry_base": 1.75,
+                "dry_allowed_length": 8,
+                "dry_penalty_last_n": 1024,
+            }
 
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}"
@@ -12139,7 +12120,23 @@ class LLMOrchestrator:
             # producer died — degrade to None like any failed aux call — while
             # our own cancellation must keep propagating.
             try:
-                _shared = await asyncio.shield(future)
+                if total_timeout is not None and total_timeout > 0:
+                    # wait_for cancels what it awaits — which is the SHIELD,
+                    # not the shared future underneath it. The producer keeps
+                    # working and still resolves it for every other consumer;
+                    # only this caller gives up. Without the shield here a
+                    # timeout would poison exactly the way 0010 describes.
+                    _shared = await asyncio.wait_for(
+                        asyncio.shield(future), total_timeout
+                    )
+                else:
+                    _shared = await asyncio.shield(future)
+            except asyncio.TimeoutError:
+                self._f._log_debug(
+                    f"[LLM]{' ' + label if label else ''} consumer gave up "
+                    f"after {total_timeout:.0f}s (producer still running)"
+                )
+                return None
             except asyncio.CancelledError:
                 if future.cancelled():
                     return None
@@ -12194,6 +12191,20 @@ class LLMOrchestrator:
                     self._f._active_llm_tasks.add(task)
 
                 try:
+                    # total_timeout caps THIS call; llm_request_timeout (900s
+                    # by default) is the global ceiling and is far too coarse
+                    # for an auxiliary call inside a budgeted pipeline. The
+                    # parameter existed in this signature and was never read:
+                    # every caller passing it believed it had a deadline and
+                    # had none. Live cost of that gap: a claims_tail_recovery
+                    # asking for 60s ran for 100.077s (2545 in / 172 out —
+                    # ~9s of work, the rest queued behind another call on a
+                    # --parallel 1 server), which pushed the following
+                    # hypothesize step into failure and cost the run its
+                    # verify and analyze steps.
+                    _http_timeout = self._f.valves.llm_request_timeout
+                    if total_timeout is not None and total_timeout > 0:
+                        _http_timeout = min(_http_timeout, int(total_timeout))
                     result = await _shared_call_llm(
                         prompt=prompt,
                         system=system_prompt,
@@ -12202,7 +12213,7 @@ class LLMOrchestrator:
                         api_token=self._f.valves.LLM_API_TOKEN,
                         temperature=temperature,
                         max_tokens=max_tokens,
-                        timeout=self._f.valves.llm_request_timeout,
+                        timeout=_http_timeout,
                         sock_read=(
                             self._f.valves.llm_sock_read_timeout
                             if self._f.valves.llm_sock_read_timeout > 0
@@ -12344,206 +12355,7 @@ class LLMOrchestrator:
     # 4. CrossEncoder helper (keep full code decision)
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def infer_user_wants_full_code(
-        self, user_question: str, project_id: str = ""
-    ) -> bool:
-        """Infer whether the user likely wants full code rather than a summary.
 
-        Produces a soft intent signal, NOT a hard gate. The returned boolean is
-        stored as ``_user_intent_full_code`` and consumed only as an
-        ``intent_hint`` string ("The user likely needs the full code" /
-        "...only a summary") that flavours downstream reasoning. It does not
-        decide whether code is kept or summarised in the assembled context — no
-        downstream path evicts or compresses code based on this value.
-
-        Because the signal is advisory, a wrong verdict at worst mislabels a
-        hint fed to another classifier; it never drops code. The cascade is a
-        query/summary-vs-full-code relevance ranking between two concrete poles:
-            1. Context tagging — [CODE]/[SHORT] hints prepended to the query.
-            2. CrossEncoder — ranks "wants full implementation" vs "wants
-               summary" (the primary signal; falls back to the LLM if the CE is
-               unavailable).
-            3. Heuristic reinforcement — summary/full keyword nudges.
-            4. LLM arbitration — only when the CrossEncoder margin is below
-               keep_full_code_llm_threshold.
-            5. Conservative default — keep full (True) in the middle band.
-
-        Args:
-            user_question (str): The user's question.
-            project_id (str): Project id.
-
-        Returns:
-            bool: True when the user likely wants full code, False for a summary.
-        """
-        # ── Step 1: guard clause ──
-        if not user_question.strip():
-            return False
-
-        # ── Step 2: build the context-tagged query ──
-        context_parts = []
-        if any(
-            kw in user_question
-            for kw in ("```", "def ", "class ", "import ", "from ", "function ")
-        ):
-            context_parts.append("[CODE]")
-        if len(user_question.split()) < 10:
-            context_parts.append("[SHORT]")
-        context_prefix = " ".join(context_parts)
-        query = f"{context_prefix} {user_question}" if context_parts else user_question
-
-        # ── Step 3: CrossEncoder relevance ranking (two concrete poles) ──
-        pairs = [
-            (
-                query,
-                "The user explicitly asks for the full implementation, detailed code, or exact syntax of a function.",
-            ),
-            (
-                query,
-                "The user only needs a summary, explanation of concepts, or high-level overview, not the full code.",
-            ),
-        ]
-        scores = await self._f._commands._predict_cross_encoder(pairs)
-
-        if scores is None or len(scores) < 2:
-            return await self._infer_user_wants_full_code_with_llm(
-                user_question, None, project_id
-            )
-
-        # ── Step 4: heuristic reinforcement with weight ──
-        content_lower = user_question.lower()
-        summary_keywords = (
-            "resume",
-            "summary",
-            "explica brevemente",
-            "resumen",
-            "briefly explain",
-            "high-level",
-        )
-        full_code_keywords = (
-            "implementa",
-            "código",
-            "función",
-            "implement",
-            "code",
-            "function",
-            "write",
-        )
-        h_weight = self._f.valves.heuristic_reinforcement_weight
-
-        scores_reinforced = list(scores)
-        if any(kw in content_lower for kw in summary_keywords):
-            scores_reinforced[1] += h_weight * 0.2
-        if any(kw in content_lower for kw in full_code_keywords):
-            scores_reinforced[0] += h_weight * 0.2
-
-        # ── Step 5: threshold bands → verdict ──
-        diff = scores_reinforced[0] - scores_reinforced[1]
-        CE_CONFIDENCE_THRESHOLD = self._f.valves.keep_full_code_ce_threshold
-        LLM_FALLBACK_THRESHOLD = self._f.valves.keep_full_code_llm_threshold
-
-        if diff >= CE_CONFIDENCE_THRESHOLD:
-            # CE is confident — use its ranking directly.
-            result = scores_reinforced[0] > scores_reinforced[1]
-            self._f._log_debug(
-                f"infer_user_wants_full_code: CE confident (diff={diff:.2f}) → {result}"
-            )
-            return result
-        elif diff < LLM_FALLBACK_THRESHOLD:
-            # CE is uncertain — arbitrate with the LLM.
-            self._f._log_debug(
-                f"infer_user_wants_full_code: CE uncertain (diff={diff:.2f} < "
-                f"{LLM_FALLBACK_THRESHOLD:.2f}), using LLM"
-            )
-            return await self._infer_user_wants_full_code_with_llm(
-                user_question, scores_reinforced, project_id
-            )
-
-        # Middle band — conservative default (assume full code wanted).
-        return True
-
-    async def _infer_user_wants_full_code_with_llm(
-        self,
-        user_question: str,
-        ce_scores: Optional[List[float]] = None,
-        project_id: str = "",
-    ) -> bool:
-        """LLM arbiter for the full-code intent hint when the CrossEncoder is unsure.
-
-        Reached when the CrossEncoder margin falls below
-        keep_full_code_llm_threshold (or when the CE is unavailable). Like its
-        caller, this produces a soft advisory signal consumed only as a CoT
-        detection hint — it does not gate code retention. Uses
-        response_format={"type":"json_object"} and enable_thinking=False so the
-        server-side GBNF grammar returns clean JSON with no reasoning preamble.
-        The default on empty/parse failure is True (assume full code) to avoid
-        biasing the hint toward omitting implementation detail.
-
-        Args:
-            user_question: The user's message (truncated to 500 chars).
-            ce_scores: Optional [full_score, summary_score] from the CrossEncoder.
-            project_id: Current project identifier.
-
-        Returns:
-            bool: True to signal full-code intent, False for summary intent.
-        """
-        # ── Step 1: build the classification prompt ──
-        if ce_scores is not None:
-            ce_block = (
-                f"CrossEncoder scores — keep_full: {ce_scores[0]:.2f}, "
-                f"summary_only: {ce_scores[1]:.2f}\n\n"
-            )
-        else:
-            ce_block = ""
-
-        prompt = (
-            f"{ce_block}"
-            f"User question:\n{user_question[:500]}\n\n"
-            f"Decide whether to show the full code or a summary.\n"
-            f'Output {{"keep_full": true}} when the user asks for implementation '
-            f"details, exact syntax, or complete code.\n"
-            f'Output {{"keep_full": false}} when the user asks for explanation, '
-            f"overview, or conceptual understanding.\n"
-            f"When uncertain, prefer true to avoid omitting critical code."
-        )
-
-        # ── Step 2: call the LLM under a JSON grammar, no thinking ──
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=(
-                "You are a decision engine. "
-                "Output ONLY a valid JSON object with a single boolean field 'keep_full'. "
-                "Your entire response must start with { and end with }."
-            ),
-            model_override=self._f.valves.summarization_model,
-            max_tokens=0,
-            temperature=0.0,
-            label="keep_full_code_llm",
-            response_format={"type": "json_object"},
-            enable_thinking=False,
-            log_raw_response=False,
-        )
-
-        # ── Step 3: parse the structured verdict (conservative default True) ──
-        if not response:
-            self._f._log_debug(
-                "_infer_user_wants_full_code_with_llm: empty response, defaulting to FULL"
-            )
-            return True
-
-        try:
-            data = json.loads(response)
-            result = bool(data.get("keep_full", True))
-            self._f._log_debug(
-                f"_infer_user_wants_full_code_with_llm: decided "
-                f"{'FULL' if result else 'SUMMARY'}"
-            )
-            return result
-        except (json.JSONDecodeError, Exception):
-            self._f._log_debug(
-                f"_infer_user_wants_full_code_with_llm: JSON parse error — "
-                f"response: {response[:200]!r}, defaulting to FULL"
-            )
-            return True
 
 
 @dataclass
@@ -12614,9 +12426,6 @@ class AgenticEvidenceLedger:
         self._f = filter_ref
         self.claims: List[LedgerClaim] = []
 
-    def reset(self) -> None:
-        """Clear claims at the start of each pipeline run."""
-        self.claims = []
 
     def _gap_is_non_indexable(self, gap: str) -> bool:
         """Return True when a reported gap asks for data the SymbolIndex
@@ -12750,6 +12559,33 @@ class AgenticEvidenceLedger:
             # The absent tail is marked explicitly so the orchestrator can
             # tell "no tail found" apart from a legitimate '{"claims": []}'
             # — the recovery path must only fire for the former.
+            #
+            # ── Why steps truncate here, and the server-side cure ──
+            # Truncation at the token cap is usually not a step that had
+            # too much to say: it is a step that fell into a STRUCTURAL
+            # REPETITION LOOP and spent its budget re-emitting the same
+            # bullet ("- Current implementation details of `set_pstate`⏎-
+            # Current implementation details of `get_pstate`⏎- ..." verbatim
+            # from the 19:33 run). The loop is a sampling-parameter problem,
+            # not a prompt problem, and its severity is a function of
+            # QUANTISATION: quantising compresses the steps of the network,
+            # which makes the model overconfident and lets it lock onto a
+            # token sequence it should have moved away from.
+            #
+            # Escape probability at repeat-penalty 1.04 / temp 0.66, per
+            # DeepSeek's numerical analysis, holding those values constant:
+            #     FP16:   100% escape,  0%     degradation
+            #     Q8_0:    99% escape,  0%     degradation
+            #     Q6_K:    95% escape,  0.5%   degradation
+            #     Q5_K_M:  85% escape,  1%     degradation
+            #     Q4_K_M:  70-85% escape, 1-2% degradation   <- current
+            # Equivalent (penalty, temp) pairs, if a lower temperature is
+            # needed for code quality:
+            #     t=0.57, p=1.14   |   t=0.60, p=1.08   |   t=0.66, p=1.04
+            # These figures describe the CURRENT model only. Moving to Q8
+            # is expected to make the loop disappear (~99% escape, no
+            # degradation), at which point claims-tail recovery becomes a
+            # rare-path safety net rather than a load-bearing one.
             control["tail_missing"] = True
             if getattr(step, "truncated", False):
                 # Not a contract violation: the generation hit
@@ -12878,6 +12714,7 @@ class AgenticEvidenceLedger:
 
     _RECOVERY_MIN_REMAINING_S = 45.0
     _RECOVERY_MAX_TOKENS = 800
+    _RECOVERY_TIMEOUT_S = 30.0
 
     async def recover_claims_tail(
         self,
@@ -12913,7 +12750,14 @@ class AgenticEvidenceLedger:
             project_id: Current project identifier.
             remaining: Seconds left in the pipeline budget — below
                 _RECOVERY_MIN_REMAINING_S the recovery is skipped with a
-                log line (one aux call plus re-extraction must fit).
+                log line (one aux call plus re-extraction must fit). The
+                call itself is capped at _RECOVERY_TIMEOUT_S, which must
+                stay BELOW that floor: asking for 60s while only requiring
+                45s of budget was incoherent, and while total_timeout was
+                a no-op (see call_llm) it let one recovery run for 100s
+                and cost the run its verify and analyze steps. The work is
+                ~9s when the server is free; 30s is generous for it and
+                still leaves the floor meaningful.
 
         Returns:
             True when a well-formed tail was appended to step.output and
@@ -12951,7 +12795,7 @@ class AgenticEvidenceLedger:
                 max_tokens=self._RECOVERY_MAX_TOKENS,
                 temperature=0.1,
                 label="claims_tail_recovery",
-                total_timeout=min(remaining, 60.0),
+                total_timeout=min(remaining, self._RECOVERY_TIMEOUT_S),
                 response_format={"type": "json_object"},
                 enable_thinking=False,
             )
@@ -20524,24 +20368,6 @@ class CommandRouter:
         return CommandRouter._has_request_lead(text)
 
     @staticmethod
-    def _text_outside_spans(content: str, byte_spans: List[Tuple[int, int]]) -> str:
-        """Return the message text lying outside the given byte spans.
-
-        tree-sitter reports offsets over the UTF-8 encoding, so removal is done
-        in byte space and decoded afterwards. Slicing a str with byte offsets
-        would corrupt multibyte characters (accents, '¿', '¡').
-        """
-        data = content.encode("utf-8")
-        kept = bytearray()
-        cursor = 0
-        for start, end in sorted(byte_spans):
-            start = max(0, min(start, len(data)))
-            end = max(start, min(end, len(data)))
-            if start > cursor:
-                kept += data[cursor:start]
-            cursor = max(cursor, end)
-        kept += data[cursor:]
-        return kept.decode("utf-8", errors="ignore").strip()
 
     async def is_code_only_message(self, content: str, project_id: str) -> bool:
         """Decide whether a message is a bare code paste with no question.
@@ -25131,89 +24957,6 @@ class MetacognitiveReasoningEngine:
 
         return obj_score, combined, coverage_score
 
-    def _compute_signal_vector(
-        self,
-        user_content: str,
-        project_id: str,
-        min_symbol_length: int = 4,
-    ) -> Dict[str, int]:
-        """
-        Synchronous SymbolGraph pre-scan.
-
-        Runs gather_evidence() on the user message — treating it as if it
-        were a hypothesis — to measure how many known codebase symbols it
-        mentions and whether any call-relation patterns are detectable.
-
-        Code is stripped from mega-messages first (same gate as every other
-        semantic consumer of the query): scanning a pasted file finds every
-        symbol in the codebase (observed: n_found=648, traceback=True) and
-        pushes the CoT heuristics toward scientific mode for trivial
-        questions. The signal must reflect what the USER wrote, not what
-        they pasted.
-
-        This is a reinforcement signal, not a trigger. High count means
-        the user is asking about specific indexed code. Low count means
-        the query is generic — fine for linear CoT, poor fit for
-        compete_hypotheses (nothing to falsify structurally).
-
-        min_symbol_length filters short generic words that happen to
-        match symbol names ('id', 'db', 'run'). Default 4.
-
-        Called synchronously BEFORE the parallel gather in
-        _detect_and_generate_cot so it adds zero perceived latency.
-
-        Returns:
-            n_mentioned:     symbols from query present in index
-                             (regardless of active block presence)
-            n_found:         symbols both mentioned AND verified in graph
-            n_relations:     call-relation patterns detected in query text
-            structural_hits: n_mentioned + n_relations (total signal)
-        """
-        _empty = {
-            "n_mentioned": 0,
-            "n_found": 0,
-            "n_relations": 0,
-            "structural_hits": 0,
-        }
-
-        if not user_content or not project_id:
-            return _empty
-
-        # ── Diet: strip pasted code from mega-messages before scanning ──
-        if len(user_content) > self._f.valves.seed_extraction_strip_min_chars:
-            _stripped = self._f._commands._extract_text_for_classification(user_content)
-            if _stripped and len(_stripped.strip()) >= 10:
-                self._f._log_debug(
-                    f"_compute_signal_vector: stripped code from mega-message "
-                    f"({len(user_content)} chars → {len(_stripped)})"
-                )
-                user_content = _stripped
-
-        try:
-            evidence = self.gather_evidence(user_content, project_id)
-
-            n_mentioned = sum(
-                1 for name in evidence.symbols_found if len(name) >= min_symbol_length
-            )
-            n_found = sum(
-                1
-                for name, found in evidence.symbols_found.items()
-                if found and len(name) >= min_symbol_length
-            )
-            n_relations = len(evidence.call_relations_valid)
-
-            return {
-                "n_mentioned": n_mentioned,
-                "n_found": n_found,
-                "n_relations": n_relations,
-                "structural_hits": n_mentioned + n_relations,
-            }
-        except Exception as e:
-            self._f._log_debug(
-                f"_compute_signal_vector: failed ({type(e).__name__}: {e}) "
-                f"→ returning empty signal"
-            )
-            return _empty
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2. Pre-evidence design and prediction generation
@@ -39136,11 +38879,9 @@ class Filter:
             default=0.8,
             ge=0.0,
             description=(
-                "Per-request DRY multiplier applied ONLY to calls that carry "
+                "Per-request DRY multiplier applied to calls that carry "
                 "response_format (the JSON contracts: experiment design, "
-                "predictions, peer review, commit summaries…). The server "
-                "runs repeat_penalty 1.000 / dry 0.000 globally — correct "
-                "for code generation, where repetition is legitimate — but a "
+                "predictions, peer review, commit summaries…). A "
                 "json_object grammar constrains STRUCTURE, not CONTENT, and "
                 "production shows these calls riding a verbatim-repeated "
                 "claim into the token cap (nine truncated experiment designs "
@@ -39157,6 +38898,50 @@ class Filter:
                 "same road as response_format, which this stack's router is "
                 "already suspected of dropping — if the fences persist, "
                 "verify the router forwards dry_* before judging this valve."
+            ),
+        )
+        llm_long_dry_multiplier: float = Field(
+            default=0.8,
+            ge=0.0,
+            description=(
+                "Same mechanism as llm_json_dry_multiplier, for the calls "
+                "that carry NO response_format and generate long prose — in "
+                "practice the agentic steps. They were the one family the "
+                "JSON gate excluded, and they are the family that truncates "
+                "most: three steps in a single run looped a bullet verbatim "
+                "('- Current implementation details of `set_pstate`⏎- "
+                "Current implementation details of `get_pstate`⏎- ...') "
+                "until agentic_step_max_tokens cut them off mid-sentence, "
+                "losing their claims tail each time. "
+                "\n\n"
+                "This is the lever to reach for INSTEAD of raising the "
+                "server's global repeat_penalty. repeat_penalty punishes "
+                "TOKENS, and code repeats tokens as a matter of grammar — "
+                "`self`, `def`, `return`, the indent, and the ``` that "
+                "closes a fence the model already opened. Every notch of it "
+                "pushes the model away from idiomatic code and away from "
+                "correct markdown, which is the reported symptom: unfenced "
+                "code and malformed diffs, worse at the temperature that "
+                "suppresses the loop. DRY punishes repeated SEQUENCES with "
+                "a penalty exponential in length, and dry_allowed_length=8 "
+                "puts the line where this domain needs it — identifiers and "
+                "one-line statements pass, repeated sentences do not. With "
+                "DRY carrying the anti-loop duty, repeat_penalty can go back "
+                "to 1.0 and the temperature can come down for format "
+                "adherence without the loop returning. "
+                "\n\n"
+                "Only applies to calls whose max_tokens reaches "
+                "llm_long_dry_min_tokens: a short auxiliary call cannot loop "
+                "its way into a cap it would never reach. 0 disables."
+            ),
+        )
+        llm_long_dry_min_tokens: int = Field(
+            default=1200,
+            ge=0,
+            description=(
+                "Minimum max_tokens for llm_long_dry_multiplier to apply. "
+                "Below this a call is too short to spiral, so its sampling "
+                "is left alone."
             ),
         )
         llm_uncapped_max_tokens: int = Field(
@@ -39594,18 +39379,6 @@ class Filter:
         )
 
         # ── 7.2 Session & code‑only detection ────────────────────────────────
-        keep_full_code_ce_threshold: float = Field(
-            default=0.30,
-            ge=0.0,
-            le=1.0,
-            description="Minimum diff to trust CrossEncoder for FULL vs SUMMARY decision.",
-        )
-        keep_full_code_llm_threshold: float = Field(
-            default=0.15,
-            ge=0.0,
-            le=1.0,
-            description="Maximum diff to trigger LLM fallback for FULL vs SUMMARY decision.",
-        )
 
         # ── 7.3 Seed & inference gate ─────────────────────────────────────────
         seed_infer_ce_threshold: float = Field(
@@ -39709,21 +39482,6 @@ class Filter:
         enable_cot_llm_detection: bool = Field(
             default=True,
             description="Use CrossEncoder + LLM cascade for CoT detection; if False, use heuristic only.",
-        )
-        enable_cot_expand_resolution: bool = Field(
-            default=True,
-            description="Auto‑resolve /expand <Name> hints emitted by architecture CoT.",
-        )
-        cot_expand_max_symbols: int = Field(
-            default=3,
-            ge=1,
-            le=10,
-            description="Maximum /expand hints resolved per CoT turn.",
-        )
-        cot_expand_max_tokens: int = Field(
-            default=3000,
-            ge=200,
-            description="Token budget for all auto‑resolved expansions combined.",
         )
         enable_status_updates: bool = Field(
             default=True,
@@ -40054,31 +39812,41 @@ class Filter:
             ),
         )
         agentic_metacog_threshold: float = Field(
-            default=0.85,
+            default=0.90,
             ge=0.0,
             le=1.0,
             description=(
                 "Combined score at which compete_hypotheses stops refining "
-                "early. Exiting on iteration 1 is the designed common case, "
-                "not a fault: the combined score is "
-                "obj_weight*obj_score + llm_weight*llm_conf (0.5/0.5), so a "
-                "self-reported llm_conf of 0.9 only needs obj_score >= 0.60 "
-                "to clear 0.75 on the first pass. Half the bar is set by the "
-                "model judging its own hypothesis; lower this valve to make "
-                "the loop lean harder on the deterministic SymbolGraph half, "
-                "raise it to converge sooner. The dead "
-                "scientific_confidence_threshold valve carried a calibration "
-                "note claiming 0.72 exits iteration 1 in ~58% of cases vs "
-                "~50% at 0.75 — that measurement predates this valve "
-                "existing, so treat it as a starting point, not a promise. "
-                "The default is 0.85 so the refinement machinery — "
-                "stagnation detection, the divergent pool, experimentum "
-                "crucis between survivors — actually gets exercised: at the "
-                "old hardcoded 0.75, a self-reported llm_conf of 0.9 ended "
-                "the competition on iteration 1 with obj_score as low as "
-                "0.60, and the deeper stages effectively never ran. Set "
-                "0.75 to restore the historical exit rate once the full "
-                "pipe has been observed."
+                "early. The combined score is obj_weight*obj_score + "
+                "llm_weight*llm_conf (0.5/0.5), so half the bar is set by "
+                "the model judging its own hypothesis. Lower this valve to "
+                "make the loop lean harder on the deterministic SymbolGraph "
+                "half; raise it to converge sooner. "
+                "\n\n"
+                "WHY 0.90 AND NOT 0.85 — a property of the CURRENT MODEL, "
+                "not of this code. Running Q4_K_M, the model has only ever "
+                "reported llm_conf in {0.80, 0.85, 0.90, 0.95, 1.00}: it is "
+                "not expressing a calibrated probability, it is playing "
+                "hot-and-cold on a five-notch dial, and 0.85/0.90 are by far "
+                "the two most common notches when hypotheses compete. "
+                "Quantisation flattens the steps of the weight matrix, and a "
+                "flatter matrix makes the model systematically OVERCONFIDENT "
+                "— the notch it picks sits higher than the evidence "
+                "warrants. At a 0.85 threshold, one of the two commonest "
+                "notches clears the bar on its own the moment obj_score "
+                "reaches 0.85, so the competition ends on iteration 1 and "
+                "the refinement machinery — stagnation detection, the "
+                "divergent pool, experimentum crucis between survivors — "
+                "never runs. At 0.90 the model's favourite notch is no "
+                "longer sufficient by itself: llm_conf 0.90 now needs "
+                "obj_score >= 0.90, i.e. real SymbolGraph verification, to "
+                "converge. "
+                "\n\n"
+                "This is expected to relax once the deployment moves to Q8, "
+                "where the steps are not compressed and the reported "
+                "confidence spreads out into something worth trusting. "
+                "Revisit this valve then: 0.85 (or the historical 0.75) may "
+                "become defensible again with a better-calibrated dial."
             ),
         )
         agentic_metacog_max_iters: int = Field(
@@ -40129,7 +39897,7 @@ class Filter:
             ),
         )
         agentic_metacog_max_compete_s: int = Field(
-            default=120,
+            default=240,
             ge=0,
             description=(
                 "Wall-clock ceiling for one hypothesis competition on a "
@@ -40141,7 +39909,27 @@ class Filter:
                 "competing 7 hypotheses, after which verify and analyze "
                 "were skipped with reason 'budget'. Hitting the ceiling is "
                 "a stop, not a verdict: the leading hypothesis is kept. "
-                "0 disables the ceiling (unbounded, pre-0027 behaviour)."
+                "0 disables the ceiling (unbounded). "
+                "\n\n"
+                "SIZING, from the 19:33 run measured per label: design "
+                "costs ~17s per hypothesis and predictions ~5s (iteration 1 "
+                "only). Iteration 1 with the default 7 hypotheses is "
+                "therefore ~157s on its own, and each refinement iteration "
+                "over ~3 survivors is ~51s. The first ceiling shipped at "
+                "120 — below the cost of iteration 1 — so the competition "
+                "was cut before finishing its first pass every single time "
+                "and never reached refinement at all. 240 covers iteration "
+                "1 plus one full refinement pass (~208s) with margin, which "
+                "is the minimum that makes the refinement machinery "
+                "reachable. All four iterations would need ~310s. "
+                "\n\n"
+                "This is not free: agentic_max_seconds is the budget for "
+                "the WHOLE pipeline (480 by default) and the same run spent "
+                "~313s outside the competition. At 240 here the steps "
+                "queued behind a competing hypothesize step will be cut — "
+                "visibly, since they are reported now. Raise "
+                "agentic_max_seconds to ~720 if both the competition and "
+                "the full step plan should fit."
             ),
         )
         agentic_claims_tail_recovery: bool = Field(
