@@ -17425,6 +17425,38 @@ class AgenticOrchestrator:
                 ),
             )
 
+        # Region: enforce the canonical scientific-method partial order.
+        # The planner CONTRACT asks for investigate → hypothesize →
+        # design_tests → verify* → analyze, but nothing enforced it: the
+        # only hard guarantees were analyze-last (parser) and the verify
+        # auto-insert position. A plan the LLM returns out of order (e.g.
+        # hypothesize before any investigate) used to run out of order,
+        # silently violating the method's core constraint that background
+        # research precedes hypothesis and hypothesis precedes testing.
+        # A STABLE sort by kind rank fixes the order while preserving the
+        # planner's relative sequencing within each kind. Runs once, at
+        # plan finalization: mid-loop insertions (NEEDS gap-fill, the
+        # hypothesis-refutation retry below) place themselves by position
+        # deliberately and are not re-sorted.
+        if self._f.valves.agentic_enforce_step_order:
+            _KIND_RANK = {
+                "investigate": 0,
+                "hypothesize": 1,
+                "design_tests": 2,
+                "verify_dynamic": 3,
+                "verify_regression": 4,
+                "verify": 5,
+                "analyze": 6,
+            }
+            _before = [s.kind for s in plan.steps]
+            plan.steps.sort(key=lambda s: _KIND_RANK.get(s.kind, 3))
+            _after = [s.kind for s in plan.steps]
+            if _before != _after:
+                self._f._log_debug(
+                    f"🤖 Agentic: step order normalized "
+                    f"{_before} → {_after} (scientific-method partial order)"
+                )
+
         # Region: stamp 1-based display_no from the final execution order.
         # The verify auto-insert above places its step by POSITION but gives
         # it a max()+1 id, so id order no longer matches list order; user
@@ -17459,6 +17491,11 @@ class AgenticOrchestrator:
             pass
         use_cache = bool(self._f.valves.agentic_step_cache)
         inserted = 0
+        # Hypothesis-refutation retries used this run (Gap 2 of the
+        # scientific method: refuted → re-hypothesize → re-verify). Bounded
+        # by agentic_hypothesis_retries; counted separately from the NEEDS
+        # gap-fill insertions so one budget cannot starve the other.
+        _hypo_retries = 0
         idx = 0
         # Region: budget policy — skip-before-start, essentials always run
         while idx < len(plan.steps):
@@ -17575,6 +17612,76 @@ class AgenticOrchestrator:
                     f"🤖 Agentic step {step.display_no} (verify): {step.status} "
                     f"in {step.seconds:.1f}s"
                 )
+
+                # -- Gap 2: close the scientific-method loop ---------------
+                # The canonical method loops on refutation: hypothesis false
+                # → re-think → NEW hypothesis → re-test. Until now the
+                # pipeline was feed-forward past this point: a refuted
+                # hypothesize claim was stamped on the ledger and handed to
+                # analyze, and neither hypothesis competition (static
+                # evidence, pre-verify) nor generative waves (executor-only,
+                # post-analyze) could respond to it. When this verify
+                # refuted at least one claim owned by a done hypothesize
+                # step, insert ONE re-hypothesize (promote the strongest
+                # surviving rival or formulate a genuinely new hypothesis —
+                # NOT a rewording of the refuted one) followed by its own
+                # verify, right after this step, so the pair still precedes
+                # the terminal analyze. Bounded by agentic_hypothesis_
+                # retries per run; the counter also stops the follow-up
+                # verify from re-triggering on the same refuted claims,
+                # which stay "refuted" on the ledger by design.
+                _max_hr = self._f.valves.agentic_hypothesis_retries
+                if step.status == "done" and _hypo_retries < _max_hr:
+                    _hypo_ids = [
+                        s.id
+                        for s in plan.steps
+                        if s.kind == "hypothesize" and s.status == "done"
+                    ]
+                    _refuted = [
+                        c
+                        for hid in _hypo_ids
+                        for c in self._ledger.claims_for(hid)
+                        if getattr(c, "verification", "") == "refuted"
+                    ]
+                    if _refuted:
+                        _hypo_retries += 1
+                        _summary = "; ".join(
+                            (c.text or "")[:120] for c in _refuted[:3]
+                        )
+                        _next_id = max(s.id for s in plan.steps) + 1
+                        _rehyp = AgenticStep(
+                            id=_next_id,
+                            goal=(
+                                "Verification REFUTED the leading "
+                                f"hypothesis claim(s): {_summary}. Promote "
+                                "the strongest surviving rival or formulate "
+                                "a genuinely NEW hypothesis consistent with "
+                                "the refutation evidence — do NOT reword "
+                                "the refuted one."
+                            ),
+                            kind="hypothesize",
+                        )
+                        _reverify = AgenticStep(
+                            id=_next_id + 1,
+                            goal="Verify the retried hypothesis claims "
+                            "against the code graph",
+                            kind="verify",
+                        )
+                        plan.steps.insert(idx + 1, _rehyp)
+                        plan.steps.insert(idx + 2, _reverify)
+                        for _pos, _s in enumerate(plan.steps, start=1):
+                            _s.display_no = _pos
+                        await self._f._emit_status(
+                            f"🤖 Agentic: hypothesis refuted — retrying "
+                            f"({_hypo_retries}/{_max_hr})"
+                        )
+                        self._f._log_debug(
+                            f"🤖 Agentic: verify refuted "
+                            f"{len(_refuted)} hypothesize claim(s) — "
+                            f"inserted re-hypothesize step {_rehyp.id} + "
+                            f"verify step {_reverify.id} "
+                            f"(retry {_hypo_retries}/{_max_hr})"
+                        )
                 idx += 1
                 continue
 
@@ -40116,6 +40223,33 @@ class Filter:
                 "log '[RIGOR-SHADOW] improvement has/ lacks a distinguishing "
                 "experiment' WITHOUT changing the decision, to calibrate. "
                 "'on' = drop improvements with no distinguishing experiment."
+            ),
+        )
+        agentic_enforce_step_order: bool = Field(
+            default=True,
+            description=(
+                "Normalize the plan to the scientific method's partial "
+                "order (investigate → hypothesize → design_tests → "
+                "verify_dynamic → verify_regression → verify → analyze) "
+                "with a STABLE sort before execution. The planner contract "
+                "asks for this order but only analyze-last was enforced; a "
+                "plan returned out of order used to run out of order. "
+                "Stable: relative order within each kind is preserved."
+            ),
+        )
+        agentic_hypothesis_retries: int = Field(
+            default=1,
+            ge=0,
+            le=3,
+            description=(
+                "Scientific-method refutation loop: when the verify step "
+                "refutes claim(s) owned by a hypothesize step, insert one "
+                "re-hypothesize (promote the surviving rival or formulate "
+                "a new hypothesis) plus its own verify before the terminal "
+                "analyze, at most this many times per run. 0 restores the "
+                "old feed-forward behavior (refutations are reported to "
+                "analyze but never retried). Each retry costs one "
+                "hypothesize LLM call plus a deterministic verify."
             ),
         )
         agentic_generative_eval: str = Field(
