@@ -210,8 +210,6 @@ class ScoredHypothesis:
     design: "ExperimentDesign"
     falsified: bool
     falsification_reason: Optional[str]
-    predictions_verified: int = 0
-    predictions_total: int = 0
     coverage_score: float = 0.0
     epistemic_uncertainty: float = 0.0
 
@@ -2242,9 +2240,6 @@ class StaticEvidence(BaseModel):
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Path memberships & data flow
     # ═══════════════════════════════════════════════════════════════════════════
-
-    path_memberships: Dict[str, List[str]]  # Path views each symbol belongs to
-    data_flow_upstream: Dict[str, List[str]] = Field(default_factory=dict)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. Objective score
@@ -6010,7 +6005,6 @@ class ContextBuilder:
     # ═══════════════════════════════════════════════════════════════════════
     # 2.5 — Resolve /expand hints in CoT output
     # ═══════════════════════════════════════════════════════════════════════
-
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2.6 — Docstring provider
@@ -11619,7 +11613,10 @@ class LongTermMemory:
             The model name/path, or "unknown" when neither source exists.
         """
         emb = getattr(self._f, "embedder", None)
-        for attr_chain in (("model_card_data", "base_model"), ("tokenizer", "name_or_path")):
+        for attr_chain in (
+            ("model_card_data", "base_model"),
+            ("tokenizer", "name_or_path"),
+        ):
             obj = emb
             for a in attr_chain:
                 obj = getattr(obj, a, None)
@@ -11720,9 +11717,7 @@ class LongTermMemory:
             # that the model is one called unknown; a real-vs-unavailable
             # pairing must fall back to the dimension check alone instead of
             # bricking the LTM over a name nobody has.
-            _name_comparable = (
-                stored_model != "unknown" and current_model != "unknown"
-            )
+            _name_comparable = stored_model != "unknown" and current_model != "unknown"
             if (
                 _name_comparable and stored_model != current_model
             ) or stored_dim != current_dim:
@@ -11921,9 +11916,7 @@ class LLMOrchestrator:
         # how the role already overrides Block A's general guidance.
         _aligned = f"{_prelim}\n\n---\n\n{system_prompt}"
         if response_format is not None:
-            _suffix = (
-                getattr(self._f.valves, "confidence_prompt", "") or ""
-            ).strip()
+            _suffix = (getattr(self._f.valves, "confidence_prompt", "") or "").strip()
             if _suffix and _suffix in _prelim:
                 _aligned += (
                     "\n\nThis call returns ONLY the JSON object requested "
@@ -12075,13 +12068,9 @@ class LLMOrchestrator:
         # adherence without the loop coming back.
         _extra_body: Optional[Dict[str, Any]] = None
         if response_format is not None:
-            _dry = float(
-                getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0
-            )
+            _dry = float(getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0)
         else:
-            _dry = float(
-                getattr(self._f.valves, "llm_long_dry_multiplier", 0.0) or 0.0
-            )
+            _dry = float(getattr(self._f.valves, "llm_long_dry_multiplier", 0.0) or 0.0)
             if _dry > 0 and (max_tokens or 0) < int(
                 getattr(self._f.valves, "llm_long_dry_min_tokens", 1200)
             ):
@@ -12300,9 +12289,7 @@ class LLMOrchestrator:
                                     f"normalized ({_how}: fence/truncation "
                                     f"handled at the producer)"
                                 )
-                                result.content = json.dumps(
-                                    _norm, ensure_ascii=False
-                                )
+                                result.content = json.dumps(_norm, ensure_ascii=False)
                                 content = result.content
                     if content:
                         await self._f._llm_cache.set(cache_key, result)
@@ -12389,8 +12376,6 @@ class LLMOrchestrator:
     # ═══════════════════════════════════════════════════════════════════════════
 
 
-
-
 @dataclass
 class AgenticStep:
     """Single unit of work in the agentic pipeline (Fase 1: fixed kinds)."""
@@ -12458,7 +12443,6 @@ class AgenticEvidenceLedger:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
         self.claims: List[LedgerClaim] = []
-
 
     def _gap_is_non_indexable(self, gap: str) -> bool:
         """Return True when a reported gap asks for data the SymbolIndex
@@ -12714,9 +12698,7 @@ class AgenticEvidenceLedger:
         so it cannot disambiguate.
         """
         try:
-            existing = {
-                " ".join(c.text.casefold().split()) for c in self.claims
-            }
+            existing = {" ".join(c.text.casefold().split()) for c in self.claims}
             restored = 0
             for d in json.loads(claims_json):
                 d = dict(d)
@@ -12862,10 +12844,7 @@ class AgenticEvidenceLedger:
             )
             return False
         step.output = (
-            prose
-            + "\n\n```json\n"
-            + json.dumps(data, ensure_ascii=False)
-            + "\n```"
+            prose + "\n\n```json\n" + json.dumps(data, ensure_ascii=False) + "\n```"
         )
         self._f._log_debug(
             f"🤖 Ledger: step {step.id} claims tail recovered "
@@ -15111,6 +15090,11 @@ class AgenticPreplanner:
                     temperature=0.6,
                     label="agentic_preplanner",
                     enable_thinking=False,
+                    total_timeout=(
+                        float(_pp_to)
+                        if (_pp_to := self._f.valves.agentic_preplanner_timeout_s) > 0
+                        else None
+                    ),
                 )
             except Exception as e:
                 self._f._log_debug(f"🧭 Preplanner: call failed ({e})")
@@ -15355,6 +15339,11 @@ class AgenticPlanner:
                 temperature=0.2,
                 label="agentic_planner",
                 enable_thinking=False,
+                total_timeout=(
+                    float(_pl_to)
+                    if (_pl_to := self._f.valves.agentic_planner_timeout_s) > 0
+                    else None
+                ),
             )
         except Exception as e:
             self._f._log_debug(f"🤖 Planner: call failed ({e}) → fixed plan")
@@ -16812,9 +16801,7 @@ class AgenticOrchestrator:
         if (
             control.get("tail_missing")
             and not self._ledger.claims_for(step.id)
-            and await self._ledger.recover_claims_tail(
-                step, project_id, remaining
-            )
+            and await self._ledger.recover_claims_tail(step, project_id, remaining)
         ):
             control = self._ledger.extract_and_validate(step, project_id)
         return control
@@ -17219,8 +17206,32 @@ class AgenticOrchestrator:
         it may assume a free slot and raise freely on internal errors.
         """
         # Region: plan under the same wall-clock budget as execution
+        # ------------------------------------------------------------------
+        # One place decides how much wall clock this run may spend, and it
+        # answers to two knobs. agentic_budget_enabled is the killswitch: off
+        # means no clock at all, every step runs to completion, which is what
+        # you want while investigating whether the budget is what is
+        # degrading an answer. agentic_max_seconds at 0 means the same thing
+        # through the value rather than the switch — 0 is the conventional
+        # "no limit" across every ceiling in this pipeline, and a budget that
+        # could not express it was the one exception.
+        #
+        # Unlimited is expressed as +inf, not as a flag: `remaining` stays a
+        # number, every `remaining - floor <= 0` and every `min(remaining,
+        # …)` downstream keeps working unchanged, and no consumer needs to
+        # learn about the switch. inf - anything is inf, so the closing
+        # reserve and the per-step ceilings simply never bind.
+        # ------------------------------------------------------------------
         aligned_prefix = self._aligned_prefix(prelim_system)
-        budget = float(self._f.valves.agentic_max_seconds)
+        _budget_on = bool(self._f.valves.agentic_budget_enabled)
+        _budget_valve = float(self._f.valves.agentic_max_seconds)
+        budget = _budget_valve if (_budget_on and _budget_valve > 0) else float("inf")
+        if budget == float("inf"):
+            self._f._log_debug(
+                "🤖 Agentic: wall-clock budget disabled "
+                f"({'killswitch off' if not _budget_on else 'agentic_max_seconds=0'})"
+                " — every planned step runs to completion"
+            )
         started = time.monotonic()
 
         # #11: the ledger accumulated across runs within a process. Reset it
@@ -17298,8 +17309,7 @@ class AgenticOrchestrator:
             project_id,
             preplan_brief=preplan_brief,
             difficulty=str(
-                getattr(self._preplanner, "last_stats", {}).get("difficulty", "")
-                or ""
+                getattr(self._preplanner, "last_stats", {}).get("difficulty", "") or ""
             ),
         )
         self._f._log_debug(
@@ -17415,9 +17425,7 @@ class AgenticOrchestrator:
         # leave a plan worth closing.
         _closing_reserve = 0.0
         if _closing_idx >= 0:
-            _closing_reserve = float(
-                self._f.valves.agentic_closing_reserve_s
-            )
+            _closing_reserve = float(self._f.valves.agentic_closing_reserve_s)
             _cap = budget / 2.0
             if _closing_reserve > _cap:
                 self._f._log_debug(
@@ -18035,8 +18043,6 @@ class AgenticOrchestrator:
                 pass
 
 
-
-
 class MultiPhasePlanner:
     """Generates the multi‑phase protocol instructions injected into the
     system prompt when the response budget is tight, and appends wrap‑up
@@ -18451,9 +18457,7 @@ class CommandRouter:
             The scores on the [0,1] scale, all transformed the same way.
         """
         vals = [float(v) for v in raw_scores]
-        if not self._ce_returns_logits and any(
-            v < 0.0 or v > 1.0 for v in vals
-        ):
+        if not self._ce_returns_logits and any(v < 0.0 or v > 1.0 for v in vals):
             self._ce_returns_logits = True
             self._f._log_debug(
                 "CrossEncoder: score outside [0,1] observed — model resolves "
@@ -18617,9 +18621,7 @@ class CommandRouter:
             data = json.loads(response)
         except Exception:
             try:
-                data, _how = self._f._meta_reasoning._parse_json_contract(
-                    response
-                )
+                data, _how = self._f._meta_reasoning._parse_json_contract(response)
             except Exception:
                 data = None
             if data is None:
@@ -18730,8 +18732,8 @@ class CommandRouter:
     # reword cannot silently reopen this.
     _REFERENCE_LINE_RE = re.compile(
         r"^.*(?:"
-        r"indexed in the SymbolGraph"          # both stubs carry this
-        r"|The code is internally available"   # _build_user_stub, para 1
+        r"indexed in the SymbolGraph"  # both stubs carry this
+        r"|The code is internally available"  # _build_user_stub, para 1
         r"|If THIS message contains no question"  # _build_user_stub, para 3
         r").*$",
         re.MULTILINE,
@@ -18940,9 +18942,7 @@ class CommandRouter:
                 # depth). Whatever lets raw text through — a partial
                 # deploy, a crash inside the normalizer — the local ladder
                 # costs nothing and keeps the classification alive.
-                data, _how = self._f._meta_reasoning._parse_json_contract(
-                    raw or ""
-                )
+                data, _how = self._f._meta_reasoning._parse_json_contract(raw or "")
                 if data is None:
                     raise
                 self._f._log_debug(
@@ -24602,8 +24602,6 @@ class MetacognitiveReasoningEngine:
             call_relations_valid={},
             recent_changes=[],
             entry_points_mentioned=[],
-            path_memberships={},
-            data_flow_upstream={},
             objective_score=0.5,
         )
 
@@ -24660,15 +24658,6 @@ class MetacognitiveReasoningEngine:
         # Side-effect free: read path memberships without marking stale.
         # mark_stale_for_symbol is intentionally omitted — gather_evidence
         # is called N×M times per competition and must not degrade PathIndex.
-        path_memberships: Dict[str, List[str]] = {}
-
-        data_flow_upstream: Dict[str, List[str]] = {}
-        for sym_name in mentioned:
-            incoming = self._f._symbol_index.get_edges_in(sym_name, project_id)
-            sources = [e.src for e in incoming if e.type == "data_flow"]
-            if sources:
-                data_flow_upstream[sym_name] = sources
-
         verifiable = len(symbols_found) + len(call_relations_valid)
         if verifiable == 0:
             objective_score = 0.5
@@ -24683,8 +24672,6 @@ class MetacognitiveReasoningEngine:
             call_relations_valid=call_relations_valid,
             recent_changes=recent_changes,
             entry_points_mentioned=entry_points_mentioned,
-            path_memberships=path_memberships,
-            data_flow_upstream=data_flow_upstream,
             objective_score=objective_score,
         )
 
@@ -25195,7 +25182,6 @@ class MetacognitiveReasoningEngine:
 
         return obj_score, combined, coverage_score
 
-
     # ═══════════════════════════════════════════════════════════════════════
     # 2. Pre-evidence design and prediction generation
     # ═══════════════════════════════════════════════════════════════════════
@@ -25447,12 +25433,9 @@ class MetacognitiveReasoningEngine:
         _ev_fp = ""
         if evidence is not None:
             _ev_fp = "|".join(
-                sorted(evidence.symbols_found)
-                + sorted(evidence.call_relations_valid)
+                sorted(evidence.symbols_found) + sorted(evidence.call_relations_valid)
             )
-        h_hash = hashlib.md5(
-            (hypothesis + "\x00" + _ev_fp).encode()
-        ).hexdigest()[:16]
+        h_hash = hashlib.md5((hypothesis + "\x00" + _ev_fp).encode()).hexdigest()[:16]
         if h_hash in self._design_cache:
             self._f._log_debug(f"design_critical_experiment: cache hit ({h_hash})")
             return self._design_cache[h_hash]
@@ -25538,7 +25521,11 @@ class MetacognitiveReasoningEngine:
             f"design_critical_experiment: {len(design.critical_claims)} critical, "
             f"{len(design.supportive_claims)} supportive, "
             f"{len(design.unknown_claims)} unknown"
-            + (" (salvaged from a truncated/fenced response)" if how == "salvaged" else "")
+            + (
+                " (salvaged from a truncated/fenced response)"
+                if how == "salvaged"
+                else ""
+            )
         )
         return design
 
@@ -25626,7 +25613,11 @@ class MetacognitiveReasoningEngine:
         self._f._log_debug(
             f"generate_predictions: {len(predictions)} prediction(s) "
             f"(skeleton_ctx={'yes' if skeleton_ctx else 'no'})"
-            + (" (salvaged from a truncated/fenced response)" if how == "salvaged" else "")
+            + (
+                " (salvaged from a truncated/fenced response)"
+                if how == "salvaged"
+                else ""
+            )
         )
         return predictions
 
@@ -26328,8 +26319,8 @@ class MetacognitiveReasoningEngine:
                 # actually resolved, not what the classifier promised was
                 # resolvable. Active Learning above keeps the DECLARED
                 # number on purpose: it reasons about the unknown bucket.
-                current_coverage, _cov_res, _cov_tot = (
-                    self._compute_effective_coverage(design, evidence, project_id)
+                current_coverage, _cov_res, _cov_tot = self._compute_effective_coverage(
+                    design, evidence, project_id
                 )
                 falsified, reason = self.is_falsified(
                     evidence,
@@ -26566,8 +26557,7 @@ class MetacognitiveReasoningEngine:
                 else "all falsified across all iterations"
             )
             self._f._log_debug(
-                f"compete_hypotheses: no valid hypothesis survived — "
-                f"{_why_none}"
+                f"compete_hypotheses: no valid hypothesis survived — " f"{_why_none}"
             )
             # Record total-failure in performance history so
             # _get_adaptive_strategy can learn from this failure mode.
@@ -26649,8 +26639,6 @@ class MetacognitiveReasoningEngine:
                     call_relations_valid={},
                     recent_changes=[],
                     entry_points_mentioned=[],
-                    path_memberships={},
-                    data_flow_upstream={},
                     objective_score=0.0,
                 ),
                 None,
@@ -28722,10 +28710,7 @@ class EnrichmentTasks:
             if summary:
                 now = time.time()
                 self._f._block_change_summaries[block_hash] = (summary.strip(), now)
-                if (
-                    len(self._f._block_change_summaries)
-                    > self._f._MAX_CHANGE_SUMMARIES
-                ):
+                if len(self._f._block_change_summaries) > self._f._MAX_CHANGE_SUMMARIES:
                     self._f._block_change_summaries.popitem(last=False)
 
                 def _write():
@@ -38903,12 +38888,10 @@ class Filter:
               6.7  Call graph mode resolution
         7.  CLASSIFICATION THRESHOLDS (Heuristic → CE → LLM)
               7.1  General multiplier
-              7.2  Session & code‑only detection
-              7.3  Seed & inference gate
-              7.4  Memory (LTM & code history)
-              7.5  Intent & use case
-              7.6  Structural decisions (relevance, paging, purge)
-              7.7  Quality & contradiction
+              7.2  Seed & inference gate
+              7.3  Intent & use case
+              7.4  Structural decisions (relevance, paging, purge)
+              7.5  Quality & contradiction
         8.  REASONING (scientific method — agentic pipeline)
               8.1  Basic enabling
               8.7  Scientific method — epistemic toolkit
@@ -39643,9 +39626,7 @@ class Filter:
             description="Multiplier for all heuristic reinforcements (bonuses to CrossEncoder scores).",
         )
 
-        # ── 7.2 Session & code‑only detection ────────────────────────────────
-
-        # ── 7.3 Seed & inference gate ─────────────────────────────────────────
+        # ── 7.2 Seed & inference gate ─────────────────────────────────────────
         seed_infer_ce_threshold: float = Field(
             default=0.25,
             ge=0.0,
@@ -39659,9 +39640,7 @@ class Filter:
             description="Maximum diff to trigger LLM fallback for seed inference.",
         )
 
-        # ── 7.4 Memory (LTM & code history) ──────────────────────────────────
-
-        # ── 7.5 Intent & use case ─────────────────────────────────────────────
+        # ── 7.3 Intent & use case ─────────────────────────────────────────────
         intent_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
@@ -39687,7 +39666,7 @@ class Filter:
             description="Maximum diff to trigger LLM fallback for use case classification.",
         )
 
-        # ── 7.6 Structural decisions (relevance, graph, paging, purge) ───────
+        # ── 7.4 Structural decisions (relevance, graph, paging, purge) ───────
         lod3_relevance_ce_threshold: float = Field(
             default=0.35,
             ge=0.0,
@@ -39725,7 +39704,7 @@ class Filter:
             description="Maximum diff to trigger LLM fallback for purge decision.",
         )
 
-        # ── 7.7 Quality & contradiction ───────────────────────────────────────
+        # ── 7.5 Quality & contradiction ───────────────────────────────────────
         duplicate_ce_threshold: float = Field(
             default=0.40,
             ge=0.0,
@@ -39771,9 +39750,53 @@ class Filter:
                 "but a trailing 'NOT FOUND:' section is always preserved."
             ),
         )
+        agentic_budget_enabled: bool = Field(
+            default=False,
+            description=(
+                "Master switch for the pipeline's wall-clock budget. Off "
+                "means no clock at all: every planned step runs to "
+                "completion, no step is ever skipped for time, and the "
+                "closing reserve never binds because there is nothing to "
+                "reserve against. Intended for exactly one question — 'is "
+                "the budget what is degrading this answer?' — which is hard "
+                "to answer while the budget is still cutting the plan. Leave "
+                "it on for normal use: on a --parallel 1 server a runaway "
+                "competition with no clock can hold the slot for the whole "
+                "turn. Setting agentic_max_seconds to 0 does the same thing "
+                "through the value instead of the switch."
+            ),
+        )
+        agentic_preplanner_timeout_s: int = Field(
+            default=240,
+            ge=0,
+            description=(
+                "Ceiling for the single pre-planner call. This is an "
+                "anti-hang guard, NOT a budget: it sits at roughly 2.5x the "
+                "measured cost of a healthy call on a --parallel 1 server "
+                "(89.7s in the reference run), so a normal pre-plan never "
+                "comes near it and only a genuinely stuck call is cut. "
+                "Deliberately generous — a pre-planner cut short degrades "
+                "to an empty brief and the planner then decides the HOW "
+                "without knowing the WHAT, which costs far more quality "
+                "than the seconds it saves. On timeout the stage fails open "
+                "(empty brief), never the run. 0 disables the ceiling."
+            ),
+        )
+        agentic_planner_timeout_s: int = Field(
+            default=180,
+            ge=0,
+            description=(
+                "Ceiling for the single planner call. Anti-hang guard at "
+                "roughly 3x the measured cost of a healthy call (59.1s in "
+                "the reference run). On timeout the planner degrades to its "
+                "deterministic fixed plan, which is a real plan but a blunt "
+                "one — so the ceiling is set where only a stuck call meets "
+                "it. 0 disables it."
+            ),
+        )
         agentic_max_seconds: int = Field(
-            default=900,
-            ge=10,
+            default=1200,
+            ge=0,
             description=(
                 "Wall-clock budget for the whole pipeline; steps that do not "
                 "fit are skipped — except the closing step, which draws on "
@@ -39783,15 +39806,21 @@ class Filter:
                 "is pre-planner ~90s + planner ~60s + investigate ~30s + a "
                 "hypothesize step that can spend its whole "
                 "agentic_metacog_max_compete_s ceiling (240s) + verify ~12s + "
-                "analyze ~110s ≈ 540s before any re-plan wave. The old 480s "
-                "default cut the plan on nearly every non-trivial question, "
-                "and what it cut was always the tail — the steps that turn "
-                "evidence into an answer. Raise further for slower hardware; "
-                "lower only if you would rather have a partial plan than wait."
+                "analyze ~110s ≈ 540s before any re-plan wave — and a slow "
+                "turn can legitimately double that without anything being "
+                "wrong. The 480s this used to default to cut the plan on "
+                "nearly every non-trivial question, and what it cut was "
+                "always the tail: the steps that turn evidence into an "
+                "answer. A budget that starves the plan does not save time, "
+                "it spends the whole run and throws away the part that made "
+                "it worth running, so this errs high on purpose — a run that "
+                "finishes early costs nothing, a run cut short costs "
+                "everything before it. Lower only if you would rather have a "
+                "partial plan than wait."
             ),
         )
         agentic_closing_reserve_s: int = Field(
-            default=120,
+            default=180,
             ge=0,
             description=(
                 "Seconds of agentic_max_seconds held back for the plan's "
@@ -40256,7 +40285,15 @@ class Filter:
             default=10,
             ge=1,
             le=120,
-            description="Wall/CPU timeout per harness execution.",
+            description=(
+                "Wall/CPU timeout per harness execution. NOT a budget knob, "
+                "and deliberately the one ceiling in this pipeline where 0 "
+                "is not 'no limit': it becomes RLIMIT_CPU(0, 0) and "
+                "subprocess timeout=0, which kill the sandbox instantly "
+                "rather than freeing it — the opposite of what 0 means "
+                "everywhere else here. It is a containment bound on code "
+                "this process did not write, so its floor stays at 1."
+            ),
         )
         agentic_dynamic_max_targets: int = Field(
             default=2,
@@ -42389,9 +42426,7 @@ class Filter:
                 if _merged:
                     # File path: merge_pasted_files already populated the
                     # channel. raw_symbols is only needed for the abort check.
-                    raw_symbols = [
-                        s for mfb in _merged for s in mfb.get("symbols", [])
-                    ]
+                    raw_symbols = [s for mfb in _merged for s in mfb.get("symbols", [])]
                 else:
                     # Inline path: strip fences, parse the clean source, and
                     # publish it on the same channel as a single block.
@@ -42400,9 +42435,7 @@ class Filter:
                         _spans = await self._code_blocks.get_code_spans(user_query)
                         if _spans:
                             _code_for_extraction = "\n\n".join(
-                                CodeBlockManager._strip_fence_markers(
-                                    user_query[s:e]
-                                )
+                                CodeBlockManager._strip_fence_markers(user_query[s:e])
                                 for s, e in _spans
                             )
                     except Exception:
@@ -42411,9 +42444,7 @@ class Filter:
                     _guessed_lang = SignatureExtractor._guess_language(
                         None, _code_for_extraction
                     )
-                    _lang = (
-                        _guessed_lang if _guessed_lang != "unknown" else "python"
-                    )
+                    _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
 
                     raw_symbols = []
                     if HAS_TREE_SITTER:
@@ -42556,9 +42587,7 @@ class Filter:
                     ).hexdigest()[:12]
 
                     messages.append({"role": "assistant", "content": response})
-                    messages[:] = self._inlet_orch.ensure_last_message_is_user(
-                        messages
-                    )
+                    messages[:] = self._inlet_orch.ensure_last_message_is_user(messages)
 
                     # -- record the ack hash so next turn's prologue skips
                     #    it: the code is already indexed, and caching the ack
@@ -42754,9 +42783,7 @@ class Filter:
                 # an error.
                 _pid = locals().get("project_id")
                 _msgs = body.get("messages") or []
-                _st = (
-                    self._conversation_state_manager.get(_pid) if _pid else None
-                )
+                _st = self._conversation_state_manager.get(_pid) if _pid else None
                 if _msgs and _st is not None:
                     _leaned = self._history_compressor.ensure_compressed_user_messages(
                         _msgs, _st, _pid
