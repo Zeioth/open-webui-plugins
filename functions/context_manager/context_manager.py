@@ -5779,11 +5779,17 @@ class ContextBuilder:
             "E": "_[Scaffold mode: signatures only, no implementation. "
             "Guidelines from system above apply.]_",
         }
-        default = (
-            "_[Reasoning mode: code review checklist + critical reasoning "
-            "guidelines from system above apply to this response]_"
-        )
-        return tails.get(use_case, default)
+        # The former default tail ("_[Reasoning mode: code review checklist
+        # + critical reasoning guidelines from system above apply to this
+        # response]_") is gone. Observed live: being the last text before
+        # generation and shaped exactly like a bracketed sign-off, the model
+        # imitated it VERBATIM as a closing line instead of applying it —
+        # the same leak family as plugin text bleeding into agentic
+        # questions. It carried no information the system prompt does not
+        # already state, so the default use case now appends nothing. The
+        # three mode-specific tails above remain: they carry real per-mode
+        # directives and were not observed leaking.
+        return tails.get(use_case, "")
 
     def _is_skeleton_tier_active(self, project_id: str) -> bool:
         """True only if the skeleton tier was actually rendered into Block A THIS turn."""
@@ -7331,8 +7337,14 @@ class ContextBuilder:
 
         # ------------------------------------------------------------------
         # Step 19: Instruction tail adapted to the active use case.
+        # Appended only when non-empty: the default use case now returns ""
+        # (see _build_instruction_tail), and an unconditional append of an
+        # empty string would inflate len(ordered) past the empty-context
+        # guard in Step 20, silently disabling the fallback path.
         # ------------------------------------------------------------------
-        ordered.append(self._build_instruction_tail(active_use_case))
+        _tail = self._build_instruction_tail(active_use_case)
+        if _tail:
+            ordered.append(_tail)
 
         # ------------------------------------------------------------------
         # Step 20: Handle empty context.
@@ -32157,6 +32169,30 @@ class InletOrchestrator:
             self._f._log_debug("prev-assistant: no content to process — skipping")
             return
 
+        # ------------------------------------------------------------------
+        # Region: repair glued code fences (model-side sampling artifact)
+        #
+        # Observed live: the model occasionally emits an opening fence glued
+        # to the preceding prose ("construye asi:```python"), dropping the
+        # newline. Left as-is the malformed fence (a) defeats the fence
+        # regexes that require a newline (_FENCED_CODE_BLOCK_RE and the
+        # '```\n(.*)\n```' extractors), and (b) re-enters the model-visible
+        # history where the pattern can be imitated on later turns. Insert
+        # the missing newline before any ``` not already at line start and
+        # not part of a longer backtick run, and write the repaired text
+        # back into the in-place history (same pattern as /expand below).
+        # Runs BEFORE response_hash so idempotency keys the repaired text.
+        # ------------------------------------------------------------------
+        if self._f.valves.normalize_glued_fences and "```" in assistant_content:
+            _repaired = re.sub(r"([^\n`])(```)", r"\1\n\2", assistant_content)
+            if _repaired != assistant_content:
+                self._f._log_debug(
+                    "prev-assistant: repaired glued code fence(s) in "
+                    "previous response"
+                )
+                assistant_content = _repaired
+                last_assistant["content"] = _repaired
+
         response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
 
         # ------------------------------------------------------------------
@@ -40733,6 +40769,17 @@ class Filter:
         confidence_prompt: str = Field(
             default="\n\nAfter your response, on a new line, output '[Confidence: XX%]'...",
             description="Suffix appended to system prompt to request confidence score.",
+        )
+        normalize_glued_fences: bool = Field(
+            default=True,
+            description=(
+                "Repair code fences glued to preceding prose (e.g. "
+                "'asi:```python') in the previous assistant response during "
+                "the inlet prologue, before hashing, indexing, LTM storage "
+                "and history re-injection. Fixes fence-anchored extraction "
+                "and stops the malformed pattern from re-entering the "
+                "model's visible history where it can be imitated."
+            ),
         )
 
         # ═════════════════════════════════════════════════════════════════════════
