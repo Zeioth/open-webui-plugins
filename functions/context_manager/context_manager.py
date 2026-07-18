@@ -12349,17 +12349,18 @@ class LLMOrchestrator:
                     future.set_exception(exc)
                     # asyncio reports "Future exception was never
                     # retrieved" when a future carrying an exception is
-                    # garbage-collected unread. Deduplicated consumers DO
-                    # read it — but the common case is that there are
-                    # none, and then nobody does: the caller learns of the
-                    # failure through the `raise` below, not through this
-                    # future. The result is a stray traceback logged at
-                    # GC time, detached from its cause and attributed to
-                    # whatever module the collector happened to run under
-                    # (live: it surfaced under sqlalchemy.engine.result,
-                    # a library this failure has nothing to do with).
-                    # Retrieving the exception marks it handled without
-                    # taking it away from any consumer that is waiting.
+                    # garbage-collected unread. Deduplicated consumers
+                    # DO read it — but the common case is that there are
+                    # none, and then nobody does: the caller learns of
+                    # the failure through the `raise` below, not through
+                    # this future. The result is a stray traceback
+                    # logged at GC time, detached from its cause and
+                    # attributed to whatever module the collector
+                    # happened to run under (live: it surfaced under
+                    # sqlalchemy.engine.result, a library this failure
+                    # has nothing to do with). Retrieving the exception
+                    # marks it handled without taking it away from any
+                    # consumer that is waiting.
                     future.add_done_callback(
                         lambda f: not f.cancelled() and f.exception()
                     )
@@ -16960,14 +16961,44 @@ class AgenticOrchestrator:
 
     @staticmethod
     def _render_workspace(steps: List[AgenticStep]) -> str:
-        """Render completed-step digests for the NEXT step's user turn."""
-        done = [s for s in steps if s.status == "done"]
-        if not done:
+        """
+        Render the previous steps for the NEXT step's user turn.
+
+        Every ATTEMPTED step appears, whatever its outcome. Rendering only
+        the successful ones leaves a workspace that reads as a complete
+        chain with gaps in the numbering: a step that sees "Step 1 [done]"
+        followed by "Step 3 [done]" has no way to know step 2 was planned
+        at all, let alone that it failed — so it reasons as if the evidence
+        step 2 was supposed to gather had been gathered and found nothing,
+        which is a different and much stronger claim than "we never
+        looked". Same for the synthesis at the end of the run.
+
+        A skipped or failed step therefore renders as a one-line marker
+        naming what did not happen and why. It costs a handful of tokens
+        and it is the difference between a workspace that is incomplete
+        and a workspace that LIES about being complete.
+
+        Args:
+            steps: Every step of the plan, in execution order.
+
+        Returns:
+            The rendered workspace, or "" when no step was attempted.
+        """
+        attempted = [s for s in steps if s.status != "pending"]
+        if not attempted:
             return ""
         lines = ["## Agentic workspace (previous steps)"]
-        for s in done:
-            lines.append(f"### Step {s.id} — {s.kind} [done]")
-            lines.append(s.digest)
+        for s in attempted:
+            if s.status == "done":
+                lines.append(f"### Step {s.id} — {s.kind} [done]")
+                lines.append(s.digest)
+            else:
+                _why = s.skip_reason or s.status
+                lines.append(f"### Step {s.id} — {s.kind} [{s.status}]")
+                lines.append(
+                    f"_(not completed: {_why} — its evidence is MISSING, "
+                    f"not absent; do not treat this as a negative result)_"
+                )
             lines.append("")
         return "\n".join(lines)
 
@@ -17350,13 +17381,62 @@ class AgenticOrchestrator:
         inserted = 0
         idx = 0
         _budget_skipped: List[int] = []
+        # Region: the closing step is not optional. Skipping runs in
+        # plan order, so the step the budget kills is always the LAST
+        # one — and the last one is the step that turns everything
+        # gathered into a coherent answer. Live: a competition on step 2
+        # ate the budget, "steps 3, 4 of 4 not run" followed, and the
+        # reply was the raw hypothesis list ("causas probables: 1… 2…
+        # 3…") with nothing verified and nothing concluded. The pipeline
+        # had done all the expensive work and then dropped the one step
+        # that made it usable.
+        #
+        # So the closing step gets its own reservation, carved out of
+        # the budget before the loop starts. Every other step competes
+        # for budget - reserve; the closer draws on the full remaining
+        # budget when its turn comes. It is the only step that can still
+        # produce a usable answer from a plan cut short, so it is the
+        # last thing to die, not the first.
+        _closing_kinds = ("analyze", "synthesize", "conclude")
+        _closing_idx = -1
+        for _i in range(len(plan.steps) - 1, -1, -1):
+            if plan.steps[_i].kind in _closing_kinds:
+                _closing_idx = _i
+                break
+        if _closing_idx < 0 and plan.steps:
+            _closing_idx = len(plan.steps) - 1
+        # The reserve is a floor for the other steps, so a reserve at or
+        # above the whole budget starves every one of them from the first
+        # instant — with the budget untouched — and the run degrades to a
+        # single closing step reasoning over an empty workspace. The valves
+        # cannot catch it (they are independent: budget ge=10, reserve
+        # ge=0), so the pairing is resolved here, where both values are
+        # known. Half the budget is the most a floor can claim and still
+        # leave a plan worth closing.
+        _closing_reserve = 0.0
+        if _closing_idx >= 0:
+            _closing_reserve = float(
+                self._f.valves.agentic_closing_reserve_s
+            )
+            _cap = budget / 2.0
+            if _closing_reserve > _cap:
+                self._f._log_debug(
+                    f"🤖 Agentic: closing reserve "
+                    f"{_closing_reserve:.0f}s exceeds half of the "
+                    f"{budget:.0f}s budget — capping at {_cap:.0f}s so the "
+                    f"earlier steps still get their turn"
+                )
+                _closing_reserve = _cap
         while idx < len(plan.steps):
             step = plan.steps[idx]
             if step.status != "pending":
                 idx += 1
                 continue
             remaining = budget - (time.monotonic() - started)
-            if remaining <= 0:
+            # The closer spends the reserve; everyone else stops short
+            # of it.
+            _floor = 0.0 if idx == _closing_idx else _closing_reserve
+            if remaining - _floor <= 0:
                 # Silently dropping planned work is the one thing this loop
                 # must never do quietly: live, the competition on step 3 ate
                 # the budget and steps 4 (verify) and 5 (analyze) vanished
@@ -18211,14 +18291,15 @@ class CommandRouter:
 
     # ── Class constants ────────────────────────────────────────────────────
 
-    # The sentinel _extract_text_for_classification returns when a message
-    # carries no natural language at all. It is not decoration: it is the
-    # structural FACT that the message cannot contain a question, and the
-    # only honest way to consume it is as a fact. Shipped as a constant so
-    # its two readers cannot drift from its writer — they did: the
-    # classifier was handed this string as if it were the user's message
-    # and asked whether the message was "a bare code paste", which it
-    # plainly is not: it is a marker. The model answered accordingly.
+    # The sentinel _extract_text_for_classification returns when a
+    # message carries no natural language at all. It is not decoration:
+    # it is the structural FACT that the message cannot contain a
+    # question, and the only honest way to consume it is as a fact.
+    # Shipped as a constant so its two readers cannot drift from its
+    # writer — they did: the classifier was handed this string as if it
+    # were the user's message and asked whether the message was "a bare
+    # code paste", which it plainly is not: it is a marker. The model
+    # answered accordingly.
     CODE_ONLY_MARKER = "[CODE ONLY — no natural language text]"
 
     _EXPAND_DOTTED = re.compile(r"^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$")
@@ -18625,13 +18706,34 @@ class CommandRouter:
 
         return self._SYMBOL_TOKEN_RE.sub(_mask, query), n_masked
 
-    # Synthetic reference lines generated by this plugin: the merge splice
-    # ("**name:** _(unchanged — N symbols already indexed in the
+    # Synthetic reference lines generated by this plugin: the merge
+    # splice ("**name:** _(unchanged — N symbols already indexed in the
     # SymbolGraph; ...)_") and the silent-ingestion stub ("_[N symbols
     # indexed in the SymbolGraph; ...]_"). Anchored to our own generated
-    # phrasing so legitimate user prose about the SymbolGraph is untouched.
+    # phrasing so legitimate user prose about the SymbolGraph is
+    # untouched. Lines the plugin itself splices into the user turn.
+    # Every consumer of a user message strips these before reading it:
+    # they are OUR text riding inside the user's, and downstream they
+    # are read as if the user had written them.
+    #
+    # Matching the MARK, not the prose. The previous pattern required
+    # the literal run "symbols indexed in the SymbolGraph" / "symbols
+    # already indexed in the SymbolGraph", and the reference line reads
+    # "781 symbols from this file are already indexed in the
+    # SymbolGraph" — six words in between, so it never matched and rode
+    # into the agentic question, the planner, and every step prompt
+    # (live: step 1's goal was "dame el diff que acabas de aplicar
+    # **Pasted_Text_1784329887…"). Both stubs are generated here, a few
+    # hundred lines apart, and drifted the moment one was reworded — so
+    # the pattern now keys on the two invariants each generator actually
+    # emits, and the harness pins the generators against it so the next
+    # reword cannot silently reopen this.
     _REFERENCE_LINE_RE = re.compile(
-        r"^.*symbols (?:already )?indexed in the SymbolGraph.*$",
+        r"^.*(?:"
+        r"indexed in the SymbolGraph"          # both stubs carry this
+        r"|The code is internally available"   # _build_user_stub, para 1
+        r"|If THIS message contains no question"  # _build_user_stub, para 3
+        r").*$",
         re.MULTILINE,
     )
 
@@ -18727,27 +18829,28 @@ class CommandRouter:
             pstate["turn_classification"] = default
             return default
 
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
         # Region: structural certainty — no prose means no question
-        # ------------------------------------------------------------------
-        # El código acota, el modelo propone dentro de límites. Whether a
-        # message is a REQUEST is a pragmatic judgement and belongs to the
-        # LLM. Whether it contains any natural language at all is a fact,
-        # already established deterministically by
+        # --------------------------------------------------------------
+        # El código acota, el modelo propone dentro de límites. Whether
+        # a message is a REQUEST is a pragmatic judgement and belongs to
+        # the LLM. Whether it contains any natural language at all is a
+        # fact, already established deterministically by
         # _extract_text_for_classification: when it returns the marker,
         # every fenced block, every indented run and every synthetic
-        # reference line has been stripped and NOTHING remained. A message
-        # with no prose cannot ask a question — there is nothing to ask it
-        # with.
+        # reference line has been stripped and NOTHING remained. A
+        # message with no prose cannot ask a question — there is nothing
+        # to ask it with.
         #
-        # Asking the LLM anyway does not merely waste a call; it produces a
-        # WRONG answer, because the model is not shown the paste. It is
-        # shown the marker, under a rule that says "is_code_only: true only
-        # if the message is a bare code paste" — and the marker is not a
-        # bare code paste, it is a marker. Measured live (17-jul 20:51): a
-        # pure paste with no accompanying text classified as
-        # code_only=False, has_request=True, intent=explain, and silent
-        # ingestion never fired for a message that was nothing but code.
+        # Asking the LLM anyway does not merely waste a call; it
+        # produces a WRONG answer, because the model is not shown the
+        # paste. It is shown the marker, under a rule that says
+        # "is_code_only: true only if the message is a bare code paste"
+        # — and the marker is not a bare code paste, it is a marker.
+        # Measured live (17-jul 20:51): a pure paste with no
+        # accompanying text classified as code_only=False,
+        # has_request=True, intent=explain, and silent ingestion never
+        # fired for a message that was nothing but code.
         if cleaned == self.CODE_ONLY_MARKER:
             default["is_code_only"] = True
             default["has_request"] = False
@@ -31548,17 +31651,18 @@ class InletOrchestrator:
         if total_span_chars <= budget:
             return messages
 
-        # ── Step 3: replace indexed oversized spans, back to front ──────────
-        # active_blocks is Dict[hash -> CodeBlock] and is ALREADY keyed by
-        # exactly the lookup this loop needs (see the writers:
-        # state.active_blocks[new_block.hash] = new_block). The dict
-        # comprehension that used to be here rebuilt it from `for b in
-        # state.active_blocks`, which iterates the KEYS — so `b` was the
-        # hash string and `b.hash` raised AttributeError: 'str' object has
-        # no attribute 'hash'. Live: the first turn after a fresh paste
-        # died here every time, and the fail-open reported it as a
-        # context-size problem. Every other consumer in the file reads this
-        # dict through .values() or .items(); this was the one that did not.
+        # ── Step 3: replace indexed oversized spans, back to front
+        # ────────── active_blocks is Dict[hash -> CodeBlock] and is
+        # ALREADY keyed by exactly the lookup this loop needs (see the
+        # writers: state.active_blocks[new_block.hash] = new_block). The
+        # dict comprehension that used to be here rebuilt it from `for b
+        # in state.active_blocks`, which iterates the KEYS — so `b` was
+        # the hash string and `b.hash` raised AttributeError: 'str'
+        # object has no attribute 'hash'. Live: the first turn after a
+        # fresh paste died here every time, and the fail-open reported
+        # it as a context-size problem. Every other consumer in the file
+        # reads this dict through .values() or .items(); this was the
+        # one that did not.
         blocks_by_hash = self._f._conversation_state_manager.get(
             project_id
         ).active_blocks
@@ -32483,8 +32587,12 @@ class InletOrchestrator:
     ) -> str:
         """Render one attachment as a labelled block for the message text.
 
-        The filename becomes a header line so the user and the model can refer to
-        the file by name. Code is fenced (for readability and is_code_only's
+        The filename becomes a marked header line so the user and the model can
+        refer to the file by name, while every consumer of the user's turn can
+        tell it apart from what the user actually wrote (see
+        CommandRouter._REFERENCE_LINE_RE — the same diet that removes the
+        already-indexed reference line removes this header). Code is fenced (for
+        readability and is_code_only's
         structural detection); prose is left as plain labelled text. The fence
         length adapts to the content — a source file may contain triple-backtick
         runs that would close a plain ``` fence early and corrupt the rendered
@@ -32502,8 +32610,23 @@ class InletOrchestrator:
             The header line plus the optionally fenced content.
         """
         body_text = content.rstrip()
+        # The header is OUR text inside the user's turn, so it carries
+        # the same mark its sibling _indexed_reference_line carries and
+        # the same diet removes it. Without the mark it is a bare
+        # filename on its own line: the fence strip that every consumer
+        # applies takes the code and leaves the name orphaned in what is
+        # then read as the user's prose — live, the agentic question
+        # became "dame el diff que acabas de
+        # aplicar\n\nPasted_Text_1784329887.txt" and the planner framed
+        # its whole plan around retrieving that file. The name stays
+        # visible to the model (that is what the header is for); it just
+        # stops pretending the user typed it.
+        _header = (
+            f"**{name}:** _(attached file — contents below; symbols are "
+            f"indexed in the SymbolGraph)_"
+        )
         if not is_code:
-            return f"{name}\n{body_text}"
+            return f"{_header}\n{body_text}"
 
         # ── Size the fence to outlast any backtick run inside the content ──
         longest_run = 0
@@ -32515,7 +32638,7 @@ class InletOrchestrator:
             else:
                 current_run = 0
         fence = "`" * max(3, longest_run + 1)
-        return f"{name}\n{fence}{fence_lang}\n{body_text}\n{fence}"
+        return f"{_header}\n{fence}{fence_lang}\n{body_text}\n{fence}"
 
     async def merge_pasted_files(self, body: dict, messages: list) -> list:
         """Splice attached-file content into the last user message and pre-extract symbols.
@@ -39649,9 +39772,39 @@ class Filter:
             ),
         )
         agentic_max_seconds: int = Field(
-            default=480,
+            default=900,
             ge=10,
-            description="Wall-clock budget for the whole pipeline; steps that do not fit are skipped.",
+            description=(
+                "Wall-clock budget for the whole pipeline; steps that do not "
+                "fit are skipped — except the closing step, which draws on "
+                "agentic_closing_reserve_s (see below). "
+                "Sizing: on a --parallel 1 server every auxiliary call queues "
+                "behind the previous one, and the measured cost of a full run "
+                "is pre-planner ~90s + planner ~60s + investigate ~30s + a "
+                "hypothesize step that can spend its whole "
+                "agentic_metacog_max_compete_s ceiling (240s) + verify ~12s + "
+                "analyze ~110s ≈ 540s before any re-plan wave. The old 480s "
+                "default cut the plan on nearly every non-trivial question, "
+                "and what it cut was always the tail — the steps that turn "
+                "evidence into an answer. Raise further for slower hardware; "
+                "lower only if you would rather have a partial plan than wait."
+            ),
+        )
+        agentic_closing_reserve_s: int = Field(
+            default=120,
+            ge=0,
+            description=(
+                "Seconds of agentic_max_seconds held back for the plan's "
+                "closing step (the analyze / synthesize that turns the "
+                "workspace into an answer). Skipping runs in plan order, so "
+                "without a reservation the step the budget kills is always "
+                "the last one — the only one that can still produce a "
+                "coherent answer from a plan cut short. Live: a hypothesis "
+                "competition ate the budget and the reply was the raw "
+                "hypothesis list, unverified and unconcluded. Every other "
+                "step stops short of this floor; the closer spends it. 0 "
+                "restores the old first-come behaviour."
+            ),
         )
         agentic_max_steps: int = Field(
             default=5,
@@ -42177,21 +42330,22 @@ class Filter:
                 )
                 return body
 
-            # 🔥 STATE MANAGEMENT
-            #   Silent ingestion (Modo B: large code-only paste)
-            # ----------------------------------------------------------------
+            # 🔥 STATE MANAGEMENT Silent ingestion (Modo B: large
+            # code-only paste)
+            # ----------------------------------------------------------
             # Region: the optional mode cannot veto the main path.
-            # Silent ingestion is an OPTIMISATION — it indexes a bare paste
-            # without spending a reasoning turn on it. But it sits at line
-            # ~307 of a 732-line inlet, so anything it raises takes the
-            # remaining 58% with it: build_block_a, build_block_b, the
-            # window manager, the whole assembly. The turn then reaches the
-            # model with no code context at all and answers from memory,
-            # which reads to the user as a fast, confidently wrong reply.
+            # Silent ingestion is an OPTIMISATION — it indexes a bare
+            # paste without spending a reasoning turn on it. But it sits
+            # at line ~307 of a 732-line inlet, so anything it raises
+            # takes the remaining 58% with it: build_block_a,
+            # build_block_b, the window manager, the whole assembly. The
+            # turn then reaches the model with no code context at all
+            # and answers from memory, which reads to the user as a
+            # fast, confidently wrong reply.
             #
             # Measured live (17-jul 20:03-20:22, every single turn): a
-            # TypeError in the detector — one missing argument at its call
-            # site — silenced a plugin whose index was fully intact
+            # TypeError in the detector — one missing argument at its
+            # call site — silenced a plugin whose index was fully intact
             # underneath (781 symbols, 6281 edges, 699 docstrings all
             # harvested seconds earlier in the same inlet).
             #
@@ -42546,43 +42700,45 @@ class Filter:
             return body
 
         except Exception as _inlet_err:
-            # Region: fail-open safety net. This try/finally had no except at
-            # all — the outlet has had one for ages — so any exception raised
-            # by the six steps escaped Filter.inlet into the host and KILLED
-            # the user's turn. The shared library raises typed errors after
-            # exhausting retries (LLMTimeoutError, LLMHTTPError,
-            # LLMEmptyResponseError), call_llm re-raises them by design, and
-            # most auxiliary call sites hold no try of their own: one failed
-            # enrichment call was enough. The production incident that
-            # exposed it: a change_summary in the prologue free-ran into the
-            # HTTP timeout three times (retries), then its final
-            # LLMTimeoutError sailed through process_prev_assistant_turn and
-            # aborted the turn the user had by then been awaiting for 45
-            # minutes. Context enrichment must never outrank the message it
-            # exists to enrich: log loudly (logger.warning is not gated by
-            # the debug valve; _log_debug is) and hand the body onward, at
-            # worst partially assembled — a degraded turn instead of a dead
-            # one. CancelledError subclasses BaseException and rightly
-            # bypasses this net.
+            # Region: fail-open safety net. This try/finally had no
+            # except at all — the outlet has had one for ages — so any
+            # exception raised by the six steps escaped Filter.inlet
+            # into the host and KILLED the user's turn. The shared
+            # library raises typed errors after exhausting retries
+            # (LLMTimeoutError, LLMHTTPError, LLMEmptyResponseError),
+            # call_llm re-raises them by design, and most auxiliary call
+            # sites hold no try of their own: one failed enrichment call
+            # was enough. The production incident that exposed it: a
+            # change_summary in the prologue free-ran into the HTTP
+            # timeout three times (retries), then its final
+            # LLMTimeoutError sailed through process_prev_assistant_turn
+            # and aborted the turn the user had by then been awaiting
+            # for 45 minutes. Context enrichment must never outrank the
+            # message it exists to enrich: log loudly (logger.warning is
+            # not gated by the debug valve; _log_debug is) and hand the
+            # body onward, at worst partially assembled — a degraded
+            # turn instead of a dead one. CancelledError subclasses
+            # BaseException and rightly bypasses this net.
             #
             # Region: emergency lean before surrendering the body.
-            # "Fail-open" is only open if what passes through can actually
-            # be served. When the failure lands BEFORE the assembly steps —
-            # anywhere in the six inlet phases — body["messages"] still
-            # holds the raw paste, and handing that to a 131k-context
-            # server is not a degraded turn, it is the same dead turn with
-            # the diagnosis thrown away. Measured live: a TypeError in the
-            # silent-ingestion gate produced "request (425350 tokens)
-            # exceeds the available context size", and the user saw a
-            # context-size error rather than anything pointing at the real
-            # exception two lines above it in the log.
+            # "Fail-open" is only open if what passes through can
+            # actually be served. When the failure lands BEFORE the
+            # assembly steps — anywhere in the six inlet phases —
+            # body["messages"] still holds the raw paste, and handing
+            # that to a 131k-context server is not a degraded turn, it
+            # is the same dead turn with the diagnosis thrown away.
+            # Measured live: a TypeError in the silent-ingestion gate
+            # produced "request (425350 tokens) exceeds the available
+            # context size", and the user saw a context-size error
+            # rather than anything pointing at the real exception two
+            # lines above it in the log.
             #
             # ensure_compressed_user_messages is the right tool for this
-            # last-ditch attempt: it is pure state + string work (no LLM,
-            # no GPU, no await), it is the same function the healthy path
-            # uses, and it degrades to a no-op when there is nothing to
-            # stub. Wrapped in its own try because a fail-open path that
-            # can itself raise is not a safety net.
+            # last-ditch attempt: it is pure state + string work (no
+            # LLM, no GPU, no await), it is the same function the
+            # healthy path uses, and it degrades to a no-op when there
+            # is nothing to stub. Wrapped in its own try because a
+            # fail-open path that can itself raise is not a safety net.
             import traceback
 
             logger.warning(
@@ -42591,10 +42747,11 @@ class Filter:
             )
             self._log_debug(traceback.format_exc())
             try:
-                # project_id is assigned inside the try above, so a failure
-                # in the first few lines can land here before it exists.
-                # Without a project there is no state to stub against and
-                # nothing to do — that is a clean no-op, not an error.
+                # project_id is assigned inside the try above, so a
+                # failure in the first few lines can land here before it
+                # exists. Without a project there is no state to stub
+                # against and nothing to do — that is a clean no-op, not
+                # an error.
                 _pid = locals().get("project_id")
                 _msgs = body.get("messages") or []
                 _st = (
@@ -42618,18 +42775,18 @@ class Filter:
                     f"passing the body through untouched"
                 )
 
-            # Region: tell the USER the turn is degraded.
-            # Everything above this point talks to the log. The person
-            # waiting for an answer sees none of it — they see a reply
-            # that arrives fast and reads like the model never saw their
-            # code, because it did not: the failure skipped the assembly
-            # steps, so no Block A, no Block B, no symbol context. Without
-            # a word here, a broken enrichment layer is indistinguishable
-            # from a bad model, and the incident that produced this patch
-            # cost several turns of confusion before the traceback was
-            # read. The emitter is still bound (the finally below clears
-            # it), and _emit_status swallows its own failures, so this
-            # cannot re-break the net.
+            # Region: tell the USER the turn is degraded. Everything
+            # above this point talks to the log. The person waiting for
+            # an answer sees none of it — they see a reply that arrives
+            # fast and reads like the model never saw their code,
+            # because it did not: the failure skipped the assembly
+            # steps, so no Block A, no Block B, no symbol context.
+            # Without a word here, a broken enrichment layer is
+            # indistinguishable from a bad model, and the incident that
+            # produced this patch cost several turns of confusion before
+            # the traceback was read. The emitter is still bound (the
+            # finally below clears it), and _emit_status swallows its
+            # own failures, so this cannot re-break the net.
             try:
                 await self._emit_status(
                     "⚠️ Context enrichment failed — answering without code "
