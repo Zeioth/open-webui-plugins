@@ -17444,6 +17444,19 @@ class AgenticOrchestrator:
         while idx < len(plan.steps):
             step = plan.steps[idx]
             if step.status != "pending":
+                # Region: surface skipped steps so the trace reads as a
+                # contiguous 1..N run. A step marked non-pending before the
+                # loop reaches it (early-exit, or a planner pre-mark)
+                # otherwise vanishes from the user-facing status stream,
+                # leaving gaps like "1/4, 3/4" that read as a malfunction.
+                # A 'done' here is a cache hit that already logged its own
+                # line, so only 'skipped' is announced.
+                if step.status == "skipped":
+                    await self._f._emit_status(
+                        f"🤖 Agentic step {step.display_no}/"
+                        f"{len(plan.steps)} ({step.kind}): skipped — "
+                        f"{step.skip_reason or 'not needed'}"
+                    )
                 idx += 1
                 continue
 
@@ -17474,6 +17487,14 @@ class AgenticOrchestrator:
                         self._f._log_debug(
                             f"🤖 Agentic step {step.display_no} (verify_dynamic): "
                             "skipped — gated on need (#10)"
+                        )
+                        # This path advances idx directly and never reaches
+                        # the top-of-loop announcer, so emit here too — no
+                        # skipped step should be silent to the user.
+                        await self._f._emit_status(
+                            f"🤖 Agentic step {step.display_no}/"
+                            f"{len(plan.steps)} (verify_dynamic): skipped — "
+                            f"gated on need (#10)"
                         )
                         idx += 1
                         continue
@@ -17704,9 +17725,17 @@ class AgenticOrchestrator:
                     f"plan (claims kept, plan continues)"
                 )
                 control["resolved"] = False
+            # Region: gate the whole check on agentic_early_exit. 'off' never
+            # evaluates it; 'shadow' evaluates and logs a would-skip while
+            # still running every step; 'on' performs the skip. Skipping is
+            # high-risk — a premature step-1 exit drops the steps that would
+            # have corrected it — so this valve exists to A/B it and defaults
+            # off the actual-skip path.
+            _ee_mode = self._f.valves.agentic_early_exit
             _exit_ok = False
             if (
-                control["resolved"]
+                _ee_mode in ("shadow", "on")
+                and control["resolved"]
                 and control["confidence"]
                 >= self._f.valves.agentic_early_exit_confidence
             ):
@@ -17726,17 +17755,29 @@ class AgenticOrchestrator:
                         f"{control['confidence']:.2f})"
                     )
             if _exit_ok:
+                # In 'shadow' the would-skip set is computed and logged but
+                # every step still runs; only 'on' mutates status. This keeps
+                # the two arms comparable: from the same gate decision the run
+                # either executes the full plan (shadow) or the trimmed plan
+                # (on).
                 skipped_ids = []
                 for later in plan.steps[idx + 1 :]:
                     if later.status == "pending" and later.kind != "verify":
-                        later.status = "skipped"
-                        later.skip_reason = "early-exit"
                         skipped_ids.append(later.id)
-                if skipped_ids:
+                        if _ee_mode == "on":
+                            later.status = "skipped"
+                            later.skip_reason = "early-exit"
+                if skipped_ids and _ee_mode == "on":
                     self._f._log_debug(
                         f"🤖 Agentic: early exit at step {step.id} "
                         f"(confidence {control['confidence']:.2f}) — "
                         f"skipping steps {skipped_ids}"
+                    )
+                elif skipped_ids:
+                    self._f._log_debug(
+                        f"🤖 [EARLY-EXIT-SHADOW] step {step.id} would exit "
+                        f"(confidence {control['confidence']:.2f}) — would "
+                        f"skip steps {skipped_ids}; running them anyway"
                     )
 
             # -- ASK_USER: stateless clarification short-circuit -----------
@@ -39736,8 +39777,24 @@ class Filter:
             ge=0.5,
             le=1.0,
             description=(
-                "A step declaring resolved=true with confidence at or above "
-                "this floor skips the remaining reasoning steps ('verify' steps are never skipped)."
+                "Confidence floor for early-exit (only consulted when "
+                "agentic_early_exit is 'shadow' or 'on'). A step declaring "
+                "resolved=true at or above this floor may skip the remaining "
+                "non-verify steps ('verify' steps are never skipped)."
+            ),
+        )
+        agentic_early_exit: str = Field(
+            default="shadow",
+            description=(
+                "Whether a high-confidence step may skip the remaining "
+                "non-verify steps. 'off' never evaluates the gate (every "
+                "step always runs). 'shadow' (default) evaluates the gate "
+                "and logs what it WOULD skip via [EARLY-EXIT-SHADOW] while "
+                "still running every step — safe telemetry for A/B testing. "
+                "'on' performs the skip (the original behaviour). Skipping "
+                "cuts cost but measurably corrupts runs when a premature "
+                "step-1 exit drops the steps that would have corrected it, "
+                "so it defaults off the actual-skip path."
             ),
         )
         agentic_metacog_reinforce: str = Field(
