@@ -2241,7 +2241,6 @@ class StaticEvidence(BaseModel):
     # 3. Path memberships & data flow
     # ═══════════════════════════════════════════════════════════════════════════
 
-
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. Objective score
     # ═══════════════════════════════════════════════════════════════════════════
@@ -6006,7 +6005,6 @@ class ContextBuilder:
     # ═══════════════════════════════════════════════════════════════════════
     # 2.5 — Resolve /expand hints in CoT output
     # ═══════════════════════════════════════════════════════════════════════
-
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2.6 — Docstring provider
@@ -11615,7 +11613,10 @@ class LongTermMemory:
             The model name/path, or "unknown" when neither source exists.
         """
         emb = getattr(self._f, "embedder", None)
-        for attr_chain in (("model_card_data", "base_model"), ("tokenizer", "name_or_path")):
+        for attr_chain in (
+            ("model_card_data", "base_model"),
+            ("tokenizer", "name_or_path"),
+        ):
             obj = emb
             for a in attr_chain:
                 obj = getattr(obj, a, None)
@@ -11716,9 +11717,7 @@ class LongTermMemory:
             # that the model is one called unknown; a real-vs-unavailable
             # pairing must fall back to the dimension check alone instead of
             # bricking the LTM over a name nobody has.
-            _name_comparable = (
-                stored_model != "unknown" and current_model != "unknown"
-            )
+            _name_comparable = stored_model != "unknown" and current_model != "unknown"
             if (
                 _name_comparable and stored_model != current_model
             ) or stored_dim != current_dim:
@@ -11917,9 +11916,7 @@ class LLMOrchestrator:
         # how the role already overrides Block A's general guidance.
         _aligned = f"{_prelim}\n\n---\n\n{system_prompt}"
         if response_format is not None:
-            _suffix = (
-                getattr(self._f.valves, "confidence_prompt", "") or ""
-            ).strip()
+            _suffix = (getattr(self._f.valves, "confidence_prompt", "") or "").strip()
             if _suffix and _suffix in _prelim:
                 _aligned += (
                     "\n\nThis call returns ONLY the JSON object requested "
@@ -12071,13 +12068,9 @@ class LLMOrchestrator:
         # adherence without the loop coming back.
         _extra_body: Optional[Dict[str, Any]] = None
         if response_format is not None:
-            _dry = float(
-                getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0
-            )
+            _dry = float(getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0)
         else:
-            _dry = float(
-                getattr(self._f.valves, "llm_long_dry_multiplier", 0.0) or 0.0
-            )
+            _dry = float(getattr(self._f.valves, "llm_long_dry_multiplier", 0.0) or 0.0)
             if _dry > 0 and (max_tokens or 0) < int(
                 getattr(self._f.valves, "llm_long_dry_min_tokens", 1200)
             ):
@@ -12296,9 +12289,7 @@ class LLMOrchestrator:
                                     f"normalized ({_how}: fence/truncation "
                                     f"handled at the producer)"
                                 )
-                                result.content = json.dumps(
-                                    _norm, ensure_ascii=False
-                                )
+                                result.content = json.dumps(_norm, ensure_ascii=False)
                                 content = result.content
                     if content:
                         await self._f._llm_cache.set(cache_key, result)
@@ -12383,8 +12374,6 @@ class LLMOrchestrator:
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. CrossEncoder helper (keep full code decision)
     # ═══════════════════════════════════════════════════════════════════════════
-
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -12584,7 +12573,6 @@ class AgenticEvidenceLedger:
         self._f = filter_ref
         self.claims: List[LedgerClaim] = []
 
-
     def _gap_is_non_indexable(self, gap: str) -> bool:
         """Return True when a reported gap asks for data the SymbolIndex
         structurally does not hold, so the NEEDS mechanism should not insert
@@ -12769,7 +12757,7 @@ class AgenticEvidenceLedger:
         if not isinstance(raw_claims, list):
             raw_claims = []
 
-        # Region: control signals (resolution / needs / re-plan markers)
+        # Region: control signals (early-exit / re-plan markers)
         try:
             control["resolved"] = bool(data.get("resolved", False))
             # Track whether the step actually REPORTED a confidence, separate
@@ -12839,9 +12827,7 @@ class AgenticEvidenceLedger:
         so it cannot disambiguate.
         """
         try:
-            existing = {
-                " ".join(c.text.casefold().split()) for c in self.claims
-            }
+            existing = {" ".join(c.text.casefold().split()) for c in self.claims}
             restored = 0
             for d in json.loads(claims_json):
                 d = dict(d)
@@ -12977,10 +12963,7 @@ class AgenticEvidenceLedger:
             )
             return False
         step.output = (
-            prose
-            + "\n\n```json\n"
-            + json.dumps(data, ensure_ascii=False)
-            + "\n```"
+            prose + "\n\n```json\n" + json.dumps(data, ensure_ascii=False) + "\n```"
         )
         self._f._log_debug(
             f"🤖 Ledger: step {step.id} claims tail recovered "
@@ -14522,9 +14505,7 @@ if __name__ == "__main__":
         tests = cached["tests"] if cached else ""
         source = "cached-tests" if tests else "llm"
         if not tests:
-            tests = await self._elicit_tests(
-                body, verdict, reasons, aligned_prefix
-            )
+            tests = await self._elicit_tests(body, verdict, reasons, aligned_prefix)
             if not tests:
                 return f"- {qid}: harness generation failed — no dynamic evidence"
 
@@ -15221,8 +15202,8 @@ class AgenticPreplanner:
                     label="agentic_preplanner",
                     enable_thinking=False,
                     total_timeout=(
-                        float(_pp_to) if (_pp_to := self._f.valves
-                                          .agentic_preplanner_timeout_s) > 0
+                        float(_pp_to)
+                        if (_pp_to := self._f.valves.agentic_preplanner_timeout_s) > 0
                         else None
                     ),
                 )
@@ -15470,8 +15451,8 @@ class AgenticPlanner:
                 label="agentic_planner",
                 enable_thinking=False,
                 total_timeout=(
-                    float(_pl_to) if (_pl_to := self._f.valves
-                                      .agentic_planner_timeout_s) > 0
+                    float(_pl_to)
+                    if (_pl_to := self._f.valves.agentic_planner_timeout_s) > 0
                     else None
                 ),
             )
@@ -15961,8 +15942,11 @@ class AgenticSynthesisComposer:
             Markdown block for dynamic_injections.
         """
         done = [s for s in plan.steps if s.status == "done"]
+        early_exit = [s for s in plan.steps if s.skip_reason == "early-exit"]
         problems = [
-            s for s in plan.steps if s.status in ("failed", "skipped")
+            s
+            for s in plan.steps
+            if s.status in ("failed", "skipped") and s.skip_reason != "early-exit"
         ]
 
         header = (
@@ -16160,6 +16144,13 @@ class AgenticSynthesisComposer:
                         )
                         lines.append(f"- ✓ {c.text}{cited}{suffix}")
             lines.append("")
+        if early_exit:
+            ids = ", ".join(str(s.id) for s in early_exit)
+            lines.append("Early exit:")
+            lines.append(
+                f"- Steps {ids} skipped: an earlier step resolved the "
+                f"question with high confidence."
+            )
         if problems:
             lines.append("Unresolved:")
             for s in problems:
@@ -16730,9 +16721,7 @@ class AgenticOrchestrator:
             "(behavioral claims)"
         )
         try:
-            await self._dyn.run_dynamic_step(
-                step, self._ledger, project_id, ""
-            )
+            await self._dyn.run_dynamic_step(step, self._ledger, project_id, "")
         except Exception as e:
             self._f._log_debug(f"🤖 Agentic: gate dynamic verify failed ({e})")
         return True
@@ -16775,8 +16764,7 @@ class AgenticOrchestrator:
             return 0
         _prefix = status_prefix or f"🤖 Agentic step {step.display_no}"
         await self._f._emit_status(
-            f"{_prefix} · metacog: static falsification of "
-            f"{len(claims)} claim(s)"
+            f"{_prefix} · metacog: static falsification of " f"{len(claims)} claim(s)"
         )
 
         # Region: per-claim falsification
@@ -16865,12 +16853,17 @@ class AgenticOrchestrator:
 
         The recovery only fires when the tail was genuinely absent
         (tail_missing) and no claims were registered — a legitimate
-        '{"claims": []}' tail never triggers it. Applied identically to
+        '{"claims": []}' tail never triggers it. Note the asymmetry with
+        the early-exit veto: a recovered "resolved" is neutralised only
+        for TRUNCATED steps, whose reasoning stopped mid-sentence; a
+        complete step ended by its own decision, so its recovered
+        self-assessment keeps its authority. Applied identically to
         main-loop and re-plan wave steps so both feed the ledger.
 
         Args:
             step: A step with status "done".
             project_id: Current project identifier.
+            remaining: Seconds left in the pipeline budget.
 
         Returns:
             The step's control signals (see extract_and_validate).
@@ -16879,9 +16872,7 @@ class AgenticOrchestrator:
         if (
             control.get("tail_missing")
             and not self._ledger.claims_for(step.id)
-            and await self._ledger.recover_claims_tail(
-                step, project_id
-            )
+            and await self._ledger.recover_claims_tail(step, project_id)
         ):
             control = self._ledger.extract_and_validate(step, project_id)
         return control
@@ -17189,11 +17180,14 @@ class AgenticOrchestrator:
         Shared entry point for the manual /agent command and the automatic
         trigger. Adds two control behaviours on top of plain execution:
 
-        - ASK_USER: a step reporting a genuine ambiguity ends the
-          pipeline and surfaces the clarifying question as the answer.
-          This is the only early termination — a step's own confidence
-          never skips the rest of the plan (GOVERNING PRINCIPLES: the
-          planner sizes the plan; every step runs).
+        - Early exit: a step whose control signals declare the question
+          resolved with confidence ≥ agentic_early_exit_confidence marks
+          every remaining pending step (except future "verify" kinds) as
+          skipped — hard evidence is never traded for speed, reasoning is.
+          A step that was TRUNCATED at the token cap can never authorise
+          this, however confident its recovered tail sounds: its reasoning
+          stopped mid-sentence, so the self-assessment describes an
+          analysis that does not exist.
         - NEEDS insertion: a step reporting a concrete gap inserts ONE
           extra investigate step right after itself (insertion only, never
           reordering), bounded by agentic_max_steps and two insertions per
@@ -17365,8 +17359,7 @@ class AgenticOrchestrator:
             project_id,
             preplan_brief=preplan_brief,
             difficulty=str(
-                getattr(self._preplanner, "last_stats", {}).get("difficulty", "")
-                or ""
+                getattr(self._preplanner, "last_stats", {}).get("difficulty", "") or ""
             ),
         )
         self._f._log_debug(
@@ -17578,9 +17571,7 @@ class AgenticOrchestrator:
                 "ask": "",
             }
             if step.status == "done":
-                control = await self._extract_with_recovery(
-                    step, project_id
-                )
+                control = await self._extract_with_recovery(step, project_id)
 
                 # -- 0030: proactive hypothesis competition ------------
                 # A hypothesize step enumerated rival root causes; compete
@@ -17678,26 +17669,75 @@ class AgenticOrchestrator:
                     f"step {new_step.id} ({new_step.goal[:60]})"
                 )
 
-            # -- no early exit --------------------------------------------
-            # A step reporting resolved=true with high confidence used to
-            # skip the rest of the plan. That is removed (GOVERNING
-            # PRINCIPLES): the planner sizes the plan from the question's
-            # complexity, and a step's own "I'm confident, skip the rest"
-            # is exactly the confident-and-wrong failure the hypothesis
-            # competition and verify exist to catch — the last quality-
-            # degrading skip in the pipeline. Every planned step now runs.
+            # -- early exit: hard evidence steps are never skipped ---------
+            # Evidence gate: skipping the rest of the plan on a step's own
+            # say-so requires that its claims survived citation validation —
+            # at least one claim whose cited qids all resolved against the
+            # SymbolIndex, and no claim with a structurally invalid citation
+            # or a refuted call relation (the same invalidity predicate the
+            # difficulty gate uses). A fabricated identifier anywhere in the
+            # step is exactly the confabulation signal this ledger exists to
+            # catch — measured live: a step-1 early exit citing a
+            # non-existent symbol skipped the two steps that would have
+            # corrected it. A resolution with no claims at all keeps running
+            # too: an exit that skips verification must be backed.
             #
-            # This also resolves a second-order regression: once the token
-            # cap became an anti-runaway ceiling (0062), step 1 stopped
-            # truncating, which had been the accidental veto keeping early
-            # exit from firing. With the cap raised, healthy step-1
-            # investigate steps resolved at >= agentic_early_exit_confidence
-            # and skipped hypothesize/analyze outright — observed live:
-            # "early exit at step 1 (confidence 0.90) — skipping steps
-            # [2, 3, 4]". Removing the mechanism is the fix; the planner's
-            # step count stands. control["resolved"]/["confidence"] are
-            # still parsed (telemetry, difficulty gate) but no longer gate
-            # execution.
+            # Truncation is a separate, structural veto. A step that hit
+            # agentic_step_max_tokens stopped mid-sentence: its reasoning is
+            # incomplete BY CONSTRUCTION, whatever it says about itself.
+            # Before claims-tail recovery (0024) such a step simply had no
+            # tail, so control stayed at the defaults and the plan carried
+            # on — truncation vetoed the early exit by accident. Recovery
+            # removed the accident: it re-asks for the tail and the model
+            # dutifully fills in "resolved": true over an analysis it never
+            # finished. Measured live (19:37): step 1 was cut off mid-
+            # sentence, recovered 8 claims, and exited at confidence 0.85,
+            # skipping the hypothesize and analyze steps that existed to
+            # challenge it. Recovering EVIDENCE is the point; inheriting a
+            # self-assessment made over a severed reasoning chain is not.
+            if getattr(step, "truncated", False) and control.get("resolved"):
+                self._f._log_debug(
+                    f"🤖 Agentic: early-exit vetoed at step {step.id} — the "
+                    f"step was TRUNCATED at the token cap, so its reasoning "
+                    f"is incomplete by construction; a recovered "
+                    f"'resolved' cannot authorise skipping the rest of the "
+                    f"plan (claims kept, plan continues)"
+                )
+                control["resolved"] = False
+            _exit_ok = False
+            if (
+                control["resolved"]
+                and control["confidence"]
+                >= self._f.valves.agentic_early_exit_confidence
+            ):
+                _step_claims = self._ledger.claims_for(step.id)
+                _bad = [
+                    c
+                    for c in _step_claims
+                    if self._ledger._structural_invalid_qids(c) or c.invalid_relations
+                ]
+                _good = [c for c in _step_claims if c.valid_qids and c not in _bad]
+                _exit_ok = bool(_good) and not _bad
+                if not _exit_ok:
+                    self._f._log_debug(
+                        f"🤖 Agentic: early-exit vetoed at step {step.id} — "
+                        f"claims={len(_step_claims)} valid={len(_good)} "
+                        f"invalid={len(_bad)} (confidence "
+                        f"{control['confidence']:.2f})"
+                    )
+            if _exit_ok:
+                skipped_ids = []
+                for later in plan.steps[idx + 1 :]:
+                    if later.status == "pending" and later.kind != "verify":
+                        later.status = "skipped"
+                        later.skip_reason = "early-exit"
+                        skipped_ids.append(later.id)
+                if skipped_ids:
+                    self._f._log_debug(
+                        f"🤖 Agentic: early exit at step {step.id} "
+                        f"(confidence {control['confidence']:.2f}) — "
+                        f"skipping steps {skipped_ids}"
+                    )
 
             # -- ASK_USER: stateless clarification short-circuit -----------
             # A step reporting a genuine ambiguity ends the pipeline early
@@ -17759,6 +17799,17 @@ class AgenticOrchestrator:
                     )
                     _ge_mode = "off"
 
+        if _ge_mode in ("shadow", "on") and any(
+            s.skip_reason == "early-exit" for s in plan.steps
+        ):
+            # A step resolved the question with high confidence and the
+            # pipeline deliberately skipped the rest — asking "is there
+            # something better?" over that partial workspace would mostly
+            # re-propose the skipped work.
+            self._f._log_debug(
+                "🤖 Agentic: generative evaluation skipped (early-exit fired)"
+            )
+            _ge_mode = "off"
         while (
             _ge_mode in ("shadow", "on")
             and _replans_used < self._f.valves.agentic_max_replans
@@ -17798,9 +17849,7 @@ class AgenticOrchestrator:
                     broker=self._broker,
                 )
                 if wstep.status == "done":
-                    _wctl = await self._extract_with_recovery(
-                        wstep, project_id
-                    )
+                    _wctl = await self._extract_with_recovery(wstep, project_id)
                     # Same reinforcement gate as main-loop steps: shadow
                     # counting must include waves or the calibration lies.
                     if _mc_gate_mode in ("shadow", "on"):
@@ -17909,8 +17958,6 @@ class AgenticOrchestrator:
                 ] = [c.__dict__ for c in self._ledger.claims[:_cap]]
             except Exception:
                 pass
-
-
 
 
 class MultiPhasePlanner:
@@ -18327,9 +18374,7 @@ class CommandRouter:
             The scores on the [0,1] scale, all transformed the same way.
         """
         vals = [float(v) for v in raw_scores]
-        if not self._ce_returns_logits and any(
-            v < 0.0 or v > 1.0 for v in vals
-        ):
+        if not self._ce_returns_logits and any(v < 0.0 or v > 1.0 for v in vals):
             self._ce_returns_logits = True
             self._f._log_debug(
                 "CrossEncoder: score outside [0,1] observed — model resolves "
@@ -18493,9 +18538,7 @@ class CommandRouter:
             data = json.loads(response)
         except Exception:
             try:
-                data, _how = self._f._meta_reasoning._parse_json_contract(
-                    response
-                )
+                data, _how = self._f._meta_reasoning._parse_json_contract(response)
             except Exception:
                 data = None
             if data is None:
@@ -18606,8 +18649,8 @@ class CommandRouter:
     # reword cannot silently reopen this.
     _REFERENCE_LINE_RE = re.compile(
         r"^.*(?:"
-        r"indexed in the SymbolGraph"          # both stubs carry this
-        r"|The code is internally available"   # _build_user_stub, para 1
+        r"indexed in the SymbolGraph"  # both stubs carry this
+        r"|The code is internally available"  # _build_user_stub, para 1
         r"|If THIS message contains no question"  # _build_user_stub, para 3
         r").*$",
         re.MULTILINE,
@@ -18816,9 +18859,7 @@ class CommandRouter:
                 # depth). Whatever lets raw text through — a partial
                 # deploy, a crash inside the normalizer — the local ladder
                 # costs nothing and keeps the classification alive.
-                data, _how = self._f._meta_reasoning._parse_json_contract(
-                    raw or ""
-                )
+                data, _how = self._f._meta_reasoning._parse_json_contract(raw or "")
                 if data is None:
                     raise
                 self._f._log_debug(
@@ -25072,7 +25113,6 @@ class MetacognitiveReasoningEngine:
 
         return obj_score, combined, coverage_score
 
-
     # ═══════════════════════════════════════════════════════════════════════
     # 2. Pre-evidence design and prediction generation
     # ═══════════════════════════════════════════════════════════════════════
@@ -25324,12 +25364,9 @@ class MetacognitiveReasoningEngine:
         _ev_fp = ""
         if evidence is not None:
             _ev_fp = "|".join(
-                sorted(evidence.symbols_found)
-                + sorted(evidence.call_relations_valid)
+                sorted(evidence.symbols_found) + sorted(evidence.call_relations_valid)
             )
-        h_hash = hashlib.md5(
-            (hypothesis + "\x00" + _ev_fp).encode()
-        ).hexdigest()[:16]
+        h_hash = hashlib.md5((hypothesis + "\x00" + _ev_fp).encode()).hexdigest()[:16]
         if h_hash in self._design_cache:
             self._f._log_debug(f"design_critical_experiment: cache hit ({h_hash})")
             return self._design_cache[h_hash]
@@ -25415,7 +25452,11 @@ class MetacognitiveReasoningEngine:
             f"design_critical_experiment: {len(design.critical_claims)} critical, "
             f"{len(design.supportive_claims)} supportive, "
             f"{len(design.unknown_claims)} unknown"
-            + (" (salvaged from a truncated/fenced response)" if how == "salvaged" else "")
+            + (
+                " (salvaged from a truncated/fenced response)"
+                if how == "salvaged"
+                else ""
+            )
         )
         return design
 
@@ -25503,7 +25544,11 @@ class MetacognitiveReasoningEngine:
         self._f._log_debug(
             f"generate_predictions: {len(predictions)} prediction(s) "
             f"(skeleton_ctx={'yes' if skeleton_ctx else 'no'})"
-            + (" (salvaged from a truncated/fenced response)" if how == "salvaged" else "")
+            + (
+                " (salvaged from a truncated/fenced response)"
+                if how == "salvaged"
+                else ""
+            )
         )
         return predictions
 
@@ -26177,8 +26222,8 @@ class MetacognitiveReasoningEngine:
                 # actually resolved, not what the classifier promised was
                 # resolvable. Active Learning above keeps the DECLARED
                 # number on purpose: it reasons about the unknown bucket.
-                current_coverage, _cov_res, _cov_tot = (
-                    self._compute_effective_coverage(design, evidence, project_id)
+                current_coverage, _cov_res, _cov_tot = self._compute_effective_coverage(
+                    design, evidence, project_id
                 )
                 falsified, reason = self.is_falsified(
                     evidence,
@@ -28528,10 +28573,7 @@ class EnrichmentTasks:
             if summary:
                 now = time.time()
                 self._f._block_change_summaries[block_hash] = (summary.strip(), now)
-                if (
-                    len(self._f._block_change_summaries)
-                    > self._f._MAX_CHANGE_SUMMARIES
-                ):
+                if len(self._f._block_change_summaries) > self._f._MAX_CHANGE_SUMMARIES:
                     self._f._block_change_summaries.popitem(last=False)
 
                 def _write():
@@ -39689,6 +39731,15 @@ class Filter:
                 "0 disables the tool loop."
             ),
         )
+        agentic_early_exit_confidence: float = Field(
+            default=0.85,
+            ge=0.5,
+            le=1.0,
+            description=(
+                "A step declaring resolved=true with confidence at or above "
+                "this floor skips the remaining reasoning steps ('verify' steps are never skipped)."
+            ),
+        )
         agentic_metacog_reinforce: str = Field(
             default="shadow",
             description=(
@@ -42195,9 +42246,7 @@ class Filter:
                 if _merged:
                     # File path: merge_pasted_files already populated the
                     # channel. raw_symbols is only needed for the abort check.
-                    raw_symbols = [
-                        s for mfb in _merged for s in mfb.get("symbols", [])
-                    ]
+                    raw_symbols = [s for mfb in _merged for s in mfb.get("symbols", [])]
                 else:
                     # Inline path: strip fences, parse the clean source, and
                     # publish it on the same channel as a single block.
@@ -42206,9 +42255,7 @@ class Filter:
                         _spans = await self._code_blocks.get_code_spans(user_query)
                         if _spans:
                             _code_for_extraction = "\n\n".join(
-                                CodeBlockManager._strip_fence_markers(
-                                    user_query[s:e]
-                                )
+                                CodeBlockManager._strip_fence_markers(user_query[s:e])
                                 for s, e in _spans
                             )
                     except Exception:
@@ -42217,9 +42264,7 @@ class Filter:
                     _guessed_lang = SignatureExtractor._guess_language(
                         None, _code_for_extraction
                     )
-                    _lang = (
-                        _guessed_lang if _guessed_lang != "unknown" else "python"
-                    )
+                    _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
 
                     raw_symbols = []
                     if HAS_TREE_SITTER:
@@ -42362,9 +42407,7 @@ class Filter:
                     ).hexdigest()[:12]
 
                     messages.append({"role": "assistant", "content": response})
-                    messages[:] = self._inlet_orch.ensure_last_message_is_user(
-                        messages
-                    )
+                    messages[:] = self._inlet_orch.ensure_last_message_is_user(messages)
 
                     # -- record the ack hash so next turn's prologue skips
                     #    it: the code is already indexed, and caching the ack
@@ -42560,9 +42603,7 @@ class Filter:
                 # an error.
                 _pid = locals().get("project_id")
                 _msgs = body.get("messages") or []
-                _st = (
-                    self._conversation_state_manager.get(_pid) if _pid else None
-                )
+                _st = self._conversation_state_manager.get(_pid) if _pid else None
                 if _msgs and _st is not None:
                     _leaned = self._history_compressor.ensure_compressed_user_messages(
                         _msgs, _st, _pid
