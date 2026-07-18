@@ -2241,6 +2241,7 @@ class StaticEvidence(BaseModel):
     # 3. Path memberships & data flow
     # ═══════════════════════════════════════════════════════════════════════════
 
+
     # ═══════════════════════════════════════════════════════════════════════════
     # 4. Objective score
     # ═══════════════════════════════════════════════════════════════════════════
@@ -6005,6 +6006,7 @@ class ContextBuilder:
     # ═══════════════════════════════════════════════════════════════════════
     # 2.5 — Resolve /expand hints in CoT output
     # ═══════════════════════════════════════════════════════════════════════
+
 
     # ═══════════════════════════════════════════════════════════════════════
     # 2.6 — Docstring provider
@@ -11613,10 +11615,7 @@ class LongTermMemory:
             The model name/path, or "unknown" when neither source exists.
         """
         emb = getattr(self._f, "embedder", None)
-        for attr_chain in (
-            ("model_card_data", "base_model"),
-            ("tokenizer", "name_or_path"),
-        ):
+        for attr_chain in (("model_card_data", "base_model"), ("tokenizer", "name_or_path")):
             obj = emb
             for a in attr_chain:
                 obj = getattr(obj, a, None)
@@ -11717,7 +11716,9 @@ class LongTermMemory:
             # that the model is one called unknown; a real-vs-unavailable
             # pairing must fall back to the dimension check alone instead of
             # bricking the LTM over a name nobody has.
-            _name_comparable = stored_model != "unknown" and current_model != "unknown"
+            _name_comparable = (
+                stored_model != "unknown" and current_model != "unknown"
+            )
             if (
                 _name_comparable and stored_model != current_model
             ) or stored_dim != current_dim:
@@ -11916,7 +11917,9 @@ class LLMOrchestrator:
         # how the role already overrides Block A's general guidance.
         _aligned = f"{_prelim}\n\n---\n\n{system_prompt}"
         if response_format is not None:
-            _suffix = (getattr(self._f.valves, "confidence_prompt", "") or "").strip()
+            _suffix = (
+                getattr(self._f.valves, "confidence_prompt", "") or ""
+            ).strip()
             if _suffix and _suffix in _prelim:
                 _aligned += (
                     "\n\nThis call returns ONLY the JSON object requested "
@@ -12068,9 +12071,13 @@ class LLMOrchestrator:
         # adherence without the loop coming back.
         _extra_body: Optional[Dict[str, Any]] = None
         if response_format is not None:
-            _dry = float(getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0)
+            _dry = float(
+                getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0
+            )
         else:
-            _dry = float(getattr(self._f.valves, "llm_long_dry_multiplier", 0.0) or 0.0)
+            _dry = float(
+                getattr(self._f.valves, "llm_long_dry_multiplier", 0.0) or 0.0
+            )
             if _dry > 0 and (max_tokens or 0) < int(
                 getattr(self._f.valves, "llm_long_dry_min_tokens", 1200)
             ):
@@ -12289,7 +12296,9 @@ class LLMOrchestrator:
                                     f"normalized ({_how}: fence/truncation "
                                     f"handled at the producer)"
                                 )
-                                result.content = json.dumps(_norm, ensure_ascii=False)
+                                result.content = json.dumps(
+                                    _norm, ensure_ascii=False
+                                )
                                 content = result.content
                     if content:
                         await self._f._llm_cache.set(cache_key, result)
@@ -12376,6 +12385,8 @@ class LLMOrchestrator:
     # ═══════════════════════════════════════════════════════════════════════════
 
 
+
+
 @dataclass
 class AgenticStep:
     """Single unit of work in the agentic pipeline (Fase 1: fixed kinds)."""
@@ -12443,6 +12454,7 @@ class AgenticEvidenceLedger:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
         self.claims: List[LedgerClaim] = []
+
 
     def _gap_is_non_indexable(self, gap: str) -> bool:
         """Return True when a reported gap asks for data the SymbolIndex
@@ -12698,7 +12710,9 @@ class AgenticEvidenceLedger:
         so it cannot disambiguate.
         """
         try:
-            existing = {" ".join(c.text.casefold().split()) for c in self.claims}
+            existing = {
+                " ".join(c.text.casefold().split()) for c in self.claims
+            }
             restored = 0
             for d in json.loads(claims_json):
                 d = dict(d)
@@ -12844,7 +12858,10 @@ class AgenticEvidenceLedger:
             )
             return False
         step.output = (
-            prose + "\n\n```json\n" + json.dumps(data, ensure_ascii=False) + "\n```"
+            prose
+            + "\n\n```json\n"
+            + json.dumps(data, ensure_ascii=False)
+            + "\n```"
         )
         self._f._log_debug(
             f"🤖 Ledger: step {step.id} claims tail recovered "
@@ -15091,8 +15108,8 @@ class AgenticPreplanner:
                     label="agentic_preplanner",
                     enable_thinking=False,
                     total_timeout=(
-                        float(_pp_to)
-                        if (_pp_to := self._f.valves.agentic_preplanner_timeout_s) > 0
+                        float(_pp_to) if (_pp_to := self._f.valves
+                                          .agentic_preplanner_timeout_s) > 0
                         else None
                     ),
                 )
@@ -15340,8 +15357,8 @@ class AgenticPlanner:
                 label="agentic_planner",
                 enable_thinking=False,
                 total_timeout=(
-                    float(_pl_to)
-                    if (_pl_to := self._f.valves.agentic_planner_timeout_s) > 0
+                    float(_pl_to) if (_pl_to := self._f.valves
+                                      .agentic_planner_timeout_s) > 0
                     else None
                 ),
             )
@@ -16801,7 +16818,9 @@ class AgenticOrchestrator:
         if (
             control.get("tail_missing")
             and not self._ledger.claims_for(step.id)
-            and await self._ledger.recover_claims_tail(step, project_id, remaining)
+            and await self._ledger.recover_claims_tail(
+                step, project_id, remaining
+            )
         ):
             control = self._ledger.extract_and_validate(step, project_id)
         return control
@@ -17309,7 +17328,8 @@ class AgenticOrchestrator:
             project_id,
             preplan_brief=preplan_brief,
             difficulty=str(
-                getattr(self._preplanner, "last_stats", {}).get("difficulty", "") or ""
+                getattr(self._preplanner, "last_stats", {}).get("difficulty", "")
+                or ""
             ),
         )
         self._f._log_debug(
@@ -17425,7 +17445,9 @@ class AgenticOrchestrator:
         # leave a plan worth closing.
         _closing_reserve = 0.0
         if _closing_idx >= 0:
-            _closing_reserve = float(self._f.valves.agentic_closing_reserve_s)
+            _closing_reserve = float(
+                self._f.valves.agentic_closing_reserve_s
+            )
             _cap = budget / 2.0
             if _closing_reserve > _cap:
                 self._f._log_debug(
@@ -18043,6 +18065,8 @@ class AgenticOrchestrator:
                 pass
 
 
+
+
 class MultiPhasePlanner:
     """Generates the multi‑phase protocol instructions injected into the
     system prompt when the response budget is tight, and appends wrap‑up
@@ -18457,7 +18481,9 @@ class CommandRouter:
             The scores on the [0,1] scale, all transformed the same way.
         """
         vals = [float(v) for v in raw_scores]
-        if not self._ce_returns_logits and any(v < 0.0 or v > 1.0 for v in vals):
+        if not self._ce_returns_logits and any(
+            v < 0.0 or v > 1.0 for v in vals
+        ):
             self._ce_returns_logits = True
             self._f._log_debug(
                 "CrossEncoder: score outside [0,1] observed — model resolves "
@@ -18621,7 +18647,9 @@ class CommandRouter:
             data = json.loads(response)
         except Exception:
             try:
-                data, _how = self._f._meta_reasoning._parse_json_contract(response)
+                data, _how = self._f._meta_reasoning._parse_json_contract(
+                    response
+                )
             except Exception:
                 data = None
             if data is None:
@@ -18732,8 +18760,8 @@ class CommandRouter:
     # reword cannot silently reopen this.
     _REFERENCE_LINE_RE = re.compile(
         r"^.*(?:"
-        r"indexed in the SymbolGraph"  # both stubs carry this
-        r"|The code is internally available"  # _build_user_stub, para 1
+        r"indexed in the SymbolGraph"          # both stubs carry this
+        r"|The code is internally available"   # _build_user_stub, para 1
         r"|If THIS message contains no question"  # _build_user_stub, para 3
         r").*$",
         re.MULTILINE,
@@ -18942,7 +18970,9 @@ class CommandRouter:
                 # depth). Whatever lets raw text through — a partial
                 # deploy, a crash inside the normalizer — the local ladder
                 # costs nothing and keeps the classification alive.
-                data, _how = self._f._meta_reasoning._parse_json_contract(raw or "")
+                data, _how = self._f._meta_reasoning._parse_json_contract(
+                    raw or ""
+                )
                 if data is None:
                     raise
                 self._f._log_debug(
@@ -25182,6 +25212,7 @@ class MetacognitiveReasoningEngine:
 
         return obj_score, combined, coverage_score
 
+
     # ═══════════════════════════════════════════════════════════════════════
     # 2. Pre-evidence design and prediction generation
     # ═══════════════════════════════════════════════════════════════════════
@@ -25433,9 +25464,12 @@ class MetacognitiveReasoningEngine:
         _ev_fp = ""
         if evidence is not None:
             _ev_fp = "|".join(
-                sorted(evidence.symbols_found) + sorted(evidence.call_relations_valid)
+                sorted(evidence.symbols_found)
+                + sorted(evidence.call_relations_valid)
             )
-        h_hash = hashlib.md5((hypothesis + "\x00" + _ev_fp).encode()).hexdigest()[:16]
+        h_hash = hashlib.md5(
+            (hypothesis + "\x00" + _ev_fp).encode()
+        ).hexdigest()[:16]
         if h_hash in self._design_cache:
             self._f._log_debug(f"design_critical_experiment: cache hit ({h_hash})")
             return self._design_cache[h_hash]
@@ -25521,11 +25555,7 @@ class MetacognitiveReasoningEngine:
             f"design_critical_experiment: {len(design.critical_claims)} critical, "
             f"{len(design.supportive_claims)} supportive, "
             f"{len(design.unknown_claims)} unknown"
-            + (
-                " (salvaged from a truncated/fenced response)"
-                if how == "salvaged"
-                else ""
-            )
+            + (" (salvaged from a truncated/fenced response)" if how == "salvaged" else "")
         )
         return design
 
@@ -25613,11 +25643,7 @@ class MetacognitiveReasoningEngine:
         self._f._log_debug(
             f"generate_predictions: {len(predictions)} prediction(s) "
             f"(skeleton_ctx={'yes' if skeleton_ctx else 'no'})"
-            + (
-                " (salvaged from a truncated/fenced response)"
-                if how == "salvaged"
-                else ""
-            )
+            + (" (salvaged from a truncated/fenced response)" if how == "salvaged" else "")
         )
         return predictions
 
@@ -26319,8 +26345,8 @@ class MetacognitiveReasoningEngine:
                 # actually resolved, not what the classifier promised was
                 # resolvable. Active Learning above keeps the DECLARED
                 # number on purpose: it reasons about the unknown bucket.
-                current_coverage, _cov_res, _cov_tot = self._compute_effective_coverage(
-                    design, evidence, project_id
+                current_coverage, _cov_res, _cov_tot = (
+                    self._compute_effective_coverage(design, evidence, project_id)
                 )
                 falsified, reason = self.is_falsified(
                     evidence,
@@ -26557,7 +26583,8 @@ class MetacognitiveReasoningEngine:
                 else "all falsified across all iterations"
             )
             self._f._log_debug(
-                f"compete_hypotheses: no valid hypothesis survived — " f"{_why_none}"
+                f"compete_hypotheses: no valid hypothesis survived — "
+                f"{_why_none}"
             )
             # Record total-failure in performance history so
             # _get_adaptive_strategy can learn from this failure mode.
@@ -28710,7 +28737,10 @@ class EnrichmentTasks:
             if summary:
                 now = time.time()
                 self._f._block_change_summaries[block_hash] = (summary.strip(), now)
-                if len(self._f._block_change_summaries) > self._f._MAX_CHANGE_SUMMARIES:
+                if (
+                    len(self._f._block_change_summaries)
+                    > self._f._MAX_CHANGE_SUMMARIES
+                ):
                     self._f._block_change_summaries.popitem(last=False)
 
                 def _write():
@@ -39751,7 +39781,7 @@ class Filter:
             ),
         )
         agentic_budget_enabled: bool = Field(
-            default=False,
+            default=True,
             description=(
                 "Master switch for the pipeline's wall-clock budget. Off "
                 "means no clock at all: every planned step runs to "
@@ -42426,7 +42456,9 @@ class Filter:
                 if _merged:
                     # File path: merge_pasted_files already populated the
                     # channel. raw_symbols is only needed for the abort check.
-                    raw_symbols = [s for mfb in _merged for s in mfb.get("symbols", [])]
+                    raw_symbols = [
+                        s for mfb in _merged for s in mfb.get("symbols", [])
+                    ]
                 else:
                     # Inline path: strip fences, parse the clean source, and
                     # publish it on the same channel as a single block.
@@ -42435,7 +42467,9 @@ class Filter:
                         _spans = await self._code_blocks.get_code_spans(user_query)
                         if _spans:
                             _code_for_extraction = "\n\n".join(
-                                CodeBlockManager._strip_fence_markers(user_query[s:e])
+                                CodeBlockManager._strip_fence_markers(
+                                    user_query[s:e]
+                                )
                                 for s, e in _spans
                             )
                     except Exception:
@@ -42444,7 +42478,9 @@ class Filter:
                     _guessed_lang = SignatureExtractor._guess_language(
                         None, _code_for_extraction
                     )
-                    _lang = _guessed_lang if _guessed_lang != "unknown" else "python"
+                    _lang = (
+                        _guessed_lang if _guessed_lang != "unknown" else "python"
+                    )
 
                     raw_symbols = []
                     if HAS_TREE_SITTER:
@@ -42587,7 +42623,9 @@ class Filter:
                     ).hexdigest()[:12]
 
                     messages.append({"role": "assistant", "content": response})
-                    messages[:] = self._inlet_orch.ensure_last_message_is_user(messages)
+                    messages[:] = self._inlet_orch.ensure_last_message_is_user(
+                        messages
+                    )
 
                     # -- record the ack hash so next turn's prologue skips
                     #    it: the code is already indexed, and caching the ack
@@ -42783,7 +42821,9 @@ class Filter:
                 # an error.
                 _pid = locals().get("project_id")
                 _msgs = body.get("messages") or []
-                _st = self._conversation_state_manager.get(_pid) if _pid else None
+                _st = (
+                    self._conversation_state_manager.get(_pid) if _pid else None
+                )
                 if _msgs and _st is not None:
                     _leaned = self._history_compressor.ensure_compressed_user_messages(
                         _msgs, _st, _pid
