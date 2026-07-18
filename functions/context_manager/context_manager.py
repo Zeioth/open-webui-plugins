@@ -12109,8 +12109,8 @@ class LLMOrchestrator:
             # Region: bystander isolation. A task cancelled while awaiting a
             # future CANCELS that future (asyncio.Task semantics) — and this
             # future is SHARED. Without the shield, one cancelled consumer
-            # (wait_for timeout in the agentic executor, stop_all() on a
-            # background task) poisons everyone: the future flips to
+            # (e.g. stop_all() on a background task; historically also the
+            # agentic executor's wait_for, removed since) poisons everyone: the future flips to
             # cancelled, the producer's set_result raises InvalidStateError
             # inside its own success path, its except handler's
             # set_exception raises a second one, and every other consumer is
@@ -12385,6 +12385,135 @@ class LLMOrchestrator:
     # ═══════════════════════════════════════════════════════════════════════════
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GOVERNING PRINCIPLES OF THE AGENTIC PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════
+# These principles were distilled from measured runs of this pipeline on a
+# --parallel 1 llama.cpp server (log-verified, not theoretical) and they
+# govern every change made below. Read them before touching anything.
+#
+# THE MAXIM — integrity before time.
+#   The scientific method only works if every executed step runs to
+#   completion. A generation must NEVER be cut before it emits its claims
+#   contract: the structured claims block sits at the very END of a step's
+#   output, so any interruption — by clock, by token cap, or by anything
+#   else — loses exactly the structured part while the prose above the cut
+#   survives. The result is indistinguishable from a step that had nothing
+#   to claim, the verify stage goes evidence-blind, and the corruption is
+#   silent. There is no acceptable percentage of this.
+#
+# PRINCIPLE 1 — cancelling any step destroys more value than it saves.
+#   Measured: cutting a step saved ~28s and cost ~1.5 quality points
+#   (~0.054 quality/s destroyed), while even the cheapest useful step
+#   produces ~0.10 quality/s. Cancellation is always the worst lever.
+#   Consequence: time budgets are respected by NOT PLANNING or NOT
+#   STARTING non-essential work — never by interrupting work in flight.
+#
+# PRINCIPLE 2 — two kinds of ceilings, only one is legitimate.
+#   ANTI-HANG guards (call_llm's 900s connection backstop, the
+#   pre-planner/planner ceilings at ~2.5-3x a healthy call) only ever
+#   fire on a genuinely stuck call. They protect the single slot and
+#   never touch healthy work: they stay. QUALITY-BUDGETS (wall-clock
+#   deadlines threaded into executors, competition deadlines, token caps
+#   sized to typical output) cut healthy-but-slow work: they were
+#   removed from this pipeline. Before adding any ceiling, classify it.
+#   A ceiling a healthy run can meet is a quality-budget in disguise.
+#
+# PRINCIPLE 3 — conditional insurance is the cheapest quality there is.
+#   The devil's advocate fires rarely (measured freq ~0.10) and costs
+#   ~1s expected per competition, yet it attacks the single most
+#   expensive failure the pipeline can produce: a confident-and-wrong
+#   hypothesis promoted to the final analysis. The tiebreaker behaves
+#   the same way (freq ~0.15). Mechanisms whose cost is conditional and
+#   whose value is asymmetric are never overhead — protect them.
+#
+# PRINCIPLE 4 — the system self-regulates; trust measured signals only.
+#   The hypothesis competition converges on iteration 1 in the designed
+#   common case (best score >= threshold) and spends extra iterations
+#   only where rivals are genuinely close. Depth is throttled by the
+#   convergence threshold acting on a MEASURED score — never by fixed
+#   step-count rules, estimated-ROI gates, or fitted constants. Raising
+#   hard iteration ceilings is inert; tuning the threshold is the lever.
+#
+# PRINCIPLE 5 — the static context is already paid for.
+#   With a stable Block A prefix the KV cache makes the marginal cost of
+#   a turn the dynamic delta plus generation only. Letting a step finish
+#   costs, at the margin, only the extra tokens it generates. Combined
+#   with Principle 1 this means: generosity in completion is cheap,
+#   interruption is expensive. The only real price of generating more is
+#   holding the slot — which is exactly what anti-hang guards cover.
+# ═══════════════════════════════════════════════════════════════════════════
+# QUANTIZATION & CALIBRATION — how model precision tunes this pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+# Quantization does NOT change how many steps to run or how many claims to
+# want. It changes ONE thing: how much the model's SELF-REPORTED confidence
+# (llm_conf) can be trusted. Everything below follows from that.
+#
+# THE REAL AXIS — trust the deterministic half more as precision drops.
+#   Each competing hypothesis is scored combined = obj_weight*obj_score +
+#   llm_weight*llm_conf. obj_score is a MEASURED SymbolGraph signal
+#   (deterministic, real). llm_conf is the model grading its own homework.
+#   Quantization compresses the weight matrix, which makes the model
+#   OVERCONFIDENT — it reports a higher notch than the evidence warrants.
+#   So the lower the precision, the more this pipeline must lean on
+#   obj_score and discount llm_conf. That is the whole quant story; it is
+#   NOT a step-count story.
+#
+# OBSERVED CALIBRATION (Q4_K_M, the current deployment).
+#   The model reports llm_conf only in {0.80, 0.85, 0.90, 0.95, 1.00} —
+#   a five-notch dial, not a calibrated probability, and it sits high.
+#   Two knobs already absorb this and are the ones to retune per quant:
+#     * agentic_metacog_threshold — 0.90 on Q4 (see its valve doc). At
+#       0.85 the model's favourite notch clears the bar alone and the
+#       refinement machinery never runs; 0.90 forces real obj_score to
+#       converge. Relax toward 0.85 / 0.75 as calibration improves.
+#     * agentic_obj_weight — the obj/llm balance, valve-wired at the
+#       competition call site (llm_weight is its complement). 0.5 baseline
+#       today; the honest quant lever is to raise it at lower precision
+#       (lean deterministic) and let it fall back toward 0.5 as the dial
+#       spreads out. Calibrate from the llm_conf notch histogram in logs.
+#
+#   Repetition-loop escape probability at repeat-penalty 1.04 / temp 0.66
+#   (per DeepSeek's numerical analysis; same figures as the DRY-loop note
+#   below in the ledger). This is why truncation-by-loop is a Q4 problem:
+#       FP16:   100% escape,  0%     degradation
+#       Q8_0:    99% escape,  0%     degradation
+#       Q6_K:    95% escape,  0.5%   degradation
+#       Q5_K_M:  85% escape,  1%     degradation
+#       Q4_K_M:  70-85% escape, 1-2% degradation   <- current
+#   On Q8 the loop essentially disappears; claims-tail recovery and the
+#   anti-runaway token ceiling both become rare-path safety nets there.
+#
+# WHY THERE IS NO "IDEAL STEPS PER QUANT" CONSTANT HERE — read before
+# adding one. It is tempting (an external analysis argued "3 steps for
+# Q4/Q6, 5 for Q8") to hardcode a step count per precision. We do not,
+# for three reasons:
+#   1. It violates THE MAXIM and Principle 1. "Use 3 steps, more hurts"
+#      is step-skipping by estimated ROI — the exact degradation this
+#      pipeline was rebuilt to remove.
+#   2. Step count is not ours to fix. The PLANNER chooses steps (2-8,
+#      agentic_max_steps) from the QUESTION's complexity; competition
+#      depth is set by convergence on a MEASURED score (Principle 4). A
+#      per-quant constant overrides both with a number that ignores the
+#      question.
+#   3. Its premise is a statistical error. The "confidence = p^N collapses
+#      with more claims" argument assumes claims are independent Bernoulli
+#      trials; they are not — they share one graph, one evidence base, one
+#      analyze pass, and are strongly correlated. And the ledger already
+#      VALIDATES EACH CITATION deterministically, so what matters is the
+#      count of claims with valid citations, not a product of invented
+#      per-claim probabilities. More verified claims is more evidence, full
+#      stop.
+#
+# NOTE (verify in logs): an external read of old logs concluded "only the
+# analyze step emits claims; investigate steps just keep prose." That was
+# almost certainly the 2500-token truncation artifact — investigate steps
+# hit the cap before their end-positioned claims block. With the cap now an
+# anti-runaway ceiling (8000), investigate steps are expected to emit their
+# claims normally. Confirm on the next real run.
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -12741,15 +12870,16 @@ class AgenticEvidenceLedger:
         """Claims emitted by one step."""
         return [c for c in self.claims if c.step_id == step_id]
 
-    _RECOVERY_MIN_REMAINING_S = 45.0
-    _RECOVERY_MAX_TOKENS = 800
-    _RECOVERY_TIMEOUT_S = 30.0
+    # Ceiling for the recovery re-ask. Anti-runaway only: the output is
+    # the claims JSON block and nothing else, so a cap a healthy re-ask
+    # can reach re-truncates the very tail this call exists to recover
+    # (the repair ladder then salvages only a prefix of the array).
+    _RECOVERY_MAX_TOKENS = 2000
 
     async def recover_claims_tail(
         self,
         step: AgenticStep,
         project_id: str,
-        remaining: float,
     ) -> bool:
         """
         Re-ask for the claims JSON tail a step never emitted.
@@ -12785,16 +12915,13 @@ class AgenticEvidenceLedger:
         Args:
             step: A done-but-truncated step whose output holds prose only.
             project_id: Current project identifier.
-            remaining: Seconds left in the pipeline budget — below
-                _RECOVERY_MIN_REMAINING_S the recovery is skipped with a
-                log line (one aux call plus re-extraction must fit). The
-                call itself is capped at _RECOVERY_TIMEOUT_S, which must
-                stay BELOW that floor: asking for 60s while only requiring
-                45s of budget was incoherent, and while total_timeout was
-                a no-op (see call_llm) it let one recovery run for 100s
-                and cost the run its verify and analyze steps. The work is
-                ~9s when the server is free; 30s is generous for it and
-                still leaves the floor meaningful.
+                The call is unclocked (GOVERNING PRINCIPLES): it
+                previously carried a 30s total_timeout while the same
+                call measured ~100s on a busy --parallel 1 slot — a cap
+                below the healthy cost of the work guarantees the exact
+                'failed after 1 attempts' errors observed live, turning
+                the repair path into dead weight. call_llm's anti-hang
+                backstop is the only ceiling.
 
         Returns:
             True when a well-formed tail was appended to step.output and
@@ -12804,13 +12931,6 @@ class AgenticEvidenceLedger:
             return False
         prose = (step.output or "").strip()
         if not prose:
-            return False
-        if remaining < self._RECOVERY_MIN_REMAINING_S:
-            self._f._log_debug(
-                f"🤖 Ledger: step {step.id} claims tail recovery skipped — "
-                f"only {remaining:.0f}s remain "
-                f"(< {self._RECOVERY_MIN_REMAINING_S:.0f}s)"
-            )
             return False
         _cause = (
             "was cut off by a token limit BEFORE it could emit"
@@ -12838,7 +12958,6 @@ class AgenticEvidenceLedger:
                 max_tokens=self._RECOVERY_MAX_TOKENS,
                 temperature=0.1,
                 label="claims_tail_recovery",
-                total_timeout=min(remaining, self._RECOVERY_TIMEOUT_S),
                 response_format={"type": "json_object"},
                 enable_thinking=False,
             )
@@ -13499,7 +13618,6 @@ class AgenticStaticVerifier:
         ledger: "AgenticEvidenceLedger",
         project_id: str,
         aligned_prefix: str,
-        timeout_s: float,
         truncated_steps: Optional[List[AgenticStep]] = None,
     ) -> None:
         """
@@ -13508,12 +13626,17 @@ class AgenticStaticVerifier:
         output (which the workspace then shows to later steps and to the
         synthesis).
 
+        Verification is unclocked (GOVERNING PRINCIPLES): it used to
+        receive the remaining pipeline budget and could degrade to the
+        deterministic fallback purely because a clock ran out. Verify is
+        an essential step — degrading it for time trades hard evidence
+        for nothing.
+
         Args:
             step: The verify step (mutated: output/status/seconds).
             ledger: Evidence ledger holding the claims to verify.
             project_id: Current project identifier.
             aligned_prefix: Head-capped preliminary system prompt.
-            timeout_s: Remaining wall-clock budget.
             truncated_steps: Steps whose generation hit the token cap. Used
                 only to explain an empty ledger: their claims were cut off,
                 not withheld, so the verdict is "degraded", not "done".
@@ -13551,7 +13674,7 @@ class AgenticStaticVerifier:
             return
 
         # Region: elicit typed checks (LLM) or fall back deterministically
-        checks = await self._elicit_checks(claims, aligned_prefix, timeout_s)
+        checks = await self._elicit_checks(claims, aligned_prefix)
         mode = "llm-elicited"
         if checks is None:
             checks = self._fallback_checks(claims)
@@ -13567,28 +13690,26 @@ class AgenticStaticVerifier:
     # ── Check elicitation ────────────────────────────────────────────────
 
     async def _elicit_checks(
-        self, claims: List[LedgerClaim], aligned_prefix: str, timeout_s: float
+        self, claims: List[LedgerClaim], aligned_prefix: str
     ) -> Optional[List[Dict[str, Any]]]:
         """One aligned JSON-contract call; None on any failure (→ fallback)."""
-        if timeout_s <= 0:
-            return None
         block = "\n".join(
             f"{n}. {c.text} (cites: {', '.join(c.qids) or '—'})"
             for n, c in enumerate(claims, 1)
         )
         prompt = self._CHECKS_CONTRACT.replace("{claims_block}", block)
         try:
-            response = await asyncio.wait_for(
-                self._f._llm_orchestrator.call_llm(
-                    prompt=prompt,
-                    system_prompt=aligned_prefix,
-                    model_override=self._f.valves.cot_model_level2,
-                    max_tokens=self._f.valves.agentic_verify_max_tokens,
-                    temperature=0.1,
-                    label="agentic_verify",
-                    enable_thinking=False,
-                ),
-                timeout=timeout_s,
+            # Direct call under call_llm's anti-hang backstop only: a
+            # clock-cut here silently swapped the LLM-elicited checks for
+            # the blunter deterministic fallback (GOVERNING PRINCIPLES).
+            response = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=aligned_prefix,
+                model_override=self._f.valves.cot_model_level2,
+                max_tokens=self._f.valves.agentic_verify_max_tokens,
+                temperature=0.1,
+                label="agentic_verify",
+                enable_thinking=False,
             )
         except Exception:
             return None
@@ -14210,7 +14331,6 @@ if __name__ == "__main__":
         ledger: "AgenticEvidenceLedger",
         project_id: str,
         aligned_prefix: str,
-        timeout_s: float,
     ) -> None:
         """
         Execute a verify_dynamic step in place.
@@ -14219,6 +14339,10 @@ if __name__ == "__main__":
         valid citations (planner symbol hints first), runs the
         extract+stub+execute flow per target, appends ⚗ dynamic-evidence
         claims, and renders a report as the step output.
+
+        Unclocked (GOVERNING PRINCIPLES): targets are never dropped for
+        time. The target count is bounded by agentic_dynamic_max_targets
+        and each sandbox execution by agentic_exec_timeout_s (anti-hang).
         """
         started = time.monotonic()
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
@@ -14251,12 +14375,8 @@ if __name__ == "__main__":
 
         report_lines = [f"## Dynamic verification ({len(targets)} target(s))"]
         for qid in targets:
-            remaining = timeout_s - (time.monotonic() - started)
-            if remaining <= 0:
-                report_lines.append(f"- {qid}: skipped (budget exhausted)")
-                continue
             line = await self._verify_target(
-                qid, ledger, project_id, aligned_prefix, remaining, step.id
+                qid, ledger, project_id, aligned_prefix, step.id
             )
             report_lines.append(line)
 
@@ -14272,7 +14392,6 @@ if __name__ == "__main__":
         ledger: "AgenticEvidenceLedger",
         project_id: str,
         aligned_prefix: str,
-        timeout_s: float,
     ) -> None:
         """
         Re-verify the direct callers of the symbols under discussion (Fase 7).
@@ -14282,8 +14401,9 @@ if __name__ == "__main__":
         target symbols and runs the SAME per-target flow as verify_dynamic on
         each: a caller that already has a cached harness re-executes at zero
         LLM cost (incremental regression — the whole point of the qid-keyed
-        harness cache); a caller without one is elicited once, up to the
-        budget. Bounded by agentic_regression_max_callers.
+        harness cache); a caller without one is elicited once. Bounded by
+        agentic_regression_max_callers; unclocked otherwise (GOVERNING
+        PRINCIPLES — callers are never dropped for time).
 
         Args:
             step: The verify_regression step (mutated in place).
@@ -14291,7 +14411,6 @@ if __name__ == "__main__":
                 plus the planner hints; dynamic claims are appended).
             project_id: Current project identifier.
             aligned_prefix: Head-capped preliminary system prompt.
-            timeout_s: Remaining wall-clock budget.
         """
         started = time.monotonic()
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
@@ -14335,12 +14454,8 @@ if __name__ == "__main__":
             f"## Regression over {len(callers)} caller(s) of " f"{', '.join(seeds)}"
         ]
         for qid in callers:
-            remaining = timeout_s - (time.monotonic() - started)
-            if remaining <= 0:
-                report_lines.append(f"- {qid}: skipped (budget exhausted)")
-                continue
             line = await self._verify_target(
-                qid, ledger, project_id, aligned_prefix, remaining, step.id
+                qid, ledger, project_id, aligned_prefix, step.id
             )
             report_lines.append(line)
 
@@ -14376,7 +14491,6 @@ if __name__ == "__main__":
         ledger: "AgenticEvidenceLedger",
         project_id: str,
         aligned_prefix: str,
-        timeout_s: float,
         step_id: int,
     ) -> str:
         """Classify → tests (cache or LLM) → execute → evidence. Returns a
@@ -14409,7 +14523,7 @@ if __name__ == "__main__":
         source = "cached-tests" if tests else "llm"
         if not tests:
             tests = await self._elicit_tests(
-                body, verdict, reasons, aligned_prefix, timeout_s
+                body, verdict, reasons, aligned_prefix
             )
             if not tests:
                 return f"- {qid}: harness generation failed — no dynamic evidence"
@@ -14436,7 +14550,6 @@ if __name__ == "__main__":
         verdict: str,
         reasons: List[str],
         aligned_prefix: str,
-        timeout_s: float,
     ) -> str:
         """One aligned LLM call producing the tests section ('' on failure)."""
         prompt = (
@@ -14445,17 +14558,17 @@ if __name__ == "__main__":
             .replace("{reasons}", "; ".join(reasons))
         )
         try:
-            response = await asyncio.wait_for(
-                self._f._llm_orchestrator.call_llm(
-                    prompt=prompt,
-                    system_prompt=aligned_prefix,
-                    model_override=self._f.valves.cot_model_level2,
-                    max_tokens=self._f.valves.agentic_harness_max_tokens,
-                    temperature=0.2,
-                    label="agentic_harness",
-                    enable_thinking=False,
-                ),
-                timeout=timeout_s,
+            # Direct call under call_llm's anti-hang backstop only: a
+            # clock-cut here silently returned an empty harness and left
+            # the target without dynamic evidence (GOVERNING PRINCIPLES).
+            response = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=aligned_prefix,
+                model_override=self._f.valves.cot_model_level2,
+                max_tokens=self._f.valves.agentic_harness_max_tokens,
+                temperature=0.2,
+                label="agentic_harness",
+                enable_thinking=False,
             )
         except Exception:
             return ""
@@ -15718,7 +15831,6 @@ class AgenticStepExecutor:
         step: AgenticStep,
         aligned_prefix: str,
         workspace: str,
-        timeout_s: float,
         project_id: str = "",
         broker: Optional["AgenticToolBroker"] = None,
     ) -> None:
@@ -15738,55 +15850,47 @@ class AgenticStepExecutor:
             aligned_prefix: Head-capped preliminary system prompt, sent
                 verbatim as the system prompt (KV prefix invariant).
             workspace: Rendered digests of previous steps for the user turn.
-            timeout_s: Remaining wall-clock budget for this step.
             project_id: Current project identifier (tool resolution).
             broker: Tool broker; None disables tool rounds.
         """
-        # Region: guard — no budget left
-        if timeout_s <= 0:
-            step.status = "skipped"
-            step.skip_reason = "budget"
-            return
-
         # Region: tool-round loop (round 0 = the base call)
+        # ------------------------------------------------------------------
+        # This method used to receive a wall-clock budget (timeout_s) and
+        # enforced it in two ways: skipping before the loop and killing the
+        # generation mid-flight with asyncio.wait_for → "(step timed out)".
+        # Both are gone, per the GOVERNING PRINCIPLES above (THE MAXIM and
+        # Principle 1): a mid-generation kill loses exactly the claims
+        # contract at the end of the output, producing prose without claims
+        # — indistinguishable from a step that had nothing to claim — and
+        # silently blinding the verify stage. A step that starts, finishes.
+        # The only ceiling that remains is call_llm's own anti-hang
+        # backstop, which fires exclusively on a genuinely stuck
+        # connection, never on healthy-but-slow work (Principle 2).
+        # ------------------------------------------------------------------
         max_rounds = max(0, self._f.valves.agentic_tool_rounds_max)
         prompt = self.build_prompt(step, workspace)
         started = time.monotonic()
         response = ""
         for round_no in range(max_rounds + 1):
-            remaining = timeout_s - (time.monotonic() - started)
-            if remaining <= 0:
-                step.seconds = time.monotonic() - started
-                step.status = "failed"
-                step.output = "(step timed out)"
-                return
             try:
                 # return_meta: the claims contract lives at the very END of
                 # the step output, so a generation that hits the cap loses it
                 # entirely. Without the library's exact finish_reason the
                 # ledger cannot tell that from a step that legitimately had
                 # nothing to claim, and reports both as "no claims recorded".
-                _meta = await asyncio.wait_for(
-                    self._f._llm_orchestrator.call_llm(
-                        prompt=prompt,
-                        system_prompt=aligned_prefix,
-                        model_override=self._f.valves.cot_model_level2,
-                        max_tokens=self._f.valves.agentic_step_max_tokens,
-                        temperature=0.3,
-                        label="agentic_step",
-                        enable_thinking=False,
-                        return_meta=True,
-                    ),
-                    timeout=remaining,
+                _meta = await self._f._llm_orchestrator.call_llm(
+                    prompt=prompt,
+                    system_prompt=aligned_prefix,
+                    model_override=self._f.valves.cot_model_level2,
+                    max_tokens=self._f.valves.agentic_step_max_tokens,
+                    temperature=0.3,
+                    label="agentic_step",
+                    enable_thinking=False,
+                    return_meta=True,
                 )
                 response = _meta.content if _meta else None
                 if _meta is not None and _meta.truncated:
                     step.truncated = True
-            except asyncio.TimeoutError:
-                step.seconds = time.monotonic() - started
-                step.status = "failed"
-                step.output = "(step timed out)"
-                return
             except Exception as e:
                 step.seconds = time.monotonic() - started
                 step.status = "failed"
@@ -16404,7 +16508,6 @@ class AgenticOrchestrator:
     async def _maybe_compete_hypothesize(
         self,
         step: AgenticStep,
-        remaining: float,
         project_id: str,
         status_prefix: str = "",
     ) -> bool:
@@ -16467,14 +16570,6 @@ class AgenticOrchestrator:
             )
             return False
 
-        if remaining < self._f.valves.agentic_metacog_min_remaining_s:
-            self._f._log_debug(
-                f"🤖 Agentic: step {step.id} hypothesize qualifies for "
-                f"competition ({n_found} rivals) but only {remaining:.0f}s "
-                f"remain — skipped"
-            )
-            return False
-
         # Region: run the competition
         await self._f._emit_status(f"{status_prefix}: competing {n_found} hypotheses")
         self._f._log_debug(
@@ -16523,8 +16618,19 @@ class AgenticOrchestrator:
         # AGENTIC-RUN telemetry reported a 16.0s hypothesize step for a
         # competition that had just burned 199 seconds, and the budget
         # skips downstream looked unexplained.
-        _cap = float(getattr(self._f.valves, "agentic_metacog_max_compete_s", 0))
-        _compete_budget = min(remaining, _cap) if _cap > 0 else remaining
+        # The competition runs unclocked. It previously received a
+        # wall-clock ceiling (agentic_metacog_max_compete_s, min'd with the
+        # pipeline budget) that could stop it between hypotheses before
+        # convergence or max_iters — a clock-based quality cut inside a
+        # step, which the GOVERNING PRINCIPLES rule out (THE MAXIM,
+        # Principle 2). Its natural bounds remain and are sufficient: a
+        # finite hypothesis set, max_iters (le=6), the convergence
+        # threshold on a measured score (Principle 4), and call_llm's
+        # anti-hang backstop under every call it makes.
+        # obj/llm balance from the quant-aware valve (llm_weight is the
+        # complement so the pair always sums to 1). See QUANTIZATION &
+        # CALIBRATION: raise agentic_obj_weight on lower-precision quants.
+        _ow = min(1.0, max(0.0, float(self._f.valves.agentic_obj_weight)))
         _t_compete = time.monotonic()
         try:
             best, score, _evidence, peer = (
@@ -16534,7 +16640,8 @@ class AgenticOrchestrator:
                     max_iters=self._f.valves.agentic_metacog_max_iters,
                     threshold=self._f.valves.agentic_metacog_threshold,
                     label=f"agentic_hypothesize_step_{step.id}",
-                    deadline_s=_compete_budget,
+                    obj_weight=_ow,
+                    llm_weight=1.0 - _ow,
                 )
             )
         except Exception as e:
@@ -16545,9 +16652,7 @@ class AgenticOrchestrator:
             step.seconds = (step.seconds or 0.0) + _compete_s
             self._f._log_debug(
                 f"🤖 Agentic: step {step.id} competition took "
-                f"{_compete_s:.1f}s of its {_compete_budget:.0f}s ceiling "
-                f"(remaining budget was {remaining:.0f}s) — folded into "
-                f"step time"
+                f"{_compete_s:.1f}s — folded into step time"
             )
         if best:
             _peer = ""
@@ -16561,7 +16666,6 @@ class AgenticOrchestrator:
     async def _maybe_verify_dynamic_on_gate(
         self,
         step: AgenticStep,
-        remaining: float,
         project_id: str,
         status_prefix: str = "",
     ) -> bool:
@@ -16628,14 +16732,6 @@ class AgenticOrchestrator:
             )
             return False
 
-        if remaining < self._f.valves.agentic_metacog_min_remaining_s:
-            self._f._log_debug(
-                f"🤖 Agentic: step {step.id} qualifies for gate-triggered "
-                f"dynamic verification but only {remaining:.0f}s remain — "
-                "skipped"
-            )
-            return False
-
         await self._f._emit_status(
             f"{status_prefix}: gate-triggered dynamic verification"
         )
@@ -16645,7 +16741,7 @@ class AgenticOrchestrator:
         )
         try:
             await self._dyn.run_dynamic_step(
-                step, self._ledger, project_id, "", remaining
+                step, self._ledger, project_id, ""
             )
         except Exception as e:
             self._f._log_debug(f"🤖 Agentic: gate dynamic verify failed ({e})")
@@ -16654,7 +16750,6 @@ class AgenticOrchestrator:
     async def _reinforce_step(
         self,
         step: AgenticStep,
-        remaining: float,
         project_id: str,
         status_prefix: str = "",
     ) -> int:
@@ -16670,9 +16765,12 @@ class AgenticOrchestrator:
         renders as ✗ REFUTED natively; the step gains a short summary
         annotation BEFORE digest/cache so both carry the reinforced result.
 
-        Budget: the whole pass is bounded to half the remaining pipeline
-        budget (15s reserve, 20s floor), sliced per claim; a per-claim
-        timeout skips that claim and keeps going.
+        Unclocked (GOVERNING PRINCIPLES): this pass used to slice half
+        the remaining pipeline budget across the claims and skip any
+        claim whose design call outlived its slice — silently leaving
+        difficult claims (the exact ones this escalation exists for)
+        unfalsified. The natural bound remains: at most 4 claims, one
+        small design call each, under call_llm's anti-hang backstop.
 
         KV: the design calls use their own prompts and dirty the single
         inference slot; recovery of the main prefix afterwards is the
@@ -16685,24 +16783,10 @@ class AgenticOrchestrator:
         claims = [c for c in self._ledger.claims if c.step_id == step.id][:4]
         if not claims:
             return 0
-        # Budget: bounded to half the remaining pipeline budget, but never
-        # more than what actually remains. The floor is the SMALLER of 20s
-        # and the remaining budget — a plain max(20, …) would force a 20s
-        # deadline even when only 5s are left (min_remaining_s has ge=0, so
-        # an operator can lower the upstream guard below 20), overrunning
-        # the pipeline; a per-claim slice below ~4s is not worth attempting.
-        deadline = min(remaining, max(20.0, min(remaining * 0.5, remaining - 15.0)))
-        if deadline < 12.0:
-            self._f._log_debug(
-                f"🤖 Agentic reinforcement: step {step.id} skipped — only "
-                f"{remaining:.0f}s remain, too little to falsify safely"
-            )
-            return 0
-        per_claim = max(4.0, deadline / len(claims))
         _prefix = status_prefix or f"🤖 Agentic step {step.display_no}"
         await self._f._emit_status(
             f"{_prefix} · metacog: static falsification of "
-            f"{len(claims)} claim(s), ≤{deadline:.0f}s"
+            f"{len(claims)} claim(s)"
         )
 
         # Region: per-claim falsification
@@ -16712,8 +16796,6 @@ class AgenticOrchestrator:
         n_tested = 0
         refuted_lines: List[str] = []
         for _ci, claim in enumerate(claims, start=1):
-            if time.monotonic() - t0 >= deadline:
-                break
             await self._f._emit_status(
                 f"{_prefix} · metacog {_ci}/{len(claims)}: falsifying "
                 f"“{claim.text[:48]}”"
@@ -16724,11 +16806,8 @@ class AgenticOrchestrator:
                 # guard is fed the measured coverage, not the classifier's
                 # self-report. Same ordering as compete_hypotheses.
                 evidence = meta.gather_evidence(claim.text, project_id)
-                design = await asyncio.wait_for(
-                    meta.design_critical_experiment(
-                        claim.text, project_id, evidence=evidence
-                    ),
-                    timeout=per_claim,
+                design = await meta.design_critical_experiment(
+                    claim.text, project_id, evidence=evidence
                 )
                 coverage, _cres, _ctot = meta._compute_effective_coverage(
                     design, evidence, project_id
@@ -16736,8 +16815,6 @@ class AgenticOrchestrator:
                 falsified, reason = meta.is_falsified(
                     evidence, design, coverage, project_id=project_id
                 )
-            except asyncio.TimeoutError:
-                continue
             except Exception:
                 continue
             n_tested += 1
@@ -16776,7 +16853,6 @@ class AgenticOrchestrator:
         self,
         step: AgenticStep,
         project_id: str,
-        remaining: float,
     ) -> Dict[str, Any]:
         """
         Extract a step's claims tail, re-asking for it once when the block
@@ -16819,7 +16895,7 @@ class AgenticOrchestrator:
             control.get("tail_missing")
             and not self._ledger.claims_for(step.id)
             and await self._ledger.recover_claims_tail(
-                step, project_id, remaining
+                step, project_id
             )
         ):
             control = self._ledger.extract_and_validate(step, project_id)
@@ -16830,7 +16906,6 @@ class AgenticOrchestrator:
         plan: AgenticPlan,
         question: str,
         aligned_prefix: str,
-        remaining: float,
         project_id: str,
     ) -> Tuple[str, List[AgenticStep]]:
         """
@@ -16867,18 +16942,19 @@ class AgenticOrchestrator:
             "No markdown fences, no prose."
         )
         try:
-            response = await asyncio.wait_for(
-                self._f._llm_orchestrator.call_llm(
-                    prompt=prompt,
-                    system_prompt=aligned_prefix,
-                    model_override=self._f.valves.cot_model_level2,
-                    max_tokens=400,
-                    temperature=0.2,
-                    label="agentic_generative_eval",
-                    response_format={"type": "json_object"},
-                    enable_thinking=False,
-                ),
-                timeout=min(remaining, max(20.0, min(remaining * 0.3, 120.0))),
+            # Direct call under call_llm's anti-hang backstop only
+            # (GOVERNING PRINCIPLES): the previous 120s wait_for ceiling
+            # could cut a healthy-but-queued call on the busy slot and
+            # silently discard the whole improvement wave.
+            response = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=aligned_prefix,
+                model_override=self._f.valves.cot_model_level2,
+                max_tokens=400,
+                temperature=0.2,
+                label="agentic_generative_eval",
+                response_format={"type": "json_object"},
+                enable_thinking=False,
             )
         except Exception:
             return "", []
@@ -17138,10 +17214,8 @@ class AgenticOrchestrator:
           analysis that does not exist.
         - NEEDS insertion: a step reporting a concrete gap inserts ONE
           extra investigate step right after itself (insertion only, never
-          reordering), bounded by agentic_max_steps, two insertions per
-          run, and agentic_needs_min_remaining_s of pipeline budget — a
-          gap reported with the clock nearly spent stays uninvestigated
-          (logged) rather than burning the remainder on a doomed step.
+          reordering), bounded by agentic_max_steps and two insertions per
+          run. Like every step, once inserted it runs to completion.
 
         Args:
             question: The question driving the pipeline.
@@ -17224,33 +17298,14 @@ class AgenticOrchestrator:
         Runs only behind run_pipeline's slot gate and fail-open boundary, so
         it may assume a free slot and raise freely on internal errors.
         """
-        # Region: plan under the same wall-clock budget as execution
+        # Region: run-timing start
         # ------------------------------------------------------------------
-        # One place decides how much wall clock this run may spend, and it
-        # answers to two knobs. agentic_budget_enabled is the killswitch: off
-        # means no clock at all, every step runs to completion, which is what
-        # you want while investigating whether the budget is what is
-        # degrading an answer. agentic_max_seconds at 0 means the same thing
-        # through the value rather than the switch — 0 is the conventional
-        # "no limit" across every ceiling in this pipeline, and a budget that
-        # could not express it was the one exception.
-        #
-        # Unlimited is expressed as +inf, not as a flag: `remaining` stays a
-        # number, every `remaining - floor <= 0` and every `min(remaining,
-        # …)` downstream keeps working unchanged, and no consumer needs to
-        # learn about the switch. inf - anything is inf, so the closing
-        # reserve and the per-step ceilings simply never bind.
+        # There is no wall-clock budget in this pipeline (GOVERNING
+        # PRINCIPLES): every planned step runs to completion, always.
+        # `started` is kept only to report the run's wall time in the
+        # AGENTIC-RUN telemetry — it gates nothing.
         # ------------------------------------------------------------------
         aligned_prefix = self._aligned_prefix(prelim_system)
-        _budget_on = bool(self._f.valves.agentic_budget_enabled)
-        _budget_valve = float(self._f.valves.agentic_max_seconds)
-        budget = _budget_valve if (_budget_on and _budget_valve > 0) else float("inf")
-        if budget == float("inf"):
-            self._f._log_debug(
-                "🤖 Agentic: wall-clock budget disabled "
-                f"({'killswitch off' if not _budget_on else 'agentic_max_seconds=0'})"
-                " — every planned step runs to completion"
-            )
         started = time.monotonic()
 
         # #11: the ledger accumulated across runs within a process. Reset it
@@ -17410,79 +17465,10 @@ class AgenticOrchestrator:
         use_cache = bool(self._f.valves.agentic_step_cache)
         inserted = 0
         idx = 0
-        _budget_skipped: List[int] = []
-        # Region: the closing step is not optional. Skipping runs in
-        # plan order, so the step the budget kills is always the LAST
-        # one — and the last one is the step that turns everything
-        # gathered into a coherent answer. Live: a competition on step 2
-        # ate the budget, "steps 3, 4 of 4 not run" followed, and the
-        # reply was the raw hypothesis list ("causas probables: 1… 2…
-        # 3…") with nothing verified and nothing concluded. The pipeline
-        # had done all the expensive work and then dropped the one step
-        # that made it usable.
-        #
-        # So the closing step gets its own reservation, carved out of
-        # the budget before the loop starts. Every other step competes
-        # for budget - reserve; the closer draws on the full remaining
-        # budget when its turn comes. It is the only step that can still
-        # produce a usable answer from a plan cut short, so it is the
-        # last thing to die, not the first.
-        _closing_kinds = ("analyze", "synthesize", "conclude")
-        _closing_idx = -1
-        for _i in range(len(plan.steps) - 1, -1, -1):
-            if plan.steps[_i].kind in _closing_kinds:
-                _closing_idx = _i
-                break
-        if _closing_idx < 0 and plan.steps:
-            _closing_idx = len(plan.steps) - 1
-        # The reserve is a floor for the other steps, so a reserve at or
-        # above the whole budget starves every one of them from the first
-        # instant — with the budget untouched — and the run degrades to a
-        # single closing step reasoning over an empty workspace. The valves
-        # cannot catch it (they are independent: budget ge=10, reserve
-        # ge=0), so the pairing is resolved here, where both values are
-        # known. Half the budget is the most a floor can claim and still
-        # leave a plan worth closing.
-        _closing_reserve = 0.0
-        if _closing_idx >= 0:
-            _closing_reserve = float(
-                self._f.valves.agentic_closing_reserve_s
-            )
-            _cap = budget / 2.0
-            if _closing_reserve > _cap:
-                self._f._log_debug(
-                    f"🤖 Agentic: closing reserve "
-                    f"{_closing_reserve:.0f}s exceeds half of the "
-                    f"{budget:.0f}s budget — capping at {_cap:.0f}s so the "
-                    f"earlier steps still get their turn"
-                )
-                _closing_reserve = _cap
+        # Region: budget policy — skip-before-start, essentials always run
         while idx < len(plan.steps):
             step = plan.steps[idx]
             if step.status != "pending":
-                idx += 1
-                continue
-            remaining = budget - (time.monotonic() - started)
-            # The closer spends the reserve; everyone else stops short
-            # of it.
-            _floor = 0.0 if idx == _closing_idx else _closing_reserve
-            if remaining - _floor <= 0:
-                # Silently dropping planned work is the one thing this loop
-                # must never do quietly: live, the competition on step 3 ate
-                # the budget and steps 4 (verify) and 5 (analyze) vanished
-                # with no log line and no status — the chat showed
-                # "step 3/5" and then simply stopped, and the only trace
-                # was a skip:"budget" buried in the closing AGENTIC-RUN
-                # JSON. The reader deserves to know the plan was cut, and
-                # by what.
-                step.status = "skipped"
-                step.skip_reason = "budget"
-                _budget_skipped.append(step.display_no)
-                self._f._log_debug(
-                    f"🤖 Agentic step {step.display_no} ({step.kind}): "
-                    f"skipped — pipeline budget exhausted "
-                    f"({budget:.0f}s spent)"
-                )
                 idx += 1
                 continue
 
@@ -17521,7 +17507,7 @@ class AgenticOrchestrator:
                     f"(verify_dynamic): executing test harnesses"
                 )
                 await self._dyn.run_dynamic_step(
-                    step, self._ledger, project_id, aligned_prefix, remaining
+                    step, self._ledger, project_id, aligned_prefix
                 )
                 if step.status == "done":
                     step.digest = self._digest(step.output)
@@ -17541,7 +17527,7 @@ class AgenticOrchestrator:
                     f"(verify_regression): re-checking callers"
                 )
                 await self._dyn.run_regression_step(
-                    step, self._ledger, project_id, aligned_prefix, remaining
+                    step, self._ledger, project_id, aligned_prefix
                 )
                 if step.status == "done":
                     step.digest = self._digest(step.output)
@@ -17565,7 +17551,6 @@ class AgenticOrchestrator:
                     self._ledger,
                     project_id,
                     aligned_prefix,
-                    remaining,
                     truncated_steps=[s for s in plan.steps if s.truncated],
                 )
                 if step.status == "done":
@@ -17601,7 +17586,6 @@ class AgenticOrchestrator:
                 step,
                 aligned_prefix,
                 workspace,
-                remaining,
                 project_id=project_id,
                 broker=self._broker,
             )
@@ -17613,7 +17597,7 @@ class AgenticOrchestrator:
             }
             if step.status == "done":
                 control = await self._extract_with_recovery(
-                    step, project_id, budget - (time.monotonic() - started)
+                    step, project_id
                 )
 
                 # -- 0030: proactive hypothesis competition ------------
@@ -17621,10 +17605,8 @@ class AgenticOrchestrator:
                 # them BEFORE the reactive gate, because weighing rivals is
                 # the step's purpose, not a reaction to a fabricated id.
                 # Runs before digest/cache so both carry the competed output.
-                _rem_compete = budget - (time.monotonic() - started)
                 await self._maybe_compete_hypothesize(
                     step,
-                    _rem_compete,
                     project_id,
                     status_prefix=(
                         f"🤖 Agentic step {step.display_no}/{len(plan.steps)} "
@@ -17645,43 +17627,30 @@ class AgenticOrchestrator:
                             f"continuing without reinforcement"
                         )
                     elif _esc:
-                        _rem_now = budget - (time.monotonic() - started)
-                        if _rem_now >= self._f.valves.agentic_metacog_min_remaining_s:
-                            self._f._log_debug(
-                                f"🤖 Agentic: step {step.id} escalates to "
-                                f"metacognitive reinforcement ({_why})"
-                            )
-                            await self._reinforce_step(
-                                step,
-                                _rem_now,
-                                project_id,
-                                status_prefix=(
-                                    f"🤖 Agentic step {step.display_no}/"
-                                    f"{len(plan.steps)} ({step.kind})"
-                                ),
-                            )
-                            # NUEVO-2/P3: after static reinforcement, the gate
-                            # may also run a real test harness for behavioral
-                            # claims — static evidence can pass what the
-                            # running code refutes.
-                            _rem_dyn = budget - (time.monotonic() - started)
-                            await self._maybe_verify_dynamic_on_gate(
-                                step,
-                                _rem_dyn,
-                                project_id,
-                                status_prefix=(
-                                    f"🤖 Agentic step {step.display_no}/"
-                                    f"{len(plan.steps)} ({step.kind})"
-                                ),
-                            )
-                        else:
-                            self._f._log_debug(
-                                f"🤖 Agentic: step {step.id} qualifies for "
-                                f"reinforcement ({_why}) but only "
-                                f"{_rem_now:.0f}s remain (< "
-                                f"{self._f.valves.agentic_metacog_min_remaining_s}s) "
-                                f"— skipped"
-                            )
+                        self._f._log_debug(
+                            f"🤖 Agentic: step {step.id} escalates to "
+                            f"metacognitive reinforcement ({_why})"
+                        )
+                        await self._reinforce_step(
+                            step,
+                            project_id,
+                            status_prefix=(
+                                f"🤖 Agentic step {step.display_no}/"
+                                f"{len(plan.steps)} ({step.kind})"
+                            ),
+                        )
+                        # NUEVO-2/P3: after static reinforcement, the gate
+                        # may also run a real test harness for behavioral
+                        # claims — static evidence can pass what the
+                        # running code refutes.
+                        await self._maybe_verify_dynamic_on_gate(
+                            step,
+                            project_id,
+                            status_prefix=(
+                                f"🤖 Agentic step {step.display_no}/"
+                                f"{len(plan.steps)} ({step.kind})"
+                            ),
+                        )
 
                 step.digest = self._digest(step.output)
                 if step.kind == "design_tests":
@@ -17700,21 +17669,16 @@ class AgenticOrchestrator:
             )
 
             # -- NEEDS: insert ONE extra investigate step after this one ---
-            # The insertion is optional extra work, exactly like the
-            # reinforcement gate above, and gets the same budget courtesy:
-            # an investigate step is a full LLM call, so inserting one into
-            # a nearly-exhausted budget burns the remainder on a step that
-            # times out and starves everything scheduled after the loop.
-            _rem_needs = budget - (time.monotonic() - started)
+            # Optional extra work: a step that reported a concrete gap
+            # inserts one follow-up investigate. Bounded by
+            # agentic_max_steps and two insertions per run; it runs to
+            # completion like every other step (GOVERNING PRINCIPLES).
             _needs_capacity = (
                 control["needs"]
                 and len(plan.steps) < self._f.valves.agentic_max_steps
                 and inserted < 2
             )
-            if (
-                _needs_capacity
-                and _rem_needs >= self._f.valves.agentic_needs_min_remaining_s
-            ):
+            if _needs_capacity:
                 new_step = AgenticStep(
                     id=max(s.id for s in plan.steps) + 1,
                     goal="Investigate: " + "; ".join(control["needs"][:2]),
@@ -17730,14 +17694,6 @@ class AgenticOrchestrator:
                 self._f._log_debug(
                     f"🤖 Agentic: step {step.id} reported gaps — inserted "
                     f"step {new_step.id} ({new_step.goal[:60]})"
-                )
-            elif _needs_capacity:
-                self._f._log_debug(
-                    f"🤖 Agentic: step {step.id} reported gaps "
-                    f"({'; '.join(control['needs'][:2])[:80]}) but only "
-                    f"{_rem_needs:.0f}s remain (< "
-                    f"{self._f.valves.agentic_needs_min_remaining_s}s) — "
-                    f"insertion skipped, gap left uninvestigated"
                 )
 
             # -- early exit: hard evidence steps are never skipped ---------
@@ -17838,22 +17794,6 @@ class AgenticOrchestrator:
             idx += 1
 
         # Region: report a truncated plan once, after the loop
-        # One line for the whole cut rather than one per step: the reader
-        # needs to know the plan did not run in full and why, not a
-        # countdown of casualties.
-        if _budget_skipped:
-            _plural = "s" if len(_budget_skipped) > 1 else ""
-            await self._f._emit_status(
-                f"⏱️ Agentic: budget spent — step{_plural} "
-                f"{', '.join(str(n) for n in _budget_skipped)} of "
-                f"{len(plan.steps)} not run"
-            )
-            self._f._log_debug(
-                f"🤖 Agentic: plan cut short by budget — "
-                f"{len(_budget_skipped)}/{len(plan.steps)} step(s) skipped "
-                f"({_budget_skipped})"
-            )
-
         # Region: generative evaluation + re-plan waves (Fase 9, Nivel 2)
         # The epistemic axis (is it correct?) closed with the verify step;
         # this is the generative axis (is there something better?). Each
@@ -17901,16 +17841,8 @@ class AgenticOrchestrator:
             _ge_mode in ("shadow", "on")
             and _replans_used < self._f.valves.agentic_max_replans
         ):
-            _rem_now = budget - (time.monotonic() - started)
-            if _rem_now < self._f.valves.agentic_replan_min_remaining_s:
-                self._f._log_debug(
-                    f"🤖 Agentic: generative evaluation skipped — "
-                    f"{_rem_now:.0f}s remain (< "
-                    f"{self._f.valves.agentic_replan_min_remaining_s}s)"
-                )
-                break
             _angle, _wave = await self._generative_evaluation(
-                plan, question, aligned_prefix, _rem_now, project_id
+                plan, question, aligned_prefix, project_id
             )
             if not _wave:
                 break
@@ -17931,11 +17863,6 @@ class AgenticOrchestrator:
                 # Appended at the tail, so its display position is the
                 # current length; earlier steps keep their numbers.
                 wstep.display_no = len(plan.steps)
-                _rem_now = budget - (time.monotonic() - started)
-                if _rem_now <= 0:
-                    wstep.status = "skipped"
-                    wstep.skip_reason = "budget"
-                    continue
                 await self._f._emit_status(
                     f"🤖 Agentic wave step {wstep.display_no} ({wstep.kind}): "
                     f"{wstep.goal[:60]}"
@@ -17945,13 +17872,12 @@ class AgenticOrchestrator:
                     wstep,
                     aligned_prefix,
                     workspace,
-                    _rem_now,
                     project_id=project_id,
                     broker=self._broker,
                 )
                 if wstep.status == "done":
                     _wctl = await self._extract_with_recovery(
-                        wstep, project_id, budget - (time.monotonic() - started)
+                        wstep, project_id
                     )
                     # Same reinforcement gate as main-loop steps: shadow
                     # counting must include waves or the calibration lies.
@@ -17965,17 +17891,14 @@ class AgenticOrchestrator:
                                 f"would escalate ({_wwhy})"
                             )
                         elif _wesc:
-                            _wrem = budget - (time.monotonic() - started)
-                            if _wrem >= self._f.valves.agentic_metacog_min_remaining_s:
-                                await self._reinforce_step(
-                                    wstep,
-                                    _wrem,
-                                    project_id,
-                                    status_prefix=(
-                                        f"🤖 Agentic wave step "
-                                        f"{wstep.id} ({wstep.kind})"
-                                    ),
-                                )
+                            await self._reinforce_step(
+                                wstep,
+                                project_id,
+                                status_prefix=(
+                                    f"🤖 Agentic wave step "
+                                    f"{wstep.id} ({wstep.kind})"
+                                ),
+                            )
                     wstep.digest = self._digest(wstep.output)
                     if use_cache and structure_hash:
                         await self._cache.put(
@@ -18033,6 +17956,7 @@ class AgenticOrchestrator:
                         "s": round(s.seconds, 1),
                         "cached": bool(s.cached),
                         "skip": s.skip_reason,
+                        "trunc": bool(s.truncated),
                     }
                     for s in plan.steps
                 ],
@@ -22839,6 +22763,20 @@ Output only the symbol name.
             # None on expiry, and None hands the caller back to its own
             # CrossEncoder fallback (scored[0][0]), which is exactly the
             # answer this call was trying to improve on.
+            #
+            # AUDITED EXCEPTION to the GOVERNING PRINCIPLES' maxim — the
+            # only one in the repo, kept deliberately. By the letter, a
+            # 30s cap on a call that measured 95s cuts healthy work. It
+            # stays because all three mitigating conditions hold at once:
+            # (1) this blocks the INLET, so the cost of waiting is paid
+            # by the whole turn before it even starts, not by a pipeline
+            # step; (2) the 95s was queue time behind the busy slot, not
+            # generation — the cap gives up WAITING, it rarely kills
+            # work in flight; (3) the fallback is deterministic and
+            # reasonable (CrossEncoder best candidate), not a corrupted
+            # partial. If any of the three stops holding — e.g. this
+            # call moves out of the inlet path — the cap goes, like all
+            # the others did.
             total_timeout=30.0,
         )
 
@@ -26174,7 +26112,6 @@ class MetacognitiveReasoningEngine:
         label: str = "",
         obj_weight: float = 0.5,
         llm_weight: float = 0.5,
-        deadline_s: Optional[float] = None,
     ) -> Tuple[str, float, "StaticEvidence", Optional["PeerReviewResult"]]:
         """
         Full scientific hypothesis competition loop.
@@ -26204,34 +26141,19 @@ class MetacognitiveReasoningEngine:
             0.5/0.5 default — verification: evidence and LLM equally weighted
             0.4/0.6 for architecture — proposing changes, design judgment > evidence
 
-        deadline_s:
-            Wall-clock ceiling for the whole competition. The cost here is
-            N hypotheses × M iterations × several LLM calls each, and the
-            caller's budget gate can only check the clock BEFORE entering —
-            once inside, an unbounded competition eats the pipeline's
-            remaining time and the stages queued behind it. Live: 199s
-            consumed by one competition, after which the verify and analyze
-            steps were skipped with reason "budget" — hard evidence traded
-            for reasoning, the exact swap the step loop refuses to make.
-            None means unbounded (the previous behaviour).
-
-            Exhaustion is a stop, never a verdict: the best hypothesis
-            scored so far is kept, and a deadline that lands before any
-            hypothesis is scored is explicitly NOT read as epistemic
-            bankruptcy — that path would fire the abductive escape and
-            spend MORE budget reacting to a clock that already ran out.
+        The competition is unclocked by design. It used to accept a
+        deadline_s ceiling that could stop it between hypotheses before
+        convergence — a clock-based quality cut that the GOVERNING
+        PRINCIPLES rule out: iterations 2+ only run when no hypothesis
+        convinced, so cutting them removes exploration exactly where it
+        is needed most. The natural bounds are sufficient and stay: a
+        finite hypothesis set, max_iters, the convergence threshold on a
+        measured score, and call_llm's anti-hang backstop under every
+        call.
 
         Returns (best_hypothesis_text, best_score, best_evidence, peer_review).
         """
         max_hypotheses = len(hypotheses)
-
-        _t_compete_start = time.monotonic()
-        _deadline = (
-            _t_compete_start + deadline_s
-            if deadline_s is not None and deadline_s > 0
-            else None
-        )
-        _budget_hit = False
 
         # Null hypothesis baseline — always included as floor comparison
         null_hyp = (
@@ -26277,18 +26199,6 @@ class MetacognitiveReasoningEngine:
 
             # TURN LEVEL: evaluate each hypothesis
             for hyp_text, llm_conf in hypotheses:
-
-                # ⓪ Budget: each hypothesis costs several LLM calls, so the
-                # clock is checked per hypothesis rather than per iteration.
-                if _deadline is not None and time.monotonic() >= _deadline:
-                    _budget_hit = True
-                    self._f._log_debug(
-                        f"compete_hypotheses: deadline ({deadline_s:.0f}s) "
-                        f"reached during iteration {iteration} — "
-                        f"{len(current_scored)}/{len(hypotheses)} hypotheses "
-                        f"evaluated, keeping what is scored"
-                    )
-                    break
 
                 # ① Gather evidence FIRST — it is free (no LLM, no GPU) and
                 # it is what lets the design step below know which claims
@@ -26431,19 +26341,6 @@ class MetacognitiveReasoningEngine:
             valid_scored.sort(key=lambda x: x.score, reverse=True)
 
             if not valid_scored:
-                # A clock that ran out is not a refutation. Falling into the
-                # bankruptcy path here would fire the abductive escape and
-                # spend MORE budget reacting to an exhausted budget — and
-                # would record a total-failure debrief that teaches
-                # _get_adaptive_strategy a failure mode the evidence never
-                # showed.
-                if _budget_hit:
-                    self._f._log_debug(
-                        f"compete_hypotheses: iteration {iteration} reached "
-                        f"the deadline before scoring any hypothesis — "
-                        f"stopping (budget, NOT epistemic bankruptcy)"
-                    )
-                    break
                 # COMPETITION LEVEL — epistemic bankruptcy: every hypothesis
                 # died this iteration. Before surrendering, try one abductive
                 # escape that negates the assumption they all shared. Fires at
@@ -26480,18 +26377,6 @@ class MetacognitiveReasoningEngine:
             # ITERATION LEVEL: track obj_score ONLY (deterministic SymbolGraph signal)
             # llm_conf excluded — self-reported by LLM, unreliable for convergence
             obj_score_history.append(best_scored.obj_score)
-
-            if _budget_hit:
-                await self._f._emit_status(
-                    f"🔬 Competition budget spent — keeping the leading "
-                    f"hypothesis (score {best_scored.score:.2f})"
-                )
-                self._f._log_debug(
-                    f"compete_hypotheses: stopped at iteration {iteration}/"
-                    f"{max_iters} — deadline ({deadline_s:.0f}s) reached; "
-                    f"winner so far scores {best_scored.score:.2f}"
-                )
-                break
 
             if best_scored.score >= threshold:
                 # Surfaced to the chat, not only the debug log: from the UI a
@@ -26577,14 +26462,9 @@ class MetacognitiveReasoningEngine:
 
         # ── Post-loop guard ───────────────────────────────────────────────
         if best_scored is None:
-            _why_none = (
-                "deadline reached before any could be scored"
-                if _budget_hit
-                else "all falsified across all iterations"
-            )
             self._f._log_debug(
-                f"compete_hypotheses: no valid hypothesis survived — "
-                f"{_why_none}"
+                "compete_hypotheses: no valid hypothesis survived — "
+                "all falsified across all iterations"
             )
             # Record total-failure in performance history so
             # _get_adaptive_strategy can learn from this failure mode.
@@ -26614,27 +26494,7 @@ class MetacognitiveReasoningEngine:
             ) and _avg_cov < float(
                 getattr(self._f.valves, "abstention_coverage_floor", 0.35)
             )
-            if _budget_hit:
-                # Neither refuted nor untestable: never evaluated. Saying
-                # "unable to validate" here would report a structural
-                # verdict the engine never reached.
-                await self._f._emit_status(
-                    "⏱️ Competition budget spent before any verdict"
-                )
-                self._f._log_debug(
-                    "compete_hypotheses: deadline reached before any "
-                    "hypothesis was scored — reporting a budget stop, not "
-                    "a refutation"
-                )
-                _msg = (
-                    "The hypothesis competition ran out of time before any "
-                    "hypothesis could be evaluated against the codebase "
-                    "structure. This is a budget limit, not a refutation: "
-                    "no structural conclusion was reached either way. State "
-                    "this honestly rather than presenting an unverified "
-                    "cause."
-                )
-            elif _abstain:
+            if _abstain:
                 await self._f._emit_status("🤔 Insufficient evidence — abstaining")
                 self._f._log_debug(
                     f"compete_hypotheses: abstaining (avg coverage "
@@ -26690,21 +26550,30 @@ class MetacognitiveReasoningEngine:
                 best_scored, runner_up = runner_up, best_scored
 
         # CONVERSATION LEVEL: devil's advocate
-        # Signal: score > 0.8 (overconfidence risk) AND peer_review disabled.
-        # When enable_peer_review=True, challenge_hypothesis() runs internally
+        # Signal: score above agentic_devil_advocate_threshold
+        # (overconfidence risk) AND peer_review disabled. When
+        # enable_peer_review=True, challenge_hypothesis() runs internally
         # inside the degraded peer review path — no duplication needed.
         # Result stored as PeerReviewResult so delimit_scope (H6) can use
-        # the critique as antithesis material.
+        # the critique as antithesis material. The threshold was a
+        # hardcoded 0.8; it is a valve now (default 0.75) per GOVERNING
+        # PRINCIPLES Principle 3: this pass is conditional-cost,
+        # asymmetric-value insurance against the single most expensive
+        # failure — a confident-and-wrong hypothesis promoted to the
+        # final analysis — so firing it a little more often is the
+        # cheapest quality lever the competition has.
         peer_review: Optional["PeerReviewResult"] = None
 
+        _da_thr = float(self._f.valves.agentic_devil_advocate_threshold)
         if (
             self._f.valves.enable_devil_advocate
             and not self._f.valves.enable_peer_review
-            and best_scored.score > 0.8
+            and best_scored.score > _da_thr
         ):
             self._f._log_debug(
                 f"compete_hypotheses: devil's advocate triggered "
-                f"(score={best_scored.score:.3f} > 0.8, overconfidence risk)"
+                f"(score={best_scored.score:.3f} > {_da_thr:.2f}, "
+                f"overconfidence risk)"
             )
             await self._f._emit_status("😈 Running devil's advocate...")
             critique = await self.challenge_hypothesis(
@@ -39768,9 +39637,30 @@ class Filter:
 
         # ── 8.16 Agentic pipeline (manual /agent — Fase 1) ──────────────────
         agentic_step_max_tokens: int = Field(
-            default=2500,
+            default=8000,
             ge=100,
-            description="Generation cap per agentic step.",
+            description=(
+                "Generation ceiling per agentic step — an ANTI-RUNAWAY "
+                "guard, NOT a quality budget (GOVERNING PRINCIPLES, "
+                "Principle 2 and THE MAXIM). The claims contract sits at "
+                "the very END of a step's output, so a cap a healthy step "
+                "can reach cuts exactly the structured part and blinds the "
+                "verify stage — the same corruption as a mid-generation "
+                "clock kill, by a different cutter. At the old default of "
+                "2500 healthy investigate steps truncated on nearly every "
+                "complex turn (measured: outputs cut at ~2400 tokens, "
+                "claims lost, ~30s recovery attempts per truncation). "
+                "8000 is sized ~3x above the longest healthy step "
+                "observed, so only a pathological generation — the Q4 "
+                "line-cycle repetition loop — can reach it. Recalibrate "
+                "against fresh logs: the correct value is 'never reached "
+                "by a sane step', and if the DRY loop is fixed at the "
+                "sampler level (or the deployment moves to Q8, where the "
+                "loop disappears), truncation at ANY value of this valve "
+                "should become a rare-path event. Do not lower it back "
+                "into the healthy range to save time — that trades claims "
+                "for seconds, the exact swap this pipeline refuses."
+            ),
         )
         agentic_digest_max_tokens: int = Field(
             default=400,
@@ -39778,22 +39668,6 @@ class Filter:
             description=(
                 "Per-step digest budget for the workspace. Head-truncated, "
                 "but a trailing 'NOT FOUND:' section is always preserved."
-            ),
-        )
-        agentic_budget_enabled: bool = Field(
-            default=True,
-            description=(
-                "Master switch for the pipeline's wall-clock budget. Off "
-                "means no clock at all: every planned step runs to "
-                "completion, no step is ever skipped for time, and the "
-                "closing reserve never binds because there is nothing to "
-                "reserve against. Intended for exactly one question — 'is "
-                "the budget what is degrading this answer?' — which is hard "
-                "to answer while the budget is still cutting the plan. Leave "
-                "it on for normal use: on a --parallel 1 server a runaway "
-                "competition with no clock can hold the slot for the whole "
-                "turn. Setting agentic_max_seconds to 0 does the same thing "
-                "through the value instead of the switch."
             ),
         )
         agentic_preplanner_timeout_s: int = Field(
@@ -39822,47 +39696,6 @@ class Filter:
                 "deterministic fixed plan, which is a real plan but a blunt "
                 "one — so the ceiling is set where only a stuck call meets "
                 "it. 0 disables it."
-            ),
-        )
-        agentic_max_seconds: int = Field(
-            default=1200,
-            ge=0,
-            description=(
-                "Wall-clock budget for the whole pipeline; steps that do not "
-                "fit are skipped — except the closing step, which draws on "
-                "agentic_closing_reserve_s (see below). "
-                "Sizing: on a --parallel 1 server every auxiliary call queues "
-                "behind the previous one, and the measured cost of a full run "
-                "is pre-planner ~90s + planner ~60s + investigate ~30s + a "
-                "hypothesize step that can spend its whole "
-                "agentic_metacog_max_compete_s ceiling (240s) + verify ~12s + "
-                "analyze ~110s ≈ 540s before any re-plan wave — and a slow "
-                "turn can legitimately double that without anything being "
-                "wrong. The 480s this used to default to cut the plan on "
-                "nearly every non-trivial question, and what it cut was "
-                "always the tail: the steps that turn evidence into an "
-                "answer. A budget that starves the plan does not save time, "
-                "it spends the whole run and throws away the part that made "
-                "it worth running, so this errs high on purpose — a run that "
-                "finishes early costs nothing, a run cut short costs "
-                "everything before it. Lower only if you would rather have a "
-                "partial plan than wait."
-            ),
-        )
-        agentic_closing_reserve_s: int = Field(
-            default=180,
-            ge=0,
-            description=(
-                "Seconds of agentic_max_seconds held back for the plan's "
-                "closing step (the analyze / synthesize that turns the "
-                "workspace into an answer). Skipping runs in plan order, so "
-                "without a reservation the step the budget kills is always "
-                "the last one — the only one that can still produce a "
-                "coherent answer from a plan cut short. Live: a hypothesis "
-                "competition ate the budget and the reply was the raw "
-                "hypothesis list, unverified and unconcluded. Every other "
-                "step stops short of this floor; the closer spends it. 0 "
-                "restores the old first-come behaviour."
             ),
         )
         agentic_max_steps: int = Field(
@@ -40108,7 +39941,38 @@ class Filter:
                 "where the steps are not compressed and the reported "
                 "confidence spreads out into something worth trusting. "
                 "Revisit this valve then: 0.85 (or the historical 0.75) may "
-                "become defensible again with a better-calibrated dial."
+                "become defensible again with a better-calibrated dial. "
+                "\n\n"
+                "DIRECTION OF THIS LEVER — easy to get backwards. The loop "
+                "stops when score >= threshold, so LOWERING this valve "
+                "makes convergence EASIER (fewer iterations) and RAISING "
+                "it forces more refinement where rivals are close. A "
+                "tuning session once recommended 'lower to 0.85 for more "
+                "iterations on contested runs' — that is the inverse of "
+                "what the code does, and 0.85 additionally lets the Q4 "
+                "model's favourite confidence notch clear the bar alone "
+                "(see above). If the goal is deeper competition, this "
+                "valve goes UP, not down."
+            ),
+        )
+        agentic_obj_weight: float = Field(
+            default=0.5,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Weight of the deterministic SymbolGraph signal "
+                "(obj_score) in the hypothesis competition's combined "
+                "score; the model's self-reported confidence (llm_conf) "
+                "gets the complement (1 - this). THE quant-aware lever "
+                "(see QUANTIZATION & CALIBRATION): quantization makes "
+                "llm_conf overconfident and coarse, so lower-precision "
+                "deployments should lean harder on the measured half. "
+                "0.5 = today's 50/50 baseline, kept as the default until "
+                "the llm_conf notch histogram from real runs justifies a "
+                "specific value; on Q4_K_M something in 0.6-0.7 is the "
+                "expected direction, relaxing back toward 0.5 on Q8/FP16 "
+                "where the reported confidence spreads into a usable "
+                "signal. Calibrate from logs, not from theory."
             ),
         )
         agentic_metacog_max_iters: int = Field(
@@ -40133,65 +39997,6 @@ class Filter:
                 "calls extend the resident KV prefix instead of evicting it, "
                 "which is what makes this default affordable. Drop to 1 if "
                 "latency matters more than reaching the divergent pool."
-            ),
-        )
-        agentic_metacog_min_remaining_s: int = Field(
-            default=60,
-            ge=0,
-            description=(
-                "Reinforcement is skipped (with a log line) when less than "
-                "this many seconds of pipeline budget remain."
-            ),
-        )
-        agentic_needs_min_remaining_s: int = Field(
-            default=90,
-            ge=0,
-            description=(
-                "A NEEDS-reported gap only inserts its extra investigate "
-                "step when at least this many seconds of pipeline budget "
-                "remain. An investigate step is a full LLM call (40-90s "
-                "measured live); inserting one into a nearly-exhausted "
-                "budget burns the remainder on a step that times out AND "
-                "starves everything scheduled after the step loop — "
-                "observed live: a gap-inserted step started with ~42s left, "
-                "died at '(step timed out)', and the generative evaluation "
-                "was then skipped at '-0s remain'."
-            ),
-        )
-        agentic_metacog_max_compete_s: int = Field(
-            default=240,
-            ge=0,
-            description=(
-                "Wall-clock ceiling for one hypothesis competition on a "
-                "hypothesize step. The competition costs N hypotheses × M "
-                "iterations × several LLM calls each, and "
-                "agentic_metacog_min_remaining_s can only gate the ENTRY — "
-                "once inside, an unbounded competition eats what the "
-                "pipeline stages behind it need. Measured live: 199s spent "
-                "competing 7 hypotheses, after which verify and analyze "
-                "were skipped with reason 'budget'. Hitting the ceiling is "
-                "a stop, not a verdict: the leading hypothesis is kept. "
-                "0 disables the ceiling (unbounded). "
-                "\n\n"
-                "SIZING, from the 19:33 run measured per label: design "
-                "costs ~17s per hypothesis and predictions ~5s (iteration 1 "
-                "only). Iteration 1 with the default 7 hypotheses is "
-                "therefore ~157s on its own, and each refinement iteration "
-                "over ~3 survivors is ~51s. The first ceiling shipped at "
-                "120 — below the cost of iteration 1 — so the competition "
-                "was cut before finishing its first pass every single time "
-                "and never reached refinement at all. 240 covers iteration "
-                "1 plus one full refinement pass (~208s) with margin, which "
-                "is the minimum that makes the refinement machinery "
-                "reachable. All four iterations would need ~310s. "
-                "\n\n"
-                "This is not free: agentic_max_seconds is the budget for "
-                "the WHOLE pipeline (480 by default) and the same run spent "
-                "~313s outside the competition. At 240 here the steps "
-                "queued behind a competing hypothesize step will be cut — "
-                "visibly, since they are reported now. Raise "
-                "agentic_max_seconds to ~720 if both the competition and "
-                "the full step plan should fit."
             ),
         )
         agentic_claims_tail_recovery: bool = Field(
@@ -40273,15 +40078,6 @@ class Filter:
                 "spins forever on a single --parallel 1 slot."
             ),
         )
-        agentic_replan_min_remaining_s: int = Field(
-            default=90,
-            ge=0,
-            description=(
-                "The generative evaluation (shadow included) is skipped "
-                "when less than this many seconds of budget remain — a "
-                "wave needs room to actually run."
-            ),
-        )
         agentic_auto_verify: bool = Field(
             default=True,
             description=(
@@ -40293,9 +40089,16 @@ class Filter:
             ),
         )
         agentic_verify_max_tokens: int = Field(
-            default=500,
+            default=1500,
             ge=100,
-            description="Generation cap for the verify step's checks JSON.",
+            description=(
+                "Generation ceiling for the verify step's checks JSON. "
+                "Anti-runaway guard, not a quality budget: the output is "
+                "pure structure (up to 12 typed checks), so a cap a "
+                "healthy elicitation can reach breaks the contract "
+                "mid-JSON. Sized well above the largest legitimate check "
+                "set."
+            ),
         )
         agentic_exec_mode: str = Field(
             default="subprocess",
@@ -40332,9 +40135,15 @@ class Filter:
             description="Maximum symbols a verify_dynamic step will test.",
         )
         agentic_harness_max_tokens: int = Field(
-            default=800,
+            default=2000,
             ge=200,
-            description="Generation cap for LLM-written test sections.",
+            description=(
+                "Generation ceiling for LLM-written test sections. "
+                "Anti-runaway guard, not a quality budget: a harness cut "
+                "mid-function fails to import and the target silently "
+                "loses its dynamic evidence. Sized well above a healthy "
+                "test section."
+            ),
         )
         agentic_tdd_ttl_seconds: float = Field(
             default=1800.0,
@@ -40494,10 +40303,27 @@ class Filter:
         enable_devil_advocate: bool = Field(
             default=True,  # ← ROI=0.160: excellent given 0.25 expected calls
             description=(
-                "Run a contrarian pass on the winning hypothesis when score > 0.8. "
-                "ROI=0.160: 0.25 expected calls (25% activation), +4% quality. "
-                "Same-model limitation means epistemic value is modest, but cost "
-                "is low enough that the ROI is excellent."
+                "Run a contrarian pass on the winning hypothesis when its "
+                "score exceeds agentic_devil_advocate_threshold. "
+                "Conditional-cost, asymmetric-value insurance (GOVERNING "
+                "PRINCIPLES, Principle 3): it fires rarely, costs one "
+                "small call, and attacks the confident-and-wrong "
+                "hypothesis — the worst output the pipeline can promote."
+            ),
+        )
+        agentic_devil_advocate_threshold: float = Field(
+            default=0.75,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Winning score above which the devil's advocate fires. "
+                "Was a hardcoded 0.8; lowered to 0.75 so the insurance "
+                "triggers on a wider band of high-confidence winners. "
+                "Measured at 0.8 the pass fired in ~10% of competitions "
+                "at ~9s per firing (~1s expected cost) — cheap enough "
+                "that widening the band buys quality at negligible cost. "
+                "Raise it back toward 0.8+ only if the extra contrarian "
+                "passes prove noisy for your model."
             ),
         )
 
