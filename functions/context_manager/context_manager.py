@@ -212,6 +212,14 @@ class ScoredHypothesis:
     falsification_reason: Optional[str]
     coverage_score: float = 0.0
     epistemic_uncertainty: float = 0.0
+    # Prediction-verification counts from the objective scorer. compete_
+    # hypotheses() passes both when constructing the result (they feed the
+    # prediction term of epistemic_uncertainty); without them declared here
+    # the constructor raised TypeError and the whole competition was caught
+    # and discarded, so no winner was ever crowned. Defaulted so older call
+    # sites that omit them keep working.
+    predictions_verified: int = 0
+    predictions_total: int = 0
 
 
 @dataclass
