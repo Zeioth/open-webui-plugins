@@ -12769,7 +12769,7 @@ class AgenticEvidenceLedger:
         if not isinstance(raw_claims, list):
             raw_claims = []
 
-        # Region: control signals (early-exit / re-plan markers)
+        # Region: control signals (resolution / needs / re-plan markers)
         try:
             control["resolved"] = bool(data.get("resolved", False))
             # Track whether the step actually REPORTED a confidence, separate
@@ -15961,11 +15961,8 @@ class AgenticSynthesisComposer:
             Markdown block for dynamic_injections.
         """
         done = [s for s in plan.steps if s.status == "done"]
-        early_exit = [s for s in plan.steps if s.skip_reason == "early-exit"]
         problems = [
-            s
-            for s in plan.steps
-            if s.status in ("failed", "skipped") and s.skip_reason != "early-exit"
+            s for s in plan.steps if s.status in ("failed", "skipped")
         ]
 
         header = (
@@ -16163,13 +16160,6 @@ class AgenticSynthesisComposer:
                         )
                         lines.append(f"- ✓ {c.text}{cited}{suffix}")
             lines.append("")
-        if early_exit:
-            ids = ", ".join(str(s.id) for s in early_exit)
-            lines.append("Early exit:")
-            lines.append(
-                f"- Steps {ids} skipped: an earlier step resolved the "
-                f"question with high confidence."
-            )
         if problems:
             lines.append("Unresolved:")
             for s in problems:
@@ -16875,17 +16865,12 @@ class AgenticOrchestrator:
 
         The recovery only fires when the tail was genuinely absent
         (tail_missing) and no claims were registered — a legitimate
-        '{"claims": []}' tail never triggers it. Note the asymmetry with
-        the early-exit veto: a recovered "resolved" is neutralised only
-        for TRUNCATED steps, whose reasoning stopped mid-sentence; a
-        complete step ended by its own decision, so its recovered
-        self-assessment keeps its authority. Applied identically to
+        '{"claims": []}' tail never triggers it. Applied identically to
         main-loop and re-plan wave steps so both feed the ledger.
 
         Args:
             step: A step with status "done".
             project_id: Current project identifier.
-            remaining: Seconds left in the pipeline budget.
 
         Returns:
             The step's control signals (see extract_and_validate).
@@ -17204,14 +17189,11 @@ class AgenticOrchestrator:
         Shared entry point for the manual /agent command and the automatic
         trigger. Adds two control behaviours on top of plain execution:
 
-        - Early exit: a step whose control signals declare the question
-          resolved with confidence ≥ agentic_early_exit_confidence marks
-          every remaining pending step (except future "verify" kinds) as
-          skipped — hard evidence is never traded for speed, reasoning is.
-          A step that was TRUNCATED at the token cap can never authorise
-          this, however confident its recovered tail sounds: its reasoning
-          stopped mid-sentence, so the self-assessment describes an
-          analysis that does not exist.
+        - ASK_USER: a step reporting a genuine ambiguity ends the
+          pipeline and surfaces the clarifying question as the answer.
+          This is the only early termination — a step's own confidence
+          never skips the rest of the plan (GOVERNING PRINCIPLES: the
+          planner sizes the plan; every step runs).
         - NEEDS insertion: a step reporting a concrete gap inserts ONE
           extra investigate step right after itself (insertion only, never
           reordering), bounded by agentic_max_steps and two insertions per
@@ -17696,75 +17678,26 @@ class AgenticOrchestrator:
                     f"step {new_step.id} ({new_step.goal[:60]})"
                 )
 
-            # -- early exit: hard evidence steps are never skipped ---------
-            # Evidence gate: skipping the rest of the plan on a step's own
-            # say-so requires that its claims survived citation validation —
-            # at least one claim whose cited qids all resolved against the
-            # SymbolIndex, and no claim with a structurally invalid citation
-            # or a refuted call relation (the same invalidity predicate the
-            # difficulty gate uses). A fabricated identifier anywhere in the
-            # step is exactly the confabulation signal this ledger exists to
-            # catch — measured live: a step-1 early exit citing a
-            # non-existent symbol skipped the two steps that would have
-            # corrected it. A resolution with no claims at all keeps running
-            # too: an exit that skips verification must be backed.
+            # -- no early exit --------------------------------------------
+            # A step reporting resolved=true with high confidence used to
+            # skip the rest of the plan. That is removed (GOVERNING
+            # PRINCIPLES): the planner sizes the plan from the question's
+            # complexity, and a step's own "I'm confident, skip the rest"
+            # is exactly the confident-and-wrong failure the hypothesis
+            # competition and verify exist to catch — the last quality-
+            # degrading skip in the pipeline. Every planned step now runs.
             #
-            # Truncation is a separate, structural veto. A step that hit
-            # agentic_step_max_tokens stopped mid-sentence: its reasoning is
-            # incomplete BY CONSTRUCTION, whatever it says about itself.
-            # Before claims-tail recovery (0024) such a step simply had no
-            # tail, so control stayed at the defaults and the plan carried
-            # on — truncation vetoed the early exit by accident. Recovery
-            # removed the accident: it re-asks for the tail and the model
-            # dutifully fills in "resolved": true over an analysis it never
-            # finished. Measured live (19:37): step 1 was cut off mid-
-            # sentence, recovered 8 claims, and exited at confidence 0.85,
-            # skipping the hypothesize and analyze steps that existed to
-            # challenge it. Recovering EVIDENCE is the point; inheriting a
-            # self-assessment made over a severed reasoning chain is not.
-            if getattr(step, "truncated", False) and control.get("resolved"):
-                self._f._log_debug(
-                    f"🤖 Agentic: early-exit vetoed at step {step.id} — the "
-                    f"step was TRUNCATED at the token cap, so its reasoning "
-                    f"is incomplete by construction; a recovered "
-                    f"'resolved' cannot authorise skipping the rest of the "
-                    f"plan (claims kept, plan continues)"
-                )
-                control["resolved"] = False
-            _exit_ok = False
-            if (
-                control["resolved"]
-                and control["confidence"]
-                >= self._f.valves.agentic_early_exit_confidence
-            ):
-                _step_claims = self._ledger.claims_for(step.id)
-                _bad = [
-                    c
-                    for c in _step_claims
-                    if self._ledger._structural_invalid_qids(c) or c.invalid_relations
-                ]
-                _good = [c for c in _step_claims if c.valid_qids and c not in _bad]
-                _exit_ok = bool(_good) and not _bad
-                if not _exit_ok:
-                    self._f._log_debug(
-                        f"🤖 Agentic: early-exit vetoed at step {step.id} — "
-                        f"claims={len(_step_claims)} valid={len(_good)} "
-                        f"invalid={len(_bad)} (confidence "
-                        f"{control['confidence']:.2f})"
-                    )
-            if _exit_ok:
-                skipped_ids = []
-                for later in plan.steps[idx + 1 :]:
-                    if later.status == "pending" and later.kind != "verify":
-                        later.status = "skipped"
-                        later.skip_reason = "early-exit"
-                        skipped_ids.append(later.id)
-                if skipped_ids:
-                    self._f._log_debug(
-                        f"🤖 Agentic: early exit at step {step.id} "
-                        f"(confidence {control['confidence']:.2f}) — "
-                        f"skipping steps {skipped_ids}"
-                    )
+            # This also resolves a second-order regression: once the token
+            # cap became an anti-runaway ceiling (0062), step 1 stopped
+            # truncating, which had been the accidental veto keeping early
+            # exit from firing. With the cap raised, healthy step-1
+            # investigate steps resolved at >= agentic_early_exit_confidence
+            # and skipped hypothesize/analyze outright — observed live:
+            # "early exit at step 1 (confidence 0.90) — skipping steps
+            # [2, 3, 4]". Removing the mechanism is the fix; the planner's
+            # step count stands. control["resolved"]/["confidence"] are
+            # still parsed (telemetry, difficulty gate) but no longer gate
+            # execution.
 
             # -- ASK_USER: stateless clarification short-circuit -----------
             # A step reporting a genuine ambiguity ends the pipeline early
@@ -17826,17 +17759,6 @@ class AgenticOrchestrator:
                     )
                     _ge_mode = "off"
 
-        if _ge_mode in ("shadow", "on") and any(
-            s.skip_reason == "early-exit" for s in plan.steps
-        ):
-            # A step resolved the question with high confidence and the
-            # pipeline deliberately skipped the rest — asking "is there
-            # something better?" over that partial workspace would mostly
-            # re-propose the skipped work.
-            self._f._log_debug(
-                "🤖 Agentic: generative evaluation skipped (early-exit fired)"
-            )
-            _ge_mode = "off"
         while (
             _ge_mode in ("shadow", "on")
             and _replans_used < self._f.valves.agentic_max_replans
@@ -29589,7 +29511,7 @@ class EnrichmentTasks:
                 temperature=0.0,
                 label=label,
                 response_format={"type": "json_object"},
-                log_raw_response=True,
+                log_raw_response=False,
                 enable_thinking=False,
             )
 
@@ -39765,15 +39687,6 @@ class Filter:
                 "Maximum tool rounds per step (TOOL: EXPAND/CALLERS/CALLEES/"
                 "DOC/GREP requests resolved locally at zero LLM cost). "
                 "0 disables the tool loop."
-            ),
-        )
-        agentic_early_exit_confidence: float = Field(
-            default=0.85,
-            ge=0.5,
-            le=1.0,
-            description=(
-                "A step declaring resolved=true with confidence at or above "
-                "this floor skips the remaining reasoning steps ('verify' steps are never skipped)."
             ),
         )
         agentic_metacog_reinforce: str = Field(
