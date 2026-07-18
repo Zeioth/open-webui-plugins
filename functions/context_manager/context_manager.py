@@ -17648,6 +17648,29 @@ class AgenticOrchestrator:
                         _summary = "; ".join(
                             (c.text or "")[:120] for c in _refuted[:3]
                         )
+                        # Park-don't-kill recovery: offer the competition's
+                        # statically-falsified rivals as candidates. The
+                        # winner just failed REAL verification, which is
+                        # exactly the moment a hypothesis parked on static
+                        # evidence becomes worth a second look.
+                        _parked = list(
+                            getattr(
+                                self._f._meta_reasoning, "_last_parked", []
+                            )
+                        )
+                        _parked_txt = ""
+                        if _parked:
+                            _parked_txt = (
+                                " Parked rivals from the earlier "
+                                "competition (falsified on static evidence; "
+                                "recoverable now that the winner failed "
+                                "real verification): "
+                                + " | ".join(
+                                    f"{t[:100]} (parked: {r[:60]})"
+                                    for t, r in _parked[:3]
+                                )
+                                + "."
+                            )
                         _next_id = max(s.id for s in plan.steps) + 1
                         _rehyp = AgenticStep(
                             id=_next_id,
@@ -17657,7 +17680,7 @@ class AgenticOrchestrator:
                                 "the strongest surviving rival or formulate "
                                 "a genuinely NEW hypothesis consistent with "
                                 "the refutation evidence — do NOT reword "
-                                "the refuted one."
+                                "the refuted one." + _parked_txt
                             ),
                             kind="hypothesize",
                         )
@@ -25865,6 +25888,35 @@ class MetacognitiveReasoningEngine:
         improvement = max(recent) - recent[0]
         return improvement < min_delta
 
+    @staticmethod
+    def _strategy_label(
+        strategy: Dict[str, Any], stagnated: bool, charter_on: bool
+    ) -> str:
+        """
+        One-line human label of the strategy driving THIS iteration.
+
+        Rendered into the competition status so the step announces HOW it is
+        weighing evidence, not just how many hypotheses remain. Built from
+        the same adaptive-strategy dict and stagnation flag that shape the
+        deterministic refinement constraints, so the label never drifts from
+        the actual behaviour.
+        """
+        parts: List[str] = []
+        if charter_on:
+            parts.append("falsify-first")
+        if strategy.get("suggest_divergent_start") or stagnated:
+            parts.append("diverging")
+        if (
+            strategy.get("prefer_symbol_verification")
+            or strategy.get("call_fail_rate", 0.0) > 0.6
+        ):
+            parts.append("symbol-existence > call-graph")
+        if strategy.get("avg_historical_coverage", 1.0) < 0.5:
+            parts.append("demand atomic claims")
+        if not parts:
+            parts.append("balanced obj+llm")
+        return ", ".join(parts)
+
     def _build_refinement_constraints(
         self,
         coverage_score: float,
@@ -25884,8 +25936,45 @@ class MetacognitiveReasoningEngine:
         1. Coverage: when evidence is sparse → demand atomic verifiable claims
         2. Pattern: when a failure mode dominates this project historically
         3. Divergence: when stagnation was detected → demand new directions
+
+        Additionally, when hypothesis_principles_charter is on, a fixed
+        epistemic charter is prepended: the distilled comparison principles
+        (falsification asymmetry, diagnosticity, explanatory power over ALL
+        symptoms, testability preference, parsimony as tiebreaker only, the
+        severity exception, no ad-hoc rescues). Deterministic text, same
+        PID philosophy: the model is TOLD how to weigh evidence instead of
+        being asked to introspect about it.
         """
         constraints: List[str] = []
+
+        if self._f.valves.hypothesis_principles_charter:
+            constraints.append(
+                "EPISTEMIC PRINCIPLES (apply when proposing and defending "
+                "hypotheses):\n"
+                "- Falsification asymmetry: one refuted structural "
+                "entailment outweighs any amount of supporting prose. For "
+                "each hypothesis, state first what would DISPROVE it.\n"
+                "- Diagnosticity: evidence consistent with every rival is "
+                "worthless; prefer claims that DISTINGUISH this hypothesis "
+                "from its rivals.\n"
+                "- Explanatory power: the hypothesis must account for ALL "
+                "observed symptoms (e.g. 'intermittent', 'only on "
+                "continuations'), not a subset; a partial explanation must "
+                "name what it leaves unexplained.\n"
+                "- Testability: prefer hypotheses that make concrete, "
+                "checkable structural predictions (named symbols, call "
+                "relations); a hypothesis with no checkable entailment "
+                "ranks BELOW one that risks refutation.\n"
+                "- Parsimony is a TIEBREAKER only: simplicity never "
+                "outranks evidence.\n"
+                "- Severity exception: a hypothesis implying silent state "
+                "corruption, cache poisoning, data loss or a concurrency "
+                "hazard deserves early testing even at low prior "
+                "probability.\n"
+                "- No ad-hoc rescues: a hypothesis that survives only by "
+                "accumulating auxiliary assumptions is degenerating; say "
+                "so instead of patching it."
+            )
 
         if coverage_score < self._f.valves.low_coverage_threshold:
             constraints.append(
@@ -26290,6 +26379,16 @@ class MetacognitiveReasoningEngine:
         """
         max_hypotheses = len(hypotheses)
 
+        # Parked pool (park, don't kill): falsified hypotheses are never
+        # deleted — all_scored already keeps them for the debrief — but
+        # until now they were unreachable afterwards. This run-scoped list
+        # exposes them (text + falsification reason) so the refutation
+        # retry in the orchestrator can offer them as recoverable rivals:
+        # a statically-falsified hypothesis becomes worth revisiting
+        # precisely when the verify step later refutes the WINNER, i.e.
+        # when the static evidence that killed it proved misleading.
+        self._last_parked: List[Tuple[str, str]] = []
+
         # Null hypothesis baseline — always included as floor comparison
         null_hyp = (
             "The behavior follows the most direct structural path "
@@ -26322,7 +26421,12 @@ class MetacognitiveReasoningEngine:
 
             await self._f._emit_status(
                 f"🔬 Evaluating {len(hypotheses)} hypotheses "
-                f"(iteration {iteration}/{max_iters})..."
+                f"(iteration {iteration}/{max_iters}) — "
+                + self._strategy_label(
+                    strategy,
+                    stagnated_this_run,
+                    self._f.valves.hypothesis_principles_charter,
+                )
             )
 
             # ITERATION LEVEL: PID constraints from previous iteration's results
@@ -26471,6 +26575,19 @@ class MetacognitiveReasoningEngine:
             # Bug 7: accumulate ALL iterations for project-level debriefing
             all_scored.extend(current_scored)
 
+            # Refresh the parked pool from everything scored so far: newest
+            # last, deduplicated by text, capped. Updated every iteration so
+            # every return path below leaves it populated.
+            _seen_parked: set = set()
+            self._last_parked = []
+            for _ps in all_scored:
+                if _ps.falsified and _ps.text not in _seen_parked:
+                    _seen_parked.add(_ps.text)
+                    self._last_parked.append(
+                        (_ps.text, _ps.falsification_reason or "falsified")
+                    )
+            self._last_parked = self._last_parked[-5:]
+
             # Sort: non-falsified by combined score descending
             valid_scored = [s for s in current_scored if not s.falsified]
             valid_scored.sort(key=lambda x: x.score, reverse=True)
@@ -26513,27 +26630,57 @@ class MetacognitiveReasoningEngine:
             # llm_conf excluded — self-reported by LLM, unreliable for convergence
             obj_score_history.append(best_scored.obj_score)
 
+            # Convergence gate: a high ABSOLUTE score is necessary but not
+            # sufficient. A winner at 0.90 with a runner-up at 0.89 has not
+            # been discriminated from the field — it just scored well in
+            # isolation, and every hypothesis IS scored each iteration, so
+            # the field data to judge decisiveness is already in hand.
+            # agentic_competition_early_converge can disable the score-based
+            # exit entirely (run every iteration = full triage of the
+            # rivals); agentic_competition_converge_margin additionally
+            # requires the winner to beat the runner-up by a margin before
+            # declaring victory. Both default to the original behaviour.
+            _ec_on = self._f.valves.agentic_competition_early_converge
+            _margin = self._f.valves.agentic_competition_converge_margin
+            _runner_score = (
+                valid_scored[1].score if len(valid_scored) >= 2 else 0.0
+            )
+            _gap = best_scored.score - _runner_score
             if best_scored.score >= threshold:
-                # Surfaced to the chat, not only the debug log: from the UI a
-                # first-iteration exit is indistinguishable from a stall, and
-                # converging on iteration 1 is the designed COMMON case — the
-                # combined score is half self-reported confidence, so a
-                # winner at llm_conf 0.9 clears 0.75 with obj at just 0.60.
-                # One status line turns "why does it stop at 1/N" into a
-                # statement instead of a support question.
-                await self._f._emit_status(
-                    f"🔬 Converged on iteration {iteration}/{max_iters} — "
-                    f"score {best_scored.score:.2f} ≥ {threshold:.2f}, no "
-                    f"further refinement needed"
-                )
-                self._f._log_debug(
-                    f"compete_hypotheses: converged at iteration {iteration}/"
-                    f"{max_iters} — combined score {best_scored.score:.2f} "
-                    f">= threshold {threshold:.2f} "
-                    f"(obj={best_scored.obj_score:.2f}, "
-                    f"llm_conf={best_scored.llm_conf:.2f}) — no refinement"
-                )
-                break
+                if _ec_on and _gap >= _margin:
+                    _mnote = (
+                        f", gap {_gap:.2f} ≥ {_margin:.2f} over runner-up"
+                        if _margin > 0.0
+                        else ""
+                    )
+                    await self._f._emit_status(
+                        f"🔬 Converged on iteration {iteration}/{max_iters} "
+                        f"— score {best_scored.score:.2f} ≥ {threshold:.2f}"
+                        f"{_mnote}, no further refinement needed"
+                    )
+                    self._f._log_debug(
+                        f"compete_hypotheses: converged at iteration "
+                        f"{iteration}/{max_iters} — combined score "
+                        f"{best_scored.score:.2f} >= threshold "
+                        f"{threshold:.2f} (obj={best_scored.obj_score:.2f}, "
+                        f"llm_conf={best_scored.llm_conf:.2f}, gap over "
+                        f"runner-up {_gap:.2f}) — no refinement"
+                    )
+                    break
+                # Threshold met but NOT exiting — say why, then keep going.
+                if not _ec_on:
+                    self._f._log_debug(
+                        f"compete_hypotheses iter {iteration}: score "
+                        f"{best_scored.score:.2f} ≥ threshold but early "
+                        f"convergence disabled — continuing full triage"
+                    )
+                else:
+                    self._f._log_debug(
+                        f"compete_hypotheses iter {iteration}: score "
+                        f"{best_scored.score:.2f} ≥ threshold but gap over "
+                        f"runner-up {_gap:.2f} < margin {_margin:.2f} — not "
+                        f"decisive, continuing to discriminate"
+                    )
             if iteration >= max_iters:
                 await self._f._emit_status(
                     f"🔬 Iteration budget exhausted ({max_iters}) — best "
@@ -40250,6 +40397,49 @@ class Filter:
                 "old feed-forward behavior (refutations are reported to "
                 "analyze but never retried). Each retry costs one "
                 "hypothesize LLM call plus a deterministic verify."
+            ),
+        )
+        hypothesis_principles_charter: bool = Field(
+            default=True,
+            description=(
+                "Prepend the epistemic principles charter to hypothesis "
+                "generation/refinement constraints: falsification asymmetry "
+                "(state what would disprove first), diagnosticity (prefer "
+                "claims that distinguish rivals), explanatory power (must "
+                "cover ALL observed symptoms), testability preference "
+                "(checkable structural predictions rank above unfalsifiable "
+                "prose), parsimony as tiebreaker only, the severity "
+                "exception (silent-corruption hypotheses tested early even "
+                "at low prior), and no ad-hoc rescues. Deterministic text "
+                "through the same PID channel as the adaptive constraints."
+            ),
+        )
+        agentic_competition_early_converge: bool = Field(
+            default=True,
+            description=(
+                "When on, the hypothesis competition stops as soon as the "
+                "leading hypothesis reaches the confidence threshold. Off "
+                "disables that exit entirely: every iteration runs, so all "
+                "rivals are triaged before a winner is declared. A high "
+                "absolute score does not mean the winner is correct — it "
+                "may just have scored well in isolation — so turning this "
+                "off (or setting agentic_competition_converge_margin) trades "
+                "iterations for confidence that the field was searched."
+            ),
+        )
+        agentic_competition_converge_margin: float = Field(
+            default=0.0,
+            ge=0.0,
+            le=0.5,
+            description=(
+                "Extra convergence condition when early convergence is on: "
+                "the leading hypothesis must beat the runner-up by at least "
+                "this combined-score margin before the competition declares "
+                "victory. 0.0 keeps the original behaviour (absolute "
+                "threshold only). ~0.10–0.15 encodes 'a high score is not "
+                "enough — the winner must DECISIVELY separate from its "
+                "rivals', which is the discrimination the field data "
+                "(all hypotheses are scored each iteration) already supports."
             ),
         )
         agentic_generative_eval: str = Field(
