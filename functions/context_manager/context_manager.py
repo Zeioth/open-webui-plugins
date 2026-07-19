@@ -14394,10 +14394,6 @@ if __name__ == "__main__":
         and each sandbox execution by agentic_exec_timeout_s (anti-hang).
         """
         started = time.monotonic()
-        # Fase 4: harness-suspect pool is STEP-scoped — reset here so
-        # the Fase 6 router reads only this step's doubts, never a
-        # previous turn's.
-        self._harness_suspects = []
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             step.status = "done"
@@ -14466,10 +14462,6 @@ if __name__ == "__main__":
             aligned_prefix: Head-capped preliminary system prompt.
         """
         started = time.monotonic()
-        # Fase 4: harness-suspect pool is STEP-scoped — reset here so
-        # the Fase 6 router reads only this step's doubts, never a
-        # previous turn's.
-        self._harness_suspects = []
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             step.status = "done"
@@ -17913,6 +17905,17 @@ class AgenticOrchestrator:
         # by agentic_hypothesis_retries; counted separately from the NEEDS
         # gap-fill insertions so one budget cannot starve the other.
         _hypo_retries = 0
+        # Fase 4/6 review fix: the harness-suspect pool is RUN-scoped.
+        # It was reset at the entry of BOTH run_dynamic_step and
+        # run_regression_step; with the normalized order (verify_dynamic
+        # -> verify_regression -> verify) a plan containing both had the
+        # regression's entry reset WIPE the suspects the dynamic step
+        # had just parked, so the Fase 6 router at the static verify
+        # never saw them — and in F4-shadow those suspects are the only
+        # protection against burning the retry budget on a doubted
+        # refutation. One reset per pipeline run, here, fixes the
+        # accumulation for every step-order combination.
+        self._dyn._harness_suspects = []
         idx = 0
         # Region: budget policy — skip-before-start, essentials always run
         while idx < len(plan.steps):
