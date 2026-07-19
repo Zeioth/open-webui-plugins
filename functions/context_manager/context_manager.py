@@ -12568,9 +12568,9 @@ class LedgerClaim:
     valid_qids: List[str] = field(default_factory=list)
     invalid_qids: List[str] = field(default_factory=list)
     evidence_type: str = "reasoning"
-    verification: str = ""  # "" | confirmed | refuted | unsupported | unverifiable
+    verification: str = ""  # "" | confirmed | refuted | unsupported | unverifiable | unoperationalizable
     verification_detail: str = ""
-    dynamic_validation: str = ""  # "" | passed | refuted — set by verify_dynamic
+    dynamic_validation: str = ""  # "" | passed | refuted | inconclusive — set by verify_dynamic
     invalid_relations: List[str] = field(default_factory=list)
 
 
@@ -13687,6 +13687,52 @@ class AgenticStaticVerifier:
         results = [self._execute(ch, project_id) for ch in checks]
         self._apply_verdicts(claims, checks, results)
         step.output = self._render_report(checks, results, mode)
+
+        # Region: Fase 2 — unoperationalizable is not unverified.
+        # A claim citing NO qids generates no checks (the fallback skips
+        # it), so _apply_verdicts leaves verification at "" and the claim
+        # silently dodges verification: downstream it reads as "not yet
+        # verified" when the truth is "cannot be verified AS FORMULATED".
+        # Those are different diagnoses — the first asks for more evidence,
+        # the second asks for a better claim. Stamp the distinct verdict
+        # (deterministic: no anchor, no LLM judgement involved) and append
+        # the affected claims to the report so synthesis sees them. The
+        # new value is inert for every existing consumer: equality checks
+        # against refuted/confirmed and the unsupported/unverifiable
+        # tuples all miss it, exactly like the "" it replaces.
+        _op_mode = self._f.valves.claims_operationalization
+        if _op_mode in ("shadow", "on"):
+            _unop = [
+                (n, c)
+                for n, c in enumerate(claims, 1)
+                if not c.verification and not c.qids
+            ]
+            if _unop and _op_mode == "shadow":
+                self._f._log_debug(
+                    f"🤖 [OPERATIONALIZE-SHADOW] {len(_unop)} anchor-less "
+                    f"claim(s) would be marked unoperationalizable: "
+                    + "; ".join(f"C{n} '{c.text[:60]}'" for n, c in _unop[:3])
+                )
+            elif _unop:
+                for _n, _c in _unop:
+                    _c.verification = "unoperationalizable"
+                    _c.verification_detail = (
+                        "claim cites no checkable anchor (no qids) — "
+                        "cannot be verified as formulated"
+                    )
+                step.output += (
+                    "\n\n### Unoperationalizable claims "
+                    f"({len(_unop)})\n"
+                    + "\n".join(
+                        f"- [C{n}] {c.text[:120]} — names no checkable "
+                        f"anchor; reformulate as an atomic check"
+                        for n, c in _unop
+                    )
+                )
+                self._f._log_debug(
+                    f"🤖 Agentic verify: {len(_unop)} claim(s) marked "
+                    f"unoperationalizable (no cited qids)"
+                )
         step.seconds = time.monotonic() - started
         step.status = "done"
 
@@ -14348,6 +14394,10 @@ if __name__ == "__main__":
         and each sandbox execution by agentic_exec_timeout_s (anti-hang).
         """
         started = time.monotonic()
+        # Fase 4: harness-suspect pool is STEP-scoped — reset here so
+        # the Fase 6 router reads only this step's doubts, never a
+        # previous turn's.
+        self._harness_suspects = []
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             step.status = "done"
@@ -14416,6 +14466,10 @@ if __name__ == "__main__":
             aligned_prefix: Head-capped preliminary system prompt.
         """
         started = time.monotonic()
+        # Fase 4: harness-suspect pool is STEP-scoped — reset here so
+        # the Fase 6 router reads only this step's doubts, never a
+        # previous turn's.
+        self._harness_suspects = []
         mode = getattr(self._f.valves, "agentic_exec_mode", "off")
         if mode != "subprocess":
             step.status = "done"
@@ -14532,9 +14586,76 @@ if __name__ == "__main__":
         callee_src = self._resolve_callee_bodies(body, qid, project_id)
         harness = self._compose(body, tests, callee_src)
         result = await self._runner.run(harness)
+
+        # Region: Fase 8 — selective replication of a SUSPECT harness.
+        # First run came back with a suspect shape (shared predicate with
+        # Fase 4): regenerate the tests ONCE with a hint describing the
+        # failure, re-compose, re-execute, and let the SECOND result be
+        # authoritative — recovered evidence instead of discarded
+        # evidence. Structurally bounded to one replication per target
+        # (straight-line code, no loop). Cache-bypassing by construction:
+        # the regeneration path never consults the stored tests. If the
+        # replica reproduces a suspect shape, the doubt is CONFIRMED with
+        # two independent data points and Fase 4 downgrades/parks as
+        # usual. Cached-result reuse (above) is never replicated: a
+        # cached suspect never re-enters here by design; only fresh
+        # executions pay the extra harness.
+        _rep_mode = self._f.valves.verify_replicate_suspect
+        _reason = self._suspect_reason_of(result)
+        if _reason and _rep_mode == "shadow":
+            self._f._log_debug(
+                f"🤖 [REPLICATE-SHADOW] {qid}: would regenerate harness "
+                f"and re-run — {_reason}"
+            )
+        elif _reason and _rep_mode == "on":
+            self._f._log_debug(
+                f"🤖 Agentic replicate: {qid} first run suspect "
+                f"({_reason}) — regenerating harness once"
+            )
+            _hint = (
+                "NOTE: a previous harness for this exact symbol failed to "
+                f"produce a trustworthy result ({_reason}). Write SIMPLER, "
+                "more robust tests: fewer asserts, only plain stdlib "
+                "values, no fixtures, no shared state between tests, and "
+                "avoid anything that could raise at import time."
+            )
+            _tests2 = await self._elicit_tests(
+                body, verdict, reasons, aligned_prefix, retry_hint=_hint
+            )
+            if _tests2:
+                _harness2 = self._compose(body, _tests2, callee_src)
+                _result2 = await self._runner.run(_harness2)
+                _reason2 = self._suspect_reason_of(_result2)
+                self._f._log_debug(
+                    f"🤖 Agentic replicate: {qid} replica status="
+                    f"{_result2.get('status')} "
+                    f"({_result2.get('passed', 0)}/"
+                    f"{_result2.get('total', 0)})"
+                    + (f" — doubt CONFIRMED ({_reason2})" if _reason2 else
+                       " — clean signal recovered")
+                )
+                _result2["replicated"] = True
+                tests, result, source = _tests2, _result2, "replicated"
+
         await self._cache_put(project_id, qid, body_hash, tests, result)
         if result["status"] in ("pass", "fail"):
             self._append_evidence(ledger, step_id, qid, result, cached=False)
+        else:
+            # Fresh infrastructure failure (error/timeout/rejected): the
+            # historical path recorded NO evidence and — worse — never
+            # parked the suspect, so the Fase 6 router could not see it.
+            # Park it here (evidence stays absent, as before: an unrun
+            # harness proves nothing either way).
+            _vi = self._f.valves.verify_dynamic_verdict_integrity
+            _r = self._suspect_reason_of(result)
+            if _r and _vi in ("shadow", "on"):
+                if not hasattr(self, "_harness_suspects"):
+                    self._harness_suspects = []
+                self._harness_suspects.append((qid, _r))
+                self._f._log_debug(
+                    f"🤖 Agentic verify_dynamic: {qid} fresh run produced "
+                    f"no evidence ({_r}) — parked as harness suspect"
+                )
         return self._format_line(qid, verdict, result, source)
 
     def _body_of(self, qid: str, project_id: str) -> str:
@@ -14551,13 +14672,21 @@ if __name__ == "__main__":
         verdict: str,
         reasons: List[str],
         aligned_prefix: str,
+        retry_hint: str = "",
     ) -> str:
-        """One aligned LLM call producing the tests section ('' on failure)."""
+        """One aligned LLM call producing the tests section ('' on failure).
+
+        retry_hint (Fase 8): appended to the prompt on a replication
+        attempt so the second harness learns from the first one's failure
+        shape instead of reproducing it.
+        """
         prompt = (
             self._TESTS_CONTRACT.replace("{body}", body[:8000])
             .replace("{verdict}", verdict)
             .replace("{reasons}", "; ".join(reasons))
         )
+        if retry_hint:
+            prompt += "\n\n" + retry_hint
         try:
             # Direct call under call_llm's anti-hang backstop only: a
             # clock-cut here silently returned an empty harness and left
@@ -14626,6 +14755,34 @@ if __name__ == "__main__":
 
     # ── Evidence + persistence ───────────────────────────────────────────
 
+    @staticmethod
+    def _suspect_reason_of(result: Dict[str, Any]) -> str:
+        """
+        Single owner of the harness-suspect predicate (Fase 4/8).
+
+        Returns a human-readable reason when the result is evidence about
+        the HARNESS rather than the code — infrastructure statuses (the
+        harness never ran) or zero-pass suspicion (0/N asserts with
+        N >= 3: everything failing, including trivial asserts, signals a
+        broken composition, not a surgical refutation) — or "" when the
+        result is trustworthy. Used by _append_evidence (verdict
+        integrity) and _verify_target (selective replication) so the two
+        phases can never drift apart.
+        """
+        status = result.get("status", "error")
+        if status in ("error", "timeout", "rejected"):
+            return f"harness did not run (status={status})"
+        if (
+            status == "fail"
+            and int(result.get("passed", 0)) == 0
+            and int(result.get("total", 0)) >= 3
+        ):
+            return (
+                f"zero-pass suspicion (0/{result.get('total', 0)} asserts "
+                f"— broken composition more likely than surgical refutation)"
+            )
+        return ""
+
     def _append_evidence(
         self,
         ledger: "AgenticEvidenceLedger",
@@ -14635,14 +14792,45 @@ if __name__ == "__main__":
         cached: bool,
     ) -> None:
         """Append a ⚗ dynamic claim; a failing assert is the strongest
-        refutation the system can produce."""
+        refutation the system can produce — PROVIDED the harness itself
+        ran. See the Fase 4 region below for the two integrity guards."""
         status = result.get("status", "error")
         detail = (
             f"{result.get('passed', 0)}/{result.get('total', 0)} asserts"
             + ("; " + result["failures"][0] if result.get("failures") else "")
             + (" [cached]" if cached else "")
+            + (" [replicated]" if result.get("replicated") else "")
         )
         _dyn_verdict = "passed" if status == "pass" else "refuted"
+
+        # Region: Fase 4 — verdict integrity (the experiment's control).
+        # The suspect predicate lives in _suspect_reason_of (single owner,
+        # shared with the Fase 8 replication in _verify_target): both
+        # failure shapes it names are evidence about the HARNESS, not the
+        # code, and were being stamped as the system's STRONGEST
+        # refutation. Both downgrade to 'inconclusive' — inert for every
+        # consumer (equality checks against passed/refuted miss it) — and
+        # the qid is parked in _harness_suspects for the Fase 6 retry
+        # router ('harness doubt' route). Shadow logs without changing
+        # verdicts.
+        _vi_mode = self._f.valves.verify_dynamic_verdict_integrity
+        _suspect_reason = self._suspect_reason_of(result)
+        if _suspect_reason and _vi_mode in ("shadow", "on"):
+            if _vi_mode == "shadow":
+                self._f._log_debug(
+                    f"🤖 [VERDICT-INTEGRITY-SHADOW] {qid}: would downgrade "
+                    f"refuted → inconclusive — {_suspect_reason}"
+                )
+            else:
+                _dyn_verdict = "inconclusive"
+                detail += f" [inconclusive: {_suspect_reason}]"
+                self._f._log_debug(
+                    f"🤖 Agentic verify_dynamic: {qid} downgraded to "
+                    f"inconclusive — {_suspect_reason}"
+                )
+            if not hasattr(self, "_harness_suspects"):
+                self._harness_suspects: List[Tuple[str, str]] = []
+            self._harness_suspects.append((qid, _suspect_reason))
 
         # NUEVO-1: propagate the dynamic verdict onto every EXISTING claim
         # that cites this qid, so triangulation and the generative axis can
@@ -14660,7 +14848,15 @@ if __name__ == "__main__":
             confidence=1.0,
             valid_qids=[qid],
             evidence_type="dynamic",
-            verification="confirmed" if status == "pass" else "refuted",
+            verification=(
+                "confirmed"
+                if status == "pass"
+                else (
+                    "unverifiable"
+                    if _dyn_verdict == "inconclusive"
+                    else "refuted"
+                )
+            ),
             verification_detail=detail[:300],
             dynamic_validation=_dyn_verdict,
         )
@@ -15029,7 +15225,9 @@ class AgenticPreplanner:
         'you pick, verbatim>", "rationale": "<one sentence, '
         'evidence-based>", "memory_findings": "<one short line on '
         'what memory contributed, or empty>", '
-        '"difficulty": "<low|medium|high>", "ask": ""}\n\n'
+        '"difficulty": "<low|medium|high>", '
+        '"question_type": "<exploratory|confirmatory|descriptive|'
+        'mechanism>", "ask": ""}\n\n'
         "difficulty grades how much investigative work the CHOSEN framing "
         "needs — judge the work, not the topic: low = a single clear "
         "framing answerable by direct lookup or explanation of code already "
@@ -15039,6 +15237,14 @@ class AgenticPreplanner:
         "non-deterministic bug, contradictory evidence, obvious causes "
         "already ruled out, or the blast radius of an architectural "
         "change.\n\n"
+        "question_type names the NATURE of the request, independent of its "
+        "difficulty: exploratory = something is wrong or odd but no cause "
+        "is proposed ('why is X weird'); confirmatory = the user proposes "
+        "a specific cause or claim to check ('is it because X', 'does X "
+        "cause Y'); descriptive = a factual inventory or lookup ('how many "
+        "callers', 'where is X used', 'what does X return'); mechanism = "
+        "how something works internally ('how does X do Y', 'walk me "
+        "through the flow'). Judge from the USER's wording.\n\n"
         "{tool_results}"
         "Request:\n{question}"
     )
@@ -15271,12 +15477,24 @@ class AgenticPreplanner:
         difficulty = str(data.get("difficulty", "") or "").strip().lower()
         if difficulty not in ("low", "medium", "high"):
             difficulty = ""
+        # question_type names the NATURE of the request (Fase 1); same
+        # degrade-to-empty discipline as difficulty: anything outside the
+        # four-value vocabulary yields "" and every consumer stands down.
+        question_type = str(data.get("question_type", "") or "").strip().lower()
+        if question_type not in (
+            "exploratory",
+            "confirmatory",
+            "descriptive",
+            "mechanism",
+        ):
+            question_type = ""
         self.last_stats = {
             "used": True,
             "framings": n_framings,
             "memory_rounds": memory_rounds,
             "asked": bool(ask and not chosen),
             "difficulty": difficulty,
+            "question_type": question_type,
         }
         if ask and not chosen:
             self._f._log_debug(
@@ -15284,12 +15502,14 @@ class AgenticPreplanner:
             )
             return "", ask
         if brief:
+            _qt_tag = f" [{question_type}]" if question_type else ""
             await self._f._emit_status(
-                f"🧭 Pre-planner: framing chosen — {chosen[:60]}"
+                f"🧭 Pre-planner: framing chosen — {chosen[:60]}{_qt_tag}"
             )
             self._f._log_debug(
                 f"🧭 Preplanner: framings={n_framings}, "
-                f"memory_rounds={memory_rounds}, chose='{chosen[:80]}'"
+                f"memory_rounds={memory_rounds}, "
+                f"type={question_type or 'untyped'}, chose='{chosen[:80]}'"
             )
             self._f._log_debug(f"🧭 Preplanner brief:\n{brief.strip()}")
         else:
@@ -15364,6 +15584,7 @@ class AgenticPlanner:
         "step should focus on (may be empty).\n\n"
         "{memory_hint}"
         "{seed_hint}"
+        "{qtype_hint}"
         "{preplan_brief}"
         "Question:\n{question}"
     )
@@ -15387,6 +15608,7 @@ class AgenticPlanner:
         project_id: str = "",
         preplan_brief: str = "",
         difficulty: str = "",
+        question_type: str = "",
     ) -> AgenticPlan:
         """
         Build a plan for the question.
@@ -15447,6 +15669,43 @@ class AgenticPlanner:
         # relevant symbols and whether this is debug/refactor/explain sharpen
         # the step breakdown. Best-effort: any failure yields an empty hint.
         seed_hint = await self._build_seed_hint(question, project_id)
+        # Fase 1: plan-shape hint from the pre-planner's question typing.
+        # The type names the NATURE of the request; each maps to the plan
+        # shape the scientific method prescribes for it. A hint, not an
+        # order: the parser accepts whatever the planner returns, and the
+        # order-normalization pass downstream still enforces the partial
+        # order. Empty type (valve off, or vocabulary miss) leaves the
+        # contract byte-identical.
+        qtype_hint = ""
+        if question_type and self._f.valves.preplan_question_typing:
+            _shapes = {
+                "exploratory": (
+                    "Question type: EXPLORATORY (no cause proposed). Shape: "
+                    "investigate-heavy — map the terrain with investigate "
+                    "step(s) BEFORE any hypothesize; do not hypothesize "
+                    "over an unmapped space.\n\n"
+                ),
+                "confirmatory": (
+                    "Question type: CONFIRMATORY (the user proposes a "
+                    "specific cause or claim). Shape: schedule hypothesize "
+                    "early with the user's claim as ONE rival among "
+                    "alternatives — never the only one — and verify it "
+                    "directly.\n\n"
+                ),
+                "descriptive": (
+                    "Question type: DESCRIPTIVE (factual inventory or "
+                    "lookup). Shape: investigate + analyze suffice; do NOT "
+                    "schedule hypothesize for factual lookups.\n\n"
+                ),
+                "mechanism": (
+                    "Question type: MECHANISM (how does it work). Shape: "
+                    "investigate step(s) that trace the call flow "
+                    "(callers/callees of the named symbols), then analyze; "
+                    "hypothesize only if the trace surfaces a genuine "
+                    "unknown.\n\n"
+                ),
+            }
+            qtype_hint = _shapes.get(question_type, "")
         # NapMem: tell the planner the MEMORY tool exists so investigate
         # goals can be phrased to include past-work lookups (V4 lever).
         memory_hint = (
@@ -15458,6 +15717,7 @@ class AgenticPlanner:
             self._CONTRACT.replace("{max_steps}", str(effective_max))
             .replace("{memory_hint}", memory_hint)
             .replace("{seed_hint}", seed_hint)
+            .replace("{qtype_hint}", qtype_hint)
             .replace("{preplan_brief}", preplan_brief or "")
             .replace("{question}", question)
         )
@@ -15725,10 +15985,12 @@ class AgenticStepExecutor:
             "You are executing step {sid} (hypothesize) of an agentic "
             "pipeline.\nGoal: {goal}\n\n"
             "Based on the workspace notes above and the code context, "
-            "enumerate 2-4 competing hypotheses for the root cause, ranked "
-            "by likelihood. For each: the mechanism, the symbols involved "
-            "(exact qualified names), and what evidence would confirm or "
-            "refute it. Do NOT commit to a single answer yet."
+            "enumerate {hyp_range} competing hypotheses for the root cause, "
+            "ranked by likelihood. Prefer fewer, genuinely DISTINCT "
+            "mechanisms over rewordings of the same idea. For each: the "
+            "mechanism, the symbols involved (exact qualified names), and "
+            "what evidence would confirm or refute it. Do NOT commit to a "
+            "single answer yet."
         ),
     }
 
@@ -15736,6 +15998,67 @@ class AgenticStepExecutor:
     # MEMORY tool can join the menu conditionally. With napmem_tool_enable
     # off, MENU + TAIL + JSON concatenate byte-identically to the historical
     # single-constant contract.
+    # Fase 3: deterministic detector for ABSENCE / UNIVERSAL investigate
+    # goals. Evidence of absence ("no caller", "never invoked") and
+    # universal claims ("all call sites", "every consumer") require
+    # exhaustive enumeration — sampling proves existence, never absence.
+    # Bilingual on purpose: planner goals come out in Spanish when the
+    # user's question was Spanish (observed live). Word-bounded to avoid
+    # substring hits ("all" inside "call", "cada" inside "empacada").
+    _SWEEP_GOAL_RE = re.compile(
+        r"\b("
+        r"no caller|not called|never|none|no other|nothing else|"
+        r"does not exist|doesn'?t exist|unused|dead code|orphan|"
+        r"all|every|each|exhaustive|any caller|"
+        r"ning[uú]n\w*|nunca|no existe|no hay|tod[oa]s|cada|"
+        r"sin usar|hu[ée]rfan\w*|exhaustiv\w*"
+        r")\b",
+        re.IGNORECASE,
+    )
+
+    _SWEEP_METHODOLOGY = (
+        "\n\nMETHODOLOGY (this goal makes or checks an ABSENCE or "
+        "UNIVERSAL claim): evidence of absence requires EXHAUSTIVE "
+        "enumeration, not sampling. Enumerate the COMPLETE relevant set — "
+        "use TOOL: CALLERS / CALLEES on every named symbol and TOOL: GREP "
+        "for textual references — and state the enumeration you performed "
+        "('checked all N callers of X: ...'). Stopping at the first "
+        "plausible finding is valid evidence for EXISTENCE claims only; "
+        "for absence or 'all/none' claims it proves nothing. If the "
+        "complete set is too large to enumerate, say so explicitly instead "
+        "of silently sampling."
+    )
+
+    # Fase 5: conclusion-quality methodology for the terminal analyze.
+    # Three labeled lines the analysis must END with — labeled so the
+    # phase metric is a grep, and so synthesis inherits them verbatim.
+    # (a) sensitivity: name the load-bearing evidence whose failure flips
+    # the conclusion; (b) residual-risk typing: false positive (something
+    # that passed checks but could be wrong) vs false negative (evidence
+    # never seen: truncation, incomplete enumeration); (c) error
+    # character when evidence disagreed: SYSTEMATIC (stale index, wrong
+    # framing — re-sampling will NOT help; reindex/reframe) vs RANDOM
+    # (sampling noise across LLM calls — re-running helps).
+    _ANALYZE_METHODOLOGY = (
+        "\n\nMETHODOLOGY (conclusion quality): END your analysis with "
+        "three short labeled lines:\n"
+        "LOAD-BEARING EVIDENCE: the single piece of evidence that, if "
+        "wrong, flips your conclusion (name the exact symbol or claim). "
+        "If no single piece is load-bearing, say the conclusion rests "
+        "redundantly on N independent pieces.\n"
+        "RESIDUAL RISK: whether the remaining uncertainty is more likely "
+        "a FALSE POSITIVE (something that passed checks but could still "
+        "be wrong) or a FALSE NEGATIVE (evidence never seen: truncated "
+        "steps, incomplete enumeration, symbols outside the context) — "
+        "pick one and say why.\n"
+        "ERROR CHARACTER: if steps disagreed or evidence was "
+        "inconsistent, classify it: SYSTEMATIC (stale index, truncated "
+        "context, wrong framing — re-running will NOT help; the fix is "
+        "reindexing or reframing) or RANDOM (sampling noise across "
+        "auxiliary calls — re-running the step helps). If evidence was "
+        "consistent, write 'consistent'."
+    )
+
     _TOOLS_MENU = (
         "\n\nAt any point BEFORE finishing you may request local tools by "
         "emitting lines exactly like:\n"
@@ -15769,8 +16092,13 @@ class AgenticStepExecutor:
         '"qids": ["<exact qualified symbol name>"], "confidence": 0.7}]}\n'
         "```\n"
         "Only include claims you can tie to symbols present in the context, "
-        "using their qualified names exactly as written. If you have no "
-        'claims, output {"claims": []}. Optional top-level fields in the '
+        "using their qualified names exactly as written. Every claim must "
+        "NAME ITS MEASUREMENT: the exact qualified symbol(s) whose "
+        "existence, body or call relation decides it. A claim that names "
+        "no checkable anchor cannot be verified as formulated and will be "
+        "marked unoperationalizable — reformulate it as an atomic check "
+        "instead (symbol existence, 'A calls B', inheritance). If you have "
+        'no claims, output {"claims": []}. Optional top-level fields in the '
         'same JSON: "resolved": true plus "confidence": 0.0-1.0 when your '
         "findings ALONE fully answer the overall question; "
         '"needs": ["<missing symbol or sub-question>"] when a specific gap '
@@ -15802,7 +16130,55 @@ class AgenticStepExecutor:
         template = self._INSTRUCTION_TEMPLATES.get(
             step.kind, self._INSTRUCTION_TEMPLATES["analyze"]
         )
-        instruction = template.format(sid=step.id, goal=step.goal)
+        # Region: difficulty-adaptive enumeration range (Fase 0). The
+        # hypothesize instruction sizes its request from the pre-planner's
+        # difficulty verdict instead of a blind constant: a simple bug does
+        # not need six rivals, a gnarly one deserves more than four. Soft
+        # by construction — it is a request in the prompt, never a
+        # truncation, so a model that genuinely has one more distinct
+        # mechanism can still emit it. Falls back to the historical "2-4"
+        # when auto-sizing is off or difficulty is unknown.
+        _hyp_range = "2-4"
+        if step.kind == "hypothesize" and self._f.valves.hypothesis_target_auto:
+            try:
+                _diff = str(
+                    getattr(
+                        self._f._agentic._preplanner, "last_stats", {}
+                    ).get("difficulty", "")
+                    or ""
+                )
+            except Exception:
+                _diff = ""
+            _hyp_range = {"low": "2-3", "medium": "3-5", "high": "4-6"}.get(
+                _diff, "2-4"
+            )
+        instruction = template.format(
+            sid=step.id, goal=step.goal, hyp_range=_hyp_range
+        )
+        # Fase 3: methodology selection for investigate steps. The
+        # selector is a deterministic word-bounded regex over the goal —
+        # the model is TOLD which discipline applies, it never chooses its
+        # own methodology (principio rector). Fires only for absence /
+        # universal goals; every other investigate keeps the historical
+        # instruction byte-identical, so the KV prefix of ordinary steps
+        # is untouched and the A/B is clean.
+        if (
+            step.kind == "investigate"
+            and self._f.valves.investigate_methodology
+            and self._SWEEP_GOAL_RE.search(step.goal or "")
+        ):
+            instruction += self._SWEEP_METHODOLOGY
+            self._f._log_debug(
+                f"🤖 Agentic: step {step.id} (investigate) — systematic "
+                f"sweep methodology selected (absence/universal goal)"
+            )
+        # Fase 5: the terminal analyze always gets the conclusion-quality
+        # methodology (no selector needed — every conclusion benefits from
+        # naming its load-bearing evidence and typing its residual risk).
+        # Gated on the exact kind, not the template fallback, so an
+        # unknown kind that borrows the analyze template stays untouched.
+        if step.kind == "analyze" and self._f.valves.analyze_methodology_charter:
+            instruction += self._ANALYZE_METHODOLOGY
         if step.symbols:
             instruction += "\nFocus symbols suggested by the planner: " + ", ".join(
                 step.symbols
@@ -16159,7 +16535,12 @@ class AgenticSynthesisComposer:
                         cited = f" [{', '.join(c.valid_qids)}]" if c.valid_qids else ""
                         suffix = (
                             f" — {c.verification}: {c.verification_detail}"
-                            if c.verification in ("unsupported", "unverifiable")
+                            if c.verification
+                            in (
+                                "unsupported",
+                                "unverifiable",
+                                "unoperationalizable",
+                            )
                             else ""
                         )
                         lines.append(f"- ✓ {c.text}{cited}{suffix}")
@@ -16547,6 +16928,36 @@ class AgenticOrchestrator:
             for c in claims
             if c.text and c.evidence_type != "dynamic"
         ]
+        n_found = len(hyps)
+
+        # Region: Fase 0 — reveal the DISTINCT rival count, then ceiling it.
+        # The rival set is built from CLAIMS, and a 4-hypothesis output
+        # easily emits 10+ claims: several claims restate one mechanism, so
+        # 'Evaluating 12 hypotheses' was mostly claim inflation, not 12
+        # ideas. Dedup first (deterministic difflib collapse, zero calls,
+        # merges only near-identical texts — never distinct ideas), and
+        # only then apply the hard cap to what enters the EXPENSIVE
+        # competition. Order is preserved: the instruction asks for
+        # rank-by-likelihood, so first-N keeps the model's own ranking.
+        # The cap governs this initial set only — the divergent pool below
+        # and the abductive escape inside the competition are safety nets
+        # that ADD hypotheses when the initial set fails, and capping them
+        # would strangle recovery exactly when it is needed.
+        _n_raw = len(hyps)
+        hyps = self._f._meta_reasoning._dedupe_hypotheses(hyps)
+        if len(hyps) < _n_raw:
+            self._f._log_debug(
+                f"🤖 Agentic: rival dedup {_n_raw} claims → "
+                f"{len(hyps)} distinct hypotheses"
+            )
+        _cap = int(self._f.valves.hypothesis_hard_cap)
+        if _cap > 0 and len(hyps) > _cap:
+            self._f._log_debug(
+                f"🤖 Agentic: rival set capped {len(hyps)} → {_cap} "
+                f"(hypothesis_hard_cap; dropped tail of the model's own "
+                f"likelihood ranking)"
+            )
+            hyps = hyps[:_cap]
         n_found = len(hyps)
 
         # Region: proactive trigger — rivals present OR debugging intent
@@ -17381,6 +17792,12 @@ class AgenticOrchestrator:
             difficulty=str(
                 getattr(self._preplanner, "last_stats", {}).get("difficulty", "") or ""
             ),
+            question_type=str(
+                getattr(self._preplanner, "last_stats", {}).get(
+                    "question_type", ""
+                )
+                or ""
+            ),
         )
         self._f._log_debug(
             f"🤖 Agentic: plan ready ({len(plan.steps)} steps, "
@@ -17643,6 +18060,74 @@ class AgenticOrchestrator:
                         for c in self._ledger.claims_for(hid)
                         if getattr(c, "verification", "") == "refuted"
                     ]
+
+                    # Region: Fase 6 — retry ROUTER. The canonical loop
+                    # returns to DIFFERENT steps depending on the failure
+                    # class, not always to hypothesize. The full routing
+                    # table, with each route's mechanism:
+                    #   · sound refutation → re-hypothesize (Gap 2, below)
+                    #   · harness doubt    → withhold the hypothesis retry
+                    #     (THIS block): a refutation whose cited qid sits
+                    #     in the dyn verifier's _harness_suspects (Fase 4:
+                    #     infrastructure failure or zero-pass suspicion)
+                    #     is evidence about the EXPERIMENT, not the
+                    #     hypothesis — burning the bounded retry budget on
+                    #     it replaces a possibly-correct hypothesis in
+                    #     response to a broken harness. Fixing the harness
+                    #     itself (regeneration bypassing the body_hash
+                    #     cache) is Fase 8; the router's job today is to
+                    #     not act on doubted evidence.
+                    #   · missing evidence → NEEDS gap-fill (exists)
+                    #   · question wrong   → step-level ask_user (exists)
+                    _rt_mode = self._f.valves.agentic_retry_router
+                    if _refuted and _rt_mode in ("shadow", "on"):
+                        _suspect_qids = {
+                            q
+                            for q, _ in getattr(
+                                self._dyn, "_harness_suspects", []
+                            )
+                        }
+                        _doubted = [
+                            c
+                            for c in _refuted
+                            if _suspect_qids and set(c.qids) & _suspect_qids
+                        ]
+                        if _doubted and _rt_mode == "shadow":
+                            self._f._log_debug(
+                                f"🤖 [RETRY-ROUTER-SHADOW] "
+                                f"{len(_doubted)}/{len(_refuted)} refuted "
+                                f"claim(s) trace to suspect harness(es) — "
+                                f"would route to harness doubt (no "
+                                f"re-hypothesize for them)"
+                            )
+                        elif _doubted:
+                            _sound = [
+                                c
+                                for c in _refuted
+                                if not (set(c.qids) & _suspect_qids)
+                            ]
+                            if not _sound:
+                                await self._f._emit_status(
+                                    "🤖 Agentic: refutation traces to a "
+                                    "suspect harness — hypothesis retry "
+                                    "withheld (harness doubt)"
+                                )
+                                self._f._log_debug(
+                                    f"🤖 Agentic retry router: all "
+                                    f"{len(_refuted)} refutation(s) cite "
+                                    f"suspect harness qid(s) "
+                                    f"{sorted(_suspect_qids)} — retry "
+                                    f"budget preserved"
+                                )
+                            else:
+                                self._f._log_debug(
+                                    f"🤖 Agentic retry router: "
+                                    f"{len(_doubted)} doubted refutation(s) "
+                                    f"excluded; retry proceeds on "
+                                    f"{len(_sound)} sound one(s)"
+                                )
+                            _refuted = _sound
+
                     if _refuted:
                         _hypo_retries += 1
                         _summary = "; ".join(
@@ -17680,7 +18165,13 @@ class AgenticOrchestrator:
                                 "the strongest surviving rival or formulate "
                                 "a genuinely NEW hypothesis consistent with "
                                 "the refutation evidence — do NOT reword "
-                                "the refuted one." + _parked_txt
+                                "the refuted one. If you instead EXTEND a "
+                                "refuted hypothesis with a domain condition "
+                                "('only when X'), the condition must name "
+                                "its own checkable anchor (symbol, flag or "
+                                "relation); a second conditional rescue "
+                                "means the hypothesis is degenerating — "
+                                "replace it instead." + _parked_txt
                             ),
                             kind="hypothesize",
                         )
@@ -25971,9 +26462,15 @@ class MetacognitiveReasoningEngine:
                 "corruption, cache poisoning, data loss or a concurrency "
                 "hazard deserves early testing even at low prior "
                 "probability.\n"
-                "- No ad-hoc rescues: a hypothesis that survives only by "
-                "accumulating auxiliary assumptions is degenerating; say "
-                "so instead of patching it."
+                "- Domain extension vs ad-hoc rescue: ONE conditional "
+                "clause may legitimately save a hypothesis ('this only "
+                "occurs while the freeze window is active') PROVIDED the "
+                "clause itself is independently checkable — name the "
+                "symbol, flag or relation that decides the condition. A "
+                "clause that cannot be checked is an ad-hoc rescue, not an "
+                "extension. A SECOND rescue clause on the same hypothesis "
+                "means it is degenerating: say so and rank it down instead "
+                "of patching it again."
             )
 
         if coverage_score < self._f.valves.low_coverage_threshold:
@@ -40399,6 +40896,48 @@ class Filter:
                 "hypothesize LLM call plus a deterministic verify."
             ),
         )
+        agentic_retry_router: str = Field(
+            default="shadow",
+            description=(
+                "Fase 6: route the refutation loop by FAILURE CLASS "
+                "instead of always re-hypothesizing. A refuted claim whose "
+                "cited qid sits in the dynamic verifier's harness-suspect "
+                "pool (Fase 4: infrastructure failure or zero-pass "
+                "suspicion) is evidence about the EXPERIMENT, not the "
+                "hypothesis — burning the bounded retry budget on it "
+                "replaces a possibly-correct hypothesis in response to a "
+                "broken harness. 'off' = every refutation triggers the "
+                "retry (old behavior). 'shadow' (default) = log the "
+                "would-be routing via [RETRY-ROUTER-SHADOW] without "
+                "changing it. 'on' = doubted refutations are excluded "
+                "from the retry trigger (retry proceeds on sound ones "
+                "only; fully doubted → retry withheld, budget preserved, "
+                "status emitted). The other routes already exist: missing "
+                "evidence → NEEDS gap-fill; wrong question → step-level "
+                "ask_user."
+            ),
+        )
+        verify_replicate_suspect: str = Field(
+            default="shadow",
+            description=(
+                "Fase 8: selective replication. When a FRESH harness run "
+                "comes back with a suspect shape (shared predicate with "
+                "verify_dynamic_verdict_integrity: infrastructure status "
+                "or zero-pass), regenerate the tests ONCE with a hint "
+                "describing the failure, re-compose and re-execute, and "
+                "let the second result be authoritative — recovered "
+                "evidence instead of discarded evidence. Structurally "
+                "bounded to one replication per target; cached results "
+                "are never replicated (only fresh executions pay the "
+                "extra harness). A replica that reproduces a suspect "
+                "shape CONFIRMS the doubt with two independent data "
+                "points and flows into the Fase 4/6 handling as usual. "
+                "'off' = never. 'shadow' (default) = log would-replicate "
+                "via [REPLICATE-SHADOW]. 'on' = replicate. Cost when it "
+                "fires: one harness-generation LLM call plus one sandbox "
+                "execution."
+            ),
+        )
         hypothesis_principles_charter: bool = Field(
             default=True,
             description=(
@@ -40410,8 +40949,13 @@ class Filter:
                 "(checkable structural predictions rank above unfalsifiable "
                 "prose), parsimony as tiebreaker only, the severity "
                 "exception (silent-corruption hypotheses tested early even "
-                "at low prior), and no ad-hoc rescues. Deterministic text "
-                "through the same PID channel as the adaptive constraints."
+                "at low prior), and the domain-extension discipline "
+                "(Fase 7: ONE conditional clause may save a hypothesis if "
+                "the clause names its own checkable anchor; an uncheckable "
+                "clause is an ad-hoc rescue, and a SECOND rescue means the "
+                "hypothesis is degenerating — rank it down instead of "
+                "patching again). Deterministic text through the same PID "
+                "channel as the adaptive constraints."
             ),
         )
         agentic_competition_early_converge: bool = Field(
@@ -40440,6 +40984,123 @@ class Filter:
                 "enough — the winner must DECISIVELY separate from its "
                 "rivals', which is the discrimination the field data "
                 "(all hypotheses are scored each iteration) already supports."
+            ),
+        )
+        hypothesis_target_auto: bool = Field(
+            default=True,
+            description=(
+                "Size the hypothesize step's enumeration request from the "
+                "pre-planner difficulty verdict (low → 2-3, medium → 3-5, "
+                "high → 4-6) instead of the blind historical '2-4'. Soft by "
+                "construction: it is a request in the prompt, never a "
+                "truncation. Off restores the fixed 2-4."
+            ),
+        )
+        preplan_question_typing: bool = Field(
+            default=True,
+            description=(
+                "Fase 1: the pre-planner classifies the request's NATURE "
+                "(exploratory = no cause proposed; confirmatory = the user "
+                "proposes a cause to check; descriptive = factual lookup; "
+                "mechanism = how it works) and the planner receives the "
+                "matching plan-shape hint (e.g. descriptive → no "
+                "hypothesize; confirmatory → user's claim as one rival "
+                "among alternatives). A hint, not an order: the parser and "
+                "the order normalization still govern. Off suppresses the "
+                "plan-shape hint (the pre-planner still reports the type "
+                "for telemetry/AGENTIC-RUN), leaving the planner contract "
+                "byte-identical to before."
+            ),
+        )
+        claims_operationalization: str = Field(
+            default="shadow",
+            description=(
+                "Fase 2: distinguish 'cannot be verified AS FORMULATED' "
+                "from 'not yet verified'. A claim citing no qids generates "
+                "no checks and silently dodges verification; downstream it "
+                "reads as pending when the real diagnosis is a badly "
+                "formulated claim. 'off' = old behavior. 'shadow' "
+                "(default) = log would-be cases via "
+                "[OPERATIONALIZE-SHADOW] without stamping. 'on' = stamp "
+                "verification='unoperationalizable' (deterministic — no "
+                "anchor means no check, no LLM judgement involved) and "
+                "list the affected claims in the verify report so "
+                "synthesis asks for a better claim instead of more "
+                "evidence. The claims contract always states the "
+                "requirement (name the measurement); this valve governs "
+                "only the verdict."
+            ),
+        )
+        investigate_methodology: bool = Field(
+            default=True,
+            description=(
+                "Fase 3: methodology selection for investigate steps. A "
+                "deterministic word-bounded regex (bilingual EN/ES) "
+                "detects ABSENCE or UNIVERSAL goals ('no caller', "
+                "'never', 'ningún', 'todos') and appends the systematic "
+                "sweep discipline: evidence of absence requires EXHAUSTIVE "
+                "enumeration via TOOL: CALLERS/CALLEES/GREP, sampling "
+                "proves existence only, and an unenumerable set must be "
+                "declared instead of silently sampled. Ordinary "
+                "investigate steps keep the historical instruction "
+                "byte-identical. Off disables the selector entirely."
+            ),
+        )
+        analyze_methodology_charter: bool = Field(
+            default=True,
+            description=(
+                "Fase 5: conclusion-quality methodology for the terminal "
+                "analyze. The analysis must END with three labeled lines: "
+                "LOAD-BEARING EVIDENCE (the single piece whose failure "
+                "flips the conclusion — sensitivity analysis), RESIDUAL "
+                "RISK (false positive: passed checks but could be wrong, "
+                "vs false negative: evidence never seen — truncation, "
+                "incomplete enumeration), and ERROR CHARACTER when "
+                "evidence disagreed (SYSTEMATIC: stale index / wrong "
+                "framing, re-running will not help, vs RANDOM: sampling "
+                "noise, re-running helps). Labeled so the phase metric is "
+                "a grep and synthesis inherits them verbatim. Off leaves "
+                "the analyze instruction byte-identical."
+            ),
+        )
+        verify_dynamic_verdict_integrity: str = Field(
+            default="shadow",
+            description=(
+                "Fase 4: the experiment's control. Two failure shapes were "
+                "stamped as the system's strongest refutation when they "
+                "are evidence about the HARNESS, not the code: (1) status "
+                "error/timeout/rejected — the harness never ran, yet every "
+                "claim citing the qid got 'refuted'; (2) zero-pass "
+                "suspicion — 'fail' with 0/N asserts passed (N>=3): a "
+                "surgical refutation fails the asserts touching the "
+                "claim, EVERYTHING failing is the signature of a broken "
+                "composition (a result that would also 'refute' a "
+                "known-good implementation refutes only the harness). "
+                "'off' = old behavior. 'shadow' (default) = log would-be "
+                "downgrades via [VERDICT-INTEGRITY-SHADOW] without "
+                "changing verdicts. 'on' = downgrade both shapes to "
+                "'inconclusive' (inert for every existing consumer) and "
+                "stamp the ⚗ claim 'unverifiable' instead of 'refuted'. "
+                "Either mode parks the qid in _harness_suspects for the "
+                "Fase 6 retry router ('harness doubt' route). Blinding — "
+                "the harness generator receiving the operationalized "
+                "check, not the hypothesis narrative — was audited and is "
+                "already structurally satisfied: _elicit_tests receives "
+                "body + testability verdict only."
+            ),
+        )
+        hypothesis_hard_cap: int = Field(
+            default=10,
+            ge=0,
+            le=20,
+            description=(
+                "Safety ceiling on DISTINCT rivals entering the hypothesis "
+                "competition, applied AFTER deterministic dedup (claims "
+                "restating one mechanism collapse first, so the cap counts "
+                "ideas, not claims). First-N keeps the model's own "
+                "likelihood ranking. Governs the initial set only — the "
+                "divergent pool and abductive escape are recovery nets and "
+                "stay exempt. 0 disables."
             ),
         )
         agentic_generative_eval: str = Field(
