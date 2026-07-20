@@ -15200,6 +15200,23 @@ class AgenticPreplanner:
       - Fully instrumented (status emissions + logs + AGENTIC-RUN field).
     """
 
+    # Fase 1 anomaly markers: symptoms in the USER's wording that make a
+    # request a malfunction diagnosis regardless of how/why phrasing.
+    # High-precision on purpose: bare 'fail'/'error' excluded (they name
+    # healthy subsystems: fail-open guards, error handling); the
+    # same-input-different-output pattern covers the live miss.
+    _ANOMALY_RE = re.compile(
+        r"\b(bug|intermittent|intermitente|flaky|crash|broken|leak|race"
+        r"|inconsistent\w*|inconsistente\w*|unexpected|inesperad\w+"
+        r"|failure|fallo|falla)\b"
+        r"|a veces|sometimes|se rompe|no funciona|deja de funcionar"
+        r"|vac[i\u00ed][oa]s?\b|\bempty\b"
+        r"|distint\w+.{0,50}\bmism[oa]s?\b|\bmism[oa]s?\b.{0,50}distint"
+        r"|different.{0,50}\bsame\b|\bsame\b.{0,50}different"
+        r"|sin cambios|without (code )?changes",
+        re.IGNORECASE,
+    )
+
     _CONTRACT = (
         "You are the PRE-planner of a code-analysis pipeline. Your job is "
         "NOT to plan — a separate planner will decide HOW. Your job is to "
@@ -15278,7 +15295,13 @@ class AgenticPreplanner:
         "cause Y'); descriptive = a factual inventory or lookup ('how many "
         "callers', 'where is X used', 'what does X return'); mechanism = "
         "how something works internally ('how does X do Y', 'walk me "
-        "through the flow'). Judge from the USER's wording.\n\n"
+        "through the flow'). A MALFUNCTION is NEVER mechanism: if the "
+        "request describes a symptom — wrong, different, empty, missing or "
+        "intermittent output, a crash, 'sometimes', 'same input different "
+        "result', 'without code changes' — it is exploratory (no cause "
+        "proposed) or confirmatory (cause proposed), even when phrased as "
+        "'why/how does X...'. mechanism is reserved for how HEALTHY, "
+        "intended behaviour works. Judge from the USER's wording.\n\n"
         "{tool_results}"
         "Request:\n{question}"
     )
@@ -15522,6 +15545,26 @@ class AgenticPreplanner:
             "mechanism",
         ):
             question_type = ""
+        # Region: anomaly override (deterministic net under the LLM
+        # classification). Observed live: 'why does PPR return DIFFERENT
+        # scores for the SAME query without code changes' typed as
+        # mechanism, whose plan-shape hint legitimately suppresses
+        # hypothesize — so the entire competition suite (charter,
+        # convergence, tiebreaker, devil's advocate) sat dormant on a bug
+        # turn. A malfunction is never mechanism. When the USER's own
+        # wording carries anomaly markers and the LLM typed the request
+        # mechanism/descriptive, demote to exploratory: worst case a
+        # lookup gains a hypothesize step (cost), never the reverse (a
+        # bug losing its hypothesis competition). Bilingual, word-bounded
+        # where a bare stem would collide ('falla' vs 'fallback').
+        if question_type in ("mechanism", "descriptive") and self._ANOMALY_RE.search(
+            question or ""
+        ):
+            self._f._log_debug(
+                f"🧭 Preplanner: typing override — anomaly markers in the "
+                f"question → exploratory (LLM said {question_type})"
+            )
+            question_type = "exploratory"
         self.last_stats = {
             "used": True,
             "framings": n_framings,
@@ -15727,6 +15770,31 @@ class AgenticPlanner:
                         f"(valve ceiling {max_steps} still enforced by the "
                         f"parser and NEEDS insertion)"
                     )
+        # Region: A/B plan profile (agentic_plan_profile). The quick path
+        # (investigate → verify → analyze, no hypothesize) is not a coded
+        # route but the EMERGENT plan shape when the typing hint and the
+        # low-difficulty budget align. For quality A/B tests the operator
+        # needs both shapes forceable from one switch: 'full' overrides
+        # budget to the valve ceiling and (below) replaces the type hint
+        # with a full-method directive; 'fast' pins the budget to 3 and
+        # directs the quick shape. 'auto' (default) = the selectors above
+        # decide, byte-identical to before.
+        _profile = str(
+            getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
+        ).lower()
+        if _profile == "full":
+            effective_max = max_steps
+            self._f._log_debug(
+                f"🤖 Planner: plan profile FULL — budget pinned to "
+                f"ceiling {max_steps}, full-method directive replaces the "
+                f"type hint"
+            )
+        elif _profile == "fast":
+            effective_max = min(3, max_steps)
+            self._f._log_debug(
+                "🤖 Planner: plan profile FAST — budget pinned to 3, "
+                "quick-path directive replaces the type hint"
+            )
         # Defensive cap: {question} is substituted raw into the contract;
         # a caller that bypasses the gate must not be able to inflate the
         # planner prompt with a full paste (see the gate cap in
@@ -15775,6 +15843,25 @@ class AgenticPlanner:
                 ),
             }
             qtype_hint = _shapes.get(question_type, "")
+        # A/B plan profile (continuation of the region above): in 'full'
+        # and 'fast' the profile directive REPLACES the type hint entirely
+        # — the point of the A/B is holding the plan shape constant across
+        # question types, so the per-type shaping must stand down.
+        if _profile == "full":
+            qtype_hint = (
+                "PLAN PROFILE: FULL METHOD (A/B override). Schedule the "
+                "complete scientific method regardless of question type: "
+                "investigate step(s), then a hypothesize step enumerating "
+                "competing hypotheses, then verification, then analyze. "
+                "Do not omit hypothesize.\n\n"
+            )
+        elif _profile == "fast":
+            qtype_hint = (
+                "PLAN PROFILE: FAST PATH (A/B override). Schedule the "
+                "minimal shape regardless of question type: investigate "
+                "step(s) then analyze. Do NOT schedule hypothesize or "
+                "design_tests.\n\n"
+            )
         # NapMem: tell the planner the MEMORY tool exists so investigate
         # goals can be phrased to include past-work lookups (V4 lever).
         memory_hint = (
@@ -40685,7 +40772,7 @@ class Filter:
             ),
         )
         agentic_max_steps: int = Field(
-            default=5,
+            default=7,
             ge=2,
             le=8,
             description=(
@@ -41039,7 +41126,7 @@ class Filter:
             ),
         )
         agentic_generative_rigor: str = Field(
-            default="shadow",
+            default="on",
             description=(
                 "P1: subject a proposed generative improvement to a structural "
                 "test before accepting it. Today the evaluator's "
@@ -41095,7 +41182,7 @@ class Filter:
             ),
         )
         agentic_retry_router: str = Field(
-            default="shadow",
+            default="on",
             description=(
                 "Fase 6: route the refutation loop by FAILURE CLASS "
                 "instead of always re-hypothesizing. A refuted claim whose "
@@ -41116,7 +41203,7 @@ class Filter:
             ),
         )
         verify_replicate_suspect: str = Field(
-            default="shadow",
+            default="on",
             description=(
                 "Fase 8: selective replication. When a FRESH harness run "
                 "comes back with a suspect shape (shared predicate with "
@@ -41157,7 +41244,7 @@ class Filter:
             ),
         )
         agentic_competition_early_converge: bool = Field(
-            default=True,
+            default=False,
             description=(
                 "When on, the hypothesis competition stops as soon as the "
                 "leading hypothesis reaches the confidence threshold. Off "
@@ -41194,6 +41281,28 @@ class Filter:
                 "truncation. Off restores the fixed 2-4."
             ),
         )
+        agentic_plan_profile: str = Field(
+            default="full",
+            description=(
+                "A/B switch between the full scientific method and the "
+                "quick path, from one place. 'auto' (default): the "
+                "selectors decide — question-type hints and the "
+                "difficulty budget produce the quick path (investigate → "
+                "verify → analyze) for descriptive/low turns and the full "
+                "method elsewhere. 'full': every agentic turn schedules "
+                "the complete method (a full-method directive replaces "
+                "the type hint, budget pinned to the agentic_max_steps "
+                "ceiling) — hypothesize always present, so the whole "
+                "competition suite runs. 'fast': every agentic turn "
+                "schedules the minimal shape (quick-path directive, "
+                "budget pinned to 3) — no hypothesize, no competition. "
+                "In full/fast the profile directive REPLACES the "
+                "question-type hint so the plan shape is held constant "
+                "across question types, which is what makes the A/B "
+                "clean. The parser invariants (analyze-last, verify "
+                "auto-insert, order normalization) apply in all three."
+            ),
+        )
         preplan_question_typing: bool = Field(
             default=True,
             description=(
@@ -41211,7 +41320,7 @@ class Filter:
             ),
         )
         claims_operationalization: str = Field(
-            default="shadow",
+            default="on",
             description=(
                 "Fase 2: distinguish 'cannot be verified AS FORMULATED' "
                 "from 'not yet verified'. A claim citing no qids generates "
@@ -41262,7 +41371,7 @@ class Filter:
             ),
         )
         verify_dynamic_verdict_integrity: str = Field(
-            default="shadow",
+            default="on",
             description=(
                 "Fase 4: the experiment's control. Two failure shapes were "
                 "stamped as the system's strongest refutation when they "
@@ -43979,6 +44088,48 @@ class Filter:
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             self._log_debug("outlet: prerequisites not met, returning body unchanged")
             return body
+
+        # ------------------------------------------------------------------
+        # Region: repair glued code fences on the LIVE response.
+        #
+        # The inlet-prologue normalizer repairs the PREVIOUS response before
+        # re-injection (history hygiene, fence-anchored extraction) — but it
+        # runs one turn late for what the user actually sees: the glued
+        # fence ('así:```python') streams straight to OpenWebUI and breaks
+        # the markdown block render. Observed live twice, persisting after
+        # DRY sequence breakers were disabled, which falsifies the sampler
+        # hypothesis for this artifact: it is the model/quant ranking the
+        # fence token above the newline after ':'. Repairing here, on the
+        # message OpenWebUI persists and re-renders at stream end, fixes
+        # the render regardless of cause. Same battle-tested regex as the
+        # prologue; same valve. If this log ever reports an empty body,
+        # this OpenWebUI version does not deliver messages to outlet and
+        # the fix must move to a stream hook — telemetry first.
+        # ------------------------------------------------------------------
+        try:
+            if self.valves.normalize_glued_fences:
+                _msgs = body.get("messages") or []
+                _last_a = next(
+                    (m for m in reversed(_msgs) if m.get("role") == "assistant"),
+                    None,
+                )
+                if _last_a is None:
+                    self._log_debug(
+                        "outlet: no assistant message in body — live fence "
+                        "repair unavailable (empty outlet body?)"
+                    )
+                elif isinstance(_last_a.get("content"), str) and (
+                    "```" in _last_a["content"]
+                ):
+                    _fixed = re.sub(r"([^\n`])(```)", r"\1\n\2", _last_a["content"])
+                    if _fixed != _last_a["content"]:
+                        _last_a["content"] = _fixed
+                        self._log_debug(
+                            "outlet: repaired glued code fence(s) on the "
+                            "live response"
+                        )
+        except Exception as _e:
+            self._log_debug(f"outlet: live fence repair skipped ({_e!r})")
 
         # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
