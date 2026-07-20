@@ -12092,27 +12092,26 @@ class LLMOrchestrator:
         if _is_agentic_call and getattr(
             self._f.valves, "agentic_unlimited_tokens", False
         ):
-            max_tokens = None
-            # Region: runaway safety cap (R18). agentic_unlimited_tokens
-            # exists so healthy REASONING is never truncated, but a
-            # degenerate generation loop is not reasoning — observed live,
-            # design_critical_experiment emitted ~50k tokens (765-846s)
-            # four times in one run from a ~300-token prompt, and with
-            # ROCm dropping the top-k op (unsupported on this device) and
-            # DRY breakers disabled there was nothing to strangle the
-            # loop. This ceiling is generous — a real experiment design or
-            # hypothesis set finishes in well under it (healthy calls run
-            # out:400-900) — so it can only ever fire on a runaway, never
-            # on sane output. 0 disables (true unlimited, the pre-R18
-            # behaviour).
-            _runaway = int(
-                getattr(
-                    self._f.valves, "agentic_runaway_token_cap", 8000
+            # R25: an explicit positive max_tokens from the caller is a
+            # deliberate per-call ceiling and must be honoured — some
+            # agentic calls emit a small bounded artifact (e.g.
+            # design_critical_experiment's classifier JSON) and pass a tight
+            # cap precisely to stop the model drifting into a long partial
+            # repetition. Only when the caller left it open (0/None) does
+            # the unlimited path apply, still floored by the runaway cap.
+            _caller_cap = max_tokens if (max_tokens and max_tokens > 0) else 0
+            if _caller_cap > 0:
+                max_tokens = _caller_cap
+            else:
+                max_tokens = None
+                _runaway = int(
+                    getattr(
+                        self._f.valves, "agentic_runaway_token_cap", 8000
+                    )
+                    or 0
                 )
-                or 0
-            )
-            if _runaway > 0:
-                max_tokens = _runaway
+                if _runaway > 0:
+                    max_tokens = _runaway
         elif not max_tokens or max_tokens <= 0:
             _default_cap = int(
                 getattr(self._f.valves, "llm_uncapped_max_tokens", 2048) or 0
@@ -26685,7 +26684,19 @@ class MetacognitiveReasoningEngine:
                 "Your entire response must start with { and end with }."
             ),
             model_override=self._f.valves.cot_model_level3,
-            max_tokens=0,
+            # R25: this call emits a small JSON object (three string lists);
+            # a healthy design classifies in ~128 output tokens (measured
+            # median). Yet it is the single largest time sink in the
+            # pipeline — called once per claim inside the falsification loop
+            # (11-20 times per turn), and a fraction of those calls run away
+            # to 4-7k tokens (100s+ each) when the model drifts into partial
+            # repetition, which the global 8k runaway cap is far too loose
+            # to catch here. A dedicated tight cap kills the drift without
+            # touching any legitimate design (the JSON fits with wide
+            # margin), turning 100s calls into ~15s ones.
+            max_tokens=int(
+                getattr(self._f.valves, "design_experiment_max_tokens", 1500)
+            ),
             temperature=0.0,
             label="design_critical_experiment",
             response_format={"type": "json_object"},
@@ -41105,6 +41116,24 @@ class Filter:
         )
 
         # ── 8.16 Agentic pipeline (manual /agent — Fase 1) ──────────────────
+        design_experiment_max_tokens: int = Field(
+            default=1500,
+            ge=200,
+            le=8000,
+            description=(
+                "R25: dedicated output cap for design_critical_experiment, "
+                "which emits a small JSON classifier object (measured "
+                "median ~128 output tokens). It is called once per claim "
+                "inside the falsification loop — 11-20 times per turn — and "
+                "was the single largest time sink: a fraction of those "
+                "calls drifted to 4-7k tokens (100s+ each) under the loose "
+                "global runaway cap. 1500 leaves wide margin over any real "
+                "design while cutting the drift, turning ~100s calls into "
+                "~15s ones. Applies specifically to this call; the global "
+                "agentic_runaway_token_cap still governs other agentic "
+                "calls that leave max_tokens open."
+            ),
+        )
         agentic_runaway_token_cap: int = Field(
             default=8000,
             ge=0,
