@@ -304,6 +304,12 @@ class UseCase(str, Enum):
         }[self.value]
 
 
+# R12: OpenWebUI names pasted-code uploads 'Pasted_Text_<epoch_ms>'. That
+# synthetic filename must never become a module prefix in a qualified id
+# (see qualify_symbol_name). Matches the stem, with or without extension.
+_PASTED_UPLOAD_RE = re.compile(r"^Pasted_Text_\d+$", re.IGNORECASE)
+
+
 def qualify_symbol_name(
     name: str, parent_symbol: str, file_path: Optional[str] = None
 ) -> str:
@@ -323,6 +329,16 @@ def qualify_symbol_name(
         return f"{parent_symbol}.{name}"
     if file_path:
         module = os.path.splitext(os.path.basename(file_path))[0]
+        # R12: OpenWebUI names a pasted-code upload 'Pasted_Text_<epoch_ms>',
+        # and that synthetic name was riding into qualified ids as a module
+        # prefix ('Pasted_Text_1784570228125.ConversationState', 24 live
+        # occurrences), poisoning the symbol index, PPR seeds, and
+        # hypothesis dedup (two identical rivals under different paste
+        # timestamps never collapse). A synthetic upload name carries no
+        # real module identity, so drop it: fall back to the bare name,
+        # exactly as for an unknown file.
+        if _PASTED_UPLOAD_RE.match(module or ""):
+            return name
         if module and module != name:
             return f"{module}.{name}"
     return name
@@ -12077,6 +12093,26 @@ class LLMOrchestrator:
             self._f.valves, "agentic_unlimited_tokens", False
         ):
             max_tokens = None
+            # Region: runaway safety cap (R18). agentic_unlimited_tokens
+            # exists so healthy REASONING is never truncated, but a
+            # degenerate generation loop is not reasoning — observed live,
+            # design_critical_experiment emitted ~50k tokens (765-846s)
+            # four times in one run from a ~300-token prompt, and with
+            # ROCm dropping the top-k op (unsupported on this device) and
+            # DRY breakers disabled there was nothing to strangle the
+            # loop. This ceiling is generous — a real experiment design or
+            # hypothesis set finishes in well under it (healthy calls run
+            # out:400-900) — so it can only ever fire on a runaway, never
+            # on sane output. 0 disables (true unlimited, the pre-R18
+            # behaviour).
+            _runaway = int(
+                getattr(
+                    self._f.valves, "agentic_runaway_token_cap", 8000
+                )
+                or 0
+            )
+            if _runaway > 0:
+                max_tokens = _runaway
         elif not max_tokens or max_tokens <= 0:
             _default_cap = int(
                 getattr(self._f.valves, "llm_uncapped_max_tokens", 2048) or 0
@@ -15205,6 +15241,14 @@ class AgenticPreplanner:
     # High-precision on purpose: bare 'fail'/'error' excluded (they name
     # healthy subsystems: fail-open guards, error handling); the
     # same-input-different-output pattern covers the live miss.
+    # R5: markers that a request states a concrete deliverable — the
+    # pre-planner should answer these, never ask for clarification.
+    _DELIVERABLE_RE = re.compile(
+        r"\b(dame|damelo|mu[eé]strame|ens[eé]-?name|escribe|genera|"
+        r"give me|show me|write|generate|al completo|completo|"
+        r"el diff|the diff|full body|con el fix|with the fix)\b",
+        re.IGNORECASE,
+    )
     _ANOMALY_RE = re.compile(
         r"\b(bug|intermittent|intermitente|flaky|crash|broken|leak|race"
         r"|inconsistent\w*|inconsistente\w*|unexpected|inesperad\w+"
@@ -15574,6 +15618,40 @@ class AgenticPreplanner:
             "question_type": question_type,
         }
         if ask and not chosen:
+            # R5: guard against a false-positive clarification request. The
+            # pre-planner asked for clarification on a fully answerable
+            # question ('dame build_block_a al completo con el fix' —
+            # names a symbol, states a concrete deliverable), which by its
+            # own contract is answerable, not ambiguous. When the question
+            # names a resolvable symbol AND carries anomaly/deliverable
+            # markers, the ask is almost certainly spurious: suppress it,
+            # fail open (proceed with no brief, exactly as when the
+            # pre-planner does not parse), and let the pipeline answer. A
+            # genuinely underspecified request ('fix the bug', no object)
+            # names no symbol and still asks.
+            _names_symbol = False
+            try:
+                _known = self._f._symbol_index.get_all_names(project_id)
+                if _known:
+                    _idents = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question or ""))
+                    _names_symbol = not _idents.isdisjoint(_known)
+            except Exception:
+                _names_symbol = False
+            _answerable = _names_symbol and (
+                self._ANOMALY_RE.search(question or "")
+                or self._DELIVERABLE_RE.search(question or "")
+            )
+            if _answerable and getattr(
+                self._f.valves, "preplan_suppress_false_clarify", True
+            ):
+                self._f._log_debug(
+                    "🧭 Preplanner: clarification suppressed — question "
+                    "names a symbol and states a deliverable/symptom "
+                    "(answerable by contract); proceeding without brief"
+                )
+                self.last_stats["asked"] = False
+                self.last_stats["clarify_suppressed"] = True
+                return "", ""
             self._f._log_debug(
                 f"🧭 Preplanner: no framing defensible — asking " f"('{ask[:80]}')"
             )
@@ -16147,8 +16225,29 @@ class AgenticPlanner:
             getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
         ).lower()
         if _prof == "full" and not any(s.kind == "hypothesize" for s in steps):
-            steps.insert(
+            # R15: insert BEFORE the first verify/analyze step, not at
+            # len-1. The old position assumed the last step is the analyze;
+            # when the planner emitted the analyze mid-list (observed live:
+            # a descriptive plan whose sids ran 1,3,4,2), len-1 dropped the
+            # hypothesize after a verify, and only the order-normalization
+            # sort rescued it — silently coupling this guard to
+            # agentic_enforce_step_order. Anchoring on the first
+            # hypothesize-consuming step makes the placement correct on its
+            # own, independent of that valve. Falls back to len-1 only if no
+            # such step exists (which cannot happen once analyze-last ran
+            # above, but stays defensive).
+            _rank = {
+                "verify_dynamic": 0,
+                "verify_regression": 1,
+                "verify": 2,
+                "analyze": 3,
+            }
+            _anchor = next(
+                (i for i, s in enumerate(steps) if s.kind in _rank),
                 len(steps) - 1,
+            )
+            steps.insert(
+                _anchor,
                 AgenticStep(
                     id=max(s.id for s in steps) + 1,
                     goal=(
@@ -16160,7 +16259,8 @@ class AgenticPlanner:
             )
             self._f._log_debug(
                 "🤖 Planner: profile FULL — hypothesize missing from the "
-                "planner output, inserted (parser enforcement)"
+                f"planner output, inserted at position {_anchor} "
+                f"(parser enforcement)"
             )
         return steps
 
@@ -16477,6 +16577,35 @@ class AgenticStepExecutor:
         prompt = self.build_prompt(step, workspace)
         started = time.monotonic()
         response = ""
+        # Region: R19 — tool-round context budget. The step prompt grows
+        # every round (it re-appends the previous prompt + the model's full
+        # prose + the new tool results), so a step that EXPANDs several
+        # large bodies can silently push prompt + aligned prefix + the
+        # generation reserve past ctx-size, causing a hard truncation or a
+        # KV eviction — the "step runs out of budget/space" the operator
+        # observed. The budget is measured, not guessed: input_budget is
+        # ctx minus the aligned prefix minus the generation reserve minus a
+        # safety margin. The EXPANDed code is what the step asked for and
+        # must stay reachable, so when the budget is tight the prune drops
+        # the model's OWN prior prose ('[Your investigation so far]'),
+        # never the tool results, and only falls back to a hard stop when
+        # even the tool results alone would overflow.
+        _tok = (
+            (lambda s: len(self._f.tokenizer.encode(s)))
+            if self._f.tokenizer
+            else (lambda s: len(s) // 4)
+        )
+        _prefix_tok = _tok(aligned_prefix)
+        _gen_reserve = int(self._f.valves.agentic_step_max_tokens)
+        _margin = int(self._f.valves.agentic_tool_ctx_margin)
+        _input_budget = max(
+            2000,
+            int(self._f.valves.agentic_ctx_size)
+            - _prefix_tok
+            - _gen_reserve
+            - _margin,
+        )
+        _accum_tool_results: List[str] = []
         for round_no in range(max_rounds + 1):
             try:
                 # return_meta: the claims contract lives at the very END of
@@ -16518,14 +16647,55 @@ class AgenticStepExecutor:
                 f": tool round {round_no + 1} — "
                 + ", ".join(f"{n}({a[:30]})" for n, a in seen)
             )
-            prompt = (
-                f"{prompt}\n\n[Your investigation so far]\n{response}"
-                f"\n\n## Tool results\n"
-                + "\n\n".join(results)
-                + "\n\nContinue this step using the tool results. You may "
+            # R19: accumulate the new tool results, then rebuild the prompt
+            # under budget. The base (workspace + instruction) and every
+            # tool result are kept; the model's prior prose is included only
+            # while it fits, and trimmed oldest-first when the budget is
+            # tight — the EXPANDed code survives, the verbose narration is
+            # what gives way.
+            _accum_tool_results.extend(results)
+            _base = self.build_prompt(step, workspace)
+            _tail = (
+                "\n\nContinue this step using the tool results. You may "
                 "request more tools with TOOL: lines, or finish now with "
                 "your prose and the required JSON claims block."
             )
+            _tools_block = "\n\n## Tool results\n" + "\n\n".join(
+                _accum_tool_results
+            )
+            _fixed_tok = _tok(_base) + _tok(_tools_block) + _tok(_tail)
+            if _fixed_tok > _input_budget:
+                # Even base + all tool results overflow: keep the most
+                # RECENT tool results (the ones this round asked for),
+                # dropping oldest, and drop prose entirely.
+                _kept: List[str] = []
+                _running = _tok(_base) + _tok(_tail)
+                for _r in reversed(_accum_tool_results):
+                    _rt = _tok(_r) + 2
+                    if _running + _rt > _input_budget:
+                        break
+                    _kept.insert(0, _r)
+                    _running += _rt
+                _dropped = len(_accum_tool_results) - len(_kept)
+                _accum_tool_results = _kept
+                self._f._log_debug(
+                    f"🤖 Agentic step {getattr(step, 'display_no', None) or step.id}"
+                    f": tool context at budget ({_input_budget} tok) — "
+                    f"dropped {_dropped} oldest tool result(s), kept "
+                    f"{len(_kept)}; prose omitted this round"
+                )
+                prompt = (
+                    _base
+                    + "\n\n## Tool results\n"
+                    + "\n\n".join(_accum_tool_results)
+                    + _tail
+                )
+            else:
+                # Budget for prose = whatever remains after fixed parts.
+                _prose = f"\n\n[Your investigation so far]\n{response}"
+                if _fixed_tok + _tok(_prose) > _input_budget:
+                    _prose = ""  # drop prose, keep all expanded code
+                prompt = _base + _prose + _tools_block + _tail
 
         # Region: record result (strip residual tool-request lines)
         step.seconds = time.monotonic() - started
@@ -18919,9 +19089,18 @@ class AgenticOrchestrator:
         # run (grep 'AGENTIC-RUN'), the calibration companion of the
         # [METACOG-SHADOW]/[REPLAN-SHADOW] lines.
         try:
+            _wall = round(time.monotonic() - started, 1)
+            _steps_s = round(sum(s.seconds for s in plan.steps), 1)
             _run_record = {
                 "trigger": trigger,
-                "wall_s": round(time.monotonic() - started, 1),
+                "wall_s": _wall,
+                # R13: the steps array never covered pre-planner, generative
+                # eval, tiebreaker or devil's advocate, so on short runs the
+                # accounted time was a fraction of the wall (live: wall
+                # 214.5s vs steps 43.6s — 80% invisible). overhead_s makes
+                # the gap explicit so optimisation is not flown blind.
+                "steps_s": _steps_s,
+                "overhead_s": round(_wall - _steps_s, 1),
                 "replans": _replans_used,
                 "preplan": getattr(self._preplanner, "last_stats", {}),
                 "steps": [
@@ -27436,7 +27615,7 @@ class MetacognitiveReasoningEngine:
                         current_scored, max_hypotheses, project_id, label
                     )
                     if escaped:
-                        hypotheses = escaped
+                        hypotheses = self._sanitize_pool(escaped, label, 'abductive')
                         obj_score_history = []  # inverted world, new baseline
                         continue
                 self._f._log_debug(
@@ -27540,8 +27719,22 @@ class MetacognitiveReasoningEngine:
                         f"produced no parseable hypotheses"
                     )
                     break
-                hypotheses = refined
-                obj_score_history = []  # reset — new direction, new baseline
+                hypotheses = self._sanitize_pool(refined, label, 'divergent')
+                # R9: keep the LAST score as the new baseline instead of
+                # wiping history. A full reset needs window+1 fresh
+                # iterations to re-arm the detector; with max_iters=4 and
+                # window=2 the reset lands at iteration 3 and the budget is
+                # exhausted before it can fire again, so a stagnated run
+                # ALWAYS burns all four iterations. Seeding the new
+                # direction with one baseline point lets the detector
+                # re-arm one iteration sooner, giving divergence a chance
+                # to show progress within budget. (The deeper cause —
+                # obj_score = verified/verifiable saturating at 1.0 when a
+                # hypothesis cites symbols that merely EXIST, so the score
+                # measures citation validity rather than causal
+                # correctness — is R8, a scoring-semantics change that
+                # needs its own validation run and is left untouched here.)
+                obj_score_history = obj_score_history[-1:]
 
             else:
                 # Convergent refinement with deterministic PID constraints
@@ -27559,7 +27752,7 @@ class MetacognitiveReasoningEngine:
                         f"parseable hypotheses"
                     )
                     break
-                hypotheses = refined
+                hypotheses = self._sanitize_pool(refined, label, 'refine')
 
         # ── Post-loop guard ───────────────────────────────────────────────
         if best_scored is None:
@@ -28060,6 +28253,30 @@ class MetacognitiveReasoningEngine:
             f"stagnated={stagnated}, score={final_score:.3f}, "
             f"call_failures={call_failures}, symbol_failures={symbol_failures}"
         )
+
+
+    def _sanitize_pool(
+        self, pool: List[Tuple[str, float]], label: str, stage: str
+    ) -> List[Tuple[str, float]]:
+        """
+        R7: enforce the distinct-rival ceiling on a REGENERATED pool.
+
+        Each competition iteration replaces the hypothesis list with the
+        parseable output of refine/divergent/abductive, whose size is
+        whatever the model emitted (observed live: 9 then 5 then 8 within
+        one competition — the 'Evaluating N' count breathing). Dedup then
+        cap so the pool the next iteration scores stays within the
+        configured target instead of drifting up with every regeneration.
+        """
+        cap = int(getattr(self._f.valves, "hypothesis_hard_cap", 10) or 0)
+        before = len(pool)
+        out = self._dedupe_hypotheses(pool, cap=cap)
+        if len(out) != before:
+            self._f._log_debug(
+                f"compete_hypotheses [{label}] {stage}: pool "
+                f"{before} → {len(out)} (dedup+cap {cap})"
+            )
+        return out
 
     def _get_adaptive_strategy(self, project_id: str) -> Dict[str, Any]:
         """
@@ -40758,6 +40975,24 @@ class Filter:
         )
 
         # ── 8.16 Agentic pipeline (manual /agent — Fase 1) ──────────────────
+        agentic_runaway_token_cap: int = Field(
+            default=8000,
+            ge=0,
+            le=32000,
+            description=(
+                "R18 runaway safety ceiling for agentic/scientific-method "
+                "calls when agentic_unlimited_tokens is on. Healthy "
+                "reasoning finishes far below it (observed sane calls run "
+                "a few hundred to ~900 output tokens); it exists only to "
+                "cut a degenerate generation loop — observed live, "
+                "design_critical_experiment ran ~50k tokens (765-846s) "
+                "four times in one session, with ROCm silently dropping "
+                "the top-k op and DRY breakers disabled leaving nothing "
+                "to strangle the loop. 8000 leaves a large margin over "
+                "any legitimate step while capping a runaway at seconds "
+                "instead of minutes. 0 disables (true unlimited)."
+            ),
+        )
         agentic_unlimited_tokens: bool = Field(
             default=True,
             description=(
@@ -40900,8 +41135,33 @@ class Filter:
                 "neighbouring turns become free."
             ),
         )
+        agentic_ctx_size: int = Field(
+            default=131072,
+            ge=8192,
+            le=1048576,
+            description=(
+                "R19: the llama.cpp --ctx-size, used to compute the "
+                "tool-round input budget (ctx minus the aligned prefix "
+                "minus the generation reserve minus the safety margin). "
+                "Must match the server's actual context length or the "
+                "budget guard will be wrong. Only affects budgeting, never "
+                "sent to the model."
+            ),
+        )
+        agentic_tool_ctx_margin: int = Field(
+            default=4000,
+            ge=0,
+            le=32000,
+            description=(
+                "R19: safety margin (tokens) held back when computing the "
+                "tool-round input budget, so measurement error in the "
+                "prefix/generation estimate cannot push a step past "
+                "ctx-size into a hard truncation or KV eviction. 4000 is "
+                "comfortable; raise it if truncation reappears."
+            ),
+        )
         agentic_tool_rounds_max: int = Field(
-            default=2,
+            default=3,
             ge=0,
             le=4,
             description=(
@@ -41371,6 +41631,23 @@ class Filter:
                 "across question types, which is what makes the A/B "
                 "clean. The parser invariants (analyze-last, verify "
                 "auto-insert, order normalization) apply in all three."
+            ),
+        )
+        preplan_suppress_false_clarify: bool = Field(
+            default=True,
+            description=(
+                "R5: suppress a pre-planner clarification request when the "
+                "question is answerable by its own contract — it names an "
+                "indexed symbol AND states a deliverable ('dame X al "
+                "completo') or a symptom (anomaly markers). Observed live, "
+                "the pre-planner asked for clarification on 'dame "
+                "build_block_a al completo con el fix' after the full "
+                "competition had already run, wasting the turn. When "
+                "suppressed the pipeline fails open (proceeds with no "
+                "brief, as when the pre-planner does not parse). A genuinely "
+                "underspecified request ('fix the bug', no symbol) names "
+                "nothing and still asks. Off restores the old always-ask "
+                "behaviour."
             ),
         )
         preplan_question_typing: bool = Field(
