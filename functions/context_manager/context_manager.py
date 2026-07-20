@@ -18922,11 +18922,52 @@ class AgenticOrchestrator:
             # the user's reply is simply a fresh turn with more context.
             # Gated by a valve and a minimum question length so a stray
             # token cannot hijack the turn.
-            if (
+            #
+            # Two guards added after a live miss: an investigate step,
+            # reciting the Block A 'critical reasoning guidelines' as its
+            # own reasoning ('verify observed vs expected before calling it
+            # a bug'), had that prose parsed into control['ask'] and killed
+            # a 7-step full-profile plan at step 2. (1) Under plan_profile
+            # FULL the operator has explicitly demanded the complete method
+            # run — an ask-user short-circuit silently defeats that
+            # guarantee, so it is suppressed and the pipeline proceeds.
+            # (2) A verify/analyze step near the end asking for
+            # clarification is almost always this recitation failure, not a
+            # real up-front ambiguity; the genuine ask belongs to the first
+            # step or two, so the short-circuit only honours an ask from an
+            # early step.
+            _prof = str(
+                getattr(self._f.valves, "agentic_plan_profile", "auto")
+                or "auto"
+            ).lower()
+            _ask_ok = (
                 self._f.valves.agentic_enable_ask_user
                 and control["ask"]
                 and len(control["ask"]) >= 8
+                and _prof != "full"
+                and idx <= int(
+                    getattr(self._f.valves, "agentic_ask_user_max_step", 2)
+                )
+                - 1
+            )
+            if (
+                not _ask_ok
+                and control["ask"]
+                and len(control["ask"]) >= 8
+                and self._f.valves.agentic_enable_ask_user
             ):
+                self._f._log_debug(
+                    f"🤖 Agentic: step {step.id} produced an ask "
+                    f"('{control['ask'][:60]}') but it is suppressed "
+                    + (
+                        "(plan_profile=full demands the complete method)"
+                        if _prof == "full"
+                        else "(ask only honoured from an early step; this "
+                        "is likely reasoning prose, not a real ambiguity)"
+                    )
+                    + " — continuing"
+                )
+            if _ask_ok:
                 self._f._log_debug(
                     f"🤖 Agentic: step {step.id} asked for clarification — "
                     f"ending pipeline (stateless)"
@@ -23938,6 +23979,23 @@ Output only the symbol name.
             # good one. Returning None instead hands the caller back to its
             # own fallback, scored[0][0].
             _names = [name for name, _ in clean_candidates]
+            # R23: the shared library logs a terminal failure with str(exc),
+            # which can be empty (observed live: 'call_llm failed after 1
+            # attempts (label=seed_disambiguate_llm): ' with no detail —
+            # a ~30s timeout on the --parallel 1 slot). shared_resources is
+            # a contract used by other plugins and is not the place to fix
+            # the format, so diagnose it caller-side: a falsy response here
+            # is that failure surfacing, and without a line saying so the
+            # empty library log is undiagnosable. Also guards the strip()
+            # below against a None return.
+            if not response:
+                self._f._log_debug(
+                    "seed_disambiguate: call returned no response (library "
+                    "reported a failure, likely a timeout on the "
+                    "--parallel 1 slot) — falling back to the CrossEncoder's "
+                    "best candidate"
+                )
+                return None
             _clean = response.strip().strip("`\"' \n\t.")
             if _clean in _names:
                 return _clean
@@ -41133,6 +41191,22 @@ class Filter:
                 "structure_hash they were produced under; a code edit "
                 "invalidates automatically. Repeated investigations across "
                 "neighbouring turns become free."
+            ),
+        )
+        agentic_ask_user_max_step: int = Field(
+            default=2,
+            ge=1,
+            le=7,
+            description=(
+                "R22: the stateless ask-user clarification short-circuit is "
+                "only honoured from a step at or before this 1-based "
+                "position. A genuine up-front ambiguity surfaces in the "
+                "first step or two; a later verify/analyze 'ask' is almost "
+                "always the model reciting Block A reasoning guidelines as "
+                "prose, which a live run parsed into the ask field and used "
+                "to kill a 7-step plan at step 2. Independent of this, "
+                "plan_profile=full suppresses the short-circuit entirely "
+                "(full demands the complete method run)."
             ),
         )
         agentic_ctx_size: int = Field(
