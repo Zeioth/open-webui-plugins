@@ -15745,7 +15745,16 @@ class AgenticPlanner:
         """
         # Region: gates — slot availability
         if not slot_free:
-            fp = AgenticOrchestrator.build_fixed_plan(question)
+            fp = AgenticOrchestrator.build_fixed_plan(
+                question,
+                full=str(
+                    getattr(
+                        self._f.valves, "agentic_plan_profile", "auto"
+                    )
+                    or "auto"
+                ).lower()
+                == "full",
+            )
             fp.source = "fallback_fixed"
             fp.rationale = "planner skipped: slot busy"
             return fp
@@ -15782,6 +15791,12 @@ class AgenticPlanner:
         _profile = str(
             getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
         ).lower()
+        # Always visible in debug: which profile is LIVE. Editing the Field
+        # default in source does not change an already-persisted OpenWebUI
+        # valves JSON — the stored value masks the code default — and
+        # without this line, 'profile not working' and 'profile not active'
+        # are indistinguishable from the logs.
+        self._f._log_debug(f"🤖 Planner: plan profile = {_profile}")
         if _profile == "full":
             effective_max = max_steps
             self._f._log_debug(
@@ -15919,7 +15934,16 @@ class AgenticPlanner:
                 f"ask ignored ('{_ask[:60]}')"
             )
         if steps is None:
-            fp = AgenticOrchestrator.build_fixed_plan(question)
+            fp = AgenticOrchestrator.build_fixed_plan(
+                question,
+                full=str(
+                    getattr(
+                        self._f.valves, "agentic_plan_profile", "auto"
+                    )
+                    or "auto"
+                ).lower()
+                == "full",
+            )
             fp.source = "fallback_fixed"
             fp.rationale = "planner output unparseable"
             return fp
@@ -16109,6 +16133,35 @@ class AgenticPlanner:
                 steps.append(
                     AgenticStep(id=len(steps) + 1, goal=question, kind="analyze")
                 )
+        # Region: plan profile FULL — parser-side guarantee. The profile
+        # directive asks the planner not to omit hypothesize, but a
+        # directive is not an invariant: a planner can emit a
+        # hypothesize-less plan under 'full', silently collapsing the A/B
+        # arm into 'fast with extra words'. Enforce it the same way
+        # analyze-last is enforced: when the profile demands the full
+        # method and no hypothesize survived parsing, insert one before
+        # the terminal analyze (may exceed max_steps by one,
+        # system-inserted like the auto-verify; the downstream order
+        # normalization places it canonically).
+        _prof = str(
+            getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
+        ).lower()
+        if _prof == "full" and not any(s.kind == "hypothesize" for s in steps):
+            steps.insert(
+                len(steps) - 1,
+                AgenticStep(
+                    id=max(s.id for s in steps) + 1,
+                    goal=(
+                        "Enumerate competing hypotheses for: "
+                        + question[:160]
+                    ),
+                    kind="hypothesize",
+                ),
+            )
+            self._f._log_debug(
+                "🤖 Planner: profile FULL — hypothesize missing from the "
+                "planner output, inserted (parser enforcement)"
+            )
         return steps
 
 
@@ -16461,7 +16514,8 @@ class AgenticStepExecutor:
             seen = list(dict.fromkeys(requests))[:4]
             results = [await broker.resolve_async(n, a, project_id) for n, a in seen]
             self._f._log_debug(
-                f"🤖 Agentic step {step.id}: tool round {round_no + 1} — "
+                f"🤖 Agentic step {getattr(step, 'display_no', None) or step.id}"
+                f": tool round {round_no + 1} — "
                 + ", ".join(f"{n}({a[:30]})" for n, a in seen)
             )
             prompt = (
@@ -16896,12 +16950,28 @@ class AgenticOrchestrator:
         )
 
     @staticmethod
-    def build_fixed_plan(question: str) -> AgenticPlan:
+    def build_fixed_plan(question: str, full: bool = False) -> AgenticPlan:
         """Fixed two-step plan: investigate the question, then analyze."""
         return AgenticPlan(
             steps=[
                 AgenticStep(id=1, goal=question, kind="investigate"),
-                AgenticStep(id=2, goal=question, kind="analyze"),
+                # Profile FULL keeps the A/B arm honest even under
+                # contention: the minimal fallback gains a hypothesize
+                # so a full-arm run can never silently degrade into
+                # the fast shape it is being compared against.
+                *(
+                    [
+                        AgenticStep(
+                            id=2,
+                            goal="Enumerate competing hypotheses for: "
+                            + question[:160],
+                            kind="hypothesize",
+                        )
+                    ]
+                    if full
+                    else []
+                ),
+                AgenticStep(id=3 if full else 2, goal=question, kind="analyze"),
             ],
             source="manual_fixed",
             rationale="Fase 1 fixed plan (no planner yet)",
