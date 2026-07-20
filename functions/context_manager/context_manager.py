@@ -16470,19 +16470,40 @@ class AgenticStepExecutor:
         # mechanism can still emit it. Falls back to the historical "2-4"
         # when auto-sizing is off or difficulty is unknown.
         _hyp_range = "2-4"
-        if step.kind == "hypothesize" and self._f.valves.hypothesis_target_auto:
-            try:
-                _diff = str(
-                    getattr(self._f._agentic._preplanner, "last_stats", {}).get(
-                        "difficulty", ""
+        # hypothesis_target_count is the single source of truth for how many
+        # rivals the hypothesize step requests. It accepts either "auto"
+        # (difficulty-derived band: low 2-3 / medium 3-5 / high 4-6, the
+        # historical behaviour) or a fixed integer as a string (e.g. "4" for
+        # a focused competition — enough rivals to discriminate a real cause,
+        # few enough that each is scored without the pool drifting toward the
+        # hard cap). The number is requested in the prompt, never enforced by
+        # truncation, so a model with one more genuinely distinct mechanism
+        # can still surface it; hypothesis_hard_cap is the real ceiling.
+        if step.kind == "hypothesize":
+            _target_raw = str(
+                getattr(self._f.valves, "hypothesis_target_count", "auto")
+                or "auto"
+            ).strip().lower()
+            if _target_raw == "auto":
+                # Difficulty-derived band. Falls back to "2-4" when the
+                # difficulty is unknown (cold pre-planner stats).
+                try:
+                    _diff = str(
+                        getattr(
+                            self._f._agentic._preplanner, "last_stats", {}
+                        ).get("difficulty", "")
+                        or ""
                     )
-                    or ""
-                )
-            except Exception:
-                _diff = ""
-            _hyp_range = {"low": "2-3", "medium": "3-5", "high": "4-6"}.get(
-                _diff, "2-4"
-            )
+                except Exception:
+                    _diff = ""
+                _hyp_range = {
+                    "low": "2-3",
+                    "medium": "3-5",
+                    "high": "4-6",
+                }.get(_diff, "2-4")
+            elif _target_raw.isdigit() and int(_target_raw) > 0:
+                _hyp_range = str(int(_target_raw))
+            # Any other value (empty, non-numeric) leaves the "2-4" default.
         instruction = template.format(sid=step.id, goal=step.goal, hyp_range=_hyp_range)
         # Fase 3: methodology selection for investigate steps. The
         # selector is a deterministic word-bounded regex over the goal —
@@ -41751,14 +41772,22 @@ class Filter:
                 "(all hypotheses are scored each iteration) already supports."
             ),
         )
-        hypothesis_target_auto: bool = Field(
-            default=True,
+        hypothesis_target_count: str = Field(
+            default="4",
             description=(
-                "Size the hypothesize step's enumeration request from the "
-                "pre-planner difficulty verdict (low → 2-3, medium → 3-5, "
-                "high → 4-6) instead of the blind historical '2-4'. Soft by "
-                "construction: it is a request in the prompt, never a "
-                "truncation. Off restores the fixed 2-4."
+                "How many competing hypotheses the hypothesize step "
+                "requests. Two forms:\n"
+                "  • \"auto\" — difficulty-derived band, the historical "
+                "behaviour: low → 2-3, medium → 3-5, high → 4-6 (falls "
+                "back to 2-4 when difficulty is unknown).\n"
+                "  • a number, e.g. \"4\" — a fixed focused competition: "
+                "enough distinct rivals to discriminate a real root cause, "
+                "few enough that each is scored properly and the pool does "
+                "not drift toward hypothesis_hard_cap.\n"
+                "The count is requested in the prompt, not enforced by "
+                "truncation, so a model with one more genuinely distinct "
+                "mechanism can still surface it; hypothesis_hard_cap "
+                "remains the real ceiling."
             ),
         )
         agentic_plan_profile: str = Field(
@@ -41894,7 +41923,7 @@ class Filter:
             ),
         )
         hypothesis_hard_cap: int = Field(
-            default=10,
+            default=7,
             ge=0,
             le=20,
             description=(
@@ -44225,7 +44254,6 @@ class Filter:
                     _resident = (
                         getattr(self, "_main_model_this_turn", "")
                         or getattr(self.valves, "cot_model_level2", "")
-                        or getattr(self.valves, "model", "")
                     )
                     if _resident:
                         self._last_used_model = _resident
