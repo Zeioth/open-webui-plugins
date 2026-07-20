@@ -12037,8 +12037,47 @@ class LLMOrchestrator:
         # free-runs until the HTTP timeout — and timeouts are retryable, so
         # the identical runaway re-posts. Coerced before the dedup/cache keys
         # so producer and deduplicated consumers agree on the effective cap.
-        # Explicit positive caps from the call site always win.
-        if not max_tokens or max_tokens <= 0:
+        # Explicit positive caps from the call site always win — EXCEPT for
+        # the agentic/scientific-method family below.
+        #
+        # Region: agentic unlimited tokens (operator decision). Per the
+        # GOVERNING PRINCIPLES, token caps sized to typical output are
+        # quality-budgets in disguise: a healthy planner hit its cap twice
+        # in one session and every run silently degraded to the fixed
+        # fallback plan. With agentic_unlimited_tokens on, every call whose
+        # label belongs to the scientific-method pipeline runs uncapped —
+        # the anti-runaway story for these calls is the anti-hang backstop
+        # (fires only on a genuinely stuck connection) plus the operator's
+        # sampler-side loop protection, not a token ceiling that can
+        # truncate healthy reasoning. Non-pipeline calls (classifiers,
+        # summarisers) keep the cap: they are not the scientific method and
+        # EOS-reliance there is still the documented runaway risk.
+        _AGENTIC_LABEL_KEYS = (
+            "hypoth",
+            "crucis",
+            "peer_review",
+            "claims_tail",
+            "abductive",
+            "divergent",
+            "presearch",
+            "refine",
+            "delimit_scope",
+            "critical_experiment",
+            "predictions",
+            "devil",
+            "tiebreak",
+            "metacog",
+            "falsif",
+            "gather_evidence",
+        )
+        _is_agentic_call = bool(label) and (
+            label.startswith("agentic_") or any(k in label for k in _AGENTIC_LABEL_KEYS)
+        )
+        if _is_agentic_call and getattr(
+            self._f.valves, "agentic_unlimited_tokens", False
+        ):
+            max_tokens = None
+        elif not max_tokens or max_tokens <= 0:
             _default_cap = int(
                 getattr(self._f.valves, "llm_uncapped_max_tokens", 2048) or 0
             )
@@ -12568,9 +12607,13 @@ class LedgerClaim:
     valid_qids: List[str] = field(default_factory=list)
     invalid_qids: List[str] = field(default_factory=list)
     evidence_type: str = "reasoning"
-    verification: str = ""  # "" | confirmed | refuted | unsupported | unverifiable | unoperationalizable
+    verification: str = (
+        ""  # "" | confirmed | refuted | unsupported | unverifiable | unoperationalizable
+    )
     verification_detail: str = ""
-    dynamic_validation: str = ""  # "" | passed | refuted | inconclusive — set by verify_dynamic
+    dynamic_validation: str = (
+        ""  # "" | passed | refuted | inconclusive — set by verify_dynamic
+    )
     invalid_relations: List[str] = field(default_factory=list)
 
 
@@ -14623,8 +14666,11 @@ if __name__ == "__main__":
                     f"{_result2.get('status')} "
                     f"({_result2.get('passed', 0)}/"
                     f"{_result2.get('total', 0)})"
-                    + (f" — doubt CONFIRMED ({_reason2})" if _reason2 else
-                       " — clean signal recovered")
+                    + (
+                        f" — doubt CONFIRMED ({_reason2})"
+                        if _reason2
+                        else " — clean signal recovered"
+                    )
                 )
                 _result2["replicated"] = True
                 tests, result, source = _tests2, _result2, "replicated"
@@ -14843,11 +14889,7 @@ if __name__ == "__main__":
             verification=(
                 "confirmed"
                 if status == "pass"
-                else (
-                    "unverifiable"
-                    if _dyn_verdict == "inconclusive"
-                    else "refuted"
-                )
+                else ("unverifiable" if _dyn_verdict == "inconclusive" else "refuted")
             ),
             verification_detail=detail[:300],
             dynamic_validation=_dyn_verdict,
@@ -15592,6 +15634,41 @@ class AgenticPlanner:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    @staticmethod
+    def _salvage_truncated_steps(cleaned: str) -> List[dict]:
+        """
+        Recover complete step objects from a token-cap-truncated plan JSON.
+
+        Walks the '"steps"' array with incremental json raw_decode: each
+        fully-formed object parses and is kept; the first mid-object
+        truncation stops the walk. String-safe by construction (raw_decode
+        understands JSON string escaping, unlike a brace counter). Returns
+        [] when nothing usable exists, letting the caller fall back.
+        """
+        marker = cleaned.find('"steps"')
+        if marker < 0:
+            return []
+        bracket = cleaned.find("[", marker)
+        if bracket < 0:
+            return []
+        decoder = json.JSONDecoder()
+        salvaged: List[dict] = []
+        i = bracket + 1
+        n = len(cleaned)
+        while i < n:
+            while i < n and cleaned[i] in " \t\r\n,":
+                i += 1
+            if i >= n or cleaned[i] != "{":
+                break
+            try:
+                obj, end = decoder.raw_decode(cleaned, i)
+            except Exception:
+                break
+            if isinstance(obj, dict):
+                salvaged.append(obj)
+            i = end
+        return salvaged
+
     async def plan(
         self,
         question: str,
@@ -15869,11 +15946,33 @@ class AgenticPlanner:
         try:
             data = json.loads(cleaned)
         except Exception as e:
-            self._f._log_debug(
-                f"🤖 Planner: JSON parse failed ({e}) → fixed plan; "
-                f"raw head: {response[:200]!r}"
-            )
-            return None
+            # Region: salvage a TRUNCATED plan before surrendering to the
+            # fixed fallback. Observed live (twice in one session): the
+            # planner hit its token cap mid-JSON (finish_reason=length),
+            # strict parse failed, and a GOOD plan — rich goals, correct
+            # kinds, visible in the raw head — was discarded for
+            # build_fixed_plan, which never schedules hypothesize. The
+            # prefix of a truncated JSON is valid up to the cut: recover
+            # every COMPLETE step object from the "steps" array with
+            # incremental raw_decode and use those; the downstream parser
+            # still applies kind coercion, analyze-last and the verify
+            # auto-insert, so a salvaged partial plan is strictly better
+            # than the fixed plan it replaces. Only when zero steps
+            # salvage does the fixed fallback keep its old role.
+            _salvaged = self._salvage_truncated_steps(cleaned)
+            if _salvaged:
+                self._f._log_debug(
+                    f"🤖 Planner: JSON parse failed ({e}) — salvaged "
+                    f"{len(_salvaged)} complete step(s) from the "
+                    f"truncated output"
+                )
+                data = {"steps": _salvaged}
+            else:
+                self._f._log_debug(
+                    f"🤖 Planner: JSON parse failed ({e}) → fixed plan; "
+                    f"raw head: {response[:200]!r}"
+                )
+                return None
         raw = data.get("steps", []) if isinstance(data, dict) else []
         if not isinstance(raw, list) or not raw:
             self._f._log_debug(
@@ -16134,9 +16233,9 @@ class AgenticStepExecutor:
         if step.kind == "hypothesize" and self._f.valves.hypothesis_target_auto:
             try:
                 _diff = str(
-                    getattr(
-                        self._f._agentic._preplanner, "last_stats", {}
-                    ).get("difficulty", "")
+                    getattr(self._f._agentic._preplanner, "last_stats", {}).get(
+                        "difficulty", ""
+                    )
                     or ""
                 )
             except Exception:
@@ -16144,9 +16243,7 @@ class AgenticStepExecutor:
             _hyp_range = {"low": "2-3", "medium": "3-5", "high": "4-6"}.get(
                 _diff, "2-4"
             )
-        instruction = template.format(
-            sid=step.id, goal=step.goal, hyp_range=_hyp_range
-        )
+        instruction = template.format(sid=step.id, goal=step.goal, hyp_range=_hyp_range)
         # Fase 3: methodology selection for investigate steps. The
         # selector is a deterministic word-bounded regex over the goal —
         # the model is TOLD which discipline applies, it never chooses its
@@ -17292,7 +17389,23 @@ class AgenticOrchestrator:
             The step's control signals (see extract_and_validate).
         """
         control = self._ledger.extract_and_validate(step, project_id)
-        if (
+        # Observed live: on a descriptive turn ('dame el diff'), a step
+        # kept prose without a claims object, the 70s recovery call fired
+        # (paying a full prefix re-prefill), returned 'prose kept as-is',
+        # and the verify then ran on zero claims in 0.0s — an entire cost
+        # chain with zero return. Descriptive lookups conclude from prose;
+        # claims exist to be verified, and a descriptive turn has nothing
+        # to verify. Skip the recovery there; every other type keeps it.
+        _qtype = str(
+            getattr(self._preplanner, "last_stats", {}).get("question_type", "") or ""
+        )
+        if control.get("tail_missing") and _qtype == "descriptive":
+            self._f._log_debug(
+                f"🤖 Ledger: step {step.id} claims tail missing but "
+                f"question_type=descriptive — recovery skipped (nothing "
+                f"to verify on a lookup turn)"
+            )
+        elif (
             control.get("tail_missing")
             and not self._ledger.claims_for(step.id)
             and await self._ledger.recover_claims_tail(step, project_id)
@@ -17785,9 +17898,7 @@ class AgenticOrchestrator:
                 getattr(self._preplanner, "last_stats", {}).get("difficulty", "") or ""
             ),
             question_type=str(
-                getattr(self._preplanner, "last_stats", {}).get(
-                    "question_type", ""
-                )
+                getattr(self._preplanner, "last_stats", {}).get("question_type", "")
                 or ""
             ),
         )
@@ -18085,10 +18196,7 @@ class AgenticOrchestrator:
                     _rt_mode = self._f.valves.agentic_retry_router
                     if _refuted and _rt_mode in ("shadow", "on"):
                         _suspect_qids = {
-                            q
-                            for q, _ in getattr(
-                                self._dyn, "_harness_suspects", []
-                            )
+                            q for q, _ in getattr(self._dyn, "_harness_suspects", [])
                         }
                         _doubted = [
                             c
@@ -18105,9 +18213,7 @@ class AgenticOrchestrator:
                             )
                         elif _doubted:
                             _sound = [
-                                c
-                                for c in _refuted
-                                if not (set(c.qids) & _suspect_qids)
+                                c for c in _refuted if not (set(c.qids) & _suspect_qids)
                             ]
                             if not _sound:
                                 await self._f._emit_status(
@@ -18133,18 +18239,14 @@ class AgenticOrchestrator:
 
                     if _refuted:
                         _hypo_retries += 1
-                        _summary = "; ".join(
-                            (c.text or "")[:120] for c in _refuted[:3]
-                        )
+                        _summary = "; ".join((c.text or "")[:120] for c in _refuted[:3])
                         # Park-don't-kill recovery: offer the competition's
                         # statically-falsified rivals as candidates. The
                         # winner just failed REAL verification, which is
                         # exactly the moment a hypothesis parked on static
                         # evidence becomes worth a second look.
                         _parked = list(
-                            getattr(
-                                self._f._meta_reasoning, "_last_parked", []
-                            )
+                            getattr(self._f._meta_reasoning, "_last_parked", [])
                         )
                         _parked_txt = ""
                         if _parked:
@@ -18214,6 +18316,36 @@ class AgenticOrchestrator:
                     self._f._log_debug(
                         f"🤖 Agentic step {step.display_no} ({step.kind}): cache hit"
                     )
+                    # Observed live: a run whose steps 1 and 3 were cache
+                    # hits showed the user ONLY 'step 2/3' — the silent
+                    # hits read as skipped/disordered steps. A cached step
+                    # DID run (its output and claims are restored); it
+                    # deserves the same visibility as an executed one.
+                    await self._f._emit_status(
+                        f"🤖 Agentic step {step.display_no}/"
+                        f"{len(plan.steps)} ({step.kind}): from cache"
+                    )
+                    # Observed live: a cache-hit hypothesize step skipped
+                    # the ENTIRE competition (this branch continues before
+                    # the executor branch where _maybe_compete lives), so
+                    # rivals restored from cache were never competed,
+                    # charter and convergence included — a silent quality
+                    # asymmetry between cached and fresh turns. The
+                    # restored claims are exactly what the competition
+                    # consumes; run it here. Its own convergence gate
+                    # keeps the cost low when a winner dominates.
+                    if (
+                        step.kind == "hypothesize"
+                        and self._f.valves.compete_on_cached_hypothesize
+                    ):
+                        await self._maybe_compete_hypothesize(
+                            step,
+                            project_id,
+                            status_prefix=(
+                                f"🤖 Agentic step {step.display_no}/"
+                                f"{len(plan.steps)} (hypothesize, cached)"
+                            ),
+                        )
                     idx += 1
                     continue
 
@@ -18324,14 +18456,46 @@ class AgenticOrchestrator:
                 )
                 plan.steps.insert(idx + 1, new_step)
                 inserted += 1
+                # Region: analyze-last restoration. Observed live: when the
+                # TERMINAL ANALYZE itself reported the gap, the idx+1
+                # insertion landed AFTER the conclusion — the user saw
+                # 'step 5/5 (investigate)' running after '4/4 (analyze)',
+                # a genuine canonical-order violation, and the new
+                # evidence never informed a conclusion step (only the
+                # synthesis composer saw it). The canonical loop for this
+                # exact case is: conclusion found missing evidence →
+                # gather → RE-CONCLUDE. So when the reporter is an
+                # analyze, insert a fresh analyze after the gap-fill,
+                # carrying the same goal, so analyze-last holds and the
+                # conclusion is re-drawn over the completed evidence.
+                # Costs one extra analyze call only in this (rare) case.
+                _reanalyze = None
+                if step.kind == "analyze":
+                    _reanalyze = AgenticStep(
+                        id=new_step.id + 1,
+                        goal=step.goal,
+                        kind="analyze",
+                    )
+                    plan.steps.insert(idx + 2, _reanalyze)
                 # Re-stamp display positions: the inserted step would
                 # otherwise render as "step 0/N" and every later step's
                 # position shifted by one (observed live in fase 4).
                 for _pos, _s in enumerate(plan.steps, start=1):
                     _s.display_no = _pos
+                # The denominator jump ('step 1/3' then 'step 2/4') read
+                # as inconsistent numbering because the growth itself was
+                # only debug-logged. Announce it where the user can see
+                # the cause.
+                await self._f._emit_status(
+                    "🤖 Agentic: plan extended (gap-fill) — "
+                    "+investigate"
+                    + (" +re-analysis" if _reanalyze else "")
+                    + f", now {len(plan.steps)} steps"
+                )
                 self._f._log_debug(
                     f"🤖 Agentic: step {step.id} reported gaps — inserted "
                     f"step {new_step.id} ({new_step.goal[:60]})"
+                    + (f" + re-analyze step {_reanalyze.id}" if _reanalyze else "")
                 )
 
             # -- early exit: hard evidence steps are never skipped ---------
@@ -27142,9 +27306,7 @@ class MetacognitiveReasoningEngine:
             # declaring victory. Both default to the original behaviour.
             _ec_on = self._f.valves.agentic_competition_early_converge
             _margin = self._f.valves.agentic_competition_converge_margin
-            _runner_score = (
-                valid_scored[1].score if len(valid_scored) >= 2 else 0.0
-            )
+            _runner_score = valid_scored[1].score if len(valid_scored) >= 2 else 0.0
             _gap = best_scored.score - _runner_score
             if best_scored.score >= threshold:
                 if _ec_on and _gap >= _margin:
@@ -40439,11 +40601,32 @@ class Filter:
         )
 
         # ── 8.16 Agentic pipeline (manual /agent — Fase 1) ──────────────────
+        agentic_unlimited_tokens: bool = Field(
+            default=True,
+            description=(
+                "Operator decision: NO token ceiling on any call of the "
+                "agentic/scientific-method pipeline (planner, preplanner, "
+                "steps, verify, harness, digest, competition, crucis, peer "
+                "review, claims recovery...). Per the GOVERNING PRINCIPLES, "
+                "a token cap a healthy run can meet is a quality-budget in "
+                "disguise — a healthy planner hit its cap twice in one "
+                "session and every run silently degraded to the fixed "
+                "fallback plan. Selection is label-based at the call_llm "
+                "choke point, so non-pipeline calls (classifiers, "
+                "summarisers) keep llm_uncapped_max_tokens as their "
+                "anti-runaway cap. When this is off, the per-label "
+                "agentic_*_max_tokens valves below apply as before. The "
+                "remaining protections for uncapped pipeline calls are the "
+                "anti-hang connection backstop and sampler-side loop "
+                "control (DRY), not ceilings that can truncate healthy "
+                "reasoning."
+            ),
+        )
         agentic_step_max_tokens: int = Field(
             default=8000,
             ge=100,
             description=(
-                "Generation ceiling per agentic step — an ANTI-RUNAWAY "
+                "[Consulted only when agentic_unlimited_tokens is off.] Generation ceiling per agentic step — an ANTI-RUNAWAY "
                 "guard, NOT a quality budget (GOVERNING PRINCIPLES, "
                 "Principle 2 and THE MAXIM). The claims contract sits at "
                 "the very END of a step's output, so a cap a healthy step "
@@ -40469,7 +40652,7 @@ class Filter:
             default=400,
             ge=50,
             description=(
-                "Per-step digest budget for the workspace. Head-truncated, "
+                "[Consulted only when agentic_unlimited_tokens is off.] Per-step digest budget for the workspace. Head-truncated, "
                 "but a trailing 'NOT FOUND:' section is always preserved."
             ),
         )
@@ -40536,10 +40719,10 @@ class Filter:
             ),
         )
         agentic_planner_max_tokens: int = Field(
-            default=768,
+            default=2000,
             ge=100,
             description=(
-                "Generation cap for the planner's JSON plan. 768 leaves "
+                "[Consulted only when agentic_unlimited_tokens is off.] Generation cap for the planner's JSON plan. 768 leaves "
                 "comfortable room for a multi-step plan with descriptive "
                 "goals and a rationale; a tighter cap truncates the JSON "
                 "mid-object, which fails to parse and falls back to the "
@@ -40582,7 +40765,7 @@ class Filter:
             ),
         )
         agentic_early_exit: str = Field(
-            default="shadow",
+            default="off",
             description=(
                 "Whether a high-confidence step may skip the remaining "
                 "non-verify steps. 'off' never evaluates the gate (every "
@@ -40899,6 +41082,18 @@ class Filter:
                 "hypothesize LLM call plus a deterministic verify."
             ),
         )
+        compete_on_cached_hypothesize: bool = Field(
+            default=True,
+            description=(
+                "Run the hypothesis competition when a hypothesize step is "
+                "served from the step cache. The cache-hit path used to "
+                "skip the entire competition (charter, convergence, "
+                "crucis), creating a silent quality asymmetry between "
+                "cached and fresh turns; the restored claims are exactly "
+                "what the competition consumes. Off restores the old "
+                "skip — cheaper, but a cached turn's rivals go uncompeted."
+            ),
+        )
         agentic_retry_router: str = Field(
             default="shadow",
             description=(
@@ -41142,10 +41337,10 @@ class Filter:
             ),
         )
         agentic_verify_max_tokens: int = Field(
-            default=1500,
+            default=2500,
             ge=100,
             description=(
-                "Generation ceiling for the verify step's checks JSON. "
+                "[Consulted only when agentic_unlimited_tokens is off.] Generation ceiling for the verify step's checks JSON. "
                 "Anti-runaway guard, not a quality budget: the output is "
                 "pure structure (up to 12 typed checks), so a cap a "
                 "healthy elicitation can reach breaks the contract "
@@ -41191,7 +41386,7 @@ class Filter:
             default=2000,
             ge=200,
             description=(
-                "Generation ceiling for LLM-written test sections. "
+                "[Consulted only when agentic_unlimited_tokens is off.] Generation ceiling for LLM-written test sections. "
                 "Anti-runaway guard, not a quality budget: a harness cut "
                 "mid-function fails to import and the target silently "
                 "loses its dynamic evidence. Sized well above a healthy "
@@ -41275,7 +41470,7 @@ class Filter:
             ge=200,
             le=2000,
             description=(
-                "Token budget per pre-planner call (framings + choice + "
+                "[Consulted only when agentic_unlimited_tokens is off.] Token budget per pre-planner call (framings + choice + "
                 "optional memory conclusions)."
             ),
         )
