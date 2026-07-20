@@ -35939,14 +35939,65 @@ class MessageAssembler:
         _block_reason = ""
         if is_continuation:
             _block_reason = "continuation turn (fast path)"
-        elif not slot_free:
-            _block_reason = "slot busy"
         elif not is_code_session:
             _block_reason = "non-code turn (fast path)"
         elif not _turn_is_code:
             _block_reason = "non-code turn (unified turn classifier)"
         elif not _agentic_question:
             _block_reason = "empty question"
+
+        # Region: R24 — a busy slot is a reason to WAIT, not to skip.
+        # slot_free=False here does not mean "a user generation is running
+        # and we must not queue behind it"; slot_free is derived from
+        # slot_busy, which the code documents as "auxiliary LLM calls are
+        # expensive right now / cold start". After a silent ingestion the
+        # background scaffolding tasks briefly hold the single --parallel 1
+        # slot, and the first real question of the session arrived in that
+        # window — so the pipeline was skipped and the entire scientific
+        # method was lost on the exact turn that most wanted it (observed
+        # live: 'fast-path (slot busy)' on turn 1, '→ pipeline' on turn 2).
+        # Skipping is the wrong policy: when the turn is otherwise eligible
+        # for the pipeline, drain the in-flight LLM work (bounded) and run
+        # it. Only genuinely non-eligible turns (continuation, non-code,
+        # empty) still take the fast path.
+        if (
+            not _block_reason
+            and not slot_free
+            and getattr(self._f.valves, "agentic_wait_for_busy_slot", True)
+        ):
+            _timeout = float(
+                getattr(self._f.valves, "agentic_slot_wait_timeout_s", 120.0)
+            )
+            self._f._log_debug(
+                f"🤖 Agentic pipeline: slot busy on an eligible turn — "
+                f"waiting up to {_timeout:.0f}s for in-flight LLM work to "
+                f"drain instead of skipping"
+            )
+            try:
+                await asyncio.wait_for(
+                    self._f._llm_orchestrator.wait_for_llm_tasks(),
+                    timeout=_timeout,
+                )
+                slot_free = True
+                self._f._log_debug(
+                    "🤖 Agentic pipeline: slot drained — proceeding with "
+                    "the pipeline"
+                )
+            except asyncio.TimeoutError:
+                _block_reason = "slot busy (drain timed out)"
+                self._f._log_debug(
+                    f"🤖 Agentic pipeline: slot still busy after "
+                    f"{_timeout:.0f}s — falling back to fast path"
+                )
+            except Exception as _e:
+                _block_reason = "slot busy"
+                self._f._log_debug(
+                    f"🤖 Agentic pipeline: slot-drain wait failed "
+                    f"({_e!r}) — falling back to fast path"
+                )
+        elif not _block_reason and not slot_free:
+            # Wait disabled by valve: preserve the old skip behaviour.
+            _block_reason = "slot busy"
 
         if _block_reason:
             self._f._log_debug(f"🤖 Agentic pipeline did NOT fire: {_block_reason}")
@@ -41193,6 +41244,31 @@ class Filter:
                 "neighbouring turns become free."
             ),
         )
+        agentic_wait_for_busy_slot: bool = Field(
+            default=True,
+            description=(
+                "R24: when an otherwise pipeline-eligible code turn finds "
+                "the single --parallel 1 slot busy (e.g. background "
+                "scaffolding still running right after a silent ingestion), "
+                "wait for the in-flight LLM work to drain and then run the "
+                "agentic pipeline, instead of silently degrading to the "
+                "fast path and losing the entire scientific method on the "
+                "first real question of the session. Off restores the old "
+                "skip-on-busy behaviour."
+            ),
+        )
+        agentic_slot_wait_timeout_s: float = Field(
+            default=120.0,
+            ge=1.0,
+            le=600.0,
+            description=(
+                "R24: maximum time to wait for the busy slot to drain "
+                "before falling back to the fast path. Bounds the worst "
+                "case so a genuinely stuck background task cannot hang the "
+                "turn indefinitely; on a healthy server the scaffolding "
+                "drains in seconds."
+            ),
+        )
         agentic_ask_user_max_step: int = Field(
             default=2,
             ge=1,
@@ -44132,6 +44208,27 @@ class Filter:
                     # merged_file_blocks (populated above for both paths).
                     _msg_to_index = last_user_msg
                     self._is_silent_ingestion = True
+                    # R24: silent ingestion loads the model and runs
+                    # docstring/lazy batches through it (the two labels the
+                    # call_llm silent-ingestion guard lets through), so the
+                    # model IS resident afterwards. But _last_used_model was
+                    # only ever set inside a full generation, so it stayed
+                    # None — and the NEXT turn (the session's first real
+                    # question) then satisfied the cold-start test
+                    # (_last_used_model is None and message_count <= 1),
+                    # tripped slot_busy=True, and was routed to the fast
+                    # path instead of the agentic pipeline. Losing the
+                    # pipeline on the first real question of the session is
+                    # the worst possible time. Record the resident model
+                    # here so the cold-start test sees a warm slot, exactly
+                    # as a prior generation would have left it.
+                    _resident = (
+                        getattr(self._f, "_main_model_this_turn", "")
+                        or getattr(self._f.valves, "cot_model_level2", "")
+                        or getattr(self._f.valves, "model", "")
+                    )
+                    if _resident:
+                        self._f._last_used_model = _resident
                     self._log_debug(
                         "[TURN-PATH] is_code_session=True → silent-ingestion "
                         "(code-only paste indexed, no reasoning)"
