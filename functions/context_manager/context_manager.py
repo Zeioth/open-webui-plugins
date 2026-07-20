@@ -44223,12 +44223,12 @@ class Filter:
                     # here so the cold-start test sees a warm slot, exactly
                     # as a prior generation would have left it.
                     _resident = (
-                        getattr(self._f, "_main_model_this_turn", "")
-                        or getattr(self._f.valves, "cot_model_level2", "")
-                        or getattr(self._f.valves, "model", "")
+                        getattr(self, "_main_model_this_turn", "")
+                        or getattr(self.valves, "cot_model_level2", "")
+                        or getattr(self.valves, "model", "")
                     )
                     if _resident:
-                        self._f._last_used_model = _resident
+                        self._last_used_model = _resident
                     self._log_debug(
                         "[TURN-PATH] is_code_session=True → silent-ingestion "
                         "(code-only paste indexed, no reasoning)"
