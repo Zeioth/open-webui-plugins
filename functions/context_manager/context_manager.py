@@ -9116,6 +9116,28 @@ class StateStore:
                 PRIMARY KEY (project_id, step_key)
             )
         """)
+        # --- Competition history (R33: adaptive-strategy input) ---
+        # One row per completed hypothesis competition. This is what makes
+        # _get_adaptive_strategy actually work: it needs >= 3 records to
+        # activate, but the in-memory _performance_history was lost every
+        # time OpenWebUI recreated the Filter, so the threshold was never
+        # reached and the strategy engine stayed dormant across a whole
+        # session (observed: 6 competitions, 0 'adaptive strategy' log
+        # lines, while every debrief reported the same call_relations
+        # failure the engine exists to correct). Persisting it here lets
+        # the pattern accumulate across turns and sessions.
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS competition_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                created_at  REAL NOT NULL
+            )
+        """)
+        self._f._db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_competition_history_project
+            ON competition_history (project_id, created_at)
+        """)
 
         # --- Agentic dynamic-verification harnesses (Fase 5) ---
         self._f._db_conn.execute("""
@@ -12105,10 +12127,7 @@ class LLMOrchestrator:
             else:
                 max_tokens = None
                 _runaway = int(
-                    getattr(
-                        self._f.valves, "agentic_runaway_token_cap", 8000
-                    )
-                    or 0
+                    getattr(self._f.valves, "agentic_runaway_token_cap", 8000) or 0
                 )
                 if _runaway > 0:
                     max_tokens = _runaway
@@ -12818,9 +12837,7 @@ class AgenticEvidenceLedger:
                 frag = step.output[pos:].strip().strip("`").strip()
                 if '"claims"' not in frag:
                     continue
-                cand = MetacognitiveReasoningEngine._repair_truncated_json(
-                    frag
-                )
+                cand = MetacognitiveReasoningEngine._repair_truncated_json(frag)
                 if isinstance(cand, dict) and "claims" in cand:
                     data, tail_start = cand, pos
                     self._f._log_debug(
@@ -15663,7 +15680,9 @@ class AgenticPreplanner:
             try:
                 _known = self._f._symbol_index.get_all_names(project_id)
                 if _known:
-                    _idents = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question or ""))
+                    _idents = set(
+                        re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question or "")
+                    )
                     _names_symbol = not _idents.isdisjoint(_known)
             except Exception:
                 _names_symbol = False
@@ -15856,10 +15875,7 @@ class AgenticPlanner:
             fp = AgenticOrchestrator.build_fixed_plan(
                 question,
                 full=str(
-                    getattr(
-                        self._f.valves, "agentic_plan_profile", "auto"
-                    )
-                    or "auto"
+                    getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
                 ).lower()
                 == "full",
             )
@@ -16045,10 +16061,7 @@ class AgenticPlanner:
             fp = AgenticOrchestrator.build_fixed_plan(
                 question,
                 full=str(
-                    getattr(
-                        self._f.valves, "agentic_plan_profile", "auto"
-                    )
-                    or "auto"
+                    getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
                 ).lower()
                 == "full",
             )
@@ -16280,10 +16293,7 @@ class AgenticPlanner:
                 _anchor,
                 AgenticStep(
                     id=max(s.id for s in steps) + 1,
-                    goal=(
-                        "Enumerate competing hypotheses for: "
-                        + question[:160]
-                    ),
+                    goal=("Enumerate competing hypotheses for: " + question[:160]),
                     kind="hypothesize",
                 ),
             )
@@ -16293,6 +16303,46 @@ class AgenticPlanner:
                 f"(parser enforcement)"
             )
         return steps
+
+
+# R32: every scaffolding header the agentic machinery injects into
+# prompts. These exact strings are OURS — a model reply has no
+# legitimate reason to contain any of them, so their presence in an
+# output is always an echo of the prompt, never a finding. Shared by
+# the step-level strip (AgenticStepExecutor) and the final-response
+# guard in Filter.outlet, so one list governs every leak surface.
+_AGENTIC_SCAFFOLD_MARKERS: Tuple[str, ...] = (
+    "## Tool results",
+    "## Agentic workspace (previous steps)",
+    "## 🤖 Agentic workspace (",
+    "[Your investigation so far]",
+    "<agentic_findings>",
+    "## Claims to verify",
+)
+
+
+def _find_scaffold_echo(text: str, min_pos: int = 1) -> int:
+    """
+    Earliest LINE-START occurrence of a scaffolding marker, or -1.
+
+    Line-start matters: the indexed codebase is this very plugin, so
+    the markers exist inside it as quoted string literals — EXPANDed
+    code or a reply legitimately showing that code contains the bytes
+    '"## Tool results"' preceded by a quote or an escape sequence,
+    never by a real newline. A genuine echoed heading is always at
+    the start of a line. Requiring that distinguishes the two exactly
+    and keeps this hygiene from ever cutting a reply mid-code.
+    """
+    best = -1
+    for m in _AGENTIC_SCAFFOLD_MARKERS:
+        p = text.find(m)
+        while p >= 0:
+            if p >= min_pos and (p == 0 or text[p - 1] == "\n"):
+                if best < 0 or p < best:
+                    best = p
+                break
+            p = text.find(m, p + 1)
+    return best
 
 
 class AgenticStepExecutor:
@@ -16327,7 +16377,16 @@ class AgenticStepExecutor:
             "those notes plus the code context to produce: (1) your "
             "analysis, (2) a concrete recommendation or answer, (3) open "
             "questions if evidence was insufficient. Reference symbols by "
-            "their exact qualified names."
+            "their exact qualified names.\n\n"
+            "Two honesty rules, in priority order. FIRST: if the user "
+            "asked to SEE a concrete artifact (a diff, a file, a previous "
+            "output) and the workspace shows it was searched for and not "
+            "found, then the correct answer IS that plain statement — say "
+            "the artifact does not exist and stop; do NOT substitute a "
+            "description of the mechanism that would have stored it. "
+            "SECOND: never paste tool-result listings, call graphs, or "
+            "code region comments as your answer; they are raw evidence, "
+            "and your job is the synthesis, in your own words."
         ),
         "design_tests": (
             "You are executing step {sid} (design_tests) of an agentic "
@@ -16510,18 +16569,21 @@ class AgenticStepExecutor:
         # truncation, so a model with one more genuinely distinct mechanism
         # can still surface it; hypothesis_hard_cap is the real ceiling.
         if step.kind == "hypothesize":
-            _target_raw = str(
-                getattr(self._f.valves, "hypothesis_target_count", "auto")
-                or "auto"
-            ).strip().lower()
+            _target_raw = (
+                str(
+                    getattr(self._f.valves, "hypothesis_target_count", "auto") or "auto"
+                )
+                .strip()
+                .lower()
+            )
             if _target_raw == "auto":
                 # Difficulty-derived band. Falls back to "2-4" when the
                 # difficulty is unknown (cold pre-planner stats).
                 try:
                     _diff = str(
-                        getattr(
-                            self._f._agentic._preplanner, "last_stats", {}
-                        ).get("difficulty", "")
+                        getattr(self._f._agentic._preplanner, "last_stats", {}).get(
+                            "difficulty", ""
+                        )
                         or ""
                     )
                 except Exception:
@@ -16651,10 +16713,7 @@ class AgenticStepExecutor:
         _margin = int(self._f.valves.agentic_tool_ctx_margin)
         _input_budget = max(
             2000,
-            int(self._f.valves.agentic_ctx_size)
-            - _prefix_tok
-            - _gen_reserve
-            - _margin,
+            int(self._f.valves.agentic_ctx_size) - _prefix_tok - _gen_reserve - _margin,
         )
         _accum_tool_results: List[str] = []
         for round_no in range(max_rounds + 1):
@@ -16711,9 +16770,7 @@ class AgenticStepExecutor:
                 "request more tools with TOOL: lines, or finish now with "
                 "your prose and the required JSON claims block."
             )
-            _tools_block = "\n\n## Tool results\n" + "\n\n".join(
-                _accum_tool_results
-            )
+            _tools_block = "\n\n## Tool results\n" + "\n\n".join(_accum_tool_results)
             _fixed_tok = _tok(_base) + _tok(_tools_block) + _tok(_tail)
             if _fixed_tok > _input_budget:
                 # Even base + all tool results overflow: keep the most
@@ -16748,9 +16805,40 @@ class AgenticStepExecutor:
                     _prose = ""  # drop prose, keep all expanded code
                 prompt = _base + _prose + _tools_block + _tail
 
-        # Region: record result (strip residual tool-request lines)
+        # Region: record result (strip residual tool scaffolding)
         step.seconds = time.monotonic() - started
         response = self._TOOL_RE.sub("", response or "").strip()
+        # R31/R32: strip echoed scaffolding from the output tail. Those
+        # headers are THIS executor's prompt scaffolding; the model has
+        # no legitimate reason to emit any of them, yet a live step
+        # ended with its tool block echoed verbatim. The echo did
+        # double damage: it buried the JSON claims tail (the ledger
+        # logged 'no parseable claims tail ... output ends: ...## Tool
+        # results...'), and it flowed through the digest into the
+        # workspace, where the final analyze parroted raw tool listings
+        # as if they were findings. Cut at the EARLIEST marker so a
+        # multi-header echo block is removed whole; if a claims JSON
+        # sat AFTER the echo (the model finished its contract late),
+        # rescue it and re-append, so the ledger never loses claims to
+        # this hygiene.
+        _cut = _find_scaffold_echo(response, min_pos=1)
+        if _cut > 0:
+            _removed = response[_cut:]
+            response = response[:_cut].rstrip()
+            if '"claims"' in _removed:
+                _pos = len(_removed)
+                for _ in range(8):
+                    _pos = _removed.rfind("{", 0, _pos)
+                    if _pos < 0:
+                        break
+                    _frag = _removed[_pos:].strip().strip("`").strip()
+                    if '"claims"' in _frag:
+                        response = response + "\n\n" + _frag
+                        break
+            self._f._log_debug(
+                f"🤖 Agentic step {step.id}: stripped echoed scaffolding "
+                f"from the output tail ({len(_removed)} chars)"
+            )
         if response:
             step.output = response
             step.status = "done"
@@ -17162,7 +17250,7 @@ class AgenticOrchestrator:
                 (
                     "trailing",
                     "## 🤖 Clarification (non-blocking)\n"
-                    "The pipeline found one ambiguous point but " 
+                    "The pipeline found one ambiguous point but "
                     "proceeded under a reasonable assumption. Answer "
                     "the request fully as planned. Then, at the VERY "
                     "END of your answer, add a short section that (a) "
@@ -18369,10 +18457,7 @@ class AgenticOrchestrator:
             plan = AgenticOrchestrator.build_fixed_plan(
                 question,
                 full=str(
-                    getattr(
-                        self._f.valves, "agentic_plan_profile", "auto"
-                    )
-                    or "auto"
+                    getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
                 ).lower()
                 == "full",
             )
@@ -19068,18 +19153,15 @@ class AgenticOrchestrator:
             # step or two, so the short-circuit only honours an ask from an
             # early step.
             _prof = str(
-                getattr(self._f.valves, "agentic_plan_profile", "auto")
-                or "auto"
+                getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
             ).lower()
             _ask_ok = (
                 self._f.valves.agentic_enable_ask_user
                 and control["ask"]
                 and len(control["ask"]) >= 8
                 and _prof != "full"
-                and idx <= int(
-                    getattr(self._f.valves, "agentic_ask_user_max_step", 2)
-                )
-                - 1
+                and idx
+                <= int(getattr(self._f.valves, "agentic_ask_user_max_step", 2)) - 1
             )
             if (
                 not _ask_ok
@@ -24070,9 +24152,7 @@ Output only the symbol name.
         # then completes well within the global backstop.
         try:
             _slot_wait = float(
-                getattr(
-                    self._f.valves, "agentic_slot_wait_timeout_s", 120.0
-                )
+                getattr(self._f.valves, "agentic_slot_wait_timeout_s", 120.0)
             )
             await asyncio.wait_for(
                 self._f._llm_orchestrator.wait_for_llm_tasks(),
@@ -27622,6 +27702,21 @@ class MetacognitiveReasoningEngine:
         abductive_used = False
         valid_scored: List["ScoredHypothesis"] = []
         all_scored: List["ScoredHypothesis"] = []  # Bug 7: all iterations
+        # R30: sanitize the ENTRY pool the same way later iterations are.
+        # dedup+cap was applied to the caller's initial set and to the
+        # refine/divergent/abductive pools inside the loop (via
+        # _sanitize_pool), but iteration 1 consumed 'hypotheses' raw — so a
+        # generator that emitted more rivals than the cap (claim inflation
+        # on the first enumeration) surfaced as 'Evaluating 13' in the
+        # status even though the cap is 7. Running the same _sanitize_pool
+        # here makes the first iteration obey the same ceiling as every
+        # other, and the emitted count reflects what is actually scored.
+        # The null baseline is prepended AFTER, so it is never dropped by
+        # the cap and the floor comparison always runs.
+        hypotheses = [h for h in hypotheses if h[0] != null_hyp[0]]
+        hypotheses = self._sanitize_pool(hypotheses, label, "initial")
+        if not any(h[0] == null_hyp[0] for h in hypotheses):
+            hypotheses = [null_hyp] + list(hypotheses)
         iteration = 0
 
         while iteration < max_iters:
@@ -27824,7 +27919,7 @@ class MetacognitiveReasoningEngine:
                         current_scored, max_hypotheses, project_id, label
                     )
                     if escaped:
-                        hypotheses = self._sanitize_pool(escaped, label, 'abductive')
+                        hypotheses = self._sanitize_pool(escaped, label, "abductive")
                         obj_score_history = []  # inverted world, new baseline
                         continue
                 self._f._log_debug(
@@ -27928,7 +28023,7 @@ class MetacognitiveReasoningEngine:
                         f"produced no parseable hypotheses"
                     )
                     break
-                hypotheses = self._sanitize_pool(refined, label, 'divergent')
+                hypotheses = self._sanitize_pool(refined, label, "divergent")
                 # R9: keep the LAST score as the new baseline instead of
                 # wiping history. A full reset needs window+1 fresh
                 # iterations to re-arm the detector; with max_iters=4 and
@@ -27961,7 +28056,7 @@ class MetacognitiveReasoningEngine:
                         f"parseable hypotheses"
                     )
                     break
-                hypotheses = self._sanitize_pool(refined, label, 'refine')
+                hypotheses = self._sanitize_pool(refined, label, "refine")
 
         # ── Post-loop guard ───────────────────────────────────────────────
         if best_scored is None:
@@ -28455,6 +28550,36 @@ class MetacognitiveReasoningEngine:
 
         if len(history) > 20:
             self._performance_history[project_id] = history[-20:]
+        # R33: persist the record so the adaptive strategy survives
+        # Filter recreation. Without this the in-memory history reset
+        # every turn, never reached the 3-record activation threshold,
+        # and the strategy engine never ran. Fire-and-forget through the
+        # existing write queue; a failed persist only costs adaptivity,
+        # never correctness, so it never raises into the competition.
+        try:
+            import json as _json
+            import dataclasses as _dc
+
+            _rec_json = _json.dumps(_dc.asdict(record))
+
+            def _persist_competition(rj=_rec_json, pid=project_id):
+                self._f._db_conn.execute(
+                    "INSERT INTO competition_history "
+                    "(project_id, record_json, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (pid, rj, time.time()),
+                )
+                self._f._db_conn.execute(
+                    "DELETE FROM competition_history WHERE "
+                    "project_id = ? AND id NOT IN (SELECT id FROM "
+                    "competition_history WHERE project_id = ? ORDER BY "
+                    "created_at DESC LIMIT 20)",
+                    (pid, pid),
+                )
+
+            await self._f._state_store._db_enqueue(_persist_competition)
+        except Exception as _e:
+            self._f._log_debug(f"_debrief_competition: persist skipped ({_e!r})")
 
         self._f._log_debug(
             f"_debrief_competition: project={project_id}, "
@@ -28462,7 +28587,6 @@ class MetacognitiveReasoningEngine:
             f"stagnated={stagnated}, score={final_score:.3f}, "
             f"call_failures={call_failures}, symbol_failures={symbol_failures}"
         )
-
 
     def _sanitize_pool(
         self, pool: List[Tuple[str, float]], label: str, stage: str
@@ -28498,6 +28622,45 @@ class MetacognitiveReasoningEngine:
         Returns defaults if fewer than 3 records exist.
         """
         history = self._performance_history.get(project_id, [])
+        # R33: hydrate from disk when the in-memory history is short.
+        # The Filter is recreated often, so memory alone rarely reaches
+        # the 3-record activation threshold; the persisted rows carry
+        # the pattern across turns and sessions. Loaded lazily (only
+        # when needed and still short) and merged newest-last, so a
+        # freshly appended in-memory record is not shadowed.
+        if len(history) < 3:
+            try:
+                import json as _json
+
+                _rows = self._f._db_conn.execute(
+                    "SELECT record_json FROM competition_history "
+                    "WHERE project_id = ? ORDER BY created_at ASC "
+                    "LIMIT 20",
+                    (project_id,),
+                ).fetchall()
+                _loaded = []
+                for _r in _rows:
+                    try:
+                        _d = _json.loads(_r[0])
+                        _loaded.append(CompetitionRecord(**_d))
+                    except Exception:
+                        continue
+                if _loaded:
+                    # Keep any in-memory records that post-date the load
+                    # by appending them after the persisted ones and
+                    # de-duplicating on timestamp.
+                    _seen = {r.timestamp for r in _loaded}
+                    _merged = _loaded + [r for r in history if r.timestamp not in _seen]
+                    history = _merged[-20:]
+                    self._performance_history[project_id] = history
+                    self._f._log_debug(
+                        f"_get_adaptive_strategy: hydrated "
+                        f"{len(_loaded)} competition record(s) from "
+                        f"disk (project={project_id}, total="
+                        f"{len(history)})"
+                    )
+            except Exception as _e:
+                self._f._log_debug(f"_get_adaptive_strategy: hydrate skipped ({_e!r})")
 
         _DEFAULTS: Dict[str, Any] = {
             "call_fail_rate": 0.0,
@@ -41942,10 +42105,10 @@ class Filter:
             description=(
                 "How many competing hypotheses the hypothesize step "
                 "requests. Two forms:\n"
-                "  • \"auto\" — difficulty-derived band, the historical "
+                '  • "auto" — difficulty-derived band, the historical '
                 "behaviour: low → 2-3, medium → 3-5, high → 4-6 (falls "
                 "back to 2-4 when difficulty is unknown).\n"
-                "  • a number, e.g. \"4\" — a fixed focused competition: "
+                '  • a number, e.g. "4" — a fixed focused competition: '
                 "enough distinct rivals to discriminate a real root cause, "
                 "few enough that each is scored properly and the pool does "
                 "not drift toward hypothesis_hard_cap.\n"
@@ -44416,9 +44579,8 @@ class Filter:
                     # the worst possible time. Record the resident model
                     # here so the cold-start test sees a warm slot, exactly
                     # as a prior generation would have left it.
-                    _resident = (
-                        getattr(self, "_main_model_this_turn", "")
-                        or getattr(self.valves, "cot_model_level2", "")
+                    _resident = getattr(self, "_main_model_this_turn", "") or getattr(
+                        self.valves, "cot_model_level2", ""
                     )
                     if _resident:
                         self._last_used_model = _resident
@@ -44841,6 +45003,46 @@ class Filter:
                         )
         except Exception as _e:
             self._log_debug(f"outlet: live fence repair skipped ({_e!r})")
+
+        # Region: R32 — final-response scaffolding guard (last line of
+        # defence). Workspace/scaffolding content has leaked into the
+        # user-facing reply more than once (tool listings parroted as
+        # the answer, region comments recited as steps). The upstream
+        # layers reduce the odds — the executor strips echoes from step
+        # outputs, the findings are fenced with the directive outside —
+        # but none of that binds the FINAL model's own generation. This
+        # guard does, deterministically: the _AGENTIC_SCAFFOLD_MARKERS
+        # are strings only this plugin writes, so their presence in the
+        # reply is always prompt echo. Cut from the earliest marker to
+        # the end. If the marker sits at the very start (the reply IS
+        # the echo), truncating would blank the reply — leave it and
+        # log loudly instead, so the regression is visible, not hidden.
+        try:
+            _msgs2 = body.get("messages") or []
+            _last2 = next(
+                (m for m in reversed(_msgs2) if m.get("role") == "assistant"),
+                None,
+            )
+            if _last2 is not None and isinstance(_last2.get("content"), str):
+                _c = _last2["content"]
+                _p0 = _find_scaffold_echo(_c, min_pos=0)
+                if _p0 >= 0:
+                    if _p0 > 80:
+                        _last2["content"] = _c[:_p0].rstrip()
+                        self._log_debug(
+                            f"outlet: stripped echoed agentic scaffolding "
+                            f"from the final response "
+                            f"({len(_c) - _p0} chars removed)"
+                        )
+                    else:
+                        self._log_debug(
+                            "outlet: final response appears to BE "
+                            "scaffolding echo — left intact (stripping "
+                            "would blank the reply); investigate the "
+                            "upstream synthesis"
+                        )
+        except Exception as _e:
+            self._log_debug(f"outlet: scaffolding guard skipped ({_e!r})")
 
         # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
