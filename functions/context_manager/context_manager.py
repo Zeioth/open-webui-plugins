@@ -12798,6 +12798,37 @@ class AgenticEvidenceLedger:
                 if isinstance(cand, dict) and "claims" in cand:
                     data, tail_start = cand, pos
                     break
+        # (c) R28: truncated-tail salvage. Live run: 4 of 9 recovery
+        #     calls (65-79s each) fired on outputs that END mid-JSON —
+        #     '"qids": ["ActivationEngine._get_or_comput' cut at the
+        #     step token cap. The model DID emit the tail; the strict
+        #     json.loads in (a)/(b) just cannot read a cut object. The
+        #     truncation repairer already used by the metacog JSON
+        #     contracts recovers the parseable prefix (complete claims
+        #     kept, the half-emitted one dropped — exactly what the
+        #     recovery call would re-ask for), at zero LLM cost. Only
+        #     a salvage that yields a dict with a "claims" key counts;
+        #     anything else still falls through to the recovery path.
+        if data is None:
+            pos = len(step.output)
+            for _ in range(8):
+                pos = step.output.rfind("{", 0, pos)
+                if pos < 0:
+                    break
+                frag = step.output[pos:].strip().strip("`").strip()
+                if '"claims"' not in frag:
+                    continue
+                cand = MetacognitiveReasoningEngine._repair_truncated_json(
+                    frag
+                )
+                if isinstance(cand, dict) and "claims" in cand:
+                    data, tail_start = cand, pos
+                    self._f._log_debug(
+                        f"🤖 Ledger: step {step.id} claims tail SALVAGED "
+                        f"from a truncated JSON ({len(cand.get('claims') or [])} "
+                        f"claim(s) recovered without a recovery call)"
+                    )
+                    break
         if data is None:
             _tail = (step.output or "")[-180:].replace("\n", "⏎")
             # The absent tail is marked explicitly so the orchestrator can
@@ -17092,7 +17123,9 @@ class AgenticOrchestrator:
 
     @staticmethod
     def _append_clarification_injections(
-        dynamic_injections: List[Tuple[str, str]], question: str
+        dynamic_injections: List[Tuple[str, str]],
+        question: str,
+        blocking: bool = True,
     ) -> None:
         """
         Append the clarification-turn injections (Fase 7 surface).
@@ -17117,18 +17150,41 @@ class AgenticOrchestrator:
         # rank is unchanged, since trailing ties "high". Recency is a
         # bonus: the ask-and-stop instruction becomes the last thing the
         # model reads before generating.
-        dynamic_injections.append(
-            (
-                "trailing",
-                "## 🤖 Clarification needed\n"
-                "Before continuing, the agentic pipeline needs one "
-                "point clarified. Ask the user this question directly "
-                "and concisely, then stop and wait for their reply:\n"
-                f"> {question}\n\n"
-                "Do not attempt to answer the original request until "
-                "they respond.",
+        # R27: two surfaces from one helper. BLOCKING is the historical
+        # behaviour (ask and stop — the pipeline did not run). The
+        # NON-BLOCKING variant rides on a completed pipeline run: the
+        # analysis is delivered in full, and the clarifying question is
+        # appended at the end so the user can refine the next turn. The
+        # answer must state the assumption it proceeded under, so the
+        # user can correct it instead of guessing what was assumed.
+        if not blocking:
+            dynamic_injections.append(
+                (
+                    "trailing",
+                    "## 🤖 Clarification (non-blocking)\n"
+                    "The pipeline found one ambiguous point but " 
+                    "proceeded under a reasonable assumption. Answer "
+                    "the request fully as planned. Then, at the VERY "
+                    "END of your answer, add a short section that (a) "
+                    "states the assumption you proceeded under, and "
+                    "(b) asks the user this question so the next turn "
+                    "can refine the answer:\n"
+                    f"> {question}",
+                )
             )
-        )
+        else:
+            dynamic_injections.append(
+                (
+                    "trailing",
+                    "## 🤖 Clarification needed\n"
+                    "Before continuing, the agentic pipeline needs one "
+                    "point clarified. Ask the user this question directly "
+                    "and concisely, then stop and wait for their reply:\n"
+                    f"> {question}\n\n"
+                    "Do not attempt to answer the original request until "
+                    "they respond.",
+                )
+            )
         dynamic_injections.append(
             (
                 "trailing",
@@ -18227,12 +18283,35 @@ class AgenticOrchestrator:
                 and _pre_ask
                 and len(_pre_ask) >= 8
             ):
-                await self._f._emit_status("🧭 Pre-planner: clarification needed")
-                self._append_clarification_injections(dynamic_injections, _pre_ask)
-                self._f._log_debug(
-                    "🧭 Preplanner requested clarification — pipeline not " "started"
+                # R27: clarification no longer kills the pipeline. The
+                # historical return here produced an empty turn (no
+                # AGENTIC-RUN) AND a raw-model reply that skipped the
+                # outlet post-processing — observed live as a fence
+                # glued to prose with no newline. Non-blocking (default):
+                # surface the question, run the pipeline anyway, and the
+                # answer carries the question at its end. The old ask-
+                # and-stop behaviour stays behind a valve.
+                _clar_blocks = bool(
+                    getattr(
+                        self._f.valves,
+                        "agentic_clarification_blocks_pipeline",
+                        False,
+                    )
                 )
-                return
+                await self._f._emit_status("🧭 Pre-planner: clarification needed")
+                self._append_clarification_injections(
+                    dynamic_injections, _pre_ask, blocking=_clar_blocks
+                )
+                if _clar_blocks:
+                    self._f._log_debug(
+                        "🧭 Preplanner requested clarification — pipeline "
+                        "not started (blocking mode)"
+                    )
+                    return
+                self._f._log_debug(
+                    "🧭 Preplanner requested clarification — attached "
+                    "non-blocking, pipeline continues"
+                )
 
         await self._f._emit_status("🤖 Agentic: planning…")
         plan = await self._planner.plan(
@@ -18264,12 +18343,44 @@ class AgenticOrchestrator:
             and not plan.steps
             and len(plan.ask) >= 8
         ):
-            await self._f._emit_status("🤖 Agentic: clarification needed")
-            self._append_clarification_injections(dynamic_injections, plan.ask)
-            self._f._log_debug(
-                "🤖 Agentic: planner requested clarification — pipeline " "not started"
+            # R27: same policy as the pre-planner gate above — the ask
+            # is surfaced but no longer kills the pipeline by default.
+            # The planner declined to produce steps here, so the non-
+            # blocking path substitutes the existing fixed fallback plan
+            # (investigate → [hypothesize under full] → analyze) and
+            # continues; the answer carries the question at its end.
+            _clar_blocks = bool(
+                getattr(
+                    self._f.valves,
+                    "agentic_clarification_blocks_pipeline",
+                    False,
+                )
             )
-            return
+            await self._f._emit_status("🤖 Agentic: clarification needed")
+            self._append_clarification_injections(
+                dynamic_injections, plan.ask, blocking=_clar_blocks
+            )
+            if _clar_blocks:
+                self._f._log_debug(
+                    "🤖 Agentic: planner requested clarification — "
+                    "pipeline not started (blocking mode)"
+                )
+                return
+            plan = AgenticOrchestrator.build_fixed_plan(
+                question,
+                full=str(
+                    getattr(
+                        self._f.valves, "agentic_plan_profile", "auto"
+                    )
+                    or "auto"
+                ).lower()
+                == "full",
+            )
+            self._f._log_debug(
+                "🤖 Agentic: planner requested clarification — attached "
+                "non-blocking, continuing with the fixed fallback plan "
+                f"({len(plan.steps)} steps)"
+            )
 
         # Region: auto-insert a verify step (Fase 4) — placed right before
         # the terminal analyze so the synthesis-feeding step reasons over
@@ -23950,6 +24061,28 @@ Scores:
 Choose the symbol that best matches the query's intent.
 Output only the symbol name.
 """
+        # R26: drain any in-flight LLM work on the single --parallel 1
+        # slot before calling, so this inlet call runs immediately
+        # instead of queueing behind a long generation and racing a
+        # timeout. The wait is bounded by agentic_slot_wait_timeout_s,
+        # so a genuinely stuck slot cannot hang the inlet forever; on
+        # a healthy server the slot drains in seconds and the call
+        # then completes well within the global backstop.
+        try:
+            _slot_wait = float(
+                getattr(
+                    self._f.valves, "agentic_slot_wait_timeout_s", 120.0
+                )
+            )
+            await asyncio.wait_for(
+                self._f._llm_orchestrator.wait_for_llm_tasks(),
+                timeout=_slot_wait,
+            )
+        except Exception:
+            # Drain failed or timed out — proceed anyway; the global
+            # backstop and the CrossEncoder fallback still apply.
+            pass
+
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt="You are a symbol disambiguator. Output only the best matching symbol name.",
@@ -23965,28 +24098,19 @@ Output only the symbol name.
             temperature=0.0,
             label="seed_disambiguate_llm",
             enable_thinking=False,
-            # This runs in the inlet: the whole turn waits on it. The work
-            # is seconds (in:125/out:49), but on a --parallel 1 server the
-            # call can queue behind a long generation — measured live at
-            # 95.209s for those same 49 tokens. total_timeout degrades to
-            # None on expiry, and None hands the caller back to its own
-            # CrossEncoder fallback (scored[0][0]), which is exactly the
-            # answer this call was trying to improve on.
-            #
-            # AUDITED EXCEPTION to the GOVERNING PRINCIPLES' maxim — the
-            # only one in the repo, kept deliberately. By the letter, a
-            # 30s cap on a call that measured 95s cuts healthy work. It
-            # stays because all three mitigating conditions hold at once:
-            # (1) this blocks the INLET, so the cost of waiting is paid
-            # by the whole turn before it even starts, not by a pipeline
-            # step; (2) the 95s was queue time behind the busy slot, not
-            # generation — the cap gives up WAITING, it rarely kills
-            # work in flight; (3) the fallback is deterministic and
-            # reasonable (CrossEncoder best candidate), not a corrupted
-            # partial. If any of the three stops holding — e.g. this
-            # call moves out of the inlet path — the cap goes, like all
-            # the others did.
-            total_timeout=30.0,
+            # R26: no total_timeout — this call now uses the global
+            # backstop (llm_request_timeout, 900s), like every other
+            # call. It runs in the inlet and the whole turn waits on
+            # it, but the work itself is seconds (in:125/out:49); the
+            # only reason it ever took ~95s live was QUEUE time behind
+            # a long generation on the --parallel 1 slot. The previous
+            # design capped it at 30s and fell to the CrossEncoder on
+            # expiry — a timeout-driven SKIP of exactly the work this
+            # call exists to do, which the standing rule (no call is
+            # skipped for timing out) rules out. Instead the slot is
+            # drained BEFORE the call (see above), so it runs promptly
+            # rather than racing a short cap against queue time; the
+            # global backstop remains only as an anti-hang guard.
         )
 
         if response:
@@ -23999,23 +24123,6 @@ Output only the symbol name.
             # good one. Returning None instead hands the caller back to its
             # own fallback, scored[0][0].
             _names = [name for name, _ in clean_candidates]
-            # R23: the shared library logs a terminal failure with str(exc),
-            # which can be empty (observed live: 'call_llm failed after 1
-            # attempts (label=seed_disambiguate_llm): ' with no detail —
-            # a ~30s timeout on the --parallel 1 slot). shared_resources is
-            # a contract used by other plugins and is not the place to fix
-            # the format, so diagnose it caller-side: a falsy response here
-            # is that failure surfacing, and without a line saying so the
-            # empty library log is undiagnosable. Also guards the strip()
-            # below against a None return.
-            if not response:
-                self._f._log_debug(
-                    "seed_disambiguate: call returned no response (library "
-                    "reported a failure, likely a timeout on the "
-                    "--parallel 1 slot) — falling back to the CrossEncoder's "
-                    "best candidate"
-                )
-                return None
             _clean = response.strip().strip("`\"' \n\t.")
             if _clean in _names:
                 return _clean
@@ -24030,9 +24137,21 @@ Output only the symbol name.
                 return max(_hits, key=len)
             self._f._log_debug(
                 f"seed_disambiguate: response {response[:60]!r} names no "
-                f"offered candidate — falling back to the CrossEncoder's best"
+                f"offered candidate — keeping the CrossEncoder ranking"
             )
             return None
+        # R29: with the R26 slot drain and the global timeout this call
+        # no longer times out; an empty response reaching here is an
+        # ABNORMAL failure (server/network), not an expected path. One
+        # log line so a regression is visible; the caller keeps its
+        # deterministic ranking for the turn. The previous caller-side
+        # diagnostic (R23) sat unreachable inside the `if response:`
+        # branch and never fired — removed as dead code.
+        self._f._log_debug(
+            "seed_disambiguate: EMPTY response after slot drain — "
+            "abnormal (R26 should prevent timeouts); investigate if "
+            "this recurs"
+        )
         return None
 
     def _extract_traceback_seeds(
@@ -41292,6 +41411,23 @@ class Filter:
                 "structure_hash they were produced under; a code edit "
                 "invalidates automatically. Repeated investigations across "
                 "neighbouring turns become free."
+            ),
+        )
+        agentic_clarification_blocks_pipeline: bool = Field(
+            default=False,
+            description=(
+                "R27: when the pre-planner or the planner asks for "
+                "clarification, whether that ask BLOCKS the pipeline. "
+                "False (default): the question is surfaced but the "
+                "pipeline runs anyway — the planner ask substitutes the "
+                "fixed fallback plan — and the answer states the "
+                "assumption it proceeded under and ends with the "
+                "clarifying question, so the user gets a full analysis "
+                "plus the chance to refine. This also routes the reply "
+                "through the normal outlet post-processing (the "
+                "blocking path skipped it, producing raw fences glued "
+                "to prose). True restores the historical ask-and-stop: "
+                "the turn only asks the question and no pipeline runs."
             ),
         )
         agentic_wait_for_busy_slot: bool = Field(
