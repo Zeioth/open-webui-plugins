@@ -17031,13 +17031,63 @@ class AgenticSynthesisComposer:
             ]
             return "\n".join(lines).rstrip()
 
+        # R34: the final model receives PROCESSED artifacts only. The
+        # per-step digests are the raw workspace — investigate digests
+        # narrate internal machinery (MEMORY/tool traffic, SQLite
+        # lookups), and injecting them let the user-facing model recite
+        # that plumbing as if it were the answer. The pipeline already
+        # has a step whose whole job is to process the workspace into a
+        # conclusion: analyze. So the fence now carries (1) the analyze
+        # output — full, not the truncated digest, already scrubbed of
+        # scaffold echoes at record time — and (2) the ledger's claims,
+        # which are deterministic verified/refuted artifacts, not raw
+        # notes. Step digests never enter the final prompt. When no
+        # analyze completed, the claims still flow and the model is
+        # told the synthesis is unavailable rather than being handed
+        # raw notes to improvise from.
+        _synth: Optional[str] = next(
+            (
+                s.output
+                for s in reversed(plan.steps)
+                if s.kind == "analyze"
+                and s.status == "done"
+                and s.output
+                and s.output != "(empty response)"
+                and len(s.output.strip()) > 40
+            ),
+            None,
+        )
+        if _synth is not None:
+            # Drop a trailing claims-JSON contract tail: the ledger has
+            # already ingested it, and the raw JSON is internal wire
+            # format, not answer material.
+            _tail = _synth.rfind('{"claims"')
+            if _tail > 0:
+                _synth = _synth[:_tail].rstrip().rstrip("`").rstrip()
+            if len(_synth) > 12000:
+                _synth = _synth[:12000] + "\n[synthesis truncated]"
+            lines.append(
+                "Synthesis (the pipeline's processed conclusion):"
+            )
+            lines.append(_synth)
+            lines.append("")
+        else:
+            lines.append(
+                "(No synthesis step completed — answer from the code "
+                "context above plus the verified evidence below.)"
+            )
+            lines.append("")
         for s in plan.steps:
             if s.status != "done":
                 continue
-            lines.append(f"Step {s.id} ({s.kind}):")
-            lines.append(s.digest)
+            _step_claims = (
+                ledger.claims_for(s.id) if ledger is not None else []
+            )
+            if not _step_claims:
+                continue
+            lines.append(f"Step {s.id} ({s.kind}) verified evidence:")
             if ledger is not None:
-                for c in ledger.claims_for(s.id):
+                for c in _step_claims:
                     badge = "⚗ " if c.evidence_type == "dynamic" else ""
                     if c.verification == "refuted":
                         lines.append(
