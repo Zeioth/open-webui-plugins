@@ -245,6 +245,47 @@ class PeerReviewResult:
 
 
 @dataclass
+class HypothesisDossier:
+    """
+    The serial method's unit of work: one hypothesis, fully forged.
+
+    A dossier accumulates everything one investigate/evaluate/analyze
+    cycle (or several, when the valve allows) established about a
+    single hypothesis: the deterministic evidence counts, the claim
+    outcomes with citations, the EC metrics the final ranking will
+    read, and the analyze step's own-words mechanism prose (which is
+    the ONLY narrative the conclusion step is allowed to see, per the
+    R34 processed-artifacts rule). Status is the forge verdict:
+    'plausible' reaches the final competition; 'dead' goes to the
+    graveyard with its cause (falsified / fabricated / unfounded /
+    null_bar) and is excluded from future generation. All fields are
+    JSON-safe so a dossier round-trips through dataclasses.asdict for
+    graveyard persistence.
+    """
+
+    hypothesis: str
+    status: str = "forging"  # forging | plausible | dead
+    cause_of_death: str = ""  # falsified|fabricated|unfounded|null_bar
+    cycles_used: int = 0
+    confirmed_checks: int = 0
+    refuted_checks: int = 0
+    refuted_symbol_checks: int = 0
+    refuted_relation_checks: int = 0
+    coverage_score: float = 0.0
+    corroboration: float = 0.0
+    generation_confidence: float = -1.0  # S5: -1.0 = not generated
+    assumptions: int = 0
+    anchors_touched: int = 0
+    confirmed_claims: List[str] = field(default_factory=list)
+    refuted_claims: List[str] = field(default_factory=list)
+    unresolved_claims: List[str] = field(default_factory=list)
+    analysis: str = ""
+    strategy_trace: List[str] = field(default_factory=list)
+    structure_hash: str = ""
+    timestamp: float = 0.0
+
+
+@dataclass
 class CompetitionRecord:
     """
     Post-competition record for metacognitive debriefing.
@@ -9138,6 +9179,30 @@ class StateStore:
             CREATE INDEX IF NOT EXISTS idx_competition_history_project
             ON competition_history (project_id, created_at)
         """)
+        # --- Hypothesis graveyard (S1: the serial method's memory of
+        # failure) --- One row per hypothesis that died in the forge
+        # (falsified / fabricated / unfounded) or failed the null bar.
+        # Informed generation hydrates its exclusion constraints from
+        # here, so a mechanism that died is never re-forged in a later
+        # run. Rows carry the structure hash of their era: when the
+        # code changes, old deaths retire naturally (the hypothesis
+        # could be true now).
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS hypothesis_graveyard (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id     TEXT NOT NULL,
+                hypothesis     TEXT NOT NULL,
+                cause          TEXT NOT NULL,
+                refuted_json   TEXT NOT NULL,
+                structure_hash TEXT NOT NULL,
+                created_at     REAL NOT NULL
+            )
+        """)
+        self._f._db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_hypothesis_graveyard_project
+            ON hypothesis_graveyard (project_id, structure_hash,
+                created_at)
+        """)
 
         # --- Agentic dynamic-verification harnesses (Fase 5) ---
         self._f._db_conn.execute("""
@@ -13234,6 +13299,21 @@ class AgenticEvidenceLedger:
         r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
         re.IGNORECASE,
     )
+    # EC-5 (external coherence): negation-aware relation assertions.
+    # The positive regex is polarity-blind — on 'X never calls Y' its
+    # caller group grabs 'never', fabricating a bogus relation that the
+    # graph marks absent, so a hypothesis CORRECTLY asserting an
+    # absence was punished as refuted. Negated assertions are checked
+    # with proper polarity (absence in the graph CONFIRMS the claim,
+    # presence refutes it) and their spans are masked before the
+    # positive pass. English and Spanish forms.
+    _NEG_RELATION_RE = re.compile(
+        r"`?(\w+)`?\s+(?:does\s+not|doesn'?t|never|no\s+longer|"
+        r"cannot|can'?t|no|nunca)\s+"
+        r"(?:calls?|invokes?|uses?|depends\s+on|llama\s+a|"
+        r"invoca\s+a|usa)\s+`?(\w+)`?",
+        re.IGNORECASE,
+    )
 
     def _validate_call_relations(self, text: str, project_id: str) -> List[str]:
         """
@@ -13257,7 +13337,18 @@ class AgenticEvidenceLedger:
         """
         invalid: List[str] = []
         try:
-            for caller, callee in self._CALL_RELATION_RE.findall(text or ""):
+            # EC-5: negated assertions checked with correct polarity —
+            # the edge EXISTING is what refutes 'A does not call B'.
+            # Spans masked before the positive pass (same rationale as
+            # gather_evidence).
+            _masked = text or ""
+            for _m in self._NEG_RELATION_RE.finditer(_masked):
+                _nc, _ne = _m.group(1), _m.group(2)
+                _present = self._relation_in_graph(_nc, _ne, project_id)
+                _masked = _masked.replace(_m.group(0), " ")
+                if _present is True:
+                    invalid.append(f"{_nc}_not_calls_{_ne}")
+            for caller, callee in self._CALL_RELATION_RE.findall(_masked):
                 if not self._qid_exists(caller, project_id):
                     continue
                 if not self._qid_exists(callee, project_id):
@@ -16321,6 +16412,39 @@ _AGENTIC_SCAFFOLD_MARKERS: Tuple[str, ...] = (
 )
 
 
+# EC-10 (precaution): consequence patterns that mark a hypothesis as
+# CRITICAL — mechanisms which, if real, imply data loss, corruption,
+# concurrency hazards, or security holes. A critical hypothesis is
+# exempt from the EC-8 funnel prune (capped at 2 exemptions per
+# competition): however improbable its static evidence looks, it gets
+# its full design + falsification pass. Deterministic text matching
+# was chosen over an LLM severity field in the JSON contract: the
+# asymmetry makes crude matching safe (a false positive costs one
+# design call; a false negative is exactly the old behavior), and it
+# covers every generation path (initial, refine, divergent,
+# abductive) without touching four parser sites. English and Spanish
+# because hypotheses are written in the question's language.
+# S5 (instrumentation): risk-adjacent vocabulary the EC-10 pattern
+# does NOT match. Surveillance only — when a screened-out candidate
+# matches this but not the EC-10 pattern, the debug log gains a
+# 'screen-miss-candidate?' marker, arming S8's trigger (severity via
+# the candidate contract). Never affects behavior.
+_EC10_NEAR_MISS_RE = re.compile(
+    r"half.?written|partial(?:ly)?\s+writ|truncat|clobber|overrun|"
+    r"\bleak|starv|\bhang|freeze|crash|\bstale\b|"
+    r"a medias|incomplet|se pierde|cuelga|congel",
+    re.IGNORECASE,
+)
+
+_EC10_CRITICAL_RE = re.compile(
+    r"data.?loss|loss of data|corrupt|overwrit|\bwipe|\bdelet|"
+    r"race.?condition|deadlock|security|vulnerab|inject|"
+    r"p\u00e9rdida de datos|corrupci|sobrescri|condici\u00f3n de carrera|"
+    r"interbloqueo|borrad",
+    re.IGNORECASE,
+)
+
+
 def _find_scaffold_echo(text: str, min_pos: int = 1) -> int:
     """
     Earliest LINE-START occurrence of a scaffolding marker, or -1.
@@ -17673,6 +17797,87 @@ class AgenticOrchestrator:
         # complement so the pair always sums to 1). See QUANTIZATION &
         # CALIBRATION: raise agentic_obj_weight on lower-precision quants.
         _ow = min(1.0, max(0.0, float(self._f.valves.agentic_obj_weight)))
+        # S1c: the serial method's switch. When on, the enumerated pool
+        # becomes the forge's candidate queue: each hypothesis is
+        # forged ONE AT A TIME into a sealed dossier (kill-early,
+        # deterministic maturity, graveyard memory), and only the
+        # PLAUSIBLE dossiers reach the competition below — which in
+        # S1 is still the existing parallel machinery, now judging a
+        # strictly richer input. The tuple confidence is derived from
+        # measured corroboration, not model self-report (llm_conf is
+        # demoted to observability in serial mode). If every dossier
+        # died, the original pool falls through unchanged: the run
+        # degrades to exactly the pre-serial behavior, loudly logged
+        # (the honest no-winner terminal is S2's deliverable).
+        if self._f.valves.agentic_serial_method:
+            await self._f._emit_status(
+                f"🤖 Serial method: forging up to "
+                f"{int(self._f.valves.agentic_serial_hypothesis_count)} "
+                f"hypotheses, one at a time…"
+            )
+            _dossiers = await self._f._meta_reasoning._forge_all(
+                step.goal or "",
+                hyps,
+                project_id,
+                f"agentic_serial_step_{step.id}",
+            )
+            _plausible = [
+                d for d in _dossiers if d.status == "plausible"
+            ]
+            await self._f._emit_status(
+                f"⚔️ Final competition: {len(_plausible)} plausible "
+                f"dossier(s) of {len(_dossiers)} sealed"
+            )
+            if _plausible:
+                # S2: the serial judgment replaces the parallel
+                # competition entirely for plausible dossiers. The
+                # verdict line carries the deterministic differentiator
+                # note (numbers, never rival prose) into the workspace
+                # — the R34 rule applied to the competition itself.
+                _winner, _note = (
+                    await self._f._meta_reasoning._judge_dossiers(
+                        step.goal or "",
+                        _plausible,
+                        project_id,
+                        f"agentic_serial_step_{step.id}",
+                    )
+                )
+                await (
+                    self._f._meta_reasoning._record_serial_competition(
+                        _dossiers, _winner, project_id
+                    )
+                )
+                if _winner is not None:
+                    await self._f._emit_status(
+                        f"🏁 Conclusion: accepted — "
+                        f"corroboration "
+                        f"{_winner.corroboration:.2f} (null bar "
+                        f"passed)"
+                    )
+                    step.output = (step.output or "") + (
+                        f"\n\n**Serial verdict** (corroboration "
+                        f"{_winner.corroboration:.2f}): "
+                        f"{_winner.hypothesis}\n"
+                        f"Mechanism: {_winner.analysis[:600]}\n"
+                        f"({_note})"
+                    )
+                else:
+                    await self._f._emit_status(
+                        "🏁 Conclusion: no hypothesis beat the null "
+                        "— cause not identified with confidence"
+                    )
+                    step.output = (step.output or "") + (
+                        f"\n\n**Serial verdict**: no hypothesis "
+                        f"beat the default explanation. "
+                        f"({_note})"
+                    )
+                return True
+            else:
+                self._f._log_debug(
+                    "serial method: zero plausible dossiers — "
+                    "falling through to the parallel competition "
+                    "over the original pool"
+                )
         _t_compete = time.monotonic()
         try:
             best, score, _evidence, peer = (
@@ -17684,6 +17889,7 @@ class AgenticOrchestrator:
                     label=f"agentic_hypothesize_step_{step.id}",
                     obj_weight=_ow,
                     llm_weight=1.0 - _ow,
+                    question=step.goal or "",
                 )
             )
         except Exception as e:
@@ -26075,8 +26281,25 @@ class MetacognitiveReasoningEngine:
         # get_edges_out here missed every class-method edge (edges are
         # indexed by qualified src), marking VALID relations False and
         # feeding false contradictions into predictions and negatives.
-        call_patterns = self._CALL_RELATION_RE.findall(hypothesis)
+        # EC-5: negated assertions first, with correct polarity — a
+        # relation the graph lacks CONFIRMS 'X never calls Y'. Matched
+        # spans are masked so the polarity-blind positive regex cannot
+        # grab the negation word as a caller. Confirmed negatives feed
+        # EC-4's corroboration count like any other verified check.
         call_relations_valid = {}
+        _masked = hypothesis
+        for _m in self._NEG_RELATION_RE.finditer(hypothesis):
+            _ncaller, _ncallee = _m.group(1), _m.group(2)
+            _present = self._relation_in_graph(
+                _ncaller, _ncallee, project_id
+            )
+            _masked = _masked.replace(_m.group(0), " ")
+            if _present is None:
+                continue
+            call_relations_valid[
+                f"{_ncaller}_not_calls_{_ncallee}"
+            ] = not _present
+        call_patterns = self._CALL_RELATION_RE.findall(_masked)
         for caller, callee in call_patterns:
             verified = self._relation_in_graph(caller, callee, project_id)
             if verified is None:
@@ -26609,11 +26832,59 @@ class MetacognitiveReasoningEngine:
                 f"would fabricate evidence"
             )
 
+        # EC-4 (corroboration): obj_score is a RATIO and saturates —
+        # 1 confirmed claim out of 1 scores identically to 8 out of 8,
+        # so equally-clean rivals tie, stagnation fires, and the
+        # iteration budget burns without discriminating (the R8
+        # pathology, observed live as 'best score 0.72 < 0.90'). The
+        # corroboration principle supplies the missing axis: more
+        # independent confirming evidence → more credible. COUNT via a
+        # saturating exponential (2→3 confirmations matters more than
+        # 7→8), DIVERSITY via a bonus when confirmations span both
+        # evidence kinds the graph checks (symbol existence AND call
+        # relations — two independent ways to be right). The obj/llm
+        # balance is untouched, scaled by the complement of the
+        # corroboration weight; falsification still vetoes upstream.
+        _n_sym_conf = sum(
+            1 for v in evidence.symbols_found.values() if v
+        )
+        _n_rel_conf = sum(
+            1 for v in evidence.call_relations_valid.values() if v
+        )
+        _n_confirmed = _n_sym_conf + _n_rel_conf
+        _diversity = 1.15 if (_n_sym_conf and _n_rel_conf) else 1.0
+        _cw = min(
+            0.6,
+            max(
+                0.0,
+                float(
+                    getattr(
+                        self._f.valves,
+                        "agentic_corroboration_weight",
+                        0.25,
+                    )
+                ),
+            ),
+        )
+        _corr = (
+            min(1.0, (1.0 - 0.85**_n_confirmed) * _diversity)
+            if _n_confirmed
+            else 0.0
+        )
+        _base = obj_weight * obj_score + llm_weight * llm_conf
+        _with_corr = (1.0 - _cw) * _base + _cw * _corr
+        if _cw > 0.0:
+            self._f._log_debug(
+                f"EC-4 corroboration: n_confirmed={_n_confirmed} "
+                f"(sym={_n_sym_conf}, rel={_n_rel_conf}, "
+                f"diversity={_diversity:.2f}) corr={_corr:.3f} "
+                f"combined {_base:.3f} → {_with_corr:.3f}"
+            )
         # Coverage penalty on combined score
         low_cov = self._f.valves.low_coverage_threshold
         if coverage_score < low_cov:
             penalty = 0.5 * (low_cov - coverage_score) / low_cov
-            combined_raw = obj_weight * obj_score + llm_weight * llm_conf
+            combined_raw = _with_corr
             combined = max(0.0, combined_raw * (1.0 - penalty))
             self._f._log_debug(
                 f"compute_weighted_score: coverage penalty "
@@ -26621,7 +26892,7 @@ class MetacognitiveReasoningEngine:
                 f"→ {combined_raw:.3f} → {combined:.3f}"
             )
         else:
-            combined = obj_weight * obj_score + llm_weight * llm_conf
+            combined = _with_corr
 
         return obj_score, combined, coverage_score
 
@@ -27675,6 +27946,7 @@ class MetacognitiveReasoningEngine:
         label: str = "",
         obj_weight: float = 0.5,
         llm_weight: float = 0.5,
+        question: str = "",
     ) -> Tuple[str, float, "StaticEvidence", Optional["PeerReviewResult"]]:
         """
         Full scientific hypothesis competition loop.
@@ -27750,6 +28022,26 @@ class MetacognitiveReasoningEngine:
         obj_score_history: List[float] = []  # obj_score ONLY — no llm_conf
         stagnated_this_run = False
         abductive_used = False
+        _ec10_exempted = 0  # EC-10: funnel-prune exemptions used
+        # EC-6 (explanatory power): the question's anchor identifiers —
+        # words that name symbols the index actually knows. A rival
+        # whose CONFIRMED checks touch more anchors explains more of
+        # what the user asked about; at equal verification and equal
+        # parsimony, that breadth is the remaining honest
+        # discriminator. Computed once per competition, capped so a
+        # keyword-stuffed question cannot dominate the tie-break.
+        _ec6_anchors: Set[str] = set()
+        if question:
+            try:
+                for _w in re.findall(
+                    r"[A-Za-z_][A-Za-z0-9_]{2,}", question
+                ):
+                    if len(_ec6_anchors) >= 12:
+                        break
+                    if self._qid_exists(_w, project_id):
+                        _ec6_anchors.add(_w)
+            except Exception:
+                _ec6_anchors = set()
         valid_scored: List["ScoredHypothesis"] = []
         all_scored: List["ScoredHypothesis"] = []  # Bug 7: all iterations
         # R30: sanitize the ENTRY pool the same way later iterations are.
@@ -27799,6 +28091,84 @@ class MetacognitiveReasoningEngine:
                 # gathering was the original order, and it produced 44
                 # claims across 7 designs with zero of them resolvable.
                 evidence = self.gather_evidence(hyp_text, project_id)
+
+                # EC-8 (the funnel): differential-diagnosis elimination —
+                # spend the least to discard the most improbable. The
+                # evidence above is FREE; the design call below is the
+                # expensive step (~20s of GPU each). A hypothesis whose
+                # free evidence shows a rich check base with multiple
+                # refutations and NOTHING confirmed is the invented-
+                # citation profile (the run's 29 falsifications, all
+                # 'relation does not exist') — every observed instance
+                # paid its design call and died anyway. Prune it here
+                # for free. Conservative: one confirmed check, or a
+                # sparse base (<3 checks — mirrors the coverage guard's
+                # distrust of thin evidence), exempts the hypothesis.
+                if getattr(self._f.valves, "agentic_funnel_prune", True):
+                    _n_conf = sum(
+                        1 for v in evidence.symbols_found.values() if v
+                    ) + sum(
+                        1
+                        for v in evidence.call_relations_valid.values()
+                        if v
+                    )
+                    _n_checked = len(evidence.symbols_found) + len(
+                        evidence.call_relations_valid
+                    )
+                    _n_refuted = _n_checked - _n_conf
+                    if (
+                        _n_checked >= 3
+                        and _n_refuted >= 2
+                        and _n_conf == 0
+                    ):
+                        # EC-10 (precaution): a hypothesis implying
+                        # catastrophic consequences never gets pruned
+                        # unexamined, however improbable — dismissing a
+                        # data-corruption mechanism on cheap static
+                        # checks alone is the one mistake this engine
+                        # must not make. Capped at 2 per competition so
+                        # keyword over-matching can never neuter the
+                        # funnel wholesale.
+                        if (
+                            _ec10_exempted < 2
+                            and _EC10_CRITICAL_RE.search(hyp_text)
+                        ):
+                            _ec10_exempted += 1
+                            self._f._log_debug(
+                                f"EC-10 precaution: critical-severity "
+                                f"hypothesis exempted from the funnel "
+                                f"prune ({_ec10_exempted}/2): "
+                                f"'{hyp_text[:60]}'"
+                            )
+                        else:
+                            _reason = (
+                                f"EC-8 funnel: {_n_refuted}/{_n_checked} "
+                                f"static checks refuted, 0 confirmed — "
+                                f"pruned before the design call"
+                            )
+                            self._f._log_debug(
+                                f"compete_hypotheses iter {iteration}: "
+                                f"{_reason} ('{hyp_text[:60]}')"
+                            )
+                            current_scored.append(
+                                ScoredHypothesis(
+                                    text=hyp_text,
+                                    score=0.0,
+                                    llm_conf=llm_conf,
+                                    obj_score=0.0,
+                                    evidence=evidence,
+                                    design=ExperimentDesign(
+                                        critical_claims=[],
+                                        supportive_claims=[],
+                                        unknown_claims=[],
+                                    ),
+                                    falsified=True,
+                                    falsification_reason=_reason,
+                                    coverage_score=0.0,
+                                    epistemic_uncertainty=1.0,
+                                )
+                            )
+                            continue
 
                 # ② Design experiment, bounded by that evidence (cached
                 # after first occurrence, keyed on hypothesis + evidence)
@@ -27945,6 +28315,89 @@ class MetacognitiveReasoningEngine:
             # Sort: non-falsified by combined score descending
             valid_scored = [s for s in current_scored if not s.falsified]
             valid_scored.sort(key=lambda x: x.score, reverse=True)
+            # EC-3 (parsimony): Occam's tie-break. EC-4 widened the
+            # score spread, but survivors can still land within noise
+            # of each other — and a ratio-plus-count score has no
+            # opinion on which of two equally-verified rivals is the
+            # SIMPLER explanation. The parsimony principle does: prefer
+            # the hypothesis needing fewer assumptions. An assumption
+            # is a claim the graph could not resolve — derived
+            # deterministically from the already-computed coverage
+            # (unresolvable fraction x claims declared), zero new
+            # checks. Only the group within epsilon of the leader is
+            # reordered; everything below keeps pure score order, so
+            # this can never promote a clearly-worse hypothesis.
+            _eps = float(
+                getattr(
+                    self._f.valves, "agentic_parsimony_epsilon", 0.05
+                )
+            )
+            if _eps > 0.0 and len(valid_scored) >= 2:
+                _top = valid_scored[0].score
+                _tied = [
+                    s for s in valid_scored if _top - s.score <= _eps
+                ]
+                if len(_tied) > 1:
+
+                    def _assumptions(s: "ScoredHypothesis") -> int:
+                        _n = len(
+                            getattr(s.design, "critical_claims", [])
+                        ) + len(
+                            getattr(s.design, "supportive_claims", [])
+                        )
+                        _cov = max(0.0, min(1.0, s.coverage_score or 0.0))
+                        return max(0, round((1.0 - _cov) * _n))
+
+                    # EC-6: at equal simplicity, prefer the rival whose
+                    # CONFIRMED checks touch more of the question's
+                    # anchors — the one explaining more of what was
+                    # actually asked. Endpoints of confirmed relation
+                    # checks count, including EC-5's negatives (knowing
+                    # X does NOT call Y is explanatory too).
+                    def _explanatory(s: "ScoredHypothesis") -> int:
+                        if not _ec6_anchors:
+                            return 0
+                        _touched: Set[str] = set()
+                        for _k, _v in s.evidence.symbols_found.items():
+                            if _v:
+                                _touched.add(_k)
+                        for _k, _v in (
+                            s.evidence.call_relations_valid.items()
+                        ):
+                            if not _v:
+                                continue
+                            _sep = (
+                                "_not_calls_"
+                                if "_not_calls_" in _k
+                                else "_calls_"
+                            )
+                            _a, _, _b = _k.partition(_sep)
+                            _touched.add(_a)
+                            _touched.add(_b)
+                        return len(_touched & _ec6_anchors)
+
+                    _before = _tied[0]
+                    _tied.sort(
+                        key=lambda s: (
+                            _assumptions(s),
+                            -_explanatory(s),
+                            -s.score,
+                        )
+                    )
+                    if _tied[0] is not _before:
+                        self._f._log_debug(
+                            f"EC-3 parsimony: {len(_tied)} survivors "
+                            f"within eps={_eps:.2f} — tie broken by "
+                            f"fewest assumptions "
+                            f"({_assumptions(_tied[0])} vs "
+                            f"{_assumptions(_before)}): "
+                            f"'{_tied[0].text[:60]}' overtakes "
+                            f"'{_before.text[:60]}'"
+                        )
+                    _tied_ids = {id(s) for s in _tied}
+                    valid_scored = _tied + [
+                        s for s in valid_scored if id(s) not in _tied_ids
+                    ]
 
             if not valid_scored:
                 # COMPETITION LEVEL — epistemic bankruptcy: every hypothesis
@@ -28528,6 +28981,1105 @@ class MetacognitiveReasoningEngine:
         except (json.JSONDecodeError, Exception):
             return hypothesis
 
+    @staticmethod
+    def _forge_verdict(
+        confirmed: int,
+        refuted: int,
+        resolvable_prev: int,
+        coverage: float,
+        cycle: int,
+        cycles_max: int,
+        maturity_need: int,
+        cov_threshold: float,
+    ) -> Tuple[str, str]:
+        """
+        Deterministic forge verdict for one completed cycle.
+
+        Returns (verdict, cause): verdict is 'dead' | 'plausible' |
+        'continue'. Pure function of measured facts — model confidence
+        plays no role — so the kill/maturity policy is testable in
+        isolation and auditable from this one place. Gate order
+        matters: kills before maturity, maturity before budget.
+
+        The falsification gate is criticality-blind (forge claims
+        carry no critical/supportive split): two refutations, or one
+        with nothing confirmed, kill. Calibratable after validation.
+        """
+        # Region: kill gates (facts against the hypothesis)
+        resolvable = confirmed + refuted
+        if refuted >= 2 or (refuted >= 1 and confirmed == 0):
+            return "dead", "falsified"
+        if resolvable == 0:
+            return "dead", "unfounded"
+        # Region: maturity (facts for the hypothesis)
+        if confirmed >= maturity_need and coverage >= cov_threshold:
+            return "plausible", "mature"
+        # Region: budget and progress (0 = unlimited cycles)
+        if cycles_max > 0 and cycle >= cycles_max:
+            return "plausible", "budget"
+        if resolvable <= resolvable_prev:
+            return "plausible", "stalled"
+        return "continue", ""
+
+    async def _generate_serial_candidate(
+        self,
+        question: str,
+        exclusions: List[str],
+        project_id: str,
+        label: str,
+        unexplored: Optional[List[str]] = None,
+        guidance: str = "",
+    ) -> Optional[Tuple[str, float, str]]:
+        """
+        Generate ONE candidate hypothesis, informed by prior failures.
+
+        The exclusion list carries one-line mechanism summaries of the
+        run's sealed dossiers plus the era-filtered graveyard, so each
+        candidate explores genuinely new ground. Returns (hypothesis,
+        confidence, severity) — confidence is the generator's optional
+        self-report, clamped to [0, 1], -1.0 when absent (S5
+        calibration instrument: it is RECORDED beside the forge
+        outcome and plays no role in any decision) — or None on a
+        parse failure (the slot driver retries or forfeits — no
+        silent fallback text is ever invented).
+        """
+        # Region: prompt with exclusion constraints
+        _excl = ""
+        if exclusions:
+            _lines = "\n".join(f"- {e}" for e in exclusions[:12])
+            _excl = (
+                "\nMechanisms already ruled out or already sealed — "
+                "your hypothesis MUST propose a DISTINCT mechanism:\n"
+                + _lines + "\n"
+            )
+        # S7: the compass line — ground prior hypotheses touched but
+        # never settled. Present only when the graveyard carries it;
+        # without data the prompt is bit-identical to pre-S7.
+        _comp = ""
+        if unexplored:
+            _clines = "\n".join(f"- {u}" for u in unexplored[:8])
+            _comp = (
+                "\nGround touched but never settled — worth "
+                "probing:\n" + _clines + "\n"
+            )
+        # S9: one-line class guidance from the Bayesian nudge —
+        # present only on a nudged regeneration, never persistent.
+        _guid = f"\n{guidance}\n" if guidance else ""
+        prompt = (
+            f"Question under investigation:\n{question[:400]}\n"
+            + _excl
+            + _comp
+            + _guid
+            + "\nPropose ONE falsifiable hypothesis about the root "
+            "mechanism. It must name real code identifiers (functions, "
+            "classes) and assert concrete, checkable relations."
+        )
+        # Region: LLM call and tolerant parse
+        try:
+            response = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=(
+                    "You are a hypothesis generator for code "
+                    "diagnosis. Output ONLY a JSON object: "
+                    '{"hypothesis": "<one sentence naming real '
+                    'identifiers>", "confidence": <0.0-1.0>, '
+                    '"severity": "normal"|"critical"}. severity '
+                    "is critical ONLY if the mechanism implies data "
+                    "loss, corruption, concurrency hazards, or "
+                    "security impact. Start with { and end with }."
+                ),
+                model_override=self._f.valves.cot_model_level3,
+                label=label,
+            )
+        except Exception as _e:
+            self._f._log_debug(
+                f"_generate_serial_candidate: call failed ({_e!r})"
+            )
+            return None
+        import json as _json
+
+        _text = (response or "").strip()
+        _pos = len(_text)
+        for _ in range(6):
+            _pos = _text.rfind("{", 0, _pos)
+            if _pos < 0:
+                break
+            try:
+                # raw_decode parses the leading JSON object and
+                # ignores trailing garbage — a truncation-echo after
+                # a valid object must not cost the candidate.
+                _obj = _json.JSONDecoder().raw_decode(
+                    _text[_pos:]
+                )[0]
+                _hyp = str(_obj.get("hypothesis", "")).strip()
+                try:
+                    _conf = float(_obj.get("confidence", -1.0))
+                except (TypeError, ValueError):
+                    _conf = -1.0
+                if _conf != -1.0:
+                    _conf = min(1.0, max(0.0, _conf))
+                # S8: severity self-tag, normalized — anything that
+                # is not exactly 'critical' is normal. The tag can
+                # only ADD screen exemptions (union with the EC-10
+                # regex, never a replacement), so a hallucinated tag
+                # costs at most one forge cycle and a missing tag is
+                # exactly the old behavior.
+                _sev = str(_obj.get("severity", "")).strip().lower()
+                if _sev != "critical":
+                    _sev = "normal"
+                if len(_hyp) >= 20:
+                    return _hyp, _conf, _sev
+            except Exception:
+                continue
+        # DIAG: a silent None here is indistinguishable from a model
+        # that emitted garbage — log the head so the run of proof can
+        # tell parser misses from generator failures.
+        self._f._log_debug(
+            f"_generate_serial_candidate: parse failed "
+            f"(raw len={len(_text)}, head='{_text[:80]}')"
+        )
+        return None
+
+    async def _forge_hypothesis(
+        self,
+        question: str,
+        hyp_text: str,
+        project_id: str,
+        label: str,
+        generation_confidence: float = -1.0,
+    ) -> "HypothesisDossier":
+        """
+        Forge ONE hypothesis to a sealed dossier (the serial core).
+
+        Each cycle is the investigate/analyze dialogue: investigate
+        collects deterministic evidence (graph checks plus EXPANDed
+        bodies of the symbols the hypothesis touches); one analyze
+        call interprets that material and emits claims; the graph
+        verdicts the claims (tri-state, abstention never counts as
+        confirmation); and _forge_verdict decides — kill, mature,
+        continue — from measured facts alone. Dead dossiers are
+        buried in the graveyard before returning.
+        """
+        # ── Step 1: dossier, era hash, anchors, strategy trace ──
+        _dossier = HypothesisDossier(
+            hypothesis=hyp_text,
+            timestamp=time.time(),
+            generation_confidence=generation_confidence,
+        )
+        try:
+            _dossier.structure_hash = (
+                self._f._symbol_index.compute_structure_hash(project_id)
+                or ""
+            )
+        except Exception:
+            _dossier.structure_hash = ""
+        _anchors: Set[str] = set()
+        for _w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question):
+            if len(_anchors) >= 12:
+                break
+            if self._qid_exists(_w, project_id):
+                _anchors.add(_w)
+        try:
+            _strat = self._get_adaptive_strategy(project_id)
+            for _k in (
+                "prefer_symbol_verification",
+                "suggest_divergent_start",
+            ):
+                if _strat.get(_k):
+                    _dossier.strategy_trace.append(_k)
+        except Exception:
+            pass
+        _broker = AgenticToolBroker(self._f)
+        _last_analysis = ""
+        _resolvable_prev = -1
+        _cycles_max = int(self._f.valves.agentic_serial_cycles_max)
+        _need = int(self._f.valves.agentic_serial_maturity_confirmed)
+        _cov_thr = float(self._f.valves.low_coverage_threshold)
+        _cycle = 0
+        while True:
+            _cycle += 1
+            _dossier.cycles_used = _cycle
+            # ── Step 2: investigate — deterministic evidence + code ──
+            _probe = hyp_text + ("\n" + _last_analysis[:600])
+            evidence = self.gather_evidence(_probe, project_id)
+            _sym_true = [
+                k for k, v in evidence.symbols_found.items() if v
+            ]
+            _expanded_parts: List[str] = []
+            _budget = 6000
+            for _sym in _sym_true[:4]:
+                try:
+                    _body = _broker._expand(_sym, project_id)
+                except Exception:
+                    continue
+                if _body and not _body.startswith("[EXPAND"):
+                    _part = _body[:_budget]
+                    _expanded_parts.append(_part)
+                    _budget -= len(_part)
+                    if _budget <= 0:
+                        break
+            # ── Step 3: fabricated gate (EC-8 profile; EC-10 exempt) ──
+            _n_conf_e = sum(
+                1 for v in evidence.symbols_found.values() if v
+            ) + sum(
+                1 for v in evidence.call_relations_valid.values() if v
+            )
+            _n_checked = len(evidence.symbols_found) + len(
+                evidence.call_relations_valid
+            )
+            _n_ref_e = _n_checked - _n_conf_e
+            if (
+                _n_checked >= 3
+                and _n_ref_e >= 2
+                and _n_conf_e == 0
+                and not _EC10_CRITICAL_RE.search(hyp_text)
+            ):
+                _dossier.status = "dead"
+                _dossier.cause_of_death = "fabricated"
+                break
+            # ── Step 4: analyze — interpret evidence, emit claims ──
+            _tally = (
+                f"symbols confirmed: {_sym_true[:6]}; "
+                f"checks refuted: {_n_ref_e}"
+            )
+            _code_blk = "\n\n".join(_expanded_parts)
+            _prompt = (
+                f"Question:\n{question[:300]}\n\n"
+                f"Hypothesis under test:\n{hyp_text}\n\n"
+                + (
+                    f"Prior analysis:\n{_last_analysis[:800]}\n\n"
+                    if _last_analysis
+                    else ""
+                )
+                + f"Deterministic evidence: {_tally}\n\n"
+                + (
+                    f"Relevant code:\n{_code_blk}\n\n"
+                    if _code_blk
+                    else ""
+                )
+                + "Validate or reject the hypothesis against this "
+                "evidence, refine the mechanism, and assert checkable "
+                "claims (each naming identifiers or 'A calls B' / "
+                "'A does not call B' relations)."
+            )
+            _kw = {}
+            _cap = int(
+                self._f.valves.agentic_serial_design_max_tokens
+            )
+            if _cap > 0:
+                _kw["max_tokens"] = _cap
+            try:
+                _resp = await self._f._llm_orchestrator.call_llm(
+                    prompt=_prompt,
+                    system_prompt=(
+                        "You are the analyze step of a scientific "
+                        "forge. Output ONLY a JSON object: "
+                        '{"analysis": "<mechanism, own words>", '
+                        '"claims": ["<checkable claim>", ...]}. '
+                        "Start with { and end with }."
+                    ),
+                    model_override=self._f.valves.cot_model_level3,
+                    label=f"{label}_forge_c{_cycle}",
+                    **_kw,
+                )
+            except Exception as _e:
+                self._f._log_debug(
+                    f"_forge_hypothesis: analyze failed ({_e!r})"
+                )
+                _resp = ""
+            import json as _json
+
+            _analysis, _claims = "", []
+            _t = (_resp or "").strip()
+            _pos = len(_t)
+            for _ in range(6):
+                _pos = _t.rfind("{", 0, _pos)
+                if _pos < 0:
+                    break
+                try:
+                    _obj = _json.JSONDecoder().raw_decode(
+                        _t[_pos:]
+                    )[0]
+                    _analysis = str(_obj.get("analysis", ""))
+                    _claims = [
+                        str(c) for c in (_obj.get("claims") or [])
+                    ][:10]
+                    break
+                except Exception:
+                    continue
+            # DIAG: parsed-claims visibility — a claims=[] cycle can
+            # mean a garbage response OR a parser miss; head + counts
+            # make the two distinguishable in the validation logs.
+            if not _analysis and not _claims:
+                self._f._log_debug(
+                    f"forge analyze c{_cycle}: parse yielded nothing "
+                    f"(raw len={len(_t)}, head='{_t[:80]}')"
+                )
+            else:
+                self._f._log_debug(
+                    f"forge analyze c{_cycle}: {len(_claims)} "
+                    f"claim(s), analysis {len(_analysis)} chars, "
+                    f"expanded {len(_expanded_parts)} symbol(s)"
+                )
+            if _analysis:
+                _last_analysis = _analysis
+                _dossier.analysis = _analysis
+            # ── Step 5: evaluate — tri-state claim verdicts ──
+            _conf_n, _ref_n = 0, 0
+            for _c in _claims:
+                _v = self._claim_verified(_c, evidence, project_id)
+                if _v is True:
+                    _conf_n += 1
+                    if len(_dossier.confirmed_claims) < 8:
+                        _dossier.confirmed_claims.append(_c)
+                elif _v is False:
+                    _ref_n += 1
+                    if len(_dossier.refuted_claims) < 8:
+                        _dossier.refuted_claims.append(_c)
+                elif len(_dossier.unresolved_claims) < 8:
+                    # S7: the unresolved claims are the dead
+                    # dossier's legacy — ground touched but never
+                    # settled, the map informed generation follows.
+                    _dossier.unresolved_claims.append(_c)
+            _dossier.confirmed_checks = _n_conf_e
+            _dossier.refuted_checks = _n_ref_e
+            _dossier.refuted_symbol_checks = sum(
+                1 for v in evidence.symbols_found.values() if not v
+            )
+            _dossier.refuted_relation_checks = sum(
+                1
+                for v in evidence.call_relations_valid.values()
+                if not v
+            )
+            _total = len(_claims) or 1
+            _dossier.coverage_score = (_conf_n + _ref_n) / _total
+            # ── Step 6: metrics the final ranking reads (EC forms) ──
+            _div = (
+                1.15
+                if (
+                    any(evidence.symbols_found.values())
+                    and any(evidence.call_relations_valid.values())
+                )
+                else 1.0
+            )
+            _dossier.corroboration = (
+                min(1.0, (1.0 - 0.85**_n_conf_e) * _div)
+                if _n_conf_e
+                else 0.0
+            )
+            _dossier.assumptions = max(
+                0, len(_claims) - (_conf_n + _ref_n)
+            )
+            _touched: Set[str] = set(_sym_true)
+            for _k2, _v2 in evidence.call_relations_valid.items():
+                if not _v2:
+                    continue
+                _sep = (
+                    "_not_calls_"
+                    if "_not_calls_" in _k2
+                    else "_calls_"
+                )
+                _a2, _, _b2 = _k2.partition(_sep)
+                _touched.add(_a2)
+                _touched.add(_b2)
+            _dossier.anchors_touched = len(_touched & _anchors)
+            # ── Step 7: the deterministic verdict ──
+            _verdict, _cause = self._forge_verdict(
+                confirmed=_conf_n,
+                refuted=_ref_n,
+                resolvable_prev=_resolvable_prev,
+                coverage=_dossier.coverage_score,
+                cycle=_cycle,
+                cycles_max=_cycles_max,
+                maturity_need=_need,
+                cov_threshold=_cov_thr,
+            )
+            _strat_tag = (
+                f" [{', '.join(_dossier.strategy_trace)}]"
+                if _dossier.strategy_trace
+                else ""
+            )
+            await self._f._emit_status(
+                f"🔬 forge cycle {_cycle}{_strat_tag}: "
+                f"{_conf_n} confirmed, "
+                f"{_ref_n} refuted → {_verdict}"
+                + (f" ({_cause})" if _cause else "")
+            )
+            if _verdict == "dead":
+                _dossier.status = "dead"
+                _dossier.cause_of_death = _cause
+                break
+            if _verdict == "plausible":
+                _dossier.status = "plausible"
+                break
+            _resolvable_prev = _conf_n + _ref_n
+        # ── Step 8: seal; bury the dead ──
+        self._f._log_debug(
+            f"forge sealed '{hyp_text[:50]}' in "
+            f"{time.time() - _dossier.timestamp:.1f}s "
+            f"({_dossier.cycles_used} cycle(s), "
+            f"status={_dossier.status}"
+            + (
+                f"/{_dossier.cause_of_death}"
+                if _dossier.cause_of_death
+                else ""
+            )
+            + ")"
+        )
+        if _dossier.status == "dead":
+            await self._bury_hypothesis(_dossier, project_id)
+        return _dossier
+
+    async def _forge_all(
+        self,
+        question: str,
+        seed_pool: List[Tuple[str, float]],
+        project_id: str,
+        label: str,
+    ) -> List["HypothesisDossier"]:
+        """
+        The serial slot driver: seal up to N dossiers, one at a time.
+
+        The enumerated pool (already paid for by the hypothesize step)
+        serves as the initial candidate QUEUE; informed generation
+        takes over when the queue runs dry or a candidate collides
+        with something already sealed or buried. Exclusion constraints
+        grow with every sealed dossier and start pre-loaded from the
+        era-filtered graveyard, so mechanisms that died in past runs
+        are never re-forged. Screening (EC-8 profile, EC-10 exempt)
+        happens per attempt and buries what it kills; a slot forfeits
+        after two failed GENERATION attempts (queue pops are free).
+        """
+        # ── Step 1: era hash, graveyard exclusions, queue ──
+        try:
+            _sh = (
+                self._f._symbol_index.compute_structure_hash(project_id)
+                or ""
+            )
+        except Exception:
+            _sh = ""
+        _grave = self._load_graveyard(project_id, _sh)
+        _exclusions: List[str] = [
+            f"{h} (cause: {c})" for h, c, _u in _grave
+        ]
+        # S7: the fecundity compass — the unsettled ground every dead
+        # dossier left behind, aggregated for informed generation.
+        # Empty when no graveyard entry carries it (pre-S7 rows or a
+        # clean era), in which case generation is bit-identical to
+        # before: the compass is data-gated at runtime.
+        _compass: List[str] = []
+        for _h2, _c2, _u2 in _grave:
+            for _item in _u2:
+                if len(_compass) >= 8:
+                    break
+                if _item not in _compass:
+                    _compass.append(_item)
+        if _exclusions:
+            self._f._log_debug(
+                f"_forge_all: {len(_exclusions)} graveyard "
+                f"exclusion(s) loaded for this era"
+            )
+        _queue: List[str] = [
+            t for t, _c in seed_pool if t and len(t.strip()) >= 20
+        ]
+        # S3: class-prior ordering. When R33's history shows call-
+        # relation claims failing chronically for this project (the
+        # prefer_symbol_verification flag), candidates whose text
+        # leans on call-relation assertions are tried LAST — the
+        # historically healthier classes get the slots first. Stable
+        # sort: within a class, enumeration order is preserved. This
+        # is the one place ordering genuinely matters in the serial
+        # design (S4 study, item: Bayesian priors order generation).
+        _strat_flags: List[str] = []
+        try:
+            _strat = self._get_adaptive_strategy(project_id)
+            _strat_flags = [
+                k
+                for k in (
+                    "prefer_symbol_verification",
+                    "suggest_divergent_start",
+                    "tighten_screen_relations",
+                    "tighten_screen_symbols",
+                )
+                if _strat.get(k)
+            ]
+            if "prefer_symbol_verification" in _strat_flags:
+                _queue.sort(
+                    key=lambda t: len(
+                        self._CALL_RELATION_RE.findall(t)
+                    )
+                )
+                self._f._log_debug(
+                    "_forge_all: queue reordered by class prior "
+                    "(relation-heavy candidates last)"
+                )
+        except Exception:
+            pass
+        _n_target = int(
+            self._f.valves.agentic_serial_hypothesis_count
+        )
+        _sealed: List["HypothesisDossier"] = []
+
+        def _collides(cand: str) -> bool:
+            # Compare against the exclusion CORE: the ' (cause: …)'
+            # suffix dilutes the similarity ratio enough to mask an
+            # exact re-forge of a buried mechanism (caught in testing:
+            # identical text scored 0.80 < 0.85 with the suffix on).
+            for _known in _exclusions + [d.hypothesis for d in _sealed]:
+                _core = _known.split(" (cause:")[0]
+                _ratio = difflib.SequenceMatcher(
+                    None, cand.lower(), _core.lower()
+                ).ratio()
+                if _ratio > 0.85:
+                    return True
+            return False
+
+        # ── Step 2: slots ──
+        _collision_count = 0  # S5: arms the fecundity trigger
+        for _slot in range(1, _n_target + 1):
+            _cand: Optional[str] = None
+            _gen_conf = -1.0  # S5: -1.0 = queue pop, not generated
+            _gen_sev = "normal"  # S8: queue pops carry no tag
+            _gen_attempts = 0
+            _nudged = False  # S9: at most one class nudge per slot
+            _guidance = ""
+            while _cand is None:
+                # Region: source — queue first, generation after
+                if _queue:
+                    _cand = _queue.pop(0)
+                else:
+                    # S9: a nudge earns the slot one extra attempt —
+                    # the nudge must never burn the forfeit budget.
+                    if _gen_attempts >= 2 + (1 if _nudged else 0):
+                        break
+                    _gen_attempts += 1
+                    _gen = await self._generate_serial_candidate(
+                        question,
+                        _exclusions,
+                        project_id,
+                        f"{label}_gen_s{_slot}a{_gen_attempts}",
+                        unexplored=_compass,
+                        guidance=_guidance,
+                    )
+                    if _gen is None:
+                        continue
+                    _cand, _gen_conf, _gen_sev = _gen
+                    # S9 (Bayesian generation nudge): when R33's
+                    # history flags the relation class as chronically
+                    # failing (the same S6 gate: >=10 records at
+                    # >=0.7), a GENERATED candidate leaning on
+                    # relation assertions is sent back once with the
+                    # class named — then whatever comes is forged.
+                    # Never a hard block; queue candidates are never
+                    # nudged (S3 already ordered them). The symbol
+                    # class is NOT text-detectable (every statement
+                    # names identifiers), so the nudge is
+                    # relation-only by design.
+                    if (
+                        not _nudged
+                        and "tighten_screen_relations" in _strat_flags
+                        and len(
+                            self._CALL_RELATION_RE.findall(_cand)
+                        )
+                        >= 2
+                    ):
+                        _nudged = True
+                        _guidance = (
+                            "Guidance: avoid mechanisms resting "
+                            "mainly on call-relation assertions — "
+                            "that class has failed chronically in "
+                            "this project."
+                        )
+                        self._f._log_debug(
+                            f"S9 nudge: relation-heavy generated "
+                            f"candidate sent back once "
+                            f"('{_cand[:60]}')"
+                        )
+                        _cand = None
+                        continue
+                # Region: collision with the sealed or the buried
+                if _collides(_cand):
+                    _collision_count += 1
+                    self._f._log_debug(
+                        f"_forge_all: candidate collides with a "
+                        f"sealed/buried mechanism — discarded "
+                        f"('{_cand[:60]}')"
+                    )
+                    _cand = None
+                    continue
+                # Region: screen (EC-8 profile; EC-10 exemption)
+                _ev = self.gather_evidence(_cand, project_id)
+                _c_n = sum(
+                    1 for v in _ev.symbols_found.values() if v
+                ) + sum(
+                    1 for v in _ev.call_relations_valid.values() if v
+                )
+                _t_n = len(_ev.symbols_found) + len(
+                    _ev.call_relations_valid
+                )
+                # S6: class-tightened screen — with the EC-9 flag on
+                # (>=10 records, class failing >=0.7), two refuted
+                # checks OF THAT CLASS suffice, saving the whole
+                # forge cycle the doomed class would have burned.
+                # Zero confirmed and the EC-10 exemption still bind.
+                _rel_ref = sum(
+                    1
+                    for v in _ev.call_relations_valid.values()
+                    if not v
+                )
+                _sym_ref = sum(
+                    1 for v in _ev.symbols_found.values() if not v
+                )
+                _tight = (
+                    "tighten_screen_relations" in _strat_flags
+                    and _rel_ref >= 2
+                ) or (
+                    "tighten_screen_symbols" in _strat_flags
+                    and _sym_ref >= 2
+                )
+                # S8: the exemption is regex OR tag — the union, never
+                # a replacement. Exemption source logged (the S8
+                # validation signal: an exemption with source=tag).
+                _fatal = (
+                    ((_t_n >= 3 and (_t_n - _c_n) >= 2) or _tight)
+                    and _c_n == 0
+                )
+                _crit_re = bool(_EC10_CRITICAL_RE.search(_cand))
+                _crit_tag = _gen_sev == "critical"
+                if _fatal and (_crit_re or _crit_tag):
+                    self._f._log_debug(
+                        f"screen exemption "
+                        f"(source={'regex' if _crit_re else 'tag'}): "
+                        f"'{_cand[:60]}'"
+                    )
+                if _fatal and not (_crit_re or _crit_tag):
+                    await self._f._emit_status(
+                        f"ⓧ Hypothesis {_slot}/{_n_target} screened "
+                        f"out — funnel: {_t_n - _c_n}/{_t_n} checks "
+                        f"refuted, 0 confirmed"
+                    )
+                    _d = HypothesisDossier(
+                        hypothesis=_cand,
+                        status="dead",
+                        cause_of_death="fabricated",
+                        structure_hash=_sh,
+                        timestamp=time.time(),
+                    )
+                    await self._bury_hypothesis(_d, project_id)
+                    if _EC10_NEAR_MISS_RE.search(_cand):
+                        # S5 surveillance: risk-adjacent phrasing the
+                        # EC-10 pattern missed — S8's trigger food.
+                        self._f._log_debug(
+                            f"screen-miss-candidate? '{_cand[:70]}'"
+                        )
+                    _exclusions.append(
+                        f"{_cand} (cause: fabricated)"
+                    )
+                    _cand = None
+                    continue
+            if _cand is None:
+                self._f._log_debug(
+                    f"_forge_all: slot {_slot} forfeited (no viable "
+                    f"candidate after queue + {_gen_attempts} "
+                    f"generation attempt(s))"
+                )
+                break
+            _tag = (
+                f" [{', '.join(_strat_flags)}]" if _strat_flags else ""
+            )
+            await self._f._emit_status(
+                f"🧪 Hypothesis {_slot}/{_n_target}{_tag} — "
+                f"candidate: {_cand[:70]}"
+            )
+            # ── Step 3: forge and seal ──
+            _dossier = await self._forge_hypothesis(
+                question,
+                _cand,
+                project_id,
+                f"{label}_s{_slot}",
+                generation_confidence=_gen_conf,
+            )
+            if not _dossier.structure_hash:
+                _dossier.structure_hash = _sh
+            _sealed.append(_dossier)
+            # S5 calibration line: greppable (gen_conf, outcome) pair.
+            self._f._log_debug(
+                f"calibration: gen_conf={_gen_conf:.2f} "
+                f"outcome={_dossier.status}"
+                + (
+                    f"/{_dossier.cause_of_death}"
+                    if _dossier.cause_of_death
+                    else ""
+                )
+            )
+            _exclusions.append(
+                f"{_dossier.hypothesis} "
+                f"(cause: {_dossier.cause_of_death or _dossier.status})"
+            )
+        if _collision_count:
+            self._f._log_debug(
+                f"_forge_all: {_collision_count} collision(s) this run"
+            )
+        return _sealed
+
+    async def _judge_dossiers(
+        self,
+        question: str,
+        dossiers: List["HypothesisDossier"],
+        project_id: str,
+        label: str,
+    ) -> Tuple[Optional["HypothesisDossier"], str]:
+        """
+        The serial judgment: three layers, model never weighs rivals.
+
+        Layer 1 ranks the plausible dossiers deterministically on the
+        EC bench (corroboration, then parsimony, then anchors — the
+        falsification veto already happened in the forge). Layer 2,
+        ONLY for survivors inside the parsimony epsilon, iterates the
+        experimentum crucis: the model designs ONE discriminating
+        claim per round, the GRAPH verdicts it, the disfavored rival
+        is eliminated; a round that discriminates nothing ends the
+        loop (progress gate — the crucis valve's 0 default stays
+        unlimited safely). Layer 3 applies the null bar: the winner
+        is accepted only if its measured corroboration exceeds the
+        null baseline's by the margin valve; the null asserts no
+        mechanism, so its corroboration is zero by definition. A
+        rejected winner is buried (cause null_bar) and (None, note)
+        returns — the honest terminal. The note is the deterministic
+        differentiator table (numbers, never rival prose): the only
+        competition narrative the downstream synthesis may see, per
+        the R34 rule.
+        """
+        # ── Step 1: deterministic ranking (Layer 1) ──
+        _pool = [d for d in dossiers if d.status == "plausible"]
+        if not _pool:
+            return None, "no plausible dossiers"
+        _pool.sort(
+            key=lambda d: (
+                -d.corroboration,
+                d.assumptions,
+                -d.anchors_touched,
+                -d.confirmed_checks,
+            )
+        )
+        _eps = float(
+            getattr(self._f.valves, "agentic_parsimony_epsilon", 0.05)
+        )
+        _top = _pool[0].corroboration
+        _tied = [d for d in _pool if _top - d.corroboration <= _eps]
+        # DIAG: the Layer-1 ranking, greppable live (the note reaches
+        # only step.output; diagnosis needs it in the debug stream).
+        self._f._log_debug(
+            "judge L1 ranking: "
+            + " | ".join(
+                f"corr={d.corroboration:.2f} assum={d.assumptions} "
+                f"anch={d.anchors_touched} '{d.hypothesis[:40]}'"
+                for d in _pool[:4]
+            )
+            + f" | tied={len(_tied)} eps={_eps:.2f}"
+        )
+        _crucis_log: List[str] = []
+        # ── Step 2: experimentum crucis elimination (Layer 2) ──
+        _max_rounds = int(self._f.valves.agentic_serial_crucis_max)
+        _round = 0
+        while len(_tied) > 1:
+            _round += 1
+            if _max_rounds > 0 and _round > _max_rounds:
+                break
+            _a, _b = _tied[0], _tied[1]
+            try:
+                _resp = await self._f._llm_orchestrator.call_llm(
+                    prompt=(
+                        f"Question:\n{question[:300]}\n\n"
+                        f"Hypothesis A: {_a.hypothesis}\n"
+                        f"Hypothesis B: {_b.hypothesis}\n\n"
+                        "Design ONE discriminating claim about the "
+                        "codebase — a concrete, checkable assertion "
+                        "(symbol existence or 'X calls Y' / 'X does "
+                        "not call Y') that is TRUE under one "
+                        "hypothesis and FALSE under the other."
+                    ),
+                    system_prompt=(
+                        "You design experimenta crucis. Output ONLY "
+                        'a JSON object: {"claim": "<assertion>", '
+                        '"if_true_supports": "A"|"B"}. Start with '
+                        "{ and end with }."
+                    ),
+                    model_override=self._f.valves.cot_model_level3,
+                    label=f"{label}_crucis_r{_round}",
+                )
+            except Exception as _e:
+                self._f._log_debug(
+                    f"_judge_dossiers: crucis call failed ({_e!r})"
+                )
+                break
+            import json as _json
+
+            _claim, _fav = "", ""
+            _t = (_resp or "").strip()
+            _pos = len(_t)
+            for _ in range(6):
+                _pos = _t.rfind("{", 0, _pos)
+                if _pos < 0:
+                    break
+                try:
+                    _obj = _json.JSONDecoder().raw_decode(
+                        _t[_pos:]
+                    )[0]
+                    _claim = str(_obj.get("claim", "")).strip()
+                    _fav = str(
+                        _obj.get("if_true_supports", "")
+                    ).strip().upper()
+                    break
+                except Exception:
+                    continue
+            if not _claim or _fav not in ("A", "B"):
+                break
+            # The GRAPH judges — the model never does.
+            _ev = self.gather_evidence(_claim, project_id)
+            _v = self._claim_verified(_claim, _ev, project_id)
+            if _v is None:
+                # Non-discriminating round: no elimination, stop.
+                _crucis_log.append(
+                    f"round {_round}: claim unverifiable — stopped"
+                )
+                break
+            _loser = (_b if (_v is (_fav == "A")) else _a)
+            _winner_of_round = _a if _loser is _b else _b
+            _crucis_log.append(
+                f"round {_round}: '{_claim[:60]}' → "
+                f"{'TRUE' if _v else 'FALSE'} — eliminated "
+                f"'{_loser.hypothesis[:50]}'"
+            )
+            await self._f._emit_status(
+                f"⚖️ Experimentum crucis {_round}: eliminated "
+                f"'{_loser.hypothesis[:50]}…'"
+            )
+            _tied = [_winner_of_round] + _tied[2:]
+        _winner = _tied[0]
+        # ── Step 3: the null bar (Layer 3) ──
+        _margin = float(self._f.valves.agentic_serial_null_margin)
+        _null_corr = 0.0  # the null asserts no mechanism: zero
+        # confirmations by definition, so the bar is the margin itself.
+        _table = "; ".join(
+            f"[{d.status}] corr={d.corroboration:.2f} "
+            f"assum={d.assumptions} anchors={d.anchors_touched} "
+            f"cycles={d.cycles_used}"
+            for d in _pool[:4]
+        )
+        _note = f"differentiators: {_table}"
+        if _crucis_log:
+            _note += " | crucis: " + " ; ".join(_crucis_log)
+        if _winner.corroboration < _null_corr + _margin:
+            _winner.status = "dead"
+            _winner.cause_of_death = "null_bar"
+            await self._bury_hypothesis(_winner, project_id)
+            _note += (
+                f" | null bar FAILED: best corroboration "
+                f"{_winner.corroboration:.2f} < margin {_margin:.2f}"
+            )
+            return None, _note
+        _note += (
+            f" | null bar PASS: {_winner.corroboration:.2f} >= "
+            f"{_margin:.2f}"
+        )
+        return _winner, _note
+
+    async def _record_serial_competition(
+        self,
+        dossiers: List["HypothesisDossier"],
+        winner: Optional["HypothesisDossier"],
+        project_id: str,
+    ) -> None:
+        """
+        Persist a CompetitionRecord for a serial run (R33 food).
+
+        The serial judgment bypasses compete_hypotheses, so without
+        this the adaptive strategies would starve and the serial-vs-
+        parallel A/B would lack its data. The record uses ONLY the
+        thirteen existing fields (hydration is CompetitionRecord(**d)
+        and tolerates no extras): trajectory carries per-dossier
+        corroborations; the failure split comes from the dossiers'
+        refuted-check split; stagnated is always False (the serial
+        method has no stagnation concept — progress gates seal
+        instead). Fire-and-forget, bounded to the same 20 rows the
+        parallel debrief keeps.
+        """
+        # Region: build the record from measured dossier facts
+        try:
+            import json as _json
+            from dataclasses import asdict as _asdict
+
+            _rel_f = sum(d.refuted_relation_checks for d in dossiers)
+            _sym_f = sum(d.refuted_symbol_checks for d in dossiers)
+            _low_thr = float(self._f.valves.low_coverage_threshold)
+            _rec = CompetitionRecord(
+                timestamp=time.time(),
+                n_hypotheses_initial=len(dossiers),
+                n_falsified=sum(
+                    1 for d in dossiers if d.status == "dead"
+                ),
+                primary_falsification_type=(
+                    "call_relations"
+                    if _rel_f > _sym_f
+                    else ("symbols" if _sym_f > 0 else "none")
+                ),
+                final_score=(
+                    winner.corroboration if winner is not None else 0.0
+                ),
+                coverage_score=(
+                    winner.coverage_score if winner is not None else 0.0
+                ),
+                iterations_used=sum(d.cycles_used for d in dossiers),
+                stagnated=False,
+                score_trajectory=[
+                    round(d.corroboration, 3) for d in dossiers
+                ],
+                call_relation_failures=_rel_f,
+                symbol_failures=_sym_f,
+                low_coverage_count=sum(
+                    1
+                    for d in dossiers
+                    if d.coverage_score < _low_thr
+                ),
+                abductive_used=False,
+            )
+            _rj = _json.dumps(_asdict(_rec))
+
+            def _persist_serial(pid=project_id, rj=_rj):
+                self._f._db_conn.execute(
+                    "INSERT INTO competition_history "
+                    "(project_id, record_json, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (pid, rj, time.time()),
+                )
+                self._f._db_conn.execute(
+                    "DELETE FROM competition_history WHERE "
+                    "project_id = ? AND id NOT IN (SELECT id FROM "
+                    "competition_history WHERE project_id = ? ORDER "
+                    "BY created_at DESC LIMIT 20)",
+                    (pid, pid),
+                )
+
+            await self._f._state_store._db_enqueue(_persist_serial)
+            self._f._log_debug(
+                f"serial debrief: recorded ({len(dossiers)} dossiers, "
+                f"winner={'yes' if winner is not None else 'no'})"
+            )
+        except Exception as _e:
+            self._f._log_debug(
+                f"_record_serial_competition: skipped ({_e!r})"
+            )
+
+    async def _bury_hypothesis(
+        self,
+        dossier: "HypothesisDossier",
+        project_id: str,
+    ) -> None:
+        """
+        Persist a dead (or null-bar-failed) dossier to the graveyard.
+
+        Fire-and-forget through the existing async write queue, exactly
+        like R33's competition records: a failed burial only costs the
+        cross-run exclusion, never correctness, and never raises into
+        the forge. The table is bounded to the most recent 40 rows per
+        project. Consumed by the S1 forge driver (next patch in the
+        series).
+        """
+        # Region: serialize and enqueue
+        try:
+            import json as _json
+
+            # S7: the payload carries both what refuted the
+            # hypothesis AND what it left unsettled — the fecundity
+            # compass. Old rows (a bare list) are read tolerantly by
+            # _load_graveyard.
+            _refuted = _json.dumps(
+                {
+                    "refuted": dossier.refuted_claims[:6],
+                    "unexplored": dossier.unresolved_claims[:6],
+                }
+            )
+            _row = (
+                project_id,
+                dossier.hypothesis,
+                dossier.cause_of_death or "unknown",
+                _refuted,
+                dossier.structure_hash,
+                time.time(),
+            )
+
+            def _persist_burial(row=_row, pid=project_id):
+                self._f._db_conn.execute(
+                    "INSERT INTO hypothesis_graveyard "
+                    "(project_id, hypothesis, cause, refuted_json, "
+                    "structure_hash, created_at) VALUES (?, ?, ?, ?, "
+                    "?, ?)",
+                    row,
+                )
+                self._f._db_conn.execute(
+                    "DELETE FROM hypothesis_graveyard WHERE "
+                    "project_id = ? AND id NOT IN (SELECT id FROM "
+                    "hypothesis_graveyard WHERE project_id = ? "
+                    "ORDER BY created_at DESC LIMIT 40)",
+                    (pid, pid),
+                )
+
+            await self._f._state_store._db_enqueue(_persist_burial)
+            self._f._log_debug(
+                f"🪦 graveyard: buried '{dossier.hypothesis[:60]}' "
+                f"(cause={dossier.cause_of_death})"
+            )
+        except Exception as _e:
+            self._f._log_debug(f"_bury_hypothesis: skipped ({_e!r})")
+
+    def _load_graveyard(
+        self,
+        project_id: str,
+        structure_hash: str,
+        limit: int = 12,
+    ) -> List[Tuple[str, str, List[str]]]:
+        """
+        Load (hypothesis, cause, unexplored) for the CURRENT era.
+
+        The structure-hash filter is the retirement mechanism: a death
+        recorded against code that has since changed is not returned —
+        the mechanism could be true now, so it must be forgeable again.
+        Newest first, bounded, corrupt rows skipped, failures return
+        empty (the forge merely loses cross-run exclusions). Consumed
+        by informed generation (next patch in the series).
+        """
+        # Region: era-filtered read (S7: refuted_json is tolerant —
+        # pre-S7 rows hold a bare list, S7 rows a dict with the
+        # unexplored ground; both shapes parse, corrupt rows yield
+        # an empty compass, never a skipped exclusion)
+        try:
+            import json as _json
+
+            _rows = self._f._db_conn.execute(
+                "SELECT hypothesis, cause, refuted_json FROM "
+                "hypothesis_graveyard "
+                "WHERE project_id = ? AND structure_hash = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (project_id, structure_hash, limit),
+            ).fetchall()
+            _out: List[Tuple[str, str, List[str]]] = []
+            for _r in _rows:
+                _unexp: List[str] = []
+                try:
+                    _p = _json.loads(_r[2])
+                    if isinstance(_p, dict):
+                        _unexp = [
+                            str(u) for u in (_p.get("unexplored") or [])
+                        ][:6]
+                except Exception:
+                    _unexp = []
+                _out.append((str(_r[0]), str(_r[1]), _unexp))
+            return _out
+        except Exception as _e:
+            self._f._log_debug(f"_load_graveyard: skipped ({_e!r})")
+            return []
+
     async def _debrief_competition(
         self,
         scored_list: List["ScoredHypothesis"],
@@ -28716,6 +30268,8 @@ class MetacognitiveReasoningEngine:
             "call_fail_rate": 0.0,
             "prefer_symbol_verification": False,
             "suggest_divergent_start": False,
+            "tighten_screen_relations": False,
+            "tighten_screen_symbols": False,
             "avg_historical_coverage": 1.0,
         }
 
@@ -28741,8 +30295,33 @@ class MetacognitiveReasoningEngine:
             "call_fail_rate": call_fail_rate,
             "prefer_symbol_verification": False,
             "suggest_divergent_start": False,
+            "tighten_screen_relations": False,
+            "tighten_screen_symbols": False,
             "avg_historical_coverage": avg_coverage,
         }
+        # S6 (EC-9, class-aware screening): when the FULL 10-record
+        # window shows one falsification class dominating at a
+        # stable >=0.7 rate, the serial pre-forge screen may kill a
+        # candidate of that class on 2 refuted checks of the class
+        # alone. The gate lives HERE, in the data condition — the
+        # consumer is inert until a week of serial records proves
+        # the pattern. Serial records report the split honestly
+        # (refuted symbol/relation check fields), so this feeds on
+        # measured facts, per the deterministic-validity principle.
+        if n >= 10 and call_fail_rate >= 0.7:
+            strategy["tighten_screen_relations"] = True
+            self._f._log_debug(
+                f"_get_adaptive_strategy: EC-9 — call-relation "
+                f"class failing at {call_fail_rate:.2f} over "
+                f"{n} records; serial screen tightened"
+            )
+        elif n >= 10 and symbol_fail_rate >= 0.7:
+            strategy["tighten_screen_symbols"] = True
+            self._f._log_debug(
+                f"_get_adaptive_strategy: EC-9 — symbol class "
+                f"failing at {symbol_fail_rate:.2f} over "
+                f"{n} records; serial screen tightened"
+            )
 
         if symbol_fail_rate < call_fail_rate * 0.5:
             strategy["prefer_symbol_verification"] = True
@@ -41921,6 +43500,128 @@ class Filter:
                 "model's favourite confidence notch clear the bar alone "
                 "(see above). If the goal is deeper competition, this "
                 "valve goes UP, not down."
+            ),
+        )
+        agentic_serial_method: bool = Field(
+            default=False,
+            description=(
+                "Serial method (S1): forge hypotheses ONE AT A TIME — "
+                "each gets a full investigate/evaluate/analyze cycle "
+                "and seals into a HypothesisDossier (plausible or "
+                "dead) before the next is generated; only plausible "
+                "dossiers reach the final competition. False keeps the "
+                "parallel competition untouched (A/B between runs)."
+            ),
+        )
+        agentic_serial_hypothesis_count: int = Field(
+            default=3,
+            ge=1,
+            description=(
+                "Serial method: target number of SEALED dossiers to "
+                "forge before the final competition."
+            ),
+        )
+        agentic_serial_cycles_max: int = Field(
+            default=0,
+            ge=0,
+            description=(
+                "Serial method: max forge cycles per hypothesis. 0 = "
+                "UNLIMITED (the validation default): termination is "
+                "guaranteed by progress gates — a cycle adding no "
+                "newly-resolvable claims seals the dossier — never by "
+                "this counter. Tighten only after the mode is proven "
+                "clean; truncated steps are hallucination generators."
+            ),
+        )
+        agentic_serial_maturity_confirmed: int = Field(
+            default=4,
+            ge=1,
+            description=(
+                "Serial method: confirmed graph checks required (with "
+                "coverage over low_coverage_threshold) for a dossier "
+                "to seal as MATURE. Deterministic — model confidence "
+                "plays no role in maturity."
+            ),
+        )
+        agentic_serial_design_max_tokens: int = Field(
+            default=0,
+            ge=0,
+            description=(
+                "Serial method: output cap for the deep design call "
+                "inside a forge cycle. 0 = UNLIMITED (validation "
+                "default; an incomplete design is worse than a slow "
+                "one). With at most count x cycles designs per run, "
+                "depth is affordable here in a way the parallel mode "
+                "never could."
+            ),
+        )
+        agentic_serial_crucis_max: int = Field(
+            default=0,
+            ge=0,
+            description=(
+                "Serial method: max experimentum-crucis elimination "
+                "rounds on epsilon ties. 0 = UNLIMITED; a round that "
+                "eliminates nobody ends the loop (progress gate), "
+                "falling through to the deterministic order."
+            ),
+        )
+        agentic_serial_null_margin: float = Field(
+            default=0.3,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Serial method: the null-hypothesis bar. The winner is "
+                "accepted only if its corroboration exceeds the null "
+                "baseline's by this margin; otherwise the honest "
+                "terminal state reports that no candidate beat the "
+                "default explanation (and the graveyard remembers)."
+            ),
+        )
+        agentic_funnel_prune: bool = Field(
+            default=True,
+            description=(
+                "EC-8 (the funnel): prune a hypothesis BEFORE paying "
+                "its design LLM call when the free static evidence is "
+                "already fatal — at least 3 graph checks performed, at "
+                "least 2 refuted, and ZERO confirmed. That profile "
+                "(invented symbols/call-graphs with nothing right) "
+                "died after the design call anyway in every observed "
+                "run; the funnel kills it for free. Conservative by "
+                "construction: any confirmed check, or a sparse "
+                "evidence base, exempts the hypothesis from pruning."
+            ),
+        )
+        agentic_parsimony_epsilon: float = Field(
+            default=0.05,
+            ge=0.0,
+            le=0.2,
+            description=(
+                "EC-3 (parsimony): when the top survivors' combined "
+                "scores sit within this epsilon of the leader, the tie "
+                "is broken by Occam's razor — the hypothesis with the "
+                "fewest assumptions wins. An assumption is a claim the "
+                "SymbolGraph could not resolve (unverifiable, derived "
+                "deterministically from coverage_score x claim count). "
+                "Acts ONLY on ties, so calibrated score semantics are "
+                "untouched. 0.0 disables the tie-break entirely."
+            ),
+        )
+        agentic_corroboration_weight: float = Field(
+            default=0.25,
+            ge=0.0,
+            le=0.6,
+            description=(
+                "EC-4 (corroboration): weight of the corroboration "
+                "term in the hypothesis competition's combined score. "
+                "obj_score is a pure verified/verifiable RATIO, so 1/1 "
+                "and 8/8 both score 1.0 and rivals tie (the R8 "
+                "saturation); corroboration measures the COUNT and "
+                "DIVERSITY of confirmations (saturating exponential "
+                "over confirmed symbol + call-relation checks, +15% "
+                "when both evidence kinds confirm), so more "
+                "independent evidence finally outranks less. The "
+                "obj/llm balance is preserved and scaled by the "
+                "complement. 0.0 restores the pre-EC-4 score exactly."
             ),
         )
         agentic_obj_weight: float = Field(
