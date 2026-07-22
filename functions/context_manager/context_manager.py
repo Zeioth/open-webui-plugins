@@ -316,6 +316,15 @@ class CompetitionRecord:
     symbol_failures: int
     low_coverage_count: int
     abductive_used: bool = False
+    # S17: real-world confirmation. Defaulted field = the ONE safe
+    # widening direction for the R33 hydration (missing key on old
+    # rows -> default; an extra dict key would break the
+    # constructor). Set True only by the explicit /accept command.
+    external_validation: bool = False
+    # S18: the pre-planner's classification, so EC-9 can key its
+    # gate by (project, question_type). Same safe defaulted
+    # widening as external_validation; old rows hydrate to "".
+    question_type: str = ""
 
 
 class UseCase(str, Enum):
@@ -13689,6 +13698,8 @@ class AgenticToolBroker:
                 return self._edges(arg, project_id, incoming=False)
             if name == "GREP":
                 return self._grep(arg, project_id)
+            if name == "WRITERS":
+                return self._writers(arg, project_id)
         except Exception as e:
             return f"[{name}({arg}) failed: {e}]"
         return f"[unknown tool {name}]"
@@ -13792,6 +13803,40 @@ class AgenticToolBroker:
         if not hits:
             return f"[GREP: no matches for {pattern!r}]"
         return f"### GREP {pattern!r} ({len(hits)} line(s), capped)\n" + "\n".join(hits)
+
+    def _writers(self, name: str, project_id: str) -> str:
+        """Assignment-site scan: WHO WRITES this variable/attribute.
+
+        The data-flow backtracking tool (S14): builds an assignment
+        pattern for the name (x =, self.x =, x +=, x[k] =) and
+        delegates to _grep's capped scan — same budgets, same hit
+        format. An APPROXIMATION, honestly labeled: no alias
+        analysis, no AST data-flow (the full taint version stays
+        deferred behind this tool's measured usefulness). Keyword
+        arguments (f(name=1)) are excluded by lookbehind in the
+        common no-space form; == and comparison operators never
+        match."""
+        # Region: validate and build the assignment pattern
+        _n = name.strip().strip("`'\"")
+        if not re.fullmatch(r"\w{2,60}", _n):
+            return f"[WRITERS: '{name[:40]}' is not an identifier]"
+        _pat = (
+            r"(?<![,(=!<>])(?:self\.)?\b"
+            + re.escape(_n)
+            + r"\s*(?:\[[^\]]*\])?\s*"
+            + r"(?:[+\-*/|&^%]|//|>>|<<)?=(?!=)"
+        )
+        # Region: delegate to the capped scan, relabel the output
+        _out = self._grep(_pat, project_id)
+        if _out.startswith("[GREP: no matches"):
+            return f"[WRITERS: no assignment sites for '{_n}']"
+        if _out.startswith("### GREP"):
+            _body = _out.split("\n", 1)
+            return (
+                f"### WRITERS '{_n}' — assignment sites\n"
+                + (_body[1] if len(_body) > 1 else "")
+            )
+        return _out
 
 
 class AgenticStaticVerifier:
@@ -14821,13 +14866,41 @@ if __name__ == "__main__":
                 f"🤖 Agentic replicate: {qid} first run suspect "
                 f"({_reason}) — regenerating harness once"
             )
-            _hint = (
-                "NOTE: a previous harness for this exact symbol failed to "
-                f"produce a trustworthy result ({_reason}). Write SIMPLER, "
-                "more robust tests: fewer asserts, only plain stdlib "
-                "values, no fixtures, no shared state between tests, and "
-                "avoid anything that could raise at import time."
-            )
+            # S16 (harness self-repair): the replication hint is now
+            # CLASS-AWARE. An infra failure (status=error: the
+            # harness never ran — syntax, import, undefined name)
+            # regenerates WITH the traceback tail, so the second
+            # harness fixes the actual error instead of blindly
+            # simplifying. Zero-pass suspicion keeps the simplify
+            # hint verbatim. Rides the SAME single replication —
+            # no-stacking holds by construction (one retry, one
+            # accounting, the Fase 4 downgrade path untouched).
+            _detail_tail = str(result.get("detail", ""))[-500:]
+            if result.get("status") == "error" and _detail_tail:
+                self._f._log_debug(
+                    f"harness self-repair: {qid} infra error — "
+                    f"traceback included in regeneration hint"
+                )
+                _hint = (
+                    "NOTE: the previous harness for this exact "
+                    f"symbol FAILED TO RUN ({_reason}). Its error "
+                    f"was:\n{_detail_tail}\n"
+                    "Fix the harness composition itself: correct "
+                    "the syntax, import only stdlib modules you "
+                    "actually use, and define every name before "
+                    "use. Keep the behavioral intent of the tests."
+                )
+            else:
+                _hint = (
+                    "NOTE: a previous harness for this exact symbol "
+                    f"failed to produce a trustworthy result "
+                    f"({_reason}). Write SIMPLER, "
+                    "more robust tests: fewer asserts, only plain "
+                    "stdlib "
+                    "values, no fixtures, no shared state between "
+                    "tests, and "
+                    "avoid anything that could raise at import time."
+                )
             _tests2 = await self._elicit_tests(
                 body, verdict, reasons, aligned_prefix, retry_hint=_hint
             )
@@ -15458,6 +15531,8 @@ class AgenticPreplanner:
         'you pick, verbatim>", "rationale": "<one sentence, '
         'evidence-based>", "memory_findings": "<one short line on '
         'what memory contributed, or empty>", '
+        '"assumptions": ["<unverified factual assumption the '
+        'chosen framing relies on>", ...], '
         '"difficulty": "<low|medium|high>", '
         '"question_type": "<exploratory|confirmatory|descriptive|'
         'mechanism>", "ask": ""}\n\n'
@@ -15635,6 +15710,11 @@ class AgenticPreplanner:
             question (or ""). Both empty on any failure — fail-open.
         """
         self.last_stats = {"used": False}
+        # S11 (assumption logging): reset per turn so a failed
+        # preplan can never leak a previous turn's assumptions into
+        # this turn's forge.
+        self._f._preplanner_assumptions = []
+        self._f._preplanner_question_type = ""  # S18: per-turn
         if not slot_free:
             return "", ""
         question = (question or "")[:2000]
@@ -15709,6 +15789,22 @@ class AgenticPreplanner:
         brief = self._render_brief(data)
         n_framings = len(data.get("framings") or [])
         chosen = str(data.get("chosen", "") or "").strip()
+        # S11: the framing's declared assumptions — unverified facts
+        # the chosen framing rests on. They flow to the serial
+        # forge's FIRST analyze cycle as claims-to-check (never as
+        # pre-confirmations), closing the 'assuming X' honesty gap:
+        # the synthesis can no longer assert an assumption nobody
+        # verified.
+        self._f._preplanner_assumptions = [
+            str(a).strip()[:160]
+            for a in (data.get("assumptions") or [])
+            if str(a).strip()
+        ][:4]
+        if self._f._preplanner_assumptions:
+            self._f._log_debug(
+                f"preplan: {len(self._f._preplanner_assumptions)} "
+                f"assumption(s) logged for the forge"
+            )
         # difficulty is the pre-planner's semantic judgment of how much
         # investigative work the chosen framing needs; anything outside the
         # three-value vocabulary degrades to "" (auto sizing then stands
@@ -15747,6 +15843,9 @@ class AgenticPreplanner:
                 f"question → exploratory (LLM said {question_type})"
             )
             question_type = "exploratory"
+        # S18: the FINAL type (post-override) feeds the serial
+        # record writer and the type-keyed EC-9 gate.
+        self._f._preplanner_question_type = question_type
         self.last_stats = {
             "used": True,
             "framings": n_framings,
@@ -16424,6 +16523,24 @@ _AGENTIC_SCAFFOLD_MARKERS: Tuple[str, ...] = (
 # covers every generation path (initial, refine, divergent,
 # abductive) without touching four parser sites. English and Spanish
 # because hypotheses are written in the question's language.
+# S12 (contract claims): claim shapes a code contract can verdict
+# deterministically. Narrow BY DESIGN — two shapes only, so the AST
+# checker never guesses: 'X returns T' (return annotation) and
+# 'X asserts <...>' (assert statements referencing the named
+# identifiers). The checker runs ONLY on claims the analyze itself
+# asserted — auto-injecting every contract of every touched symbol
+# would inflate EC-4 corroboration for any hypothesis near
+# well-annotated code, so that failure mode is designed out.
+_CONTRACT_RETURN_RE = re.compile(
+    r"(?:return type of\s+)?`?(\w+)`?\s+returns?\s+"
+    r"(?:type\s+)?`?'?(\w+)'?`?",
+    re.IGNORECASE,
+)
+_CONTRACT_ASSERT_RE = re.compile(
+    r"`?(\w+)`?\s+asserts?\s+(?:that\s+)?(.+)",
+    re.IGNORECASE,
+)
+
 # S5 (instrumentation): risk-adjacent vocabulary the EC-10 pattern
 # does NOT match. Surveillance only — when a screened-out candidate
 # matches this but not the EC-10 pattern, the debug log gains a
@@ -16607,6 +16724,8 @@ class AgenticStepExecutor:
         "\n\nAt any point BEFORE finishing you may request local tools by "
         "emitting lines exactly like:\n"
         "TOOL: EXPAND(SymbolName)   — full body of a symbol\n"
+        "TOOL: WRITERS(name)        — assignment sites that write "
+        "a variable/attribute\n"
         "TOOL: CALLERS(name)        — who calls it\n"
         "TOOL: CALLEES(Qualified.Name) — what it calls\n"
         "TOOL: DOC(SymbolName)      — its docstring\n"
@@ -17671,8 +17790,18 @@ class AgenticOrchestrator:
         Returns:
             True if a competition ran, False otherwise.
         """
+        if step.kind != "hypothesize":
+            return False
         mode = self._f.valves.agentic_hypothesize_compete
-        if mode == "off" or step.kind != "hypothesize":
+        _serial = bool(self._f.valves.agentic_serial_method)
+        # GATE FIX (observed live): the serial method has its OWN
+        # switch and must not inherit the parallel competition's
+        # entry conditions. The forge GENERATES candidates, so the
+        # rival-count ('should') and shadow gates below are wrong
+        # gates for it — a run with one enumerated hypothesis never
+        # reached the forge. With the serial valve on, only the
+        # step-kind gate applies.
+        if mode == "off" and not _serial:
             return False
 
         # Region: gather rival hypotheses from this step's claims
@@ -17725,10 +17854,10 @@ class AgenticOrchestrator:
         except Exception:
             _intent_debug = False
         should = n_found >= 2 or (_intent_debug and n_found >= 1)
-        if not should:
+        if not should and not _serial:
             return False
 
-        if mode == "shadow":
+        if mode == "shadow" and not _serial:
             self._f._log_debug(
                 f"🤖 [COMPETE-SHADOW] step {step.id} (hypothesize) would "
                 f"compete {n_found} rival hypotheses "
@@ -17794,9 +17923,6 @@ class AgenticOrchestrator:
         # threshold on a measured score (Principle 4), and call_llm's
         # anti-hang backstop under every call it makes.
         # obj/llm balance from the quant-aware valve (llm_weight is the
-        # complement so the pair always sums to 1). See QUANTIZATION &
-        # CALIBRATION: raise agentic_obj_weight on lower-precision quants.
-        _ow = min(1.0, max(0.0, float(self._f.valves.agentic_obj_weight)))
         # S1c: the serial method's switch. When on, the enumerated pool
         # becomes the forge's candidate queue: each hypothesis is
         # forged ONE AT A TIME into a sealed dossier (kill-early,
@@ -17806,10 +17932,10 @@ class AgenticOrchestrator:
         # strictly richer input. The tuple confidence is derived from
         # measured corroboration, not model self-report (llm_conf is
         # demoted to observability in serial mode). If every dossier
-        # died, the original pool falls through unchanged: the run
-        # degrades to exactly the pre-serial behavior, loudly logged
-        # (the honest no-winner terminal is S2's deliverable).
-        if self._f.valves.agentic_serial_method:
+        # died, that IS the finding: the honest terminal reports it
+        # and the step proceeds — the parallel fallthrough is
+        # retired; the serial method is self-sufficient.
+        if _serial:
             await self._f._emit_status(
                 f"🤖 Serial method: forging up to "
                 f"{int(self._f.valves.agentic_serial_hypothesis_count)} "
@@ -17873,43 +17999,36 @@ class AgenticOrchestrator:
                     )
                 return True
             else:
-                self._f._log_debug(
-                    "serial method: zero plausible dossiers — "
-                    "falling through to the parallel competition "
-                    "over the original pool"
+                # Parallel retirement, step one: zero plausible no
+                # longer falls through — the serial method is
+                # self-sufficient. Every dossier dying IS a finding,
+                # reported honestly with the measured causes from
+                # the sealed dossiers (empty pool + failed
+                # generation reports zero sealed, same shape).
+                _causes = "; ".join(
+                    f"'{d.hypothesis[:40]}' "
+                    f"({d.cause_of_death or 'died'})"
+                    for d in _dossiers[:4]
                 )
-        _t_compete = time.monotonic()
-        try:
-            best, score, _evidence, peer = (
-                await self._f._meta_reasoning.compete_hypotheses(
-                    hyps,
-                    project_id,
-                    max_iters=self._f.valves.agentic_metacog_max_iters,
-                    threshold=self._f.valves.agentic_metacog_threshold,
-                    label=f"agentic_hypothesize_step_{step.id}",
-                    obj_weight=_ow,
-                    llm_weight=1.0 - _ow,
-                    question=step.goal or "",
+                await self._f._emit_status(
+                    f"🏁 Conclusion: all {len(_dossiers)} "
+                    f"dossier(s) died — cause not identified "
+                    f"with confidence"
                 )
-            )
-        except Exception as e:
-            self._f._log_debug(f"🤖 Agentic: competition failed ({e})")
+                step.output = (step.output or "") + (
+                    "\n\n**Serial verdict**: every forged "
+                    "hypothesis was refuted or unfounded."
+                    + (f" {_causes}" if _causes else "")
+                )
             return True
-        finally:
-            _compete_s = time.monotonic() - _t_compete
-            step.seconds = (step.seconds or 0.0) + _compete_s
-            self._f._log_debug(
-                f"🤖 Agentic: step {step.id} competition took "
-                f"{_compete_s:.1f}s — folded into step time"
-            )
-        if best:
-            _peer = ""
-            if peer is not None and getattr(peer, "verdict", ""):
-                _peer = f" (peer review: {peer.verdict})"
-            step.output = (
-                step.output or ""
-            ) + f"\n\n**Competed verdict** (score {score:.2f}{_peer}): {best}"
-        return True
+        # Parallel retirement, step two: with the serial method
+        # self-sufficient (it returns True on every outcome above),
+        # this point is reached ONLY with the serial valve off — in
+        # which case there is no competition to run. The old
+        # compete_hypotheses call and its result handling are
+        # removed; the enumerated pool stands as the step's output,
+        # exactly as any non-competed hypothesize step.
+        return False
 
     async def _maybe_verify_dynamic_on_gate(
         self,
@@ -19133,9 +19252,17 @@ class AgenticOrchestrator:
                     # restored claims are exactly what the competition
                     # consumes; run it here. Its own convergence gate
                     # keeps the cost low when a winner dominates.
-                    if (
-                        step.kind == "hypothesize"
-                        and self._f.valves.compete_on_cached_hypothesize
+                    # GATE FIX (cache-hit path): the serial method
+                    # must reach the forge on a cached hypothesize
+                    # step REGARDLESS of compete_on_cached_hypothesize
+                    # — that valve governs the retired parallel
+                    # competition, not the forge. Without this, a
+                    # cache hit with the parallel valve off would
+                    # silently skip the serial method entirely (its
+                    # own _maybe_compete gate keeps cost bounded).
+                    if step.kind == "hypothesize" and (
+                        self._f.valves.agentic_serial_method
+                        or self._f.valves.compete_on_cached_hypothesize
                     ):
                         await self._maybe_compete_hypothesize(
                             step,
@@ -21561,8 +21688,72 @@ class CommandRouter:
             messages.pop()
             messages.append({"role": "assistant", "content": response})
             return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
+        if self._f.valves.enable_accept_command and content.startswith(
+            "/accept"
+        ):
+            response = await self._handle_accept_command(project_id)
+            messages.pop()
+            messages.append({"role": "assistant", "content": response})
+            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
 
         return False, None
+
+    async def _handle_accept_command(self, project_id: str) -> str:
+        """
+        Mark the latest competition record as externally validated.
+
+        The S17 learning-loop closer: R33's history sees only
+        falsifications; the EXPLICIT /accept (never inferred from
+        conversation flow — that detection is mushy by design
+        rejection) records that the winning hypothesis survived
+        contact with the real world. Rewrites the newest row's JSON
+        with external_validation=True through the same DB queue the
+        writers use.
+        """
+        # Region: read the newest record
+        try:
+            import json as _json
+
+            _row = self._f._db_conn.execute(
+                "SELECT id, record_json FROM competition_history "
+                "WHERE project_id = ? ORDER BY created_at DESC "
+                "LIMIT 1",
+                (project_id,),
+            ).fetchone()
+        except Exception as _e:
+            return f"/accept failed: could not read history ({_e})"
+        if not _row:
+            return (
+                "/accept: no competition record exists for this "
+                "project yet — run a diagnostic turn first."
+            )
+        # Region: rewrite with the validation flag
+        try:
+            _d = _json.loads(_row[1])
+            if _d.get("external_validation"):
+                return "/accept: the latest record is already marked."
+            _d["external_validation"] = True
+            _rj = _json.dumps(_d)
+
+            def _mark(rid=_row[0], rj=_rj):
+                self._f._db_conn.execute(
+                    "UPDATE competition_history SET record_json = ? "
+                    "WHERE id = ?",
+                    (rj, rid),
+                )
+
+            await self._f._state_store._db_enqueue(_mark)
+            self._f._log_debug(
+                f"/accept: record id={_row[0]} marked "
+                f"external_validation=True"
+            )
+            return (
+                "✅ Accepted: the latest hypothesis-competition "
+                "record is now marked as validated in the real "
+                "world. R33 will see this win."
+            )
+        except Exception as _e:
+            return f"/accept failed: {_e}"
 
     async def _handle_forget_command(
         self, messages: List[dict], project_id: str, __user__: Optional[dict]
@@ -28982,6 +29173,95 @@ class MetacognitiveReasoningEngine:
             return hypothesis
 
     @staticmethod
+    def _verify_contract_claim(
+        claim: str,
+        expanded_bodies: List[str],
+    ) -> Optional[bool]:
+        """
+        Deterministically verdict a contract claim against real code.
+
+        Complements _claim_verified: the graph abstains on 'X returns
+        int' (neither a symbol-existence nor a relation claim); this
+        checker fills exactly that gap from the AST of the bodies the
+        investigate step already EXPANDed — zero LLM, zero sandbox.
+        Tri-state like everything else: True (annotation/assert
+        confirms), False (contradicts), None (not a contract claim,
+        symbol not in the expanded bodies, or a body too truncated to
+        parse — abstention never counts as confirmation).
+        """
+        # ── Step 1: classify the claim shape ──
+        _mret = _CONTRACT_RETURN_RE.match(claim.strip())
+        _masrt = (
+            None if _mret else _CONTRACT_ASSERT_RE.match(claim.strip())
+        )
+        if not _mret and not _masrt:
+            return None
+        # ── Step 2: locate the function in the expanded bodies ──
+        _fname = (_mret or _masrt).group(1)
+        _fn = None
+        for _body in expanded_bodies:
+            try:
+                _tree = ast.parse(textwrap.dedent(_body))
+            except SyntaxError:
+                # Budget truncation can break syntax mid-body; an
+                # unparseable body abstains, never guesses.
+                continue
+            for _node in ast.walk(_tree):
+                if (
+                    isinstance(
+                        _node,
+                        (ast.FunctionDef, ast.AsyncFunctionDef),
+                    )
+                    and _node.name == _fname
+                ):
+                    _fn = _node
+                    break
+            if _fn is not None:
+                break
+        if _fn is None:
+            return None
+        # ── Step 3: verdict against the contract ──
+        if _mret:
+            _want = _mret.group(2)
+            _ann = _fn.returns
+            if _ann is None:
+                return None
+            _names = {
+                n.id for n in ast.walk(_ann) if isinstance(n, ast.Name)
+            } | {
+                n.attr
+                for n in ast.walk(_ann)
+                if isinstance(n, ast.Attribute)
+            } | {
+                str(n.value)
+                for n in ast.walk(_ann)
+                if isinstance(n, ast.Constant)
+            }
+            return _want in _names
+        # assert shape: the named identifiers of the predicate must
+        # appear in some assert of the function; asserts existing but
+        # none matching refutes; no asserts at all refutes too (the
+        # claim said the function asserts — it does not).
+        _pred_ids = set(re.findall(r"[A-Za-z_]\w*", _masrt.group(2)))
+        _pred_ids -= {"is", "not", "None", "and", "or", "that"}
+        _asserts = [
+            n for n in ast.walk(_fn) if isinstance(n, ast.Assert)
+        ]
+        if not _asserts:
+            return False
+        for _a in _asserts:
+            _aids = {
+                n.id for n in ast.walk(_a) if isinstance(n, ast.Name)
+            } | {
+                n.attr
+                for n in ast.walk(_a)
+                if isinstance(n, ast.Attribute)
+            }
+            if _pred_ids & _aids:
+                return True
+        return False
+
+    @staticmethod
     def _forge_verdict(
         confirmed: int,
         refuted: int,
@@ -29218,6 +29498,39 @@ class MetacognitiveReasoningEngine:
                     _budget -= len(_part)
                     if _budget <= 0:
                         break
+            # S14 auto-use: a state-corruption hypothesis gets
+            # writer-site evidence its CALLERS view structurally
+            # cannot see. Suspects = snake_case identifiers from the
+            # hypothesis that are NOT confirmed symbols (confirmed
+            # ones already got EXPAND; the unresolved state-like
+            # names are where corruption hides). Underscore-bearing
+            # tokens only — English words excluded naturally, no
+            # stopword list to maintain. Cap 2 names, 1200 chars
+            # each, on top of the body budget.
+            if _EC10_CRITICAL_RE.search(hyp_text) or (
+                _EC10_NEAR_MISS_RE.search(hyp_text)
+            ):
+                _sus = [
+                    t
+                    for t in dict.fromkeys(
+                        re.findall(
+                            r"[a-z][a-z0-9]*_[a-z0-9_]+", hyp_text
+                        )
+                    )
+                    if t not in _sym_true
+                ][:2]
+                for _sus_name in _sus:
+                    try:
+                        _w = _broker._writers(_sus_name, project_id)
+                    except Exception:
+                        continue
+                    if _w and not _w.startswith("[WRITERS"):
+                        _expanded_parts.append(_w[:1200])
+                if _sus:
+                    self._f._log_debug(
+                        f"forge writers: probed {_sus} for state "
+                        f"writes"
+                    )
             # ── Step 3: fabricated gate (EC-8 profile; EC-10 exempt) ──
             _n_conf_e = sum(
                 1 for v in evidence.symbols_found.values() if v
@@ -29243,9 +29556,25 @@ class MetacognitiveReasoningEngine:
                 f"checks refuted: {_n_ref_e}"
             )
             _code_blk = "\n\n".join(_expanded_parts)
+            # S11: the framing assumptions enter the FIRST cycle as
+            # claims to check — the graph verdicts them like any
+            # other claim; they are never pre-confirmed.
+            _assump = list(
+                getattr(self._f, "_preplanner_assumptions", []) or []
+            )[:4]
+            _assump_blk = ""
+            if _cycle == 1 and _assump:
+                _alines = "\n".join(f"- {a}" for a in _assump)
+                _assump_blk = (
+                    "Framing assumptions to verify explicitly "
+                    "(assert each as a checkable claim):\n"
+                    + _alines
+                    + "\n\n"
+                )
             _prompt = (
                 f"Question:\n{question[:300]}\n\n"
                 f"Hypothesis under test:\n{hyp_text}\n\n"
+                + _assump_blk
                 + (
                     f"Prior analysis:\n{_last_analysis[:800]}\n\n"
                     if _last_analysis
@@ -29259,8 +29588,10 @@ class MetacognitiveReasoningEngine:
                 )
                 + "Validate or reject the hypothesis against this "
                 "evidence, refine the mechanism, and assert checkable "
-                "claims (each naming identifiers or 'A calls B' / "
-                "'A does not call B' relations)."
+                "claims (each naming identifiers, 'A calls B' / "
+                "'A does not call B' relations, or code contracts "
+                "visible in the shown bodies: 'X returns int', "
+                "'X asserts y is not None')."
             )
             _kw = {}
             _cap = int(
@@ -29328,6 +29659,14 @@ class MetacognitiveReasoningEngine:
             _conf_n, _ref_n = 0, 0
             for _c in _claims:
                 _v = self._claim_verified(_c, evidence, project_id)
+                # S12: the graph abstained — a contract claim may
+                # still be deterministically decidable from the AST
+                # of the expanded bodies. Graph first, contract
+                # second, both tri-state.
+                if _v is None:
+                    _v = self._verify_contract_claim(
+                        _c, _expanded_parts
+                    )
                 if _v is True:
                     _conf_n += 1
                     if len(_dossier.confirmed_claims) < 8:
@@ -29536,13 +29875,19 @@ class MetacognitiveReasoningEngine:
 
         # ── Step 2: slots ──
         _collision_count = 0  # S5: arms the fecundity trigger
+        _counterfactual = ""  # S15: armed by a thin-plausible seal
         for _slot in range(1, _n_target + 1):
             _cand: Optional[str] = None
             _gen_conf = -1.0  # S5: -1.0 = queue pop, not generated
             _gen_sev = "normal"  # S8: queue pops carry no tag
             _gen_attempts = 0
             _nudged = False  # S9: at most one class nudge per slot
-            _guidance = ""
+            # S15: a pending counterfactual (armed by the previous
+            # thin-plausible seal) becomes this slot's opening
+            # guidance, consumed exactly once. Guidance only — the
+            # generator may ignore it; no candidate is ever forced.
+            _guidance = _counterfactual
+            _counterfactual = ""
             while _cand is None:
                 # Region: source — queue first, generation after
                 if _queue:
@@ -29584,8 +29929,12 @@ class MetacognitiveReasoningEngine:
                         >= 2
                     ):
                         _nudged = True
+                        # S15 interplay: the class nudge APPENDS to
+                        # any pending counterfactual guidance — the
+                        # two steers compose, neither clobbers.
                         _guidance = (
-                            "Guidance: avoid mechanisms resting "
+                            (_guidance + "\n" if _guidance else "")
+                            + "Guidance: avoid mechanisms resting "
                             "mainly on call-relation assertions — "
                             "that class has failed chronically in "
                             "this project."
@@ -29701,6 +30050,34 @@ class MetacognitiveReasoningEngine:
             )
             if not _dossier.structure_hash:
                 _dossier.structure_hash = _sh
+            # S15 (counterfactual generation): a dossier that
+            # SURVIVED but thin — plausible with coverage under the
+            # low bar — is exactly where the proactive rival lives:
+            # the sister hypothesis assuming its critical assumption
+            # is FALSE. Armed for the NEXT slot via S9's transient
+            # channel; the abductive escape produces this reactively
+            # only when everything dies, this produces it while the
+            # competition is alive.
+            try:
+                _low_thr = float(
+                    self._f.valves.low_coverage_threshold
+                )
+            except Exception:
+                _low_thr = 0.0
+            if (
+                _dossier.status == "plausible"
+                and _dossier.coverage_score < _low_thr
+            ):
+                _counterfactual = (
+                    "Also consider: what if the critical assumption "
+                    f"of '{_dossier.hypothesis[:90]}' were FALSE? "
+                    "Propose the rival mechanism that scenario "
+                    "implies."
+                )
+                self._f._log_debug(
+                    f"S15 counterfactual: armed from thin-plausible "
+                    f"'{_dossier.hypothesis[:50]}'"
+                )
             _sealed.append(_dossier)
             # S5 calibration line: greppable (gen_conf, outcome) pair.
             self._f._log_debug(
@@ -29878,6 +30255,21 @@ class MetacognitiveReasoningEngine:
                 f" | null bar FAILED: best corroboration "
                 f"{_winner.corroboration:.2f} < margin {_margin:.2f}"
             )
+            # S13 (actionable abstention): the honest 'no lo sé'
+            # becomes the next command the user can run — built
+            # WITHOUT any LLM call from the strongest dossier's own
+            # unresolved claims (the S7 legacy: asserted, never
+            # verifiable, exactly what deciding this needs). With
+            # nothing unresolved to name, no plan is invented.
+            _plan_items = [
+                c for c in _winner.unresolved_claims[:3] if c.strip()
+            ]
+            if _plan_items:
+                _note += (
+                    " | to decide this, the next investigation "
+                    "should check: "
+                    + "; ".join(f"'{c[:80]}'" for c in _plan_items)
+                )
             return None, _note
         _note += (
             f" | null bar PASS: {_winner.corroboration:.2f} >= "
@@ -29943,6 +30335,10 @@ class MetacognitiveReasoningEngine:
                     if d.coverage_score < _low_thr
                 ),
                 abductive_used=False,
+                question_type=str(
+                    getattr(self._f, "_preplanner_question_type", "")
+                    or ""
+                ),
             )
             _rj = _json.dumps(_asdict(_rec))
 
@@ -30308,7 +30704,52 @@ class MetacognitiveReasoningEngine:
         # the pattern. Serial records report the split honestly
         # (refuted symbol/relation check fields), so this feeds on
         # measured facts, per the deterministic-validity principle.
-        if n >= 10 and call_fail_rate >= 0.7:
+        # S18: the gate is KEYED by question type when enough typed
+        # history exists — a project failing call-relations on
+        # exploratory questions should not punish confirmatory ones.
+        # The typed window needs >=10 records OF THIS TYPE (drawn
+        # from the full retained history, not just the global
+        # 10-window); with fewer, the GLOBAL rule below governs
+        # unchanged — the fallback never offers less protection
+        # than the untyped gate did.
+        _qt = str(
+            getattr(self._f, "_preplanner_question_type", "") or ""
+        )
+        _typed = (
+            [
+                r
+                for r in history
+                if getattr(r, "question_type", "") == _qt
+            ][-10:]
+            if _qt
+            else []
+        )
+        if len(_typed) >= 10:
+            _t_call = sum(
+                1
+                for r in _typed
+                if r.primary_falsification_type == "call_relations"
+            ) / 10.0
+            _t_sym = sum(
+                1
+                for r in _typed
+                if r.primary_falsification_type == "symbols"
+            ) / 10.0
+            if _t_call >= 0.7:
+                strategy["tighten_screen_relations"] = True
+                self._f._log_debug(
+                    f"_get_adaptive_strategy: EC-9 — call-relation "
+                    f"class failing at {_t_call:.2f} over 10 "
+                    f"records (type={_qt}); serial screen tightened"
+                )
+            elif _t_sym >= 0.7:
+                strategy["tighten_screen_symbols"] = True
+                self._f._log_debug(
+                    f"_get_adaptive_strategy: EC-9 — symbol class "
+                    f"failing at {_t_sym:.2f} over 10 "
+                    f"records (type={_qt}); serial screen tightened"
+                )
+        elif n >= 10 and call_fail_rate >= 0.7:
             strategy["tighten_screen_relations"] = True
             self._f._log_debug(
                 f"_get_adaptive_strategy: EC-9 — call-relation "
@@ -43453,55 +43894,6 @@ class Filter:
                 "pool-destroying)."
             ),
         )
-        agentic_metacog_threshold: float = Field(
-            default=0.90,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Combined score at which compete_hypotheses stops refining "
-                "early. The combined score is obj_weight*obj_score + "
-                "llm_weight*llm_conf (0.5/0.5), so half the bar is set by "
-                "the model judging its own hypothesis. Lower this valve to "
-                "make the loop lean harder on the deterministic SymbolGraph "
-                "half; raise it to converge sooner. "
-                "\n\n"
-                "WHY 0.90 AND NOT 0.85 — a property of the CURRENT MODEL, "
-                "not of this code. Running Q4_K_M, the model has only ever "
-                "reported llm_conf in {0.80, 0.85, 0.90, 0.95, 1.00}: it is "
-                "not expressing a calibrated probability, it is playing "
-                "hot-and-cold on a five-notch dial, and 0.85/0.90 are by far "
-                "the two most common notches when hypotheses compete. "
-                "Quantisation flattens the steps of the weight matrix, and a "
-                "flatter matrix makes the model systematically OVERCONFIDENT "
-                "— the notch it picks sits higher than the evidence "
-                "warrants. At a 0.85 threshold, one of the two commonest "
-                "notches clears the bar on its own the moment obj_score "
-                "reaches 0.85, so the competition ends on iteration 1 and "
-                "the refinement machinery — stagnation detection, the "
-                "divergent pool, experimentum crucis between survivors — "
-                "never runs. At 0.90 the model's favourite notch is no "
-                "longer sufficient by itself: llm_conf 0.90 now needs "
-                "obj_score >= 0.90, i.e. real SymbolGraph verification, to "
-                "converge. "
-                "\n\n"
-                "This is expected to relax once the deployment moves to Q8, "
-                "where the steps are not compressed and the reported "
-                "confidence spreads out into something worth trusting. "
-                "Revisit this valve then: 0.85 (or the historical 0.75) may "
-                "become defensible again with a better-calibrated dial. "
-                "\n\n"
-                "DIRECTION OF THIS LEVER — easy to get backwards. The loop "
-                "stops when score >= threshold, so LOWERING this valve "
-                "makes convergence EASIER (fewer iterations) and RAISING "
-                "it forces more refinement where rivals are close. A "
-                "tuning session once recommended 'lower to 0.85 for more "
-                "iterations on contested runs' — that is the inverse of "
-                "what the code does, and 0.85 additionally lets the Q4 "
-                "model's favourite confidence notch clear the bar alone "
-                "(see above). If the goal is deeper competition, this "
-                "valve goes UP, not down."
-            ),
-        )
         agentic_serial_method: bool = Field(
             default=False,
             description=(
@@ -43622,50 +44014,6 @@ class Filter:
                 "independent evidence finally outranks less. The "
                 "obj/llm balance is preserved and scaled by the "
                 "complement. 0.0 restores the pre-EC-4 score exactly."
-            ),
-        )
-        agentic_obj_weight: float = Field(
-            default=0.5,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Weight of the deterministic SymbolGraph signal "
-                "(obj_score) in the hypothesis competition's combined "
-                "score; the model's self-reported confidence (llm_conf) "
-                "gets the complement (1 - this). THE quant-aware lever "
-                "(see QUANTIZATION & CALIBRATION): quantization makes "
-                "llm_conf overconfident and coarse, so lower-precision "
-                "deployments should lean harder on the measured half. "
-                "0.5 = today's 50/50 baseline, kept as the default until "
-                "the llm_conf notch histogram from real runs justifies a "
-                "specific value; on Q4_K_M something in 0.6-0.7 is the "
-                "expected direction, relaxing back toward 0.5 on Q8/FP16 "
-                "where the reported confidence spreads into a usable "
-                "signal. Calibrate from logs, not from theory."
-            ),
-        )
-        agentic_metacog_max_iters: int = Field(
-            default=4,
-            ge=1,
-            le=6,
-            description=(
-                "compete_hypotheses iterations when reinforcing a step. "
-                "1 = a single falsification pass. Refinement "
-                "of surviving hypotheses needs >= 2. Stagnation detection "
-                "(and the divergent pool it gates) needs >= "
-                "stagnation_window + 2, i.e. 4 at the default window of 2: "
-                "the detector requires window+1 scores in history, and the "
-                "loop breaks on the final iteration before it is consulted. "
-                "The old ceiling of 3 made stagnation unreachable at every "
-                "permitted value. Each iteration costs one design + "
-                "prediction + evidence pass per surviving hypothesis, so "
-                "4 (default) is the lowest value that reaches "
-                "stagnation, so the full method is available; each iteration "
-                "costs one design + prediction + evidence pass per surviving "
-                "hypothesis, but with align_aux_calls_to_prefix on those "
-                "calls extend the resident KV prefix instead of evicting it, "
-                "which is what makes this default affordable. Drop to 1 if "
-                "latency matters more than reaching the divergent pool."
             ),
         )
         agentic_claims_tail_recovery: bool = Field(
@@ -44374,29 +44722,6 @@ class Filter:
                 "divergent thinking (high temperature, contrarian prompt). "
                 "Harmless with agentic_metacog_max_iters=2 (cannot fire). "
                 "Set agentic_metacog_max_iters=4 to enable effectively."
-            ),
-        )
-        hypothesis_divergent_n: int = Field(
-            default=2,
-            ge=0,
-            le=5,
-            description=(
-                "Planner-gated divergent pool (Capa 1): extra high-temperature "
-                "hypotheses generated BEFORE a hypothesize-step competition, "
-                "each with a mechanically different root cause and its "
-                "discriminating observable. 0 disables (byte-equivalent to "
-                "previous behavior). Only fires on planner-chosen hypothesize "
-                "steps, never on ordinary queries."
-            ),
-        )
-        hypothesis_divergent_temperature: float = Field(
-            default=0.9,
-            ge=0.0,
-            le=1.5,
-            description=(
-                "Sampling temperature for the divergent hypothesis pool. High "
-                "on purpose: diversity lives in the exploratory pool only; "
-                "scoring and synthesis stay cold."
             ),
         )
         enable_abductive_escape: bool = Field(
@@ -45168,6 +45493,18 @@ class Filter:
         enable_skeleton_intent: bool = Field(
             default=True,
             description="Serve a copy‑pasteable signature‑only skeleton for scaffolding queries.",
+        )
+        enable_accept_command: bool = Field(
+            default=True,
+            description=(
+                "Enable the /accept chat command: marks the most "
+                "recent hypothesis-competition record of this "
+                "project as validated in the real world "
+                "(external_validation=True). Closes the R33 "
+                "learning loop — without it the strategy history "
+                "learns only from falsifications, never from "
+                "confirmed wins."
+            ),
         )
         enable_freeze_command: bool = Field(
             default=True,
