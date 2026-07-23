@@ -12133,6 +12133,11 @@ class LLMOrchestrator:
             "devil",
             "tiebreak",
             "metacog",
+            # delimit_scope is the judge's Layer 5. Its key was dropped
+            # when the call was dead and not restored when the call came
+            # back, so the scoping call was silently classified as a
+            # non-pipeline utility and capped like a classifier.
+            "delimit_scope",
             "falsif",
             "gather_evidence",
         )
@@ -12142,23 +12147,31 @@ class LLMOrchestrator:
         if _is_agentic_call and getattr(
             self._f.valves, "agentic_unlimited_tokens", False
         ):
-            # R25: an explicit positive max_tokens from the caller is a
-            # deliberate per-call ceiling and must be honoured — some
-            # agentic calls emit a small bounded artifact (e.g.
-            # design_critical_experiment's classifier JSON) and pass a tight
-            # cap precisely to stop the model drifting into a long partial
-            # repetition. Only when the caller left it open (0/None) does
-            # the unlimited path apply, still floored by the runaway cap.
-            _caller_cap = max_tokens if (max_tokens and max_tokens > 0) else 0
-            if _caller_cap > 0:
-                max_tokens = _caller_cap
-            else:
-                max_tokens = None
-                _runaway = int(
-                    getattr(self._f.valves, "agentic_runaway_token_cap", 8000) or 0
-                )
-                if _runaway > 0:
-                    max_tokens = _runaway
+            # R25 REVISED. The previous rule let an explicit caller cap
+            # win over this switch, which contradicted the switch's own
+            # documented contract ('when this is off, the per-label
+            # agentic_*_max_tokens valves apply as before' — implying
+            # they do NOT when it is on) and silently neutered it: six
+            # pipeline call sites pass exactly those valves, so for
+            # them the switch did nothing at all. A validation run
+            # showed the cost — 37 truncations, 18 of them agentic_step
+            # stopping at its 8000-token valve, feeding half-written
+            # reasoning into the workspace that later steps read.
+            #
+            # The switch now means what it says: on the pipeline, a
+            # per-label ceiling is never applied, and the ONLY bound is
+            # the R18 runaway cap — a backstop against a degenerate
+            # loop, sized so healthy reasoning can never meet it. The
+            # original concern (a small bounded artifact drifting into
+            # partial repetition) is answered by that backstop plus
+            # sampler-side loop control, not by a ceiling that also
+            # truncates the calls doing the actual thinking.
+            max_tokens = None
+            _runaway = int(
+                getattr(self._f.valves, "agentic_runaway_token_cap", 0) or 0
+            )
+            if _runaway > 0:
+                max_tokens = _runaway
         elif not max_tokens or max_tokens <= 0:
             _default_cap = int(
                 getattr(self._f.valves, "llm_uncapped_max_tokens", 2048) or 0
@@ -16581,6 +16594,71 @@ _EC10_CRITICAL_RE = re.compile(
 )
 
 
+# The context renderer emits this pointer under every call site it
+# resolves within a tier. It is built at RUNTIME (an f-string over a
+# qualified id), so a reply containing it is echoing injected context,
+# not quoting the plugin's source — the source holds the template, not
+# a rendered instance. Tolerant about the leading comment marker and
+# the quoting style because a model that parrots the block often drops
+# the '# ' or swaps backticks for quotes.
+_TIER_POINTER_RE = re.compile(
+    r"^[ \t]*#?[ \t]*\u2191 see [`'\"].+?[`'\"] in this tier[ \t]*$",
+    re.MULTILINE,
+)
+# A skeleton block opens with a box-drawing rule. Unlike the pointer
+# this DOES occur in the plugin's own source (region comments), so it
+# is never a trigger on its own — it is only used to walk back from a
+# confirmed pointer to the top of the block being recited.
+_SKELETON_RULE_RE = re.compile(r"^[ \t]*\u2500{2,}", re.MULTILINE)
+
+
+def _close_dangling_fence(text: str) -> str:
+    """
+    Close a code fence left open by a hard truncation.
+
+    Any cut by character or token count is structurally blind: land it
+    inside a fenced block and the text handed on ends mid-fence. When
+    that text is workspace material injected into the final prompt, the
+    model reads an open fence and keeps emitting code — the answer
+    turns into a listing. Balancing the delimiter costs one line and
+    removes the failure mode; a spurious close on genuinely odd
+    backticks is harmless next to an unterminated block.
+    """
+    if not text or text.count("```") % 2 == 0:
+        return text
+    return text.rstrip() + "\n```"
+
+
+def _find_context_echo(text: str, min_pos: int = 0) -> int:
+    """
+    Start index of a recited context skeleton, or -1.
+
+    Complements _find_scaffold_echo, which covers the AGENTIC
+    scaffolding (workspace digests, tool listings). This covers the
+    other half seen in live runs: the reply reciting the rendered
+    CODE context — region rules, bodies, and the tier pointers that
+    only the renderer produces.
+
+    Anchored on the pointer because it is unambiguous, then walked
+    back to the rule that opens the block so the cut lands before the
+    recitation rather than in the middle of it.
+    """
+    # ── Step 1: the unambiguous anchor ──
+    m = _TIER_POINTER_RE.search(text, min_pos)
+    if m is None:
+        return -1
+    cut = m.start()
+    # ── Step 2: walk back to the block's opening rule ──
+    # Bounded so a pointer far below unrelated prose cannot drag the
+    # cut up into a legitimate answer.
+    scan_from = max(min_pos, cut - 4000)
+    for rm in _SKELETON_RULE_RE.finditer(text, scan_from, cut):
+        if rm.start() >= min_pos:
+            cut = rm.start()
+            break
+    return cut if cut >= min_pos else -1
+
+
 def _find_scaffold_echo(text: str, min_pos: int = 1) -> int:
     """
     Earliest LINE-START occurrence of a scaffolding marker, or -1.
@@ -17083,7 +17161,19 @@ class AgenticStepExecutor:
         # sat AFTER the echo (the model finished its contract late),
         # rescue it and re-append, so the ledger never loses claims to
         # this hygiene.
-        _cut = _find_scaffold_echo(response, min_pos=1)
+        # Same two shapes as the outlet guard; a step that recites
+        # the rendered context poisons every downstream step that
+        # reads its output from the workspace, so the cut happens
+        # here too rather than only at the end.
+        _cuts = [
+            p
+            for p in (
+                _find_scaffold_echo(response, min_pos=1),
+                _find_context_echo(response, min_pos=1),
+            )
+            if p > 0
+        ]
+        _cut = min(_cuts) if _cuts else -1
         if _cut > 0:
             _removed = response[_cut:]
             response = response[:_cut].rstrip()
@@ -17327,7 +17417,12 @@ class AgenticSynthesisComposer:
             if _tail > 0:
                 _synth = _synth[:_tail].rstrip().rstrip("`").rstrip()
             if len(_synth) > 12000:
-                _synth = _synth[:12000] + "\n[synthesis truncated]"
+                # Fence-safe: a blind cut here lands inside a fenced
+                # block often enough, and this text is injected into
+                # the FINAL prompt — an open fence there is read as
+                # 'keep emitting code'.
+                _synth = _close_dangling_fence(_synth[:12000])
+                _synth += "\n[synthesis truncated]"
             lines.append("Synthesis (the pipeline's processed conclusion):")
             lines.append(_synth)
             lines.append("")
@@ -17464,7 +17559,90 @@ class AgenticSynthesisComposer:
             "intent or environment); in every other case, answer, flagging "
             "any assumption you had to make."
         )
+        # The directive is data-driven: 'ok'/'bad' come from the
+        # ledger's own tally (already read above), and the code
+        # section is offered only when a step actually pulled code
+        # into the workspace — asking for it otherwise invites a
+        # fabricated snippet.
+        _has_code = any(
+            ("```" in (s.output or "")) or ("```" in (s.digest or ""))
+            for s in plan.steps
+        )
+        lines += self._answer_format_directive(ok, bad, _has_code)
         return "\n".join(lines).rstrip()
+
+    @staticmethod
+    def _answer_format_directive(
+        n_valid: int,
+        n_invalid: int,
+        has_code: bool,
+    ) -> List[str]:
+        """
+        Instruct the final model on the SHAPE of its answer.
+
+        The pipeline's value is not only its conclusion but the audit
+        trail behind it: which facts were mechanically checked against
+        the graph and which were not. Free-form prose hides that line,
+        and the reader cannot tell a verified claim from a plausible
+        sentence. These sections expose it, so the answer can be
+        judged instead of trusted.
+
+        Sections adapt to what exists: the gap section is only asked
+        for when something really was left open, the code section only
+        when code is in play. A heading with nothing under it teaches
+        the model to pad.
+        """
+        # ── Step 1: the two invariant sections ──
+        out: List[str] = [
+            "",
+            "Structure your reply with these headed sections, in this "
+            "order. Write each in your own prose — this is a shape to "
+            "fill, never a template to copy:",
+            "",
+            "**Most likely explanation** — the single mechanism you "
+            "hold responsible, named concretely (the functions and the "
+            "causal chain between them), in a short paragraph. If the "
+            "evidence supports no single mechanism, say that instead "
+            "of promoting the least bad candidate.",
+            "",
+            "**What the evidence shows** — the facts that carry the "
+            "explanation: the symbols, call relations and code paths "
+            "that were checked against the indexed graph, each stated "
+            "so the reader can go and confirm it. Never give an "
+            "unverified claim the same voice as a verified one.",
+        ]
+        # ── Step 2: the honest gap, only when there is one ──
+        if n_invalid > 0 or n_valid == 0:
+            out += [
+                "",
+                "**What was not verified** — what this investigation "
+                "could NOT settle, and why: a symbol absent from the "
+                "index, a step that ran out of room, a relation the "
+                "graph could not confirm. State it plainly. An "
+                "acknowledged gap is worth more to the reader than a "
+                "confident sentence papering over it.",
+            ]
+        # ── Step 3: code, with an explicit fencing contract ──
+        if has_code:
+            out += [
+                "",
+                "**Code** — only if a concrete change or snippet is "
+                "warranted. Fence every block: open with "
+                "```python (or the correct language) on its own line, "
+                "close with ``` on its own line. Never leave a block "
+                "unterminated, never nest fences, and keep prose "
+                "outside them — an unclosed block swallows the rest of "
+                "the answer.",
+            ]
+        # ── Step 4: where the reader goes next ──
+        out += [
+            "",
+            "**How to proceed** — the next concrete step, ordered so "
+            "the one that settles the most uncertainty comes first: "
+            "the symbol to read, the check to run, the thing to "
+            "instrument. Actionable, not generic advice.",
+        ]
+        return out
 
 
 class AgenticOrchestrator:
@@ -18341,8 +18519,18 @@ class AgenticOrchestrator:
             body = self._f._tokens.truncate_text_to_tokens(
                 text[: m.start()].rstrip(), max(20, budget - tail_tok)
             )
-            return f"{body}\n{tail}" if body else tail
-        return self._f._tokens.truncate_text_to_tokens(text, budget)
+            # Both return paths are token-truncated, so both can end
+            # mid-fence; the digest is workspace material that reaches
+            # the final prompt. The body is balanced BEFORE the tail is
+            # appended: closing the pair afterwards would leave the
+            # NOT FOUND section inside the code block, burying the very
+            # negative space this branch exists to preserve.
+            if body:
+                return f"{_close_dangling_fence(body)}\n{tail}"
+            return _close_dangling_fence(tail)
+        return _close_dangling_fence(
+            self._f._tokens.truncate_text_to_tokens(text, budget)
+        )
 
     @staticmethod
     def _render_workspace(steps: List[AgenticStep]) -> str:
@@ -27936,6 +28124,98 @@ class MetacognitiveReasoningEngine:
         )
         return None
 
+    @staticmethod
+    def _tag_strategy(dossier: "HypothesisDossier", tag: str) -> None:
+        """
+        Record that a strategy actually FIRED on this dossier.
+
+        The trace is rendered into the cycle status, so a tag added
+        here becomes visible to the person watching the chat. The
+        discipline is that a tag means the strategy DID something on
+        this hypothesis — not that it was enabled, not that it was
+        consulted and declined. A tag that appears unconditionally
+        carries no information and trains the reader to ignore the
+        whole list.
+        """
+        if tag and tag not in dossier.strategy_trace:
+            dossier.strategy_trace.append(tag)
+
+    # The investigation ladder. Each rung pulls a different slice of
+    # the call tree into view, so cycle N never re-treads cycle N-1's
+    # ground. Ordered by cost of being wrong: a hypothesis naming
+    # symbols that do not exist is dead before anyone reads a caller,
+    # and callers (who depends on this) discriminate harder than
+    # callees (what this depends on) because they carry the blame.
+    _INVESTIGATION_LADDER: Tuple[str, ...] = (
+        "symbols",
+        "callers",
+        "callees",
+        "writers",
+        "contracts",
+    )
+
+    def _select_investigation(
+        self,
+        cycle: int,
+        dossier: "HypothesisDossier",
+        hyp_text: str,
+        project_id: str,
+    ) -> str:
+        """
+        Choose THIS cycle's line of investigation. Deterministic.
+
+        The old cycle re-probed whatever identifiers happened to
+        appear in the previous analysis, so a hypothesis whose prose
+        kept naming the same three symbols expanded the same three
+        bodies every cycle and stalled with nothing new to weigh.
+        Walking a ladder instead guarantees each cycle reaches code
+        the last one could not see, which is what makes 'ran out of
+        cycles' mean 'the call tree is covered' rather than 'the
+        model repeated itself'.
+
+        Priorities REORDER the ladder rather than overriding a
+        single cycle. Substituting one rung looked simpler and was
+        wrong: promoting writers into cycle 2 left writers still
+        sitting at its ladder position, so the hypothesis spent two
+        of its cycles on the same rung and reached one fewer region
+        of the tree. Reordering moves a rung; it never clones one.
+        """
+        # ── Step 1: rungs already walked, from the dossier's trace ──
+        _used = {
+            t.split(":", 1)[1]
+            for t in dossier.strategy_trace
+            if t.startswith("investigate:")
+        }
+        _order = [r for r in self._INVESTIGATION_LADDER if r not in _used]
+        if not _order:
+            # Every rung walked: start again with a fresh budget,
+            # which now buys depth on ground already mapped.
+            _order = list(self._INVESTIGATION_LADDER)
+        # ── Step 2: promote the rung the evidence is asking for ──
+        def _promote(rung: str) -> None:
+            if rung in _order:
+                _order.remove(rung)
+                _order.insert(0, rung)
+        try:
+            _strat = self._get_adaptive_strategy(project_id)
+        except Exception:
+            _strat = {}
+        # Weakest signal first: each promotion overrides the last,
+        # so the most specific evidence ends up at the front.
+        if _strat.get("prefer_symbol_verification"):
+            _promote("symbols")
+        if _EC10_CRITICAL_RE.search(hyp_text) or _EC10_NEAR_MISS_RE.search(
+            hyp_text
+        ):
+            # State corruption is visible at the write sites and
+            # nowhere else; the structural views cannot see it.
+            _promote("writers")
+        if dossier.refuted_relation_checks > 0:
+            # A contradicted call edge is settled by reading the
+            # callers, not by advancing past the contradiction.
+            _promote("callers")
+        return _order[0]
+
     async def _forge_hypothesis(
         self,
         question: str,
@@ -27986,6 +28266,14 @@ class MetacognitiveReasoningEngine:
             pass
         _broker = AgenticToolBroker(self._f)
         _last_analysis = ""
+        # Every node whose body this hypothesis has already read,
+        # across all cycles. The ladder climbs, but a caller two
+        # rungs up can still be a symbol seen on rung one; skipping
+        # what is already in hand is what turns the extra cycles
+        # into extra COVERAGE rather than a longer prompt. It is
+        # also the honest measure of how much of the call tree this
+        # hypothesis was actually tested against.
+        _expanded_qids: Set[str] = set()
         # Hypothetico-deductive cycle: predictions deduced at the END
         # of cycle N are structural consequences the hypothesis has
         # NOT yet been credited for. Cycle N+1 probes them, so a
@@ -28013,11 +28301,18 @@ class MetacognitiveReasoningEngine:
                     f"'{hyp_text[:50]}' — sealing as-is"
                 )
                 break
-            # ── Step 2: investigate — deterministic evidence + code ──
-            # The probe carries the previous analysis AND the
-            # deduced predictions: gather_evidence verifies them
-            # structurally against the graph, which is what closes
-            # the deductive half of the cycle.
+            # ── PHASE 1: INVESTIGATION ──
+            # A strategy chooses this cycle's line of enquiry and pulls
+            # the corresponding slice of the call tree into view. The
+            # probe still carries the previous analysis and the deduced
+            # predictions, so gather_evidence keeps checking them
+            # structurally; what changed is that the CODE brought in
+            # alongside is now chosen rather than whatever the last
+            # analysis happened to name.
+            _line = self._select_investigation(
+                _cycle, _dossier, hyp_text, project_id
+            )
+            self._tag_strategy(_dossier, f"investigate:{_line}")
             _probe = (
                 hyp_text
                 + ("\n" + _last_analysis[:600])
@@ -28031,47 +28326,111 @@ class MetacognitiveReasoningEngine:
             _sym_true = [k for k, v in evidence.symbols_found.items() if v]
             _expanded_parts: List[str] = []
             _budget = 6000
-            for _sym in _sym_true[:4]:
-                try:
-                    _body = _broker._expand(_sym, project_id)
-                except Exception:
-                    continue
-                if _body and not _body.startswith("[EXPAND"):
-                    _part = _body[:_budget]
-                    _expanded_parts.append(_part)
-                    _budget -= len(_part)
+            _seen_before = set(_expanded_qids)
+
+            def _take(text: str, key: str) -> bool:
+                """Accept a fetched body if it is new and fits."""
+                nonlocal _budget
+                if not text or text.startswith("["):
+                    return False
+                if key in _seen_before:
+                    return False
+                _part = text[: max(0, _budget)]
+                if not _part:
+                    return False
+                _expanded_parts.append(_part)
+                _expanded_qids.add(key)
+                _budget -= len(_part)
+                return True
+
+            if _line == "symbols":
+                # The hypothesis's own named symbols: does the code it
+                # talks about exist, and what does it actually say?
+                for _sym in _sym_true[:4]:
+                    try:
+                        _take(_broker._expand(_sym, project_id), _sym)
+                    except Exception:
+                        continue
                     if _budget <= 0:
                         break
-            # S14 auto-use: a state-corruption hypothesis gets
-            # writer-site evidence its CALLERS view structurally
-            # cannot see. Suspects = snake_case identifiers from the
-            # hypothesis that are NOT confirmed symbols (confirmed
-            # ones already got EXPAND; the unresolved state-like
-            # names are where corruption hides). Underscore-bearing
-            # tokens only — English words excluded naturally, no
-            # stopword list to maintain. Cap 2 names, 1200 chars
-            # each, on top of the body budget.
-            if _EC10_CRITICAL_RE.search(hyp_text) or (
-                _EC10_NEAR_MISS_RE.search(hyp_text)
-            ):
+            elif _line in ("callers", "callees"):
+                # Climb the call tree. CALLERS answers 'who depends on
+                # this', which is where a breakage shows; CALLEES
+                # answers 'what does this rely on', which is where a
+                # wrong assumption hides. Neighbours are then EXPANDed
+                # so the analyst reads bodies, not just names.
+                _inc = _line == "callers"
+                for _sym in _sym_true[:3]:
+                    try:
+                        _nb = _broker._edges(_sym, project_id, _inc)
+                    except Exception:
+                        continue
+                    _take(_nb, f"{_line}:{_sym}")
+                    for _n in re.findall(
+                        r"[A-Za-z_][A-Za-z0-9_.]{2,}", _nb or ""
+                    )[:3]:
+                        if _budget <= 0:
+                            break
+                        try:
+                            _take(_broker._expand(_n, project_id), _n)
+                        except Exception:
+                            continue
+                    if _budget <= 0:
+                        break
+            elif _line == "writers":
+                # Who MUTATES the state this hypothesis blames. Suspects
+                # are underscore-bearing tokens that are not confirmed
+                # symbols — confirmed ones already had their bodies read,
+                # and corruption hides in the names that did not resolve.
                 _sus = [
                     t
                     for t in dict.fromkeys(
                         re.findall(r"[a-z][a-z0-9]*_[a-z0-9_]+", hyp_text)
                     )
                     if t not in _sym_true
-                ][:2]
+                ][:3]
                 for _sus_name in _sus:
                     try:
-                        _w = _broker._writers(_sus_name, project_id)
+                        if _take(
+                            _broker._writers(_sus_name, project_id),
+                            f"writers:{_sus_name}",
+                        ):
+                            self._tag_strategy(_dossier, "S14-writers")
                     except Exception:
                         continue
-                    if _w and not _w.startswith("[WRITERS"):
-                        _expanded_parts.append(_w[:1200])
-                if _sus:
-                    self._f._log_debug(
-                        f"forge writers: probed {_sus} for state " f"writes"
-                    )
+                if not _expanded_parts:
+                    for _sym in _sym_true[:3]:
+                        try:
+                            _take(_broker._expand(_sym, project_id), _sym)
+                        except Exception:
+                            continue
+            else:
+                # contracts: re-read the named symbols with the analyst
+                # pointed at signatures and returns. S12's AST checker
+                # verdicts what the prose asserts about them.
+                for _sym in _sym_true[:4]:
+                    try:
+                        _take(
+                            _broker._expand(_sym, project_id),
+                            f"contract:{_sym}",
+                        )
+                    except Exception:
+                        continue
+            if _EC10_CRITICAL_RE.search(hyp_text) or (
+                _EC10_NEAR_MISS_RE.search(hyp_text)
+            ):
+                self._tag_strategy(_dossier, "EC-10-precaution")
+            await self._f._emit_status(
+                f"🔍 Investigate c{_cycle} [{_line}]: "
+                f"{len(_sym_true)} symbol(s) resolved, "
+                f"{len(_expanded_parts)} new body/bodies read"
+            )
+            self._f._log_debug(
+                f"forge investigate c{_cycle} [{_line}]: "
+                f"{len(_expanded_parts)} part(s), "
+                f"{6000 - _budget} chars, "
+                f"{len(_expanded_qids)} distinct node(s) so far"
+            )
             # ── Step 3: fabricated gate (EC-8 profile; EC-10 exempt) ──
             _n_conf_e = sum(1 for v in evidence.symbols_found.values() if v) + sum(
                 1 for v in evidence.call_relations_valid.values() if v
@@ -28089,7 +28448,13 @@ class MetacognitiveReasoningEngine:
                 _dossier.status = "dead"
                 _dossier.cause_of_death = "fabricated"
                 break
-            # ── Step 4: analyze — interpret evidence, emit claims ──
+            # ── PHASE 2: EXPERIMENT ──
+            # The test itself, in two halves that must stay in this
+            # order: the model derives what MUST be true of the code if
+            # the hypothesis holds, and the graph then verdicts each
+            # derivation. The model states what would falsify it; the
+            # index decides whether it did. A prediction is only risky
+            # while its outcome is still unknown to whoever made it.
             _tally = (
                 f"symbols confirmed: {_sym_true[:6]}; " f"checks refuted: {_n_ref_e}"
             )
@@ -28129,12 +28494,16 @@ class MetacognitiveReasoningEngine:
                 )
                 + f"Deterministic evidence: {_tally}\n\n"
                 + (f"Relevant code:\n{_code_blk}\n\n" if _code_blk else "")
-                + "Validate or reject the hypothesis against this "
-                "evidence, refine the mechanism, and assert checkable "
-                "claims (each naming identifiers, 'A calls B' / "
-                "'A does not call B' relations, or code contracts "
-                "visible in the shown bodies: 'X returns int', "
-                "'X asserts y is not None')."
+                + "Derive the checkable consequences of this "
+                "hypothesis against the evidence shown. Each claim "
+                "must be decidable from the code index: name "
+                "identifiers, assert 'A calls B' / 'A does not call "
+                "B' relations, or state contracts visible in the "
+                "bodies above ('X returns int', 'X asserts y is not "
+                "None'). Prefer claims that could FAIL: a consequence "
+                "the hypothesis shares with its rivals tests nothing. "
+                "Keep the analysis to one sentence naming the "
+                "mechanism — the reasoning comes after the results."
             )
             _kw = {}
             _cap = int(self._f.valves.agentic_serial_design_max_tokens)
@@ -28190,7 +28559,9 @@ class MetacognitiveReasoningEngine:
             if _analysis:
                 _last_analysis = _analysis
                 _dossier.analysis = _analysis
-            # ── Step 5: evaluate — tri-state claim verdicts ──
+            # The graph rules on each derived consequence. This is the
+            # experiment's outcome: deterministic, and unavailable to
+            # the model that produced the claims.
             _conf_n, _ref_n = 0, 0
             for _c in _claims:
                 _v = self._claim_verified(_c, evidence, project_id)
@@ -28200,6 +28571,11 @@ class MetacognitiveReasoningEngine:
                 # second, both tri-state.
                 if _v is None:
                     _v = self._verify_contract_claim(_c, _expanded_parts)
+                    if _v is not None:
+                        # Tagged only on a real verdict: the contract
+                        # checker ran on every abstention, but it only
+                        # CONTRIBUTED when it settled one.
+                        self._tag_strategy(_dossier, "S12-contract")
                 if _v is True:
                     _conf_n += 1
                     if len(_dossier.confirmed_claims) < 8:
@@ -28221,8 +28597,83 @@ class MetacognitiveReasoningEngine:
             _dossier.refuted_relation_checks = sum(
                 1 for v in evidence.call_relations_valid.values() if not v
             )
+            if _dossier.refuted_relation_checks:
+                # EC-5 external coherence: an asserted call edge the
+                # graph contradicts. Tagged only when one was actually
+                # refuted, which is when the criterion did work.
+                self._tag_strategy(_dossier, "EC-5-relation")
             _total = len(_claims) or 1
             _dossier.coverage_score = (_conf_n + _ref_n) / _total
+            await self._f._emit_status(
+                f"⚗️ Experiment c{_cycle}: {len(_claims)} consequence(s) "
+                f"tested → {_conf_n} confirmed, {_ref_n} refuted, "
+                f"{len(_claims) - _conf_n - _ref_n} undecidable"
+            )
+
+            # ── PHASE 3: ANALYSIS ──
+            # Interpretation, and only now. Until this patch the model
+            # wrote its analysis in the same breath as its claims —
+            # before the graph had ruled on any of them — so the
+            # reasoning it left behind was reasoning about what it
+            # EXPECTED, never about what happened. The verdicts are the
+            # experiment's result; reasoning that cannot see them is
+            # not analysis. Skipped when nothing was decided: there is
+            # no result to interpret, and asking anyway invites the
+            # model to argue from its own expectations.
+            if _conf_n or _ref_n:
+                _res_lines = []
+                for _c in _dossier.refuted_claims[-4:]:
+                    _res_lines.append(f"REFUTED by the index: {_c}")
+                for _c in _dossier.confirmed_claims[-4:]:
+                    _res_lines.append(f"CONFIRMED by the index: {_c}")
+                for _c in _dossier.unresolved_claims[-2:]:
+                    _res_lines.append(f"UNDECIDABLE from the index: {_c}")
+                _an_prompt = (
+                    f"Hypothesis under test:\n{hyp_text}\n\n"
+                    f"Line of investigation this cycle: {_line}\n\n"
+                    "Experiment results (the code index ruled on each "
+                    "consequence you derived; these verdicts are "
+                    "mechanical and are not open to argument):\n"
+                    + "\n".join(f"- {r}" for r in _res_lines)
+                    + (
+                        f"\n\nYour prior reading:\n{_last_analysis[:600]}"
+                        if _last_analysis
+                        else ""
+                    )
+                    + "\n\nInterpret these results for the hypothesis. "
+                    "State what they establish, what a REFUTED "
+                    "consequence costs the mechanism (a refuted "
+                    "consequence of a true hypothesis is a contradiction "
+                    "— say so rather than explaining it away), and what "
+                    "remains open. Do not introduce new claims here; "
+                    "they cannot be tested this cycle."
+                )
+                try:
+                    _an = await self._f._llm_orchestrator.call_llm(
+                        prompt=_an_prompt,
+                        system_prompt=(
+                            "You are the analysis step of a scientific "
+                            "forge. Reason about the experiment's "
+                            "results in plain prose. No JSON, no lists "
+                            "of new claims, no restating the inputs."
+                        ),
+                        model_override=self._f.valves.cot_model_level3,
+                        label=f"{label}_analyze_c{_cycle}",
+                    )
+                except Exception as _e_an:
+                    _an = ""
+                    self._f._log_debug(
+                        f"forge analysis c{_cycle}: skipped ({_e_an!r})"
+                    )
+                if _an and _an.strip():
+                    _last_analysis = _an.strip()
+                    _dossier.analysis = _last_analysis
+                    self._tag_strategy(_dossier, "analysis")
+                    self._f._log_debug(
+                        f"forge analysis c{_cycle}: "
+                        f"{len(_last_analysis)} chars over "
+                        f"{len(_res_lines)} verdict(s)"
+                    )
             # ── Step 6: metrics the final ranking reads (EC forms) ──
             _div = (
                 1.15
@@ -28261,10 +28712,16 @@ class MetacognitiveReasoningEngine:
                 if _dossier.strategy_trace
                 else ""
             )
+            # The cycle's verdict closes the loop the three phases
+            # opened. Coverage is reported alongside it because 'ran
+            # out of cycles' and 'exhausted the reachable call tree'
+            # are different outcomes and the reader deserves to know
+            # which one produced the verdict.
             await self._f._emit_status(
-                f"🔬 forge cycle {_cycle}{_strat_tag}: "
-                f"{_conf_n} confirmed, "
-                f"{_ref_n} refuted → {_verdict}" + (f" ({_cause})" if _cause else "")
+                f"⚖️ Verdict c{_cycle}{_strat_tag}: {_verdict}"
+                + (f" ({_cause})" if _cause else "")
+                + f" — {len(_expanded_qids)} node(s) of the call tree "
+                f"read so far"
             )
             if _verdict == "dead":
                 _dossier.status = "dead"
@@ -28561,6 +29018,18 @@ class MetacognitiveReasoningEngine:
             )
             if not _dossier.structure_hash:
                 _dossier.structure_hash = _sh
+            # Slot-level strategies tagged onto the dossier they
+            # actually shaped: S15's counterfactual and S9's class
+            # nudge are consumed during GENERATION, before this
+            # dossier exists, so they cannot tag themselves at the
+            # point of use. Recording them here keeps the cycle
+            # status honest about what steered this candidate.
+            if _guidance:
+                self._tag_strategy(_dossier, "S15-counterfactual")
+            if _nudged:
+                self._tag_strategy(_dossier, "S9-class-nudge")
+            if _exclusions:
+                self._tag_strategy(_dossier, "S7-graveyard")
             # S15 (counterfactual generation): a dossier that
             # SURVIVED but thin — plausible with coverage under the
             # low bar — is exactly where the proactive rival lives:
@@ -28799,10 +29268,20 @@ class MetacognitiveReasoningEngine:
                 )
             if "review" not in _winner.strategy_trace:
                 _winner.strategy_trace.append("review")
+            # The verdict is announced whatever it says. Surfacing
+            # only REJECT would let the reader infer that silence
+            # means the layer did not run — which was true while
+            # its valve was off, and is exactly the ambiguity this
+            # audit set out to remove.
             if _review.verdict == "REJECT":
                 await self._f._emit_status(
                     f"⚖️ Adversarial review REJECTS the winner "
                     f"({_kind}) — reported, not overridden"
+                )
+            else:
+                await self._f._emit_status(
+                    f"⚖️ Adversarial review ({_kind}): "
+                    f"{_review.verdict}"
                 )
             self._f._log_debug(
                 f"judge L4 {_kind}: {_review.verdict} "
@@ -28845,6 +29324,10 @@ class MetacognitiveReasoningEngine:
                     if "scoped" not in _winner.strategy_trace:
                         _winner.strategy_trace.append("scoped")
                     _note += " | scoped to its domain of validity"
+                    await self._f._emit_status(
+                        "⚖️ Winner scoped to its domain of "
+                        "validity (dialectical synthesis)"
+                    )
         return _winner, _note
 
     async def _record_serial_competition(
@@ -41709,21 +42192,31 @@ class Filter:
             ),
         )
         agentic_runaway_token_cap: int = Field(
-            default=8000,
+            default=0,
             ge=0,
             le=32000,
             description=(
                 "R18 runaway safety ceiling for agentic/scientific-method "
                 "calls when agentic_unlimited_tokens is on. Healthy "
                 "reasoning finishes far below it (observed sane calls run "
-                "a few hundred to ~900 output tokens); it exists only to "
+                "a few hundred to ~900 output tokens, worst legitimate "
+                "step ~8000); it exists only to "
                 "cut a degenerate generation loop — observed live, "
                 "design_critical_experiment ran ~50k tokens (765-846s) "
                 "four times in one session, with ROCm silently dropping "
                 "the top-k op and DRY breakers disabled leaving nothing "
-                "to strangle the loop. 8000 leaves a large margin over "
-                "any legitimate step while capping a runaway at seconds "
-                "instead of minutes. 0 disables (true unlimited)."
+                "to strangle the loop. Raised 8000 → 32000 after a run "
+                "where 8000 truncated healthy forge cycles and claims "
+                "recovery 37 times: at 8000 this was a quality budget "
+                "wearing a safety label, which is what the unlimited "
+                "switch exists to abolish. 32000 sits 4x above the "
+                "worst legitimate step and still cuts the ~50k loop. "
+                "Now 0 by operator decision: TRUE unlimited. Any non-zero "
+                "value is a ceiling healthy reasoning can eventually meet, "
+                "which is the thing the unlimited switch exists to abolish. "
+                "The remaining protections are the anti-hang connection "
+                "backstop and sampler-side loop control. Set a positive "
+                "value only to re-arm the R18 ceiling."
             ),
         )
         agentic_unlimited_tokens: bool = Field(
@@ -42708,7 +43201,7 @@ class Filter:
             ),
         )
         enable_peer_review: bool = Field(
-            default=False,  # ← ROI=0 without 2nd model
+            default=True,  # ← devil's advocate until a 2nd model exists
             description=(
                 "Enable peer review using a different model architecture. "
                 "ROI=0 when peer_review_model is empty or same as cot_model_level3 "
@@ -45180,7 +45673,23 @@ class Filter:
             )
             if _last2 is not None and isinstance(_last2.get("content"), str):
                 _c = _last2["content"]
-                _p0 = _find_scaffold_echo(_c, min_pos=0)
+                # Two independent echo shapes, whichever starts
+                # first: the agentic scaffolding, and the recited
+                # code skeleton (region rules plus the renderer's
+                # tier pointers). The validation run leaked the
+                # SECOND one — a reply that opened with one clause
+                # of an answer and then recited build_block_a's
+                # rendered body — which the agentic markers alone
+                # could never see.
+                _cands = [
+                    p
+                    for p in (
+                        _find_scaffold_echo(_c, min_pos=0),
+                        _find_context_echo(_c, min_pos=0),
+                    )
+                    if p >= 0
+                ]
+                _p0 = min(_cands) if _cands else -1
                 if _p0 >= 0:
                     if _p0 > 80:
                         _last2["content"] = _c[:_p0].rstrip()
