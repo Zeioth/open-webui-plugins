@@ -28204,6 +28204,22 @@ class MetacognitiveReasoningEngine:
         # so the most specific evidence ends up at the front.
         if _strat.get("prefer_symbol_verification"):
             _promote("symbols")
+        # RS-2: low coverage means the experiment could not DECIDE
+        # most of its claims — the material to rule on them was not
+        # in view. The remedy is more tree, not more re-reading:
+        # promote the first unused widening rung. Ranked above the
+        # project-history bias (it is about THIS dossier's state)
+        # and below EC-10 and refuted relations (which name a
+        # specific place to look; this one only says 'look wider').
+        try:
+            _low_thr = float(self._f.valves.low_coverage_threshold)
+        except Exception:
+            _low_thr = 0.0
+        if cycle > 1 and dossier.coverage_score < _low_thr:
+            for _widen in ("callers", "callees"):
+                if _widen in _order:
+                    _promote(_widen)
+                    break
         if _EC10_CRITICAL_RE.search(hyp_text) or _EC10_NEAR_MISS_RE.search(
             hyp_text
         ):
@@ -28325,7 +28341,19 @@ class MetacognitiveReasoningEngine:
             evidence = self.gather_evidence(_probe, project_id)
             _sym_true = [k for k, v in evidence.symbols_found.items() if v]
             _expanded_parts: List[str] = []
+            # RS-2, second half: the cycle after a low-coverage
+            # experiment reads with a wider budget. Undecidable
+            # claims mean the deciding material was out of view;
+            # the _seen_before ledger guarantees the extra room is
+            # spent on nodes not yet read, never on re-reading.
             _budget = 6000
+            try:
+                _lowc = float(self._f.valves.low_coverage_threshold)
+            except Exception:
+                _lowc = 0.0
+            _widened = _cycle > 1 and _dossier.coverage_score < _lowc
+            if _widened:
+                _budget = 9000
             _seen_before = set(_expanded_qids)
 
             def _take(text: str, key: str) -> bool:
@@ -28421,8 +28449,9 @@ class MetacognitiveReasoningEngine:
             ):
                 self._tag_strategy(_dossier, "EC-10-precaution")
             await self._f._emit_status(
-                f"🔍 Investigate c{_cycle} [{_line}]: "
-                f"{len(_sym_true)} symbol(s) resolved, "
+                f"🔍 Investigate c{_cycle} [{_line}]"
+                + (" (widened)" if _widened else "")
+                + f": {len(_sym_true)} symbol(s) resolved, "
                 f"{len(_expanded_parts)} new body/bodies read"
             )
             self._f._log_debug(
@@ -29228,6 +29257,46 @@ class MetacognitiveReasoningEngine:
                 )
             return None, _note
         _note += f" | null bar PASS: {_winner.corroboration:.2f} >= " f"{_margin:.2f}"
+        # ── Surviving rivals ──
+        # A winner is chosen, but the accounts it beat do not stop
+        # being corroborated. Complex bugs often have more than one
+        # real cause, and until now every rival vanished at this
+        # point: the status said how MANY survived, never which.
+        #
+        # The two audiences get different things, and the split is
+        # R34, not squeamishness. The NOTE reaches the final model,
+        # so it carries numbers only — rival prose in the prompt is
+        # what teaches a model to recite the competition instead of
+        # answering. The STATUS reaches the person reading the chat
+        # and never enters a prompt, so it can name the rival in
+        # full. That is where the multi-cause signal belongs anyway:
+        # the reader is the one who can recognise that two surviving
+        # accounts are both true of their own system.
+        _rivals = [d for d in _pool if d is not _winner and d.status == "plausible"]
+        if _rivals:
+            _note += (
+                f" | {len(_rivals)} rival account(s) also survived "
+                f"(corroboration "
+                + ", ".join(f"{d.corroboration:.2f}" for d in _rivals[:3])
+                + ")"
+            )
+            for _rv in _rivals[:2]:
+                # Deliberately not framed as a runner-up: a rival this
+                # close was not refuted, it was out-ranked, and the
+                # difference matters to whoever has to act on it.
+                await self._f._emit_status(
+                    f"🧷 Also survived (corr {_rv.corroboration:.2f}, "
+                    f"{_rv.confirmed_checks} confirmed): "
+                    f"{_rv.hypothesis[:100]}"
+                )
+            self._f._log_debug(
+                f"judge: {len(_rivals)} rival(s) survived alongside the "
+                f"winner — "
+                + " | ".join(
+                    f"corr={d.corroboration:.2f} '{d.hypothesis[:40]}'"
+                    for d in _rivals[:3]
+                )
+            )
         # ── Layer 4: adversarial review of the surviving winner ──
         # The three layers above are DETERMINISTIC: they rank, they
         # discriminate, they hold a null bar. None of them attacks
@@ -31558,18 +31627,31 @@ class EnrichmentTasks:
         never falls back to prose or a numbered list.
 
         Args:
-            items: List of (qid, signature, snippet) tuples. Only qid and
-                   signature are consumed; snippet is reserved for future use.
+            items: List of (qid, signature, snippet) tuples. All three are
+                   consumed: the snippet is what makes the description a
+                   reading of the code rather than a paraphrase of the
+                   name.
 
         Returns:
             str: Ready-to-send prompt string.
         """
         lines: List[str] = []
-        for qid, signature, _ in items:
+        for qid, signature, snippet in items:
             # Truncate long signatures to keep the prompt compact and
             # avoid pushing context beyond the model's effective attention span.
             sig = signature[:80] if signature else qid
             lines.append(f"  - {qid}: {sig}")
+            # The body, when the index could locate it. A model given
+            # only a name and a signature cannot describe behaviour —
+            # it can only restate the name, and a restatement that
+            # happens to be wrong (a _validate_* that validates
+            # nothing) enters the skeleton tier looking exactly like
+            # documentation.
+            if snippet and snippet.strip():
+                _body = snippet.strip()
+                lines.append("    body:")
+                for _bl in _body.split("\n"):
+                    lines.append(f"      {_bl}")
 
         listing = "\n".join(lines)
         max_chars = self._f.valves.docstring_max_chars
@@ -31587,6 +31669,14 @@ class EnrichmentTasks:
             f"Never abbreviate, truncate, or merge an identifier.\n"
             f"  - Values: plain strings, one sentence each. Never leave a "
             f"value empty.\n"
+            f"  - Describe what the body DOES, read from the code "
+            f"shown. Do not infer behaviour from the identifier: "
+            f"where the name and the body disagree, describe the "
+            f"body. A name is a claim about the code; the body is "
+            f"the code.\n"
+            f"  - Where no body is shown, describe only what the "
+            f"signature establishes, and do not invent behaviour "
+            f"to fill the gap.\n"
             f"  - Output ONLY the JSON object, with all {n_items} entries. "
             f"No markdown fences, no preamble, no explanation.\n\n"
             f"Identifiers ({n_items} total):\n{listing}"
@@ -31597,6 +31687,7 @@ class EnrichmentTasks:
         qid: str,
         signature: str,
         label: str,
+        snippet: str = "",
     ) -> Optional[str]:
         """
         Generate a docstring for exactly one symbol via a single-item LLM call.
@@ -31613,18 +31704,34 @@ class EnrichmentTasks:
             qid:       Qualified symbol id to document.
             signature: The symbol's signature string (used as context).
             label:     LLM call label, suffixed for retry-call identification.
+            snippet:   The symbol's body, when the index could locate it.
+                       Defaults to empty so a caller with nothing to show
+                       degrades to a signature-only description rather
+                       than failing — but a recovered item must be held
+                       to the same standard as a batched one, so the
+                       batch retry passes it.
 
         Returns:
             A one-sentence docstring, or None on failure.
         """
         sig = signature[:80] if signature else qid
         max_chars = self._f.valves.docstring_max_chars
+        _body = (snippet or "").strip()
         prompt = (
             f"Generate a one-sentence description (under {max_chars} "
             f"characters) for this identifier.\n\n"
             f"Identifier: {qid}\n"
-            f"Signature: {sig}\n\n"
-            f'Output only the JSON object, e.g. {{"{qid}": "..."}}'
+            f"Signature: {sig}\n"
+            + (f"Body:\n{_body}\n" if _body else "")
+            + (
+                "\nDescribe what the body DOES, read from the code "
+                "above. Where the name and the body disagree, "
+                "describe the body.\n\n"
+                if _body
+                else "\nNo body is available; describe only what the "
+                "signature establishes and invent nothing.\n\n"
+            )
+            + f'Output only the JSON object, e.g. {{"{qid}": "..."}}'
         )
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
@@ -31992,9 +32099,14 @@ class EnrichmentTasks:
                     lines = block.content.split("\n")
                     start_idx = max(0, sym.line_start - 1)
                     end_idx = min(len(lines), (sym.line_end or sym.line_start + 30))
-                    snippet = "\n".join(lines[start_idx:end_idx])[:500]
+                    # 500 chars was sized for a field nothing read;
+                    # now that the body IS the input, that cap cut
+                    # most functions off mid-logic — and a body
+                    # truncated before its return statement invites
+                    # exactly the guessing this change removes.
+                    snippet = "\n".join(lines[start_idx:end_idx])[:1200]
                 else:
-                    snippet = block.content[:500]
+                    snippet = block.content[:1200]
             else:
                 signature, snippet = qid, ""
             items.append((qid, signature, snippet))
@@ -32082,6 +32194,10 @@ class EnrichmentTasks:
                     f"retrying {len(missing)} unresolved qid(s) individually"
                 )
                 sig_by_qid = {q: s for q, s, _ in batch}
+                # Recovery must not silently produce a weaker
+                # description than the batch would have: an item
+                # rescued by the single-call path gets the same body.
+                snip_by_qid = {q: n for q, _, n in batch}
                 recovered = 0
                 for qid in missing:
                     # Checked between retries, never mid-call: the retry call
@@ -32098,7 +32214,10 @@ class EnrichmentTasks:
                         )
                         break
                     single_doc = await self._generate_docstring_single(
-                        qid, sig_by_qid.get(qid, qid), label
+                        qid,
+                        sig_by_qid.get(qid, qid),
+                        label,
+                        snip_by_qid.get(qid, ""),
                     )
                     if single_doc:
                         parsed[qid] = single_doc
