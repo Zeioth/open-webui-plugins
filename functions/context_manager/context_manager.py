@@ -26647,6 +26647,20 @@ class MetacognitiveReasoningEngine:
         )
         return min(1.0, max(0.0, uncertainty))
 
+    # EC-5 polarity: the negated-relation regex must be an attribute
+    # of THIS class — the relation-validation method above calls
+    # self._NEG_RELATION_RE, and AgenticEvidenceLedger's copy is not
+    # in scope here. A live AttributeError ('MetacognitiveReasoning
+    # Engine' object has no attribute '_NEG_RELATION_RE') during the
+    # competition confirmed the gap; this defines the twin beside the
+    # positive regex so both polarities resolve on self.
+    _NEG_RELATION_RE = re.compile(
+        r"`?(\w+)`?\s+(?:does\s+not|doesn'?t|never|no\s+longer|"
+        r"cannot|can'?t|no|nunca)\s+"
+        r"(?:calls?|invokes?|uses?|reads?|writes?|depends\s+on|"
+        r"llama\s+a|invoca\s+a|usa)\s+`?(\w+)`?",
+        re.IGNORECASE,
+    )
     _CALL_RELATION_RE = re.compile(
         r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|reads?|writes?|depends on)"
         r"\s+`?(\w+)`?",
@@ -43705,14 +43719,17 @@ class Filter:
             ),
         )
         agentic_serial_method: bool = Field(
-            default=False,
+            default=True,
             description=(
                 "Serial method (S1): forge hypotheses ONE AT A TIME — "
                 "each gets a full investigate/evaluate/analyze cycle "
                 "and seals into a HypothesisDossier (plausible or "
                 "dead) before the next is generated; only plausible "
                 "dossiers reach the final competition. False keeps the "
-                "parallel competition untouched (A/B between runs)."
+                "parallel competition untouched (A/B between runs). "
+                "Default True: the serial method is now the primary "
+                "reasoning path; set False only to A/B against the "
+                "(retired-by-default) parallel competition."
             ),
         )
         agentic_serial_hypothesis_count: int = Field(
