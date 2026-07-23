@@ -13832,9 +13832,8 @@ class AgenticToolBroker:
             return f"[WRITERS: no assignment sites for '{_n}']"
         if _out.startswith("### GREP"):
             _body = _out.split("\n", 1)
-            return (
-                f"### WRITERS '{_n}' — assignment sites\n"
-                + (_body[1] if len(_body) > 1 else "")
+            return f"### WRITERS '{_n}' — assignment sites\n" + (
+                _body[1] if len(_body) > 1 else ""
             )
         return _out
 
@@ -16532,8 +16531,7 @@ _AGENTIC_SCAFFOLD_MARKERS: Tuple[str, ...] = (
 # would inflate EC-4 corroboration for any hypothesis near
 # well-annotated code, so that failure mode is designed out.
 _CONTRACT_RETURN_RE = re.compile(
-    r"(?:return type of\s+)?`?(\w+)`?\s+returns?\s+"
-    r"(?:type\s+)?`?'?(\w+)'?`?",
+    r"(?:return type of\s+)?`?(\w+)`?\s+returns?\s+" r"(?:type\s+)?`?'?(\w+)'?`?",
     re.IGNORECASE,
 )
 _CONTRACT_ASSERT_RE = re.compile(
@@ -17309,9 +17307,7 @@ class AgenticSynthesisComposer:
                 _synth = _synth[:_tail].rstrip().rstrip("`").rstrip()
             if len(_synth) > 12000:
                 _synth = _synth[:12000] + "\n[synthesis truncated]"
-            lines.append(
-                "Synthesis (the pipeline's processed conclusion):"
-            )
+            lines.append("Synthesis (the pipeline's processed conclusion):")
             lines.append(_synth)
             lines.append("")
         else:
@@ -17323,9 +17319,7 @@ class AgenticSynthesisComposer:
         for s in plan.steps:
             if s.status != "done":
                 continue
-            _step_claims = (
-                ledger.claims_for(s.id) if ledger is not None else []
-            )
+            _step_claims = ledger.claims_for(s.id) if ledger is not None else []
             if not _step_claims:
                 continue
             lines.append(f"Step {s.id} ({s.kind}) verified evidence:")
@@ -17947,9 +17941,7 @@ class AgenticOrchestrator:
                 project_id,
                 f"agentic_serial_step_{step.id}",
             )
-            _plausible = [
-                d for d in _dossiers if d.status == "plausible"
-            ]
+            _plausible = [d for d in _dossiers if d.status == "plausible"]
             await self._f._emit_status(
                 f"⚔️ Final competition: {len(_plausible)} plausible "
                 f"dossier(s) of {len(_dossiers)} sealed"
@@ -17960,18 +17952,14 @@ class AgenticOrchestrator:
                 # verdict line carries the deterministic differentiator
                 # note (numbers, never rival prose) into the workspace
                 # — the R34 rule applied to the competition itself.
-                _winner, _note = (
-                    await self._f._meta_reasoning._judge_dossiers(
-                        step.goal or "",
-                        _plausible,
-                        project_id,
-                        f"agentic_serial_step_{step.id}",
-                    )
+                _winner, _note = await self._f._meta_reasoning._judge_dossiers(
+                    step.goal or "",
+                    _plausible,
+                    project_id,
+                    f"agentic_serial_step_{step.id}",
                 )
-                await (
-                    self._f._meta_reasoning._record_serial_competition(
-                        _dossiers, _winner, project_id
-                    )
+                await self._f._meta_reasoning._record_serial_competition(
+                    _dossiers, _winner, project_id
                 )
                 if _winner is not None:
                     await self._f._emit_status(
@@ -18006,8 +17994,7 @@ class AgenticOrchestrator:
                 # the sealed dossiers (empty pool + failed
                 # generation reports zero sealed, same shape).
                 _causes = "; ".join(
-                    f"'{d.hypothesis[:40]}' "
-                    f"({d.cause_of_death or 'died'})"
+                    f"'{d.hypothesis[:40]}' " f"({d.cause_of_death or 'died'})"
                     for d in _dossiers[:4]
                 )
                 await self._f._emit_status(
@@ -21688,9 +21675,7 @@ class CommandRouter:
             messages.pop()
             messages.append({"role": "assistant", "content": response})
             return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
-        if self._f.valves.enable_accept_command and content.startswith(
-            "/accept"
-        ):
+        if self._f.valves.enable_accept_command and content.startswith("/accept"):
             response = await self._handle_accept_command(project_id)
             messages.pop()
             messages.append({"role": "assistant", "content": response})
@@ -21737,15 +21722,13 @@ class CommandRouter:
 
             def _mark(rid=_row[0], rj=_rj):
                 self._f._db_conn.execute(
-                    "UPDATE competition_history SET record_json = ? "
-                    "WHERE id = ?",
+                    "UPDATE competition_history SET record_json = ? " "WHERE id = ?",
                     (rj, rid),
                 )
 
             await self._f._state_store._db_enqueue(_mark)
             self._f._log_debug(
-                f"/accept: record id={_row[0]} marked "
-                f"external_validation=True"
+                f"/accept: record id={_row[0]} marked " f"external_validation=True"
             )
             return (
                 "✅ Accepted: the latest hypothesis-competition "
@@ -26481,15 +26464,11 @@ class MetacognitiveReasoningEngine:
         _masked = hypothesis
         for _m in self._NEG_RELATION_RE.finditer(hypothesis):
             _ncaller, _ncallee = _m.group(1), _m.group(2)
-            _present = self._relation_in_graph(
-                _ncaller, _ncallee, project_id
-            )
+            _present = self._relation_in_graph(_ncaller, _ncallee, project_id)
             _masked = _masked.replace(_m.group(0), " ")
             if _present is None:
                 continue
-            call_relations_valid[
-                f"{_ncaller}_not_calls_{_ncallee}"
-            ] = not _present
+            call_relations_valid[f"{_ncaller}_not_calls_{_ncallee}"] = not _present
         call_patterns = self._CALL_RELATION_RE.findall(_masked)
         for caller, callee in call_patterns:
             verified = self._relation_in_graph(caller, callee, project_id)
@@ -27036,12 +27015,8 @@ class MetacognitiveReasoningEngine:
         # relations — two independent ways to be right). The obj/llm
         # balance is untouched, scaled by the complement of the
         # corroboration weight; falsification still vetoes upstream.
-        _n_sym_conf = sum(
-            1 for v in evidence.symbols_found.values() if v
-        )
-        _n_rel_conf = sum(
-            1 for v in evidence.call_relations_valid.values() if v
-        )
+        _n_sym_conf = sum(1 for v in evidence.symbols_found.values() if v)
+        _n_rel_conf = sum(1 for v in evidence.call_relations_valid.values() if v)
         _n_confirmed = _n_sym_conf + _n_rel_conf
         _diversity = 1.15 if (_n_sym_conf and _n_rel_conf) else 1.0
         _cw = min(
@@ -27058,9 +27033,7 @@ class MetacognitiveReasoningEngine:
             ),
         )
         _corr = (
-            min(1.0, (1.0 - 0.85**_n_confirmed) * _diversity)
-            if _n_confirmed
-            else 0.0
+            min(1.0, (1.0 - 0.85**_n_confirmed) * _diversity) if _n_confirmed else 0.0
         )
         _base = obj_weight * obj_score + llm_weight * llm_conf
         _with_corr = (1.0 - _cw) * _base + _cw * _corr
@@ -28224,9 +28197,7 @@ class MetacognitiveReasoningEngine:
         _ec6_anchors: Set[str] = set()
         if question:
             try:
-                for _w in re.findall(
-                    r"[A-Za-z_][A-Za-z0-9_]{2,}", question
-                ):
+                for _w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question):
                     if len(_ec6_anchors) >= 12:
                         break
                     if self._qid_exists(_w, project_id):
@@ -28298,20 +28269,12 @@ class MetacognitiveReasoningEngine:
                 if getattr(self._f.valves, "agentic_funnel_prune", True):
                     _n_conf = sum(
                         1 for v in evidence.symbols_found.values() if v
-                    ) + sum(
-                        1
-                        for v in evidence.call_relations_valid.values()
-                        if v
-                    )
+                    ) + sum(1 for v in evidence.call_relations_valid.values() if v)
                     _n_checked = len(evidence.symbols_found) + len(
                         evidence.call_relations_valid
                     )
                     _n_refuted = _n_checked - _n_conf
-                    if (
-                        _n_checked >= 3
-                        and _n_refuted >= 2
-                        and _n_conf == 0
-                    ):
+                    if _n_checked >= 3 and _n_refuted >= 2 and _n_conf == 0:
                         # EC-10 (precaution): a hypothesis implying
                         # catastrophic consequences never gets pruned
                         # unexamined, however improbable — dismissing a
@@ -28320,10 +28283,7 @@ class MetacognitiveReasoningEngine:
                         # must not make. Capped at 2 per competition so
                         # keyword over-matching can never neuter the
                         # funnel wholesale.
-                        if (
-                            _ec10_exempted < 2
-                            and _EC10_CRITICAL_RE.search(hyp_text)
-                        ):
+                        if _ec10_exempted < 2 and _EC10_CRITICAL_RE.search(hyp_text):
                             _ec10_exempted += 1
                             self._f._log_debug(
                                 f"EC-10 precaution: critical-severity "
@@ -28518,22 +28478,14 @@ class MetacognitiveReasoningEngine:
             # checks. Only the group within epsilon of the leader is
             # reordered; everything below keeps pure score order, so
             # this can never promote a clearly-worse hypothesis.
-            _eps = float(
-                getattr(
-                    self._f.valves, "agentic_parsimony_epsilon", 0.05
-                )
-            )
+            _eps = float(getattr(self._f.valves, "agentic_parsimony_epsilon", 0.05))
             if _eps > 0.0 and len(valid_scored) >= 2:
                 _top = valid_scored[0].score
-                _tied = [
-                    s for s in valid_scored if _top - s.score <= _eps
-                ]
+                _tied = [s for s in valid_scored if _top - s.score <= _eps]
                 if len(_tied) > 1:
 
                     def _assumptions(s: "ScoredHypothesis") -> int:
-                        _n = len(
-                            getattr(s.design, "critical_claims", [])
-                        ) + len(
+                        _n = len(getattr(s.design, "critical_claims", [])) + len(
                             getattr(s.design, "supportive_claims", [])
                         )
                         _cov = max(0.0, min(1.0, s.coverage_score or 0.0))
@@ -28552,16 +28504,10 @@ class MetacognitiveReasoningEngine:
                         for _k, _v in s.evidence.symbols_found.items():
                             if _v:
                                 _touched.add(_k)
-                        for _k, _v in (
-                            s.evidence.call_relations_valid.items()
-                        ):
+                        for _k, _v in s.evidence.call_relations_valid.items():
                             if not _v:
                                 continue
-                            _sep = (
-                                "_not_calls_"
-                                if "_not_calls_" in _k
-                                else "_calls_"
-                            )
+                            _sep = "_not_calls_" if "_not_calls_" in _k else "_calls_"
                             _a, _, _b = _k.partition(_sep)
                             _touched.add(_a)
                             _touched.add(_b)
@@ -29191,9 +29137,7 @@ class MetacognitiveReasoningEngine:
         """
         # ── Step 1: classify the claim shape ──
         _mret = _CONTRACT_RETURN_RE.match(claim.strip())
-        _masrt = (
-            None if _mret else _CONTRACT_ASSERT_RE.match(claim.strip())
-        )
+        _masrt = None if _mret else _CONTRACT_ASSERT_RE.match(claim.strip())
         if not _mret and not _masrt:
             return None
         # ── Step 2: locate the function in the expanded bodies ──
@@ -29226,17 +29170,11 @@ class MetacognitiveReasoningEngine:
             _ann = _fn.returns
             if _ann is None:
                 return None
-            _names = {
-                n.id for n in ast.walk(_ann) if isinstance(n, ast.Name)
-            } | {
-                n.attr
-                for n in ast.walk(_ann)
-                if isinstance(n, ast.Attribute)
-            } | {
-                str(n.value)
-                for n in ast.walk(_ann)
-                if isinstance(n, ast.Constant)
-            }
+            _names = (
+                {n.id for n in ast.walk(_ann) if isinstance(n, ast.Name)}
+                | {n.attr for n in ast.walk(_ann) if isinstance(n, ast.Attribute)}
+                | {str(n.value) for n in ast.walk(_ann) if isinstance(n, ast.Constant)}
+            )
             return _want in _names
         # assert shape: the named identifiers of the predicate must
         # appear in some assert of the function; asserts existing but
@@ -29244,18 +29182,12 @@ class MetacognitiveReasoningEngine:
         # claim said the function asserts — it does not).
         _pred_ids = set(re.findall(r"[A-Za-z_]\w*", _masrt.group(2)))
         _pred_ids -= {"is", "not", "None", "and", "or", "that"}
-        _asserts = [
-            n for n in ast.walk(_fn) if isinstance(n, ast.Assert)
-        ]
+        _asserts = [n for n in ast.walk(_fn) if isinstance(n, ast.Assert)]
         if not _asserts:
             return False
         for _a in _asserts:
-            _aids = {
-                n.id for n in ast.walk(_a) if isinstance(n, ast.Name)
-            } | {
-                n.attr
-                for n in ast.walk(_a)
-                if isinstance(n, ast.Attribute)
+            _aids = {n.id for n in ast.walk(_a) if isinstance(n, ast.Name)} | {
+                n.attr for n in ast.walk(_a) if isinstance(n, ast.Attribute)
             }
             if _pred_ids & _aids:
                 return True
@@ -29329,8 +29261,7 @@ class MetacognitiveReasoningEngine:
             _lines = "\n".join(f"- {e}" for e in exclusions[:12])
             _excl = (
                 "\nMechanisms already ruled out or already sealed — "
-                "your hypothesis MUST propose a DISTINCT mechanism:\n"
-                + _lines + "\n"
+                "your hypothesis MUST propose a DISTINCT mechanism:\n" + _lines + "\n"
             )
         # S7: the compass line — ground prior hypotheses touched but
         # never settled. Present only when the graveyard carries it;
@@ -29372,9 +29303,7 @@ class MetacognitiveReasoningEngine:
                 label=label,
             )
         except Exception as _e:
-            self._f._log_debug(
-                f"_generate_serial_candidate: call failed ({_e!r})"
-            )
+            self._f._log_debug(f"_generate_serial_candidate: call failed ({_e!r})")
             return None
         import json as _json
 
@@ -29388,9 +29317,7 @@ class MetacognitiveReasoningEngine:
                 # raw_decode parses the leading JSON object and
                 # ignores trailing garbage — a truncation-echo after
                 # a valid object must not cost the candidate.
-                _obj = _json.JSONDecoder().raw_decode(
-                    _text[_pos:]
-                )[0]
+                _obj = _json.JSONDecoder().raw_decode(_text[_pos:])[0]
                 _hyp = str(_obj.get("hypothesis", "")).strip()
                 try:
                     _conf = float(_obj.get("confidence", -1.0))
@@ -29448,8 +29375,7 @@ class MetacognitiveReasoningEngine:
         )
         try:
             _dossier.structure_hash = (
-                self._f._symbol_index.compute_structure_hash(project_id)
-                or ""
+                self._f._symbol_index.compute_structure_hash(project_id) or ""
             )
         except Exception:
             _dossier.structure_hash = ""
@@ -29479,12 +29405,21 @@ class MetacognitiveReasoningEngine:
         while True:
             _cycle += 1
             _dossier.cycles_used = _cycle
+            # Optional hard ceiling on forge cycles: 0 (default)
+            # means no cap — the progress gates (maturity / stall)
+            # terminate, which is the designed behavior. A positive
+            # value is a safety ceiling for pathological cases; when
+            # hit, the dossier seals as-is with whatever it has.
+            if _cycles_max > 0 and _cycle > _cycles_max:
+                self._f._log_debug(
+                    f"forge: cycle ceiling {_cycles_max} reached for "
+                    f"'{hyp_text[:50]}' — sealing as-is"
+                )
+                break
             # ── Step 2: investigate — deterministic evidence + code ──
             _probe = hyp_text + ("\n" + _last_analysis[:600])
             evidence = self.gather_evidence(_probe, project_id)
-            _sym_true = [
-                k for k, v in evidence.symbols_found.items() if v
-            ]
+            _sym_true = [k for k, v in evidence.symbols_found.items() if v]
             _expanded_parts: List[str] = []
             _budget = 6000
             for _sym in _sym_true[:4]:
@@ -29513,9 +29448,7 @@ class MetacognitiveReasoningEngine:
                 _sus = [
                     t
                     for t in dict.fromkeys(
-                        re.findall(
-                            r"[a-z][a-z0-9]*_[a-z0-9_]+", hyp_text
-                        )
+                        re.findall(r"[a-z][a-z0-9]*_[a-z0-9_]+", hyp_text)
                     )
                     if t not in _sym_true
                 ][:2]
@@ -29528,13 +29461,10 @@ class MetacognitiveReasoningEngine:
                         _expanded_parts.append(_w[:1200])
                 if _sus:
                     self._f._log_debug(
-                        f"forge writers: probed {_sus} for state "
-                        f"writes"
+                        f"forge writers: probed {_sus} for state " f"writes"
                     )
             # ── Step 3: fabricated gate (EC-8 profile; EC-10 exempt) ──
-            _n_conf_e = sum(
-                1 for v in evidence.symbols_found.values() if v
-            ) + sum(
+            _n_conf_e = sum(1 for v in evidence.symbols_found.values() if v) + sum(
                 1 for v in evidence.call_relations_valid.values() if v
             )
             _n_checked = len(evidence.symbols_found) + len(
@@ -29552,24 +29482,19 @@ class MetacognitiveReasoningEngine:
                 break
             # ── Step 4: analyze — interpret evidence, emit claims ──
             _tally = (
-                f"symbols confirmed: {_sym_true[:6]}; "
-                f"checks refuted: {_n_ref_e}"
+                f"symbols confirmed: {_sym_true[:6]}; " f"checks refuted: {_n_ref_e}"
             )
             _code_blk = "\n\n".join(_expanded_parts)
             # S11: the framing assumptions enter the FIRST cycle as
             # claims to check — the graph verdicts them like any
             # other claim; they are never pre-confirmed.
-            _assump = list(
-                getattr(self._f, "_preplanner_assumptions", []) or []
-            )[:4]
+            _assump = list(getattr(self._f, "_preplanner_assumptions", []) or [])[:4]
             _assump_blk = ""
             if _cycle == 1 and _assump:
                 _alines = "\n".join(f"- {a}" for a in _assump)
                 _assump_blk = (
                     "Framing assumptions to verify explicitly "
-                    "(assert each as a checkable claim):\n"
-                    + _alines
-                    + "\n\n"
+                    "(assert each as a checkable claim):\n" + _alines + "\n\n"
                 )
             _prompt = (
                 f"Question:\n{question[:300]}\n\n"
@@ -29581,11 +29506,7 @@ class MetacognitiveReasoningEngine:
                     else ""
                 )
                 + f"Deterministic evidence: {_tally}\n\n"
-                + (
-                    f"Relevant code:\n{_code_blk}\n\n"
-                    if _code_blk
-                    else ""
-                )
+                + (f"Relevant code:\n{_code_blk}\n\n" if _code_blk else "")
                 + "Validate or reject the hypothesis against this "
                 "evidence, refine the mechanism, and assert checkable "
                 "claims (each naming identifiers, 'A calls B' / "
@@ -29594,9 +29515,7 @@ class MetacognitiveReasoningEngine:
                 "'X asserts y is not None')."
             )
             _kw = {}
-            _cap = int(
-                self._f.valves.agentic_serial_design_max_tokens
-            )
+            _cap = int(self._f.valves.agentic_serial_design_max_tokens)
             if _cap > 0:
                 _kw["max_tokens"] = _cap
             try:
@@ -29614,9 +29533,7 @@ class MetacognitiveReasoningEngine:
                     **_kw,
                 )
             except Exception as _e:
-                self._f._log_debug(
-                    f"_forge_hypothesis: analyze failed ({_e!r})"
-                )
+                self._f._log_debug(f"_forge_hypothesis: analyze failed ({_e!r})")
                 _resp = ""
             import json as _json
 
@@ -29628,13 +29545,9 @@ class MetacognitiveReasoningEngine:
                 if _pos < 0:
                     break
                 try:
-                    _obj = _json.JSONDecoder().raw_decode(
-                        _t[_pos:]
-                    )[0]
+                    _obj = _json.JSONDecoder().raw_decode(_t[_pos:])[0]
                     _analysis = str(_obj.get("analysis", ""))
-                    _claims = [
-                        str(c) for c in (_obj.get("claims") or [])
-                    ][:10]
+                    _claims = [str(c) for c in (_obj.get("claims") or [])][:10]
                     break
                 except Exception:
                     continue
@@ -29664,9 +29577,7 @@ class MetacognitiveReasoningEngine:
                 # of the expanded bodies. Graph first, contract
                 # second, both tri-state.
                 if _v is None:
-                    _v = self._verify_contract_claim(
-                        _c, _expanded_parts
-                    )
+                    _v = self._verify_contract_claim(_c, _expanded_parts)
                 if _v is True:
                     _conf_n += 1
                     if len(_dossier.confirmed_claims) < 8:
@@ -29686,9 +29597,7 @@ class MetacognitiveReasoningEngine:
                 1 for v in evidence.symbols_found.values() if not v
             )
             _dossier.refuted_relation_checks = sum(
-                1
-                for v in evidence.call_relations_valid.values()
-                if not v
+                1 for v in evidence.call_relations_valid.values() if not v
             )
             _total = len(_claims) or 1
             _dossier.coverage_score = (_conf_n + _ref_n) / _total
@@ -29702,22 +29611,14 @@ class MetacognitiveReasoningEngine:
                 else 1.0
             )
             _dossier.corroboration = (
-                min(1.0, (1.0 - 0.85**_n_conf_e) * _div)
-                if _n_conf_e
-                else 0.0
+                min(1.0, (1.0 - 0.85**_n_conf_e) * _div) if _n_conf_e else 0.0
             )
-            _dossier.assumptions = max(
-                0, len(_claims) - (_conf_n + _ref_n)
-            )
+            _dossier.assumptions = max(0, len(_claims) - (_conf_n + _ref_n))
             _touched: Set[str] = set(_sym_true)
             for _k2, _v2 in evidence.call_relations_valid.items():
                 if not _v2:
                     continue
-                _sep = (
-                    "_not_calls_"
-                    if "_not_calls_" in _k2
-                    else "_calls_"
-                )
+                _sep = "_not_calls_" if "_not_calls_" in _k2 else "_calls_"
                 _a2, _, _b2 = _k2.partition(_sep)
                 _touched.add(_a2)
                 _touched.add(_b2)
@@ -29741,8 +29642,7 @@ class MetacognitiveReasoningEngine:
             await self._f._emit_status(
                 f"🔬 forge cycle {_cycle}{_strat_tag}: "
                 f"{_conf_n} confirmed, "
-                f"{_ref_n} refuted → {_verdict}"
-                + (f" ({_cause})" if _cause else "")
+                f"{_ref_n} refuted → {_verdict}" + (f" ({_cause})" if _cause else "")
             )
             if _verdict == "dead":
                 _dossier.status = "dead"
@@ -29758,11 +29658,7 @@ class MetacognitiveReasoningEngine:
             f"{time.time() - _dossier.timestamp:.1f}s "
             f"({_dossier.cycles_used} cycle(s), "
             f"status={_dossier.status}"
-            + (
-                f"/{_dossier.cause_of_death}"
-                if _dossier.cause_of_death
-                else ""
-            )
+            + (f"/{_dossier.cause_of_death}" if _dossier.cause_of_death else "")
             + ")"
         )
         if _dossier.status == "dead":
@@ -29791,16 +29687,11 @@ class MetacognitiveReasoningEngine:
         """
         # ── Step 1: era hash, graveyard exclusions, queue ──
         try:
-            _sh = (
-                self._f._symbol_index.compute_structure_hash(project_id)
-                or ""
-            )
+            _sh = self._f._symbol_index.compute_structure_hash(project_id) or ""
         except Exception:
             _sh = ""
         _grave = self._load_graveyard(project_id, _sh)
-        _exclusions: List[str] = [
-            f"{h} (cause: {c})" for h, c, _u in _grave
-        ]
+        _exclusions: List[str] = [f"{h} (cause: {c})" for h, c, _u in _grave]
         # S7: the fecundity compass — the unsettled ground every dead
         # dossier left behind, aggregated for informed generation.
         # Empty when no graveyard entry carries it (pre-S7 rows or a
@@ -29818,9 +29709,7 @@ class MetacognitiveReasoningEngine:
                 f"_forge_all: {len(_exclusions)} graveyard "
                 f"exclusion(s) loaded for this era"
             )
-        _queue: List[str] = [
-            t for t, _c in seed_pool if t and len(t.strip()) >= 20
-        ]
+        _queue: List[str] = [t for t, _c in seed_pool if t and len(t.strip()) >= 20]
         # S3: class-prior ordering. When R33's history shows call-
         # relation claims failing chronically for this project (the
         # prefer_symbol_verification flag), candidates whose text
@@ -29843,20 +29732,14 @@ class MetacognitiveReasoningEngine:
                 if _strat.get(k)
             ]
             if "prefer_symbol_verification" in _strat_flags:
-                _queue.sort(
-                    key=lambda t: len(
-                        self._CALL_RELATION_RE.findall(t)
-                    )
-                )
+                _queue.sort(key=lambda t: len(self._CALL_RELATION_RE.findall(t)))
                 self._f._log_debug(
                     "_forge_all: queue reordered by class prior "
                     "(relation-heavy candidates last)"
                 )
         except Exception:
             pass
-        _n_target = int(
-            self._f.valves.agentic_serial_hypothesis_count
-        )
+        _n_target = int(self._f.valves.agentic_serial_hypothesis_count)
         _sealed: List["HypothesisDossier"] = []
 
         def _collides(cand: str) -> bool:
@@ -29923,10 +29806,7 @@ class MetacognitiveReasoningEngine:
                     if (
                         not _nudged
                         and "tighten_screen_relations" in _strat_flags
-                        and len(
-                            self._CALL_RELATION_RE.findall(_cand)
-                        )
-                        >= 2
+                        and len(self._CALL_RELATION_RE.findall(_cand)) >= 2
                     ):
                         _nudged = True
                         # S15 interplay: the class nudge APPENDS to
@@ -29958,41 +29838,24 @@ class MetacognitiveReasoningEngine:
                     continue
                 # Region: screen (EC-8 profile; EC-10 exemption)
                 _ev = self.gather_evidence(_cand, project_id)
-                _c_n = sum(
-                    1 for v in _ev.symbols_found.values() if v
-                ) + sum(
+                _c_n = sum(1 for v in _ev.symbols_found.values() if v) + sum(
                     1 for v in _ev.call_relations_valid.values() if v
                 )
-                _t_n = len(_ev.symbols_found) + len(
-                    _ev.call_relations_valid
-                )
+                _t_n = len(_ev.symbols_found) + len(_ev.call_relations_valid)
                 # S6: class-tightened screen — with the EC-9 flag on
                 # (>=10 records, class failing >=0.7), two refuted
                 # checks OF THAT CLASS suffice, saving the whole
                 # forge cycle the doomed class would have burned.
                 # Zero confirmed and the EC-10 exemption still bind.
-                _rel_ref = sum(
-                    1
-                    for v in _ev.call_relations_valid.values()
-                    if not v
-                )
-                _sym_ref = sum(
-                    1 for v in _ev.symbols_found.values() if not v
-                )
+                _rel_ref = sum(1 for v in _ev.call_relations_valid.values() if not v)
+                _sym_ref = sum(1 for v in _ev.symbols_found.values() if not v)
                 _tight = (
-                    "tighten_screen_relations" in _strat_flags
-                    and _rel_ref >= 2
-                ) or (
-                    "tighten_screen_symbols" in _strat_flags
-                    and _sym_ref >= 2
-                )
+                    "tighten_screen_relations" in _strat_flags and _rel_ref >= 2
+                ) or ("tighten_screen_symbols" in _strat_flags and _sym_ref >= 2)
                 # S8: the exemption is regex OR tag — the union, never
                 # a replacement. Exemption source logged (the S8
                 # validation signal: an exemption with source=tag).
-                _fatal = (
-                    ((_t_n >= 3 and (_t_n - _c_n) >= 2) or _tight)
-                    and _c_n == 0
-                )
+                _fatal = ((_t_n >= 3 and (_t_n - _c_n) >= 2) or _tight) and _c_n == 0
                 _crit_re = bool(_EC10_CRITICAL_RE.search(_cand))
                 _crit_tag = _gen_sev == "critical"
                 if _fatal and (_crit_re or _crit_tag):
@@ -30018,12 +29881,8 @@ class MetacognitiveReasoningEngine:
                     if _EC10_NEAR_MISS_RE.search(_cand):
                         # S5 surveillance: risk-adjacent phrasing the
                         # EC-10 pattern missed — S8's trigger food.
-                        self._f._log_debug(
-                            f"screen-miss-candidate? '{_cand[:70]}'"
-                        )
-                    _exclusions.append(
-                        f"{_cand} (cause: fabricated)"
-                    )
+                        self._f._log_debug(f"screen-miss-candidate? '{_cand[:70]}'")
+                    _exclusions.append(f"{_cand} (cause: fabricated)")
                     _cand = None
                     continue
             if _cand is None:
@@ -30033,12 +29892,9 @@ class MetacognitiveReasoningEngine:
                     f"generation attempt(s))"
                 )
                 break
-            _tag = (
-                f" [{', '.join(_strat_flags)}]" if _strat_flags else ""
-            )
+            _tag = f" [{', '.join(_strat_flags)}]" if _strat_flags else ""
             await self._f._emit_status(
-                f"🧪 Hypothesis {_slot}/{_n_target}{_tag} — "
-                f"candidate: {_cand[:70]}"
+                f"🧪 Hypothesis {_slot}/{_n_target}{_tag} — " f"candidate: {_cand[:70]}"
             )
             # ── Step 3: forge and seal ──
             _dossier = await self._forge_hypothesis(
@@ -30059,15 +29915,10 @@ class MetacognitiveReasoningEngine:
             # only when everything dies, this produces it while the
             # competition is alive.
             try:
-                _low_thr = float(
-                    self._f.valves.low_coverage_threshold
-                )
+                _low_thr = float(self._f.valves.low_coverage_threshold)
             except Exception:
                 _low_thr = 0.0
-            if (
-                _dossier.status == "plausible"
-                and _dossier.coverage_score < _low_thr
-            ):
+            if _dossier.status == "plausible" and _dossier.coverage_score < _low_thr:
                 _counterfactual = (
                     "Also consider: what if the critical assumption "
                     f"of '{_dossier.hypothesis[:90]}' were FALSE? "
@@ -30083,20 +29934,14 @@ class MetacognitiveReasoningEngine:
             self._f._log_debug(
                 f"calibration: gen_conf={_gen_conf:.2f} "
                 f"outcome={_dossier.status}"
-                + (
-                    f"/{_dossier.cause_of_death}"
-                    if _dossier.cause_of_death
-                    else ""
-                )
+                + (f"/{_dossier.cause_of_death}" if _dossier.cause_of_death else "")
             )
             _exclusions.append(
                 f"{_dossier.hypothesis} "
                 f"(cause: {_dossier.cause_of_death or _dossier.status})"
             )
         if _collision_count:
-            self._f._log_debug(
-                f"_forge_all: {_collision_count} collision(s) this run"
-            )
+            self._f._log_debug(f"_forge_all: {_collision_count} collision(s) this run")
         return _sealed
 
     async def _judge_dossiers(
@@ -30139,9 +29984,7 @@ class MetacognitiveReasoningEngine:
                 -d.confirmed_checks,
             )
         )
-        _eps = float(
-            getattr(self._f.valves, "agentic_parsimony_epsilon", 0.05)
-        )
+        _eps = float(getattr(self._f.valves, "agentic_parsimony_epsilon", 0.05))
         _top = _pool[0].corroboration
         _tied = [d for d in _pool if _top - d.corroboration <= _eps]
         # DIAG: the Layer-1 ranking, greppable live (the note reaches
@@ -30186,9 +30029,7 @@ class MetacognitiveReasoningEngine:
                     label=f"{label}_crucis_r{_round}",
                 )
             except Exception as _e:
-                self._f._log_debug(
-                    f"_judge_dossiers: crucis call failed ({_e!r})"
-                )
+                self._f._log_debug(f"_judge_dossiers: crucis call failed ({_e!r})")
                 break
             import json as _json
 
@@ -30200,13 +30041,9 @@ class MetacognitiveReasoningEngine:
                 if _pos < 0:
                     break
                 try:
-                    _obj = _json.JSONDecoder().raw_decode(
-                        _t[_pos:]
-                    )[0]
+                    _obj = _json.JSONDecoder().raw_decode(_t[_pos:])[0]
                     _claim = str(_obj.get("claim", "")).strip()
-                    _fav = str(
-                        _obj.get("if_true_supports", "")
-                    ).strip().upper()
+                    _fav = str(_obj.get("if_true_supports", "")).strip().upper()
                     break
                 except Exception:
                     continue
@@ -30217,11 +30054,9 @@ class MetacognitiveReasoningEngine:
             _v = self._claim_verified(_claim, _ev, project_id)
             if _v is None:
                 # Non-discriminating round: no elimination, stop.
-                _crucis_log.append(
-                    f"round {_round}: claim unverifiable — stopped"
-                )
+                _crucis_log.append(f"round {_round}: claim unverifiable — stopped")
                 break
-            _loser = (_b if (_v is (_fav == "A")) else _a)
+            _loser = _b if (_v is (_fav == "A")) else _a
             _winner_of_round = _a if _loser is _b else _b
             _crucis_log.append(
                 f"round {_round}: '{_claim[:60]}' → "
@@ -30261,20 +30096,14 @@ class MetacognitiveReasoningEngine:
             # unresolved claims (the S7 legacy: asserted, never
             # verifiable, exactly what deciding this needs). With
             # nothing unresolved to name, no plan is invented.
-            _plan_items = [
-                c for c in _winner.unresolved_claims[:3] if c.strip()
-            ]
+            _plan_items = [c for c in _winner.unresolved_claims[:3] if c.strip()]
             if _plan_items:
                 _note += (
                     " | to decide this, the next investigation "
-                    "should check: "
-                    + "; ".join(f"'{c[:80]}'" for c in _plan_items)
+                    "should check: " + "; ".join(f"'{c[:80]}'" for c in _plan_items)
                 )
             return None, _note
-        _note += (
-            f" | null bar PASS: {_winner.corroboration:.2f} >= "
-            f"{_margin:.2f}"
-        )
+        _note += f" | null bar PASS: {_winner.corroboration:.2f} >= " f"{_margin:.2f}"
         return _winner, _note
 
     async def _record_serial_competition(
@@ -30308,36 +30137,25 @@ class MetacognitiveReasoningEngine:
             _rec = CompetitionRecord(
                 timestamp=time.time(),
                 n_hypotheses_initial=len(dossiers),
-                n_falsified=sum(
-                    1 for d in dossiers if d.status == "dead"
-                ),
+                n_falsified=sum(1 for d in dossiers if d.status == "dead"),
                 primary_falsification_type=(
                     "call_relations"
                     if _rel_f > _sym_f
                     else ("symbols" if _sym_f > 0 else "none")
                 ),
-                final_score=(
-                    winner.corroboration if winner is not None else 0.0
-                ),
-                coverage_score=(
-                    winner.coverage_score if winner is not None else 0.0
-                ),
+                final_score=(winner.corroboration if winner is not None else 0.0),
+                coverage_score=(winner.coverage_score if winner is not None else 0.0),
                 iterations_used=sum(d.cycles_used for d in dossiers),
                 stagnated=False,
-                score_trajectory=[
-                    round(d.corroboration, 3) for d in dossiers
-                ],
+                score_trajectory=[round(d.corroboration, 3) for d in dossiers],
                 call_relation_failures=_rel_f,
                 symbol_failures=_sym_f,
                 low_coverage_count=sum(
-                    1
-                    for d in dossiers
-                    if d.coverage_score < _low_thr
+                    1 for d in dossiers if d.coverage_score < _low_thr
                 ),
                 abductive_used=False,
                 question_type=str(
-                    getattr(self._f, "_preplanner_question_type", "")
-                    or ""
+                    getattr(self._f, "_preplanner_question_type", "") or ""
                 ),
             )
             _rj = _json.dumps(_asdict(_rec))
@@ -30363,9 +30181,7 @@ class MetacognitiveReasoningEngine:
                 f"winner={'yes' if winner is not None else 'no'})"
             )
         except Exception as _e:
-            self._f._log_debug(
-                f"_record_serial_competition: skipped ({_e!r})"
-            )
+            self._f._log_debug(f"_record_serial_competition: skipped ({_e!r})")
 
     async def _bury_hypothesis(
         self,
@@ -30465,9 +30281,7 @@ class MetacognitiveReasoningEngine:
                 try:
                     _p = _json.loads(_r[2])
                     if isinstance(_p, dict):
-                        _unexp = [
-                            str(u) for u in (_p.get("unexplored") or [])
-                        ][:6]
+                        _unexp = [str(u) for u in (_p.get("unexplored") or [])][:6]
                 except Exception:
                     _unexp = []
                 _out.append((str(_r[0]), str(_r[1]), _unexp))
@@ -30712,29 +30526,25 @@ class MetacognitiveReasoningEngine:
         # 10-window); with fewer, the GLOBAL rule below governs
         # unchanged — the fallback never offers less protection
         # than the untyped gate did.
-        _qt = str(
-            getattr(self._f, "_preplanner_question_type", "") or ""
-        )
+        _qt = str(getattr(self._f, "_preplanner_question_type", "") or "")
         _typed = (
-            [
-                r
-                for r in history
-                if getattr(r, "question_type", "") == _qt
-            ][-10:]
+            [r for r in history if getattr(r, "question_type", "") == _qt][-10:]
             if _qt
             else []
         )
         if len(_typed) >= 10:
-            _t_call = sum(
-                1
-                for r in _typed
-                if r.primary_falsification_type == "call_relations"
-            ) / 10.0
-            _t_sym = sum(
-                1
-                for r in _typed
-                if r.primary_falsification_type == "symbols"
-            ) / 10.0
+            _t_call = (
+                sum(
+                    1
+                    for r in _typed
+                    if r.primary_falsification_type == "call_relations"
+                )
+                / 10.0
+            )
+            _t_sym = (
+                sum(1 for r in _typed if r.primary_falsification_type == "symbols")
+                / 10.0
+            )
             if _t_call >= 0.7:
                 strategy["tighten_screen_relations"] = True
                 self._f._log_debug(
