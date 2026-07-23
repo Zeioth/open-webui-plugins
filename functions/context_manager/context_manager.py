@@ -8158,6 +8158,13 @@ class SignatureExtractor:
     # 4. Call extraction from tree-sitter
     # ═══════════════════════════════════════════════════════════════════════════
 
+    # A bound call (self.X(...)) injects the instance as the first
+    # positional argument, so a def without 'self' and without
+    # @staticmethod crashes with 'takes N positional arguments but
+    # N+1 were given' the moment anyone calls it through self.
+    # The helper is pure (no instance state), so the decorator is
+    # the design, not a workaround.
+    @staticmethod
     def _extract_docstrings_python(code: str, symbols: List["CodeSymbol"]) -> None:
         """
         Extract docstrings from Python source code using AST with class context awareness.
@@ -26831,6 +26838,13 @@ class MetacognitiveReasoningEngine:
 
         return False, None
 
+    # A bound call (self.X(...)) injects the instance as the first
+    # positional argument, so a def without 'self' and without
+    # @staticmethod crashes with 'takes N positional arguments but
+    # N+1 were given' the moment anyone calls it through self.
+    # The helper is pure (no instance state), so the decorator is
+    # the design, not a workaround.
+    @staticmethod
     def _repair_truncated_json(text: str) -> Optional[dict]:
         """
         Recover the parseable prefix of a JSON object cut off mid-generation.
@@ -27676,6 +27690,13 @@ class MetacognitiveReasoningEngine:
             )
             return None
 
+    # A bound call (self.X(...)) injects the instance as the first
+    # positional argument, so a def without 'self' and without
+    # @staticmethod crashes with 'takes N positional arguments but
+    # N+1 were given' the moment anyone calls it through self.
+    # The helper is pure (no instance state), so the decorator is
+    # the design, not a workaround.
+    @staticmethod
     def _verify_contract_claim(
         claim: str,
         expanded_bodies: List[str],
