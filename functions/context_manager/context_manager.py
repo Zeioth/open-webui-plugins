@@ -175,54 +175,6 @@ class ExperimentDesign:
 
 
 @dataclass
-class ScoredHypothesis:
-    """
-    Complete evaluation result for one hypothesis in compete_hypotheses().
-
-    coverage_score:
-        Fraction of total claims that were structurally verifiable.
-        coverage = (critical + supportive) / (critical + supportive + unknown).
-        Low coverage means the obj_score is based on sparse evidence —
-        a high score with low coverage is an availability bias artifact.
-
-    epistemic_uncertainty:
-        Bayesian-inspired uncertainty estimate combining coverage,
-        prediction failures, and score ambiguity.
-        0.0 = high confidence | 1.0 = high uncertainty.
-        Used to gate peer review (only when uncertainty > threshold).
-
-    falsified:
-        True if is_falsified() triggered a hard kill.
-        Note: with coverage guard enabled, falsification is suppressed
-        when coverage_score < min_coverage_for_falsification and
-        a penalty is applied instead.
-
-    falsification_reason:
-        Human-readable explanation from is_falsified().
-        Also used for downgrade penalties (coverage guard case).
-    """
-
-    text: str
-    score: float
-    llm_conf: float
-    obj_score: float
-    evidence: "StaticEvidence"
-    design: "ExperimentDesign"
-    falsified: bool
-    falsification_reason: Optional[str]
-    coverage_score: float = 0.0
-    epistemic_uncertainty: float = 0.0
-    # Prediction-verification counts from the objective scorer. compete_
-    # hypotheses() passes both when constructing the result (they feed the
-    # prediction term of epistemic_uncertainty); without them declared here
-    # the constructor raised TypeError and the whole competition was caught
-    # and discarded, so no winner was ever crowned. Defaulted so older call
-    # sites that omit them keep working.
-    predictions_verified: int = 0
-    predictions_total: int = 0
-
-
-@dataclass
 class PeerReviewResult:
     """
     Result of MetacognitiveReasoningEngine.peer_review_hypothesis().
@@ -242,7 +194,6 @@ class PeerReviewResult:
     critiques: List[str]
     reviewer_model: str
     is_external: bool = False
-
 
 @dataclass
 class HypothesisDossier:
@@ -12169,11 +12120,7 @@ class LLMOrchestrator:
             "crucis",
             "peer_review",
             "claims_tail",
-            "abductive",
-            "divergent",
             "presearch",
-            "refine",
-            "delimit_scope",
             "critical_experiment",
             "predictions",
             "devil",
@@ -13182,6 +13129,18 @@ class AgenticEvidenceLedger:
                 f"did not carry a claims object, prose kept as-is"
             )
             return False
+        # Seen live: a truncated step can end INSIDE an open code fence
+        # (step 2 was cut mid call-graph block). _FENCE_RE pairs fences
+        # greedily across the whole output, so a dangling opener in the
+        # prose pairs with the closer of the tail appended below,
+        # captures prose+JSON as one blob, and every fence candidate
+        # fails json.loads — the recovered claims were silently
+        # discarded and the 90s recovery call wasted (the re-extraction
+        # logged TRUNCATED again with the recovered tail visibly present
+        # at the end of the output). Close any dangling fence first so
+        # the appended claims fence pairs with itself.
+        if prose.count("```") % 2 == 1:
+            prose += "\n```"
         step.output = (
             prose + "\n\n```json\n" + json.dumps(data, ensure_ascii=False) + "\n```"
         )
@@ -15806,6 +15765,15 @@ class AgenticPreplanner:
                 f"preplan: {len(self._f._preplanner_assumptions)} "
                 f"assumption(s) logged for the forge"
             )
+            # Strategy visibility: the assumptions being tested are
+            # part of the method the user is watching — until now
+            # this was server-log only, and the chat showed the
+            # framing with no hint that its load-bearing assumptions
+            # enter the forge as claims-to-verify.
+            await self._f._emit_status(
+                f"🧭 Testing {len(self._f._preplanner_assumptions)} "
+                f"framing assumption(s) in the forge"
+            )
         # difficulty is the pre-planner's semantic judgment of how much
         # investigative work the chosen framing needs; anything outside the
         # three-value vocabulary degrades to "" (auto sizing then stands
@@ -15884,13 +15852,57 @@ class AgenticPreplanner:
             if _answerable and getattr(
                 self._f.valves, "preplan_suppress_false_clarify", True
             ):
+                # The ask is spurious AND the framing exploration already
+                # happened. Returning empty here discarded that work and
+                # left the turn with no framing at all — observed live as
+                # '🧭 Pre-planner: exploring framings…' followed by
+                # silence, with the planner receiving nothing. Since we
+                # have just judged the question answerable, the model's
+                # OWN first framing is the honest fallback: adopt it,
+                # label the adoption in both the status and the brief's
+                # rationale, and let the planner work from it. Only when
+                # no framing was produced at all do we proceed blind.
+                self.last_stats["asked"] = False
+                self.last_stats["clarify_suppressed"] = True
+                _fallback = ""
+                for _f_txt in data.get("framings") or []:
+                    if str(_f_txt).strip():
+                        _fallback = str(_f_txt).strip()
+                        break
+                if _fallback:
+                    data["chosen"] = _fallback
+                    data["rationale"] = (
+                        "Fallback: the pre-planner requested clarification "
+                        "on a question its own contract calls answerable; "
+                        "its leading framing was adopted so the "
+                        "exploration is not discarded."
+                    )
+                    brief = self._render_brief(data)
+                    if brief:
+                        _qt_tag = (
+                            f" [{question_type}]" if question_type else ""
+                        )
+                        await self._f._emit_status(
+                            f"🧭 Pre-planner: framing chosen (fallback) "
+                            f"— {_fallback[:60]}{_qt_tag}"
+                        )
+                        self._f._log_debug(
+                            f"🧭 Preplanner: clarification suppressed; "
+                            f"adopted leading framing as fallback "
+                            f"(framings={n_framings}, "
+                            f"type={question_type or 'untyped'}, "
+                            f"chose='{_fallback[:80]}')"
+                        )
+                        self._f._log_debug(
+                            f"🧭 Preplanner brief:\n{brief.strip()}"
+                        )
+                        return brief, ""
                 self._f._log_debug(
                     "🧭 Preplanner: clarification suppressed — question "
                     "names a symbol and states a deliverable/symptom "
-                    "(answerable by contract); proceeding without brief"
+                    "(answerable by contract); no framing produced, "
+                    "proceeding without brief"
                 )
-                self.last_stats["asked"] = False
-                self.last_stats["clarify_suppressed"] = True
                 return "", ""
             self._f._log_debug(
                 f"🧭 Preplanner: no framing defensible — asking " f"('{ask[:80]}')"
@@ -17788,174 +17800,45 @@ class AgenticOrchestrator:
         """
         if step.kind != "hypothesize":
             return False
-        mode = self._f.valves.agentic_hypothesize_compete
         _serial = bool(self._f.valves.agentic_serial_method)
-        # GATE FIX (observed live): the serial method has its OWN
-        # switch and must not inherit the parallel competition's
-        # entry conditions. The forge GENERATES candidates, so the
-        # rival-count ('should') and shadow gates below are wrong
-        # gates for it — a run with one enumerated hypothesis never
-        # reached the forge. With the serial valve on, only the
-        # step-kind gate applies.
-        if mode == "off" and not _serial:
+        if not _serial:
+            # Parallel excision, final step: compete_hypotheses and
+            # its machinery are gone. A hypothesize step with the
+            # serial valve off has no competition to run — the step
+            # output stands as-is, like any non-competed step. The
+            # old head's gathering (claims, dedup, cap), the intent
+            # 'should' gate, the shadow gate, and the divergent-pool
+            # enrichment all served the parallel competition and
+            # were dead weight for the forge, which generates its
+            # own candidates from an empty queue (the operator's
+            # architecture) — so the head collapses to this.
             return False
-
-        # Region: gather rival hypotheses from this step's claims
-        claims = self._ledger.claims_for(step.id)
-        hyps: List[Tuple[str, float]] = [
-            (c.text, max(0.0, min(1.0, c.confidence)))
-            for c in claims
-            if c.text and c.evidence_type != "dynamic"
-        ]
-        n_found = len(hyps)
-
-        # Region: Fase 0 — reveal the DISTINCT rival count, then ceiling it.
-        # The rival set is built from CLAIMS, and a 4-hypothesis output
-        # easily emits 10+ claims: several claims restate one mechanism, so
-        # 'Evaluating 12 hypotheses' was mostly claim inflation, not 12
-        # ideas. Dedup first (deterministic difflib collapse, zero calls,
-        # merges only near-identical texts — never distinct ideas), and
-        # only then apply the hard cap to what enters the EXPENSIVE
-        # competition. Order is preserved: the instruction asks for
-        # rank-by-likelihood, so first-N keeps the model's own ranking.
-        # The cap governs this initial set only — the divergent pool below
-        # and the abductive escape inside the competition are safety nets
-        # that ADD hypotheses when the initial set fails, and capping them
-        # would strangle recovery exactly when it is needed.
-        _n_raw = len(hyps)
-        hyps = self._f._meta_reasoning._dedupe_hypotheses(hyps)
-        if len(hyps) < _n_raw:
-            self._f._log_debug(
-                f"🤖 Agentic: rival dedup {_n_raw} claims → "
-                f"{len(hyps)} distinct hypotheses"
-            )
-        _cap = int(self._f.valves.hypothesis_hard_cap)
-        if _cap > 0 and len(hyps) > _cap:
-            self._f._log_debug(
-                f"🤖 Agentic: rival set capped {len(hyps)} → {_cap} "
-                f"(hypothesis_hard_cap; dropped tail of the model's own "
-                f"likelihood ranking)"
-            )
-            hyps = hyps[:_cap]
-        n_found = len(hyps)
-
-        # Region: proactive trigger — rivals present OR debugging intent
-        _intent_debug = False
-        try:
-            _cls = self._f._project_state_manager.get_pstate(project_id).get(
-                "turn_classification"
-            )
-            if _cls:
-                _intent_debug = str(_cls.get("intent", "")) == "debug"
-        except Exception:
-            _intent_debug = False
-        should = n_found >= 2 or (_intent_debug and n_found >= 1)
-        if not should and not _serial:
-            return False
-
-        if mode == "shadow" and not _serial:
-            self._f._log_debug(
-                f"🤖 [COMPETE-SHADOW] step {step.id} (hypothesize) would "
-                f"compete {n_found} rival hypotheses "
-                f"(debug_intent={_intent_debug}) — not running"
-            )
-            return False
-
-        # Region: run the competition
-        # The status must not lie in serial mode: the enumerated pool is
-        # the forge's SEED QUEUE (candidates are forged one at a time,
-        # and the forge generates its own when the queue runs dry), not
-        # a set of rivals competing in parallel. Announcing 'competing
-        # 7 hypotheses' right before '🧪 Hypothesis 1/3' was the
-        # parallel path's wording surviving into a serial run.
-        if _serial:
-            await self._f._emit_status(
-                f"{status_prefix}: {n_found} hypothesis seed(s) "
-                f"enumerated → serial forge"
-            )
-            self._f._log_debug(
-                f"🤖 Agentic: step {step.id} enumerated {n_found} seed "
-                f"hypotheses for the serial forge "
-                f"(debug_intent={_intent_debug})"
-            )
-        else:
-            await self._f._emit_status(f"{status_prefix}: competing {n_found} hypotheses")
-            self._f._log_debug(
-                f"🤖 Agentic: step {step.id} competes {n_found} rival "
-                f"hypotheses (debug_intent={_intent_debug})"
-            )
-        # Capa 1 — planner-gated divergent pool: this path is reached ONLY on
-        # a planner-chosen hypothesize step, so widening the rival set here is
-        # exactly the "planner decides when it needs this" behavior. The
-        # competition's objective scoring stays the selector.
-        _div_n = int(getattr(self._f.valves, "hypothesis_divergent_n", 0))
-        if _div_n > 0:
-            try:
-                _div = await self._f._meta_reasoning._generate_presearch_divergent(
-                    step.goal or "",
-                    hyps,
-                    _div_n,
-                    float(
-                        getattr(
-                            self._f.valves,
-                            "hypothesis_divergent_temperature",
-                            0.9,
-                        )
-                    ),
-                    project_id,
-                    label=f"agentic_hypothesize_step_{step.id}",
-                )
-                if _div:
-                    _before = len(hyps)
-                    hyps = self._f._meta_reasoning._dedupe_hypotheses(
-                        hyps + _div, protect=_before
-                    )
-                    self._f._log_debug(
-                        f"🤖 Agentic: divergent pool +{len(hyps) - _before} "
-                        f"(requested {_div_n}, {len(_div)} parsed) → "
-                        f"{len(hyps)} rivals"
-                    )
-                    n_found = len(hyps)
-            except Exception as e:
-                self._f._log_debug(f"🤖 Agentic: divergent pool failed ({e})")
-        # The entry gate above only proves the clock was alive when we
-        # arrived; the ceiling below is what stops the competition from
-        # spending everything the stages behind it still need. The elapsed
-        # time is folded into step.seconds because the competition IS this
-        # step's work (it rewrites step.output) — without that, the
-        # AGENTIC-RUN telemetry reported a 16.0s hypothesize step for a
-        # competition that had just burned 199 seconds, and the budget
-        # skips downstream looked unexplained.
-        # The competition runs unclocked. It previously received a
-        # wall-clock ceiling (agentic_metacog_max_compete_s, min'd with the
-        # pipeline budget) that could stop it between hypotheses before
-        # convergence or max_iters — a clock-based quality cut inside a
-        # step, which the GOVERNING PRINCIPLES rule out (THE MAXIM,
-        # Principle 2). Its natural bounds remain and are sufficient: a
-        # finite hypothesis set, max_iters (le=6), the convergence
-        # threshold on a measured score (Principle 4), and call_llm's
-        # anti-hang backstop under every call it makes.
-        # obj/llm balance from the quant-aware valve (llm_weight is the
-        # S1c: the serial method's switch. When on, the enumerated pool
-        # becomes the forge's candidate queue: each hypothesis is
-        # forged ONE AT A TIME into a sealed dossier (kill-early,
-        # deterministic maturity, graveyard memory), and only the
-        # PLAUSIBLE dossiers reach the competition below — which in
-        # S1 is still the existing parallel machinery, now judging a
-        # strictly richer input. The tuple confidence is derived from
-        # measured corroboration, not model self-report (llm_conf is
-        # demoted to observability in serial mode). If every dossier
-        # died, that IS the finding: the honest terminal reports it
-        # and the step proceeds — the parallel fallthrough is
-        # retired; the serial method is self-sufficient.
+        hyps: List[Tuple[str, float]] = []
+        await self._f._emit_status(
+            f"{status_prefix}: serial forge — candidates are "
+            f"generated one at a time"
+        )
         if _serial:
             await self._f._emit_status(
                 f"🤖 Serial method: forging up to "
                 f"{int(self._f.valves.agentic_serial_hypothesis_count)} "
                 f"hypotheses, one at a time…"
             )
+            # anch=0 on every dossier of every run traced to this
+            # argument: the step goal ('Enumerar hipótesis sobre la
+            # causa raíz…') is planner prose that rarely names code
+            # symbols, so the EC-6 anchor set built from it was
+            # always empty. The USER'S question names the symbols
+            # under investigation — it is both the anchor source
+            # EC-6's own rationale calls for ('explains more of
+            # what the user asked about') and the better generation
+            # prompt (the actual problem, not a meta-instruction).
+            _fq = (
+                str(getattr(self, "_turn_question", "") or "")
+                or (step.goal or "")
+            )
             _dossiers = await self._f._meta_reasoning._forge_all(
-                step.goal or "",
+                _fq,
                 hyps,
                 project_id,
                 f"agentic_serial_step_{step.id}",
@@ -17972,7 +17855,7 @@ class AgenticOrchestrator:
                 # note (numbers, never rival prose) into the workspace
                 # — the R34 rule applied to the competition itself.
                 _winner, _note = await self._f._meta_reasoning._judge_dossiers(
-                    step.goal or "",
+                    _fq,
                     _plausible,
                     project_id,
                     f"agentic_serial_step_{step.id}",
@@ -18021,10 +17904,39 @@ class AgenticOrchestrator:
                     f"dossier(s) died — cause not identified "
                     f"with confidence"
                 )
+                # S13 extension: the all-dead terminal is exactly
+                # where an actionable queue helps most, and until
+                # now only the null-bar-FAILED branch carried one.
+                # Built the same way — deterministically, zero LLM
+                # calls — from the DEAD dossiers' own unresolved
+                # claims (S7's legacy: asserted, never verifiable,
+                # exactly the ground the next investigation should
+                # settle). Deduped across dossiers, capped at 3;
+                # with nothing unresolved, no plan is invented —
+                # unfounded deaths from empty analyses leave no
+                # trail, and inventing one would be dishonest.
+                _dead_plan: List[str] = []
+                for _dd in _dossiers:
+                    for _uc in _dd.unresolved_claims:
+                        if len(_dead_plan) >= 3:
+                            break
+                        _uc = _uc.strip()
+                        if _uc and _uc not in _dead_plan:
+                            _dead_plan.append(_uc)
+                    if len(_dead_plan) >= 3:
+                        break
+                _next = (
+                    " | to decide this, the next investigation "
+                    "should check: "
+                    + "; ".join(f"'{c[:80]}'" for c in _dead_plan)
+                    if _dead_plan
+                    else ""
+                )
                 step.output = (step.output or "") + (
                     "\n\n**Serial verdict**: every forged "
                     "hypothesis was refuted or unfounded."
                     + (f" {_causes}" if _causes else "")
+                    + _next
                 )
             return True
         # Parallel retirement, step two: with the serial method
@@ -18682,6 +18594,12 @@ class AgenticOrchestrator:
         Runs only behind run_pipeline's slot gate and fail-open boundary, so
         it may assume a free slot and raise freely on internal errors.
         """
+        # EC-6 anchors need the USER'S question, not the planner's
+        # paraphrase: stored per turn (same pattern as the
+        # preplanner's question type) so the forge and the judge
+        # can reach it without threading a parameter through every
+        # intermediate call. Overwritten on each pipeline entry.
+        self._turn_question = str(question or "")
         # Region: run-timing start
         # ------------------------------------------------------------------
         # There is no wall-clock budget in this pipeline (GOVERNING
@@ -19266,9 +19184,11 @@ class AgenticOrchestrator:
                     # cache hit with the parallel valve off would
                     # silently skip the serial method entirely (its
                     # own _maybe_compete gate keeps cost bounded).
-                    if step.kind == "hypothesize" and (
+                    # Parallel excision: only the serial valve
+                    # matters now — compete_on_cached_hypothesize
+                    # guarded the removed parallel competition.
+                    if step.kind == "hypothesize" and bool(
                         self._f.valves.agentic_serial_method
-                        or self._f.valves.compete_on_cached_hypothesize
                     ):
                         await self._maybe_compete_hypothesize(
                             step,
@@ -19281,6 +19201,36 @@ class AgenticOrchestrator:
                     idx += 1
                     continue
 
+            # ARCHITECTURAL RESTRUCTURE (operator's design): in
+            # serial mode the hypothesize step runs NO enumeration
+            # LLM call — hypotheses are generated ONE AT A TIME
+            # inside the forge, informed by the graveyard compass
+            # and exclusions. The step remains in the plan as the
+            # forge's anchor point (its goal is the forge question),
+            # and this branch mirrors the cache-hit shape: no
+            # executor run, no claim extraction on a marker output,
+            # straight to the forge, then continue. Saves the
+            # 25-90s enumeration call observed per run.
+            if step.kind == "hypothesize" and bool(
+                self._f.valves.agentic_serial_method
+            ):
+                step.status = "done"
+                step.output = (
+                    "(serial method: hypothesis enumeration "
+                    "skipped — candidates are generated one at a "
+                    "time inside the forge)"
+                )
+                await self._maybe_compete_hypothesize(
+                    step,
+                    project_id,
+                    status_prefix=(
+                        f"🤖 Agentic step {step.display_no}/"
+                        f"{len(plan.steps)} (hypothesize)"
+                    ),
+                )
+                step.digest = self._digest(step.output)
+                idx += 1
+                continue
             await self._f._emit_status(
                 f"🤖 Agentic step {step.display_no}/{len(plan.steps)} "
                 f"({step.kind}): {step.goal[:60]}"
@@ -26626,66 +26576,6 @@ class MetacognitiveReasoningEngine:
                 resolved += 1
         return resolved / total, resolved, total
 
-    def _compute_epistemic_uncertainty(
-        self,
-        obj_score: float,
-        coverage_score: float,
-        predictions_verified: int,
-        predictions_total: int,
-    ) -> float:
-        """
-        Bayesian-inspired epistemic uncertainty estimate.
-        Deterministic — no LLM.
-
-        Three objective signals (all SymbolGraph-derived):
-        1. Coverage uncertainty (50%): low coverage → high uncertainty
-        2. Prediction uncertainty (20%): failed predictions → high uncertainty
-        3. Score ambiguity (30%): score near 0.5 → high uncertainty
-
-        Returns uncertainty in [0, 1]:
-            0.0 = high confidence
-            1.0 = high uncertainty
-
-        Used to gate peer review — only when uncertainty > threshold
-        does peer review add epistemic value.
-        """
-        coverage_uncertainty = 1.0 - coverage_score
-
-        if predictions_total > 0:
-            pred_uncertainty = 1.0 - (predictions_verified / predictions_total)
-        else:
-            pred_uncertainty = 0.5  # no predictions = genuinely unknown
-
-        # Peaks at 0.5, zero at 0 or 1
-        score_uncertainty = 1.0 - abs(obj_score - 0.5) * 2.0
-
-        uncertainty = (
-            0.5 * coverage_uncertainty
-            + 0.2 * pred_uncertainty
-            + 0.3 * score_uncertainty
-        )
-        return min(1.0, max(0.0, uncertainty))
-
-    # EC-5 polarity: the negated-relation regex must be an attribute
-    # of THIS class — the relation-validation method above calls
-    # self._NEG_RELATION_RE, and AgenticEvidenceLedger's copy is not
-    # in scope here. A live AttributeError ('MetacognitiveReasoning
-    # Engine' object has no attribute '_NEG_RELATION_RE') during the
-    # competition confirmed the gap; this defines the twin beside the
-    # positive regex so both polarities resolve on self.
-    _NEG_RELATION_RE = re.compile(
-        r"`?(\w+)`?\s+(?:does\s+not|doesn'?t|never|no\s+longer|"
-        r"cannot|can'?t|no|nunca)\s+"
-        r"(?:calls?|invokes?|uses?|reads?|writes?|depends\s+on|"
-        r"llama\s+a|invoca\s+a|usa)\s+`?(\w+)`?",
-        re.IGNORECASE,
-    )
-    _CALL_RELATION_RE = re.compile(
-        r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|reads?|writes?|depends on)"
-        r"\s+`?(\w+)`?",
-        re.IGNORECASE,
-    )
-
     def _qid_exists(self, qid: str, project_id: str) -> bool:
         """
         O(1) existence check via the SymbolIndex block maps.
@@ -26918,205 +26808,6 @@ class MetacognitiveReasoningEngine:
 
         return False, None
 
-    def compute_weighted_score(
-        self,
-        evidence: "StaticEvidence",
-        design: "ExperimentDesign",
-        llm_conf: float,
-        predictions_verified: int = 0,
-        predictions_total: int = 0,
-        downgraded_reason: Optional[str] = None,
-        obj_weight: float = 0.5,
-        llm_weight: float = 0.5,
-        project_id: str = "",
-    ) -> Tuple[float, float, float]:
-        """
-        Compute (obj_score, combined_score, coverage_score).
-
-        obj_weight / llm_weight control the balance between structural
-        evidence (deterministic) and LLM confidence (self-reported).
-
-        Default 50/50 for debugging/verification queries.
-        Architecture queries use 40/60 (proposing new design, not verifying
-        existing behavior — LLM design judgment matters more).
-
-        Scoring layers:
-        1. Structural: critical claims 10x, supportive 1x. Claims whose
-           verdict is None ABSTAIN — excluded from both sides of the
-           ratio. Counting unverifiable claims as verified (the previous
-           benefit-of-the-doubt True at full weight) is what kept
-           obj_score pinned at 1.0 in production; with abstention, obj
-           measures the fraction verified OF WHAT IS CHECKABLE, and the
-           coverage machinery separately reports how much was checkable.
-           When nothing is checkable, obj falls back to the neutral 0.5.
-        2. Downgrade penalty: if is_falsified() was coverage-guarded.
-        3. Prediction bonus: verified predictions +10% max — applied ONLY
-           when obj is a measured score. When every claim abstained, obj
-           is the neutral 0.5 ("unknown") and a bonus on top of it would
-           manufacture structural support that was never observed.
-        4. Coverage penalty: low coverage penalizes combined proportionally.
-
-        project_id enables live SymbolGraph resolution of relation claims
-        (see _claim_verdict); empty string preserves evidence-only
-        matching for callers without a project in scope.
-
-        Returns (obj_score, combined_score, coverage_score).
-        """
-        CRITICAL_WEIGHT = 10.0
-        SUPPORTIVE_WEIGHT = 1.0
-
-        coverage_score, _n_resolved, _n_total = self._compute_effective_coverage(
-            design, evidence, project_id
-        )
-        _declared = self._compute_coverage_score(design)
-        if _n_total and (_declared - coverage_score) > 0.01:
-            self._f._log_debug(
-                f"compute_weighted_score: coverage MEASURED "
-                f"{coverage_score:.2f} ({_n_resolved}/{_n_total} claims "
-                f"resolvable against the SymbolGraph) vs {_declared:.2f} "
-                f"declared by the classifier — the labels promised more "
-                f"than the evidence can check"
-            )
-
-        if not self._f.valves.enable_weighted_scoring or not design.critical_claims:
-            verifiable = len(evidence.symbols_found) + len(
-                evidence.call_relations_valid
-            )
-            if verifiable == 0:
-                obj_score = 0.5
-                obj_measured = False
-            else:
-                verified = sum(1 for v in evidence.symbols_found.values() if v) + sum(
-                    1 for v in evidence.call_relations_valid.values() if v
-                )
-                obj_score = verified / verifiable
-                obj_measured = True
-        else:
-            total_weight = 0.0
-            verified_weight = 0.0
-            _n_abstained = 0
-            for claim in design.critical_claims:
-                verdict = self._claim_verified(claim, evidence, project_id)
-                if verdict is None:
-                    _n_abstained += 1
-                    continue
-                total_weight += CRITICAL_WEIGHT
-                if verdict:
-                    verified_weight += CRITICAL_WEIGHT
-            for claim in design.supportive_claims:
-                verdict = self._claim_verified(claim, evidence, project_id)
-                if verdict is None:
-                    _n_abstained += 1
-                    continue
-                total_weight += SUPPORTIVE_WEIGHT
-                if verdict:
-                    verified_weight += SUPPORTIVE_WEIGHT
-            obj_measured = total_weight > 0
-            obj_score = verified_weight / total_weight if obj_measured else 0.5
-            if not obj_measured:
-                # The single most diagnostic line this engine can emit, and
-                # it did not exist: a competition where every claim abstains
-                # is reporting "I know nothing", and without saying so the
-                # neutral 0.5 is indistinguishable in the logs from a
-                # measured half-verified score.
-                self._f._log_debug(
-                    f"compute_weighted_score: ALL {_n_abstained} claim(s) "
-                    f"abstained — nothing in this hypothesis is resolvable "
-                    f"against the SymbolGraph; obj is the neutral 0.5, not "
-                    f"measured evidence"
-                )
-
-        # Downgrade penalty — coverage-guarded falsification
-        if downgraded_reason:
-            obj_score = max(0.0, obj_score - 0.3)
-            self._f._log_debug(
-                f"compute_weighted_score: downgrade penalty applied "
-                f"({downgraded_reason[:60]})"
-            )
-
-        # Prediction bonus — only ever on a MEASURED score
-        if predictions_total > 0 and obj_measured:
-            prediction_ratio = predictions_verified / predictions_total
-            obj_score = min(1.0, obj_score + 0.1 * prediction_ratio)
-        elif predictions_total > 0:
-            # A bonus on the abstention neutral fabricates evidence out of
-            # "I don't know". Live: four of seven evaluations in one run
-            # scored obj 0.600/0.583 with EVERY claim abstaining — the
-            # numbers were 0.5 plus this bonus, read downstream as partial
-            # structural support and, through _compute_epistemic_uncertainty
-            # (which peaks exactly at 0.5), as lower uncertainty than the
-            # engine actually had, gating peer review off the very cases
-            # that needed it most.
-            self._f._log_debug(
-                f"compute_weighted_score: prediction bonus WITHHELD "
-                f"({predictions_verified}/{predictions_total} verified) — "
-                f"obj is the abstention neutral; a bonus on 'unknown' "
-                f"would fabricate evidence"
-            )
-
-        # EC-4 (corroboration): obj_score is a RATIO and saturates —
-        # 1 confirmed claim out of 1 scores identically to 8 out of 8,
-        # so equally-clean rivals tie, stagnation fires, and the
-        # iteration budget burns without discriminating (the R8
-        # pathology, observed live as 'best score 0.72 < 0.90'). The
-        # corroboration principle supplies the missing axis: more
-        # independent confirming evidence → more credible. COUNT via a
-        # saturating exponential (2→3 confirmations matters more than
-        # 7→8), DIVERSITY via a bonus when confirmations span both
-        # evidence kinds the graph checks (symbol existence AND call
-        # relations — two independent ways to be right). The obj/llm
-        # balance is untouched, scaled by the complement of the
-        # corroboration weight; falsification still vetoes upstream.
-        _n_sym_conf = sum(1 for v in evidence.symbols_found.values() if v)
-        _n_rel_conf = sum(1 for v in evidence.call_relations_valid.values() if v)
-        _n_confirmed = _n_sym_conf + _n_rel_conf
-        _diversity = 1.15 if (_n_sym_conf and _n_rel_conf) else 1.0
-        _cw = min(
-            0.6,
-            max(
-                0.0,
-                float(
-                    getattr(
-                        self._f.valves,
-                        "agentic_corroboration_weight",
-                        0.25,
-                    )
-                ),
-            ),
-        )
-        _corr = (
-            min(1.0, (1.0 - 0.85**_n_confirmed) * _diversity) if _n_confirmed else 0.0
-        )
-        _base = obj_weight * obj_score + llm_weight * llm_conf
-        _with_corr = (1.0 - _cw) * _base + _cw * _corr
-        if _cw > 0.0:
-            self._f._log_debug(
-                f"EC-4 corroboration: n_confirmed={_n_confirmed} "
-                f"(sym={_n_sym_conf}, rel={_n_rel_conf}, "
-                f"diversity={_diversity:.2f}) corr={_corr:.3f} "
-                f"combined {_base:.3f} → {_with_corr:.3f}"
-            )
-        # Coverage penalty on combined score
-        low_cov = self._f.valves.low_coverage_threshold
-        if coverage_score < low_cov:
-            penalty = 0.5 * (low_cov - coverage_score) / low_cov
-            combined_raw = _with_corr
-            combined = max(0.0, combined_raw * (1.0 - penalty))
-            self._f._log_debug(
-                f"compute_weighted_score: coverage penalty "
-                f"(coverage={coverage_score:.2f}) "
-                f"→ {combined_raw:.3f} → {combined:.3f}"
-            )
-        else:
-            combined = _with_corr
-
-        return obj_score, combined, coverage_score
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # 2. Pre-evidence design and prediction generation
-    # ═══════════════════════════════════════════════════════════════════════
-
-    @staticmethod
     def _repair_truncated_json(text: str) -> Optional[dict]:
         """
         Recover the parseable prefix of a JSON object cut off mid-generation.
@@ -27471,1547 +27162,187 @@ class MetacognitiveReasoningEngine:
         )
         return design
 
-    async def generate_predictions(
+    async def peer_review_hypothesis(
         self,
         hypothesis: str,
+        evidence: "StaticEvidence",
+        design: "ExperimentDesign",
         project_id: str,
-    ) -> List[str]:
+    ) -> Optional["PeerReviewResult"]:
         """
-        Deduce structural consequences of the hypothesis.
-        TURN LEVEL (H5 temporal hierarchy).
-        Gated by enable_generate_predictions valve.
+        External peer review of the winning hypothesis.
+        CONVERSATION LEVEL (H5).
 
-        Asks: 'If this hypothesis is correct, what OTHER structural facts
-        should be true in the codebase?' beyond what it explicitly states.
+        Three execution paths:
 
-        These predictions are verified by gather_evidence() in the next
-        iteration, closing the hypothetico-deductive cycle.
+        Path 1 — enable_peer_review=False:
+            Returns None. Synthesis unaffected.
 
-        Note: skeleton context is fetched via _format_skeleton (synchronous).
-        If unavailable, predictions are generated without code structure
-        context and will be more generic. This degrades gracefully —
-        the absence is logged explicitly.
+        Path 2 — same model or no model set:
+            Degrades to challenge_hypothesis() (devil's advocate).
+            Returns PeerReviewResult(is_external=False).
+
+        Path 3 — different model (genuine peer review):
+            Blind review — context excludes primary reasoning chain
+            to prevent anchoring bias.
+            Returns PeerReviewResult(is_external=True).
+
+        Designed for future activation — peer_review_model is expected
+        to be empty under current hardware constraints.
         """
-        if not self._f.valves.enable_generate_predictions:
-            return []
+        if not self._f.valves.enable_peer_review:
+            return None
 
-        skeleton_ctx = ""
-        try:
-            skeleton = self._f._ctx_builder._format_skeleton(
-                project_id
-            )  # sync — no await
-            skeleton_ctx = skeleton[:2000] if skeleton else ""
-        except Exception as e:
+        _same_model = (
+            not self._f.valves.peer_review_model
+            or self._f.valves.peer_review_model == self._f.valves.cot_model_level3
+        )
+
+        if _same_model:
             self._f._log_debug(
-                f"generate_predictions: skeleton unavailable "
-                f"({type(e).__name__}: {e}) — "
-                f"predictions generated without code structure context"
+                "peer_review: degrading to devil's advocate "
+                "(peer_review_model not set or identical to cot_model_level3)"
             )
+            critique = await self.challenge_hypothesis(hypothesis, evidence, project_id)
+            return PeerReviewResult(
+                verdict="QUALIFY" if critique else "APPROVE",
+                critiques=[critique] if critique else [],
+                reviewer_model="internal_devil_advocate",
+                is_external=False,
+            )
+
+        self._f._log_debug(
+            f"peer_review: using external model "
+            f"'{self._f.valves.peer_review_model}'"
+        )
+        await self._f._emit_status(
+            f"🔍 Peer review with {self._f.valves.peer_review_model}..."
+        )
+
+        evidence_summary = self._format_raw_evidence_for_review(evidence, design)
 
         prompt = (
-            f"Hypothesis:\n{hypothesis}\n\n"
-            + (
-                f"Code structure (signatures only):\n{skeleton_ctx}\n\n"
-                if skeleton_ctx
-                else ""
-            )
-            + "If this hypothesis is correct, what additional structural facts "
-            "MUST be true in the codebase?\n"
-            "List 2-3 concrete, directly verifiable claims "
-            "(e.g. 'X calls Y', 'Z exists', 'A inherits from B').\n"
-            "Only include claims checkable against the symbol graph.\n"
-            "Do NOT repeat claims already explicit in the hypothesis.\n\n"
-            'Output only the JSON object: {"predictions": ["claim1", "claim2"]}'
+            f"Hypothesis under review:\n{hypothesis}\n\n"
+            f"Verified structural evidence from the codebase:\n"
+            f"{evidence_summary}\n\n"
+            f"Find structural flaws:\n"
+            f"1. Does the hypothesis assume relations the evidence contradicts?\n"
+            f"2. Does it ignore critical symbols present in the evidence?\n"
+            f"3. Is there a simpler structural explanation?\n\n"
+            f'Output only the JSON object, e.g. {{"verdict": "QUALIFY", '
+            f'"critiques": ["X calls Y but edge not found"]}}'
         )
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
-                "You are a structural prediction generator for software architecture. "
-                "Output ONLY a valid JSON object with key 'predictions' "
-                "(list of strings). "
+                "You are an independent software architecture auditor. "
+                "You have NOT seen the reasoning that generated this hypothesis — "
+                "only the hypothesis and raw structural evidence. "
+                "Output ONLY a valid JSON object with 'verdict' "
+                "(APPROVE | REJECT | QUALIFY) and 'critiques' (list of strings). "
                 "Your entire response must start with { and end with }."
             ),
-            model_override=self._f.valves.cot_model_level3,
+            model_override=self._f.valves.peer_review_model,
             max_tokens=0,
-            temperature=0.3,
-            label="generate_predictions",
+            temperature=0.0,
+            label="peer_review_llm",
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
 
         if not response:
-            return []
-
-        data, how = self._parse_json_contract(response)
-        if data is None:
-            self._f._log_debug(
-                f"generate_predictions: parse error — {response[:200]!r}"
-            )
-            return []
-        # The prompt asks for 2-3; 5 tolerates enthusiasm, the dedupe kills
-        # the repetition loop's copies.
-        predictions = self._dedupe_claims(data.get("predictions", []) or [], 5)
-        self._f._log_debug(
-            f"generate_predictions: {len(predictions)} prediction(s) "
-            f"(skeleton_ctx={'yes' if skeleton_ctx else 'no'})"
-            + (
-                " (salvaged from a truncated/fenced response)"
-                if how == "salvaged"
-                else ""
-            )
-        )
-        return predictions
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # 3. Active Learning (H4)
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def _identify_missing_information(
-        self,
-        design: "ExperimentDesign",
-        project_id: str,
-    ) -> List[str]:
-        """
-        Active Learning: identify unknown_claims that mention symbols
-        present in the SymbolGraph but not recognized as verifiable
-        by the experiment design.
-
-        These are 'almost verifiable' claims — the LLM classified them
-        as unknown, but we CAN check them structurally.
-
-        Deterministic — no LLM. Pure SymbolGraph lookup.
-        Gated by enable_active_learning valve.
-        """
-        if not self._f.valves.enable_active_learning:
-            return []
-        if not design.unknown_claims:
-            return []
-
-        all_names = self._f._symbol_index.get_all_names(project_id)
-        resolvable: List[str] = []
-
-        for claim in design.unknown_claims:
-            words = set(re.findall(r"\b\w+\b", claim))
-            candidates = words.intersection(all_names)
-            resolvable.extend(candidates)
-
-        return list(set(resolvable))
-
-    def _resolve_unknown_claims(
-        self,
-        design: "ExperimentDesign",
-        resolvable_symbols: List[str],
-        project_id: str,
-    ) -> "ExperimentDesign":
-        """
-        Active Learning: reclassify unknown_claims as supportive_claims
-        when their mentioned symbols exist in the SymbolGraph.
-
-        Deterministic reclassification — no LLM.
-        Effect: increases coverage_score before falsification runs.
-
-        Limited to active_learning_max_reclassifications to avoid
-        over-expanding the verification scope.
-        Invalidates the design cache entry so the next hit re-fetches
-        the updated design.
-        """
-        if not resolvable_symbols:
-            return design
-
-        max_reclass = self._f.valves.active_learning_max_reclassifications
-        new_supportive = list(design.supportive_claims)
-        new_unknown = []
-        reclassified = 0
-
-        for claim in design.unknown_claims:
-            if reclassified >= max_reclass:
-                new_unknown.append(claim)
-                continue
-            words = set(re.findall(r"\b\w+\b", claim))
-            if words.intersection(set(resolvable_symbols)):
-                new_supportive.append(claim)
-                reclassified += 1
-                self._f._log_debug(
-                    f"active_learning: reclassified unknown → supportive: "
-                    f"'{claim[:60]}'"
-                )
-            else:
-                new_unknown.append(claim)
-
-        if reclassified > 0:
-            self._f._log_debug(f"active_learning: {reclassified} claim(s) reclassified")
-            h_hash = design.hypothesis_hash
-            if h_hash in self._design_cache:
-                del self._design_cache[h_hash]
-
-        return ExperimentDesign(
-            critical_claims=design.critical_claims,
-            supportive_claims=new_supportive,
-            unknown_claims=new_unknown,
-            hypothesis_hash=design.hypothesis_hash,
-        )
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # 4. Competition loop helpers
-    # ═══════════════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def _parse_hypotheses_from_response(
-        text: str,
-    ) -> List[Tuple[str, float]]:
-        """
-        Extract (hypothesis_text, confidence) pairs from an LLM response.
-
-        Accepts two formats:
-            Hypothesis N: <text>        ← standard scientific reasoning
-            Design Option N: <text>     ← architecture reasoning
-        Both followed by: Confidence: <0.0-1.0>
-        """
-        results = []
-        pattern = re.compile(
-            r"(?:(?:Design\s+)?(?:Option|Hypothesis))\s*\d*\s*:\s*"
-            r"(.+?)\s*Confidence\s*:\s*([\d.]+)",
-            re.IGNORECASE | re.DOTALL,
-        )
-        for match in pattern.finditer(text):
-            hyp_text = match.group(1).strip().rstrip(".")
-            try:
-                conf = float(match.group(2))
-                conf = max(0.0, min(1.0, conf))
-            except ValueError:
-                conf = 0.5
-            results.append((hyp_text, conf))
-        return results
-
-    def _detect_stagnation(
-        self,
-        obj_score_history: List[float],
-        window: int = 2,
-        min_delta: float = 0.02,
-    ) -> bool:
-        """
-        Detect stagnation in the OBJECTIVE score (SymbolGraph-based).
-        ITERATION LEVEL (H5 temporal hierarchy).
-
-        Critical: uses obj_score_history, NOT combined score history.
-        llm_conf is self-reported by the LLM and unreliable as a
-        convergence signal. The SymbolGraph-derived obj_score is the
-        only trustworthy measure of progress.
-
-        Returns True if obj_score hasn't improved by min_delta
-        in the last `window` iterations.
-        """
-        if len(obj_score_history) < window + 1:
-            return False
-        recent = obj_score_history[-(window + 1) :]
-        improvement = max(recent) - recent[0]
-        return improvement < min_delta
-
-    @staticmethod
-    def _strategy_label(
-        strategy: Dict[str, Any], stagnated: bool, charter_on: bool
-    ) -> str:
-        """
-        One-line human label of the strategy driving THIS iteration.
-
-        Rendered into the competition status so the step announces HOW it is
-        weighing evidence, not just how many hypotheses remain. Built from
-        the same adaptive-strategy dict and stagnation flag that shape the
-        deterministic refinement constraints, so the label never drifts from
-        the actual behaviour.
-        """
-        parts: List[str] = []
-        if charter_on:
-            parts.append("falsify-first")
-        if strategy.get("suggest_divergent_start") or stagnated:
-            parts.append("diverging")
-        if (
-            strategy.get("prefer_symbol_verification")
-            or strategy.get("call_fail_rate", 0.0) > 0.6
-        ):
-            parts.append("symbol-existence > call-graph")
-        if strategy.get("avg_historical_coverage", 1.0) < 0.5:
-            parts.append("demand atomic claims")
-        if not parts:
-            parts.append("balanced obj+llm")
-        return ", ".join(parts)
-
-    def _build_refinement_constraints(
-        self,
-        coverage_score: float,
-        strategy: Dict[str, Any],
-        stagnated: bool,
-    ) -> str:
-        """
-        Build deterministic prompt constraints based on objective metrics.
-        ITERATION LEVEL — PID output injected into LLM inputs.
-
-        The LLM receives constraints derived from SymbolGraph reality —
-        NOT self-evaluation requests. It never knows these are
-        metacognitive adjustments. This is the PID/OODA control loop:
-        objective signals → prompt modifications → better LLM outputs.
-
-        Three constraint types (all deterministic):
-        1. Coverage: when evidence is sparse → demand atomic verifiable claims
-        2. Pattern: when a failure mode dominates this project historically
-        3. Divergence: when stagnation was detected → demand new directions
-
-        Additionally, when hypothesis_principles_charter is on, a fixed
-        epistemic charter is prepended: the distilled comparison principles
-        (falsification asymmetry, diagnosticity, explanatory power over ALL
-        symptoms, testability preference, parsimony as tiebreaker only, the
-        severity exception, no ad-hoc rescues). Deterministic text, same
-        PID philosophy: the model is TOLD how to weigh evidence instead of
-        being asked to introspect about it.
-        """
-        constraints: List[str] = []
-
-        if self._f.valves.hypothesis_principles_charter:
-            constraints.append(
-                "EPISTEMIC PRINCIPLES (apply when proposing and defending "
-                "hypotheses):\n"
-                "- Falsification asymmetry: one refuted structural "
-                "entailment outweighs any amount of supporting prose. For "
-                "each hypothesis, state first what would DISPROVE it.\n"
-                "- Diagnosticity: evidence consistent with every rival is "
-                "worthless; prefer claims that DISTINGUISH this hypothesis "
-                "from its rivals.\n"
-                "- Explanatory power: the hypothesis must account for ALL "
-                "observed symptoms (e.g. 'intermittent', 'only on "
-                "continuations'), not a subset; a partial explanation must "
-                "name what it leaves unexplained.\n"
-                "- Testability: prefer hypotheses that make concrete, "
-                "checkable structural predictions (named symbols, call "
-                "relations); a hypothesis with no checkable entailment "
-                "ranks BELOW one that risks refutation.\n"
-                "- Parsimony is a TIEBREAKER only: simplicity never "
-                "outranks evidence.\n"
-                "- Severity exception: a hypothesis implying silent state "
-                "corruption, cache poisoning, data loss or a concurrency "
-                "hazard deserves early testing even at low prior "
-                "probability.\n"
-                "- Domain extension vs ad-hoc rescue: ONE conditional "
-                "clause may legitimately save a hypothesis ('this only "
-                "occurs while the freeze window is active') PROVIDED the "
-                "clause itself is independently checkable — name the "
-                "symbol, flag or relation that decides the condition. A "
-                "clause that cannot be checked is an ad-hoc rescue, not an "
-                "extension. A SECOND rescue clause on the same hypothesis "
-                "means it is degenerating: say so and rank it down instead "
-                "of patching it again."
-            )
-
-        if coverage_score < self._f.valves.low_coverage_threshold:
-            constraints.append(
-                "CONSTRAINT: Many claims in the previous hypothesis could not be "
-                "verified structurally. In the new hypotheses, express all claims "
-                "as direct, atomic checks: symbol existence ('X exists'), call "
-                "relations ('A calls B'), or inheritance ('C inherits D'). "
-                "Avoid abstract architectural descriptions without structural anchors."
-            )
-
-        call_fail_rate = strategy.get("call_fail_rate", 0.0)
-        if call_fail_rate > 0.6:
-            constraints.append(
-                "CONSTRAINT: In this codebase, call relation claims frequently "
-                "fail structural verification. Prioritize hypotheses grounded in "
-                "symbol existence over call graph assumptions."
-            )
-        elif strategy.get("prefer_symbol_verification"):
-            constraints.append(
-                "CONSTRAINT: Symbol existence checks are more reliable than "
-                "call relation checks in this codebase. Weight them accordingly."
-            )
-
-        if stagnated:
-            constraints.append(
-                "CONSTRAINT: Previous hypotheses converged without reaching the "
-                "confidence threshold. Generate structurally diverse alternatives. "
-                "Consider indirect dependencies, non-obvious modules, or "
-                "completely different root causes. Avoid variations of the "
-                "previous hypothesis."
-            )
-
-        return "\n".join(constraints) if constraints else ""
-
-    @staticmethod
-    def _dedupe_hypotheses(
-        hyps: List[Tuple[str, float]], cap: int = 0, protect: int = 0
-    ) -> List[Tuple[str, float]]:
-        """
-        Drop near-duplicate hypothesis texts, keeping first occurrence.
-
-        Uses difflib's real ratio() (deterministic, zero model calls) with a
-        0.8 similarity threshold — a CE-based semantic dedupe was rejected as
-        one extra model pass for marginal gain on <10 short sentences.
-
-        ratio(), not quick_ratio(): the latter is a cheap UPPER BOUND that
-        compares character multisets and ignores order, so two hypotheses
-        about the same code — inevitably sharing vocabulary ("cache", "slot",
-        "restore", and every Spanish stopword) — clear 0.8 while describing
-        completely different mechanisms. Thresholding an upper bound
-        over-detects duplicates by construction; observed live, a divergent
-        pool of 3 originals + 2 new collapsed to 2, destroying rivals the
-        planner had legitimately enumerated.
-
-        Args:
-            hyps: (text, confidence) tuples in priority order.
-            cap: Optional maximum kept (0 = no cap).
-            protect: The first N entries are kept unconditionally. A merge
-                that exists to WIDEN a rival set must never drop what it
-                started with; only the additions are filtered against it.
-
-        Returns:
-            Deduplicated list, order preserved.
-        """
-        # ── Step 1: sequential near-duplicate filter ────────────────────────
-        kept: List[Tuple[str, float]] = []
-        for _i, (text, conf) in enumerate(hyps):
-            t = (text or "").strip()
-            if not t:
-                continue
-            if _i < protect:
-                kept.append((t, conf))
-                continue
-            dup = any(
-                difflib.SequenceMatcher(None, t.lower(), k.lower()).ratio() > 0.8
-                for k, _ in kept
-            )
-            if not dup:
-                kept.append((t, conf))
-        # ── Step 2: optional cap ────────────────────────────────────────────
-        if cap > 0:
-            kept = kept[:cap]
-        return kept
-
-    async def _generate_presearch_divergent(
-        self,
-        question: str,
-        existing: List[Tuple[str, float]],
-        n: int,
-        temperature: float,
-        project_id: str,
-        label: str = "",
-    ) -> List[Tuple[str, float]]:
-        """
-        Planner-gated divergent pool (Capa 1): widen the rival set BEFORE a
-        hypothesize-step competition with mechanically different root causes.
-
-        Fires only on planner-chosen hypothesize steps (see
-        _maybe_compete_hypothesize), never on ordinary queries. Diversity
-        lives in this exploratory pool; the competition's objective scoring
-        stays cold and does the selecting — the empirically supported split
-        (diverse pool + external evidence-based selector).
-
-        Args:
-            question: The step goal / user question driving the competition.
-            existing: Rival hypotheses already gathered from the step claims.
-            n: How many divergent additions to request.
-            temperature: Sampling temperature for the divergent call.
-            project_id: Current project identifier.
-            label: Log label prefix.
-
-        Returns:
-            (text, confidence) tuples parsed from the response; [] on failure.
-        """
-        # ── Step 1: build the contrast list ─────────────────────────────────
-        listed = "\n".join(f"- {t}" for t, _ in existing[:6]) or "- (none yet)"
-        # Popperian null hypothesis: one of the divergent slots may assert
-        # that the observed behavior has NO code cause. Costs nothing here
-        # (rides the pool); the competition falsifies it like any other.
-        null_clause = ""
-        if getattr(self._f.valves, "hypothesis_include_null", False):
-            null_clause = (
-                f"\nImportant: if it is plausible, make ONE of the {n} "
-                f"hypotheses the NULL hypothesis — that the observed behavior "
-                f"has no code cause at all (non-determinism, coincidence, an "
-                f"environmental/config artifact, or a misread of the symptom "
-                f"itself) — and give the observable that would confirm it "
-                f"(e.g. the effect not reproducing under identical inputs).\n"
-            )
-        prompt = (
-            f"Question under investigation:\n{question[:600]}\n\n"
-            f"Candidate explanations already on the table:\n{listed}\n\n"
-            f"Propose {n} ADDITIONAL hypotheses whose root-cause MECHANISM is "
-            f"different from every candidate above (different module, timing/"
-            f"ordering, state lifecycle, configuration, or the observation "
-            f"itself being misleading). For each, also name the single "
-            f"observable that would discriminate it from the others."
-            f"{null_clause}\n\n"
-            f"Hypothesis: <one concise sentence>\n"
-            f"Confidence: <0.0-1.0>"
-        )
-        # ── Step 2: high-temperature call ─────────────────────────────────
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=(
-                "You are a divergent thinking engine for software debugging. "
-                "Propose mechanically distinct hypotheses grounded in how "
-                "real codebases fail. No extra commentary."
-            ),
-            model_override=self._f.valves.cot_model_level3,
-            max_tokens=600,
-            temperature=temperature,
-            label=f"{label}_presearch_div" if label else "sci_presearch_div",
-        )
-        if not response:
-            return []
-        return MetacognitiveReasoningEngine._parse_hypotheses_from_response(response)
-
-    async def _generate_abductive_hypotheses(
-        self,
-        falsified: List["ScoredHypothesis"],
-        max_hypotheses: int,
-        project_id: str,
-        label: str = "",
-    ) -> List[Tuple[str, float]]:
-        """
-        Epistemic-bankruptcy escape (Capa 3): every hypothesis died, so the
-        true cause lies OUTSIDE the assumption space they shared.
-
-        One call, two moves: name the assumption all dead hypotheses share,
-        then negate it and propose mechanisms that only make sense in that
-        inverted world. Grounded in each hypothesis's falsification_reason —
-        abduction anchored in why things failed, not free-floating
-        creativity. COMPETITION LEVEL — fires at most once per competition
-        (enforced by the caller).
-
-        Args:
-            falsified: Scored hypotheses from the iteration where all died.
-            max_hypotheses: How many escape hypotheses to request.
-            project_id: Current project identifier.
-            label: Log label prefix.
-
-        Returns:
-            (text, confidence) tuples parsed from the response; [] on failure.
-        """
-        # ── Step 1: obituary of the dead hypothesis space ───────────────────
-        obituary = (
-            "\n".join(
-                f"- '{s.text}' — falsified: {s.falsification_reason or 'unknown'}"
-                for s in falsified
-                if s.falsified
-            )
-            or "- (no detail available)"
-        )
-        prompt = (
-            f"ALL of these hypotheses were falsified against the real code "
-            f"graph:\n{obituary}\n\n"
-            f"Step 1 — State, in ONE sentence, the ASSUMPTION they all share "
-            f"(the belief that made them all wrong together).\n"
-            f"Step 2 — Assume that assumption is FALSE. Propose "
-            f"{max_hypotheses} hypotheses that only make sense in that "
-            f"inverted world: a different mechanism each (timing/ordering, "
-            f"state lifecycle, a different module entirely, or the "
-            f"observation itself being misleading). For each, name the "
-            f"single observable that would discriminate it.\n\n"
-            f"Assumption: <one sentence>\n"
-            f"Hypothesis: <one concise sentence>\n"
-            f"Confidence: <0.0-1.0>"
-        )
-        # ── Step 2: high-temperature call ─────────────────────────────────
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=(
-                "You are an abductive reasoning engine. The entire hypothesis "
-                "space just collapsed; your job is to step outside it. Ground "
-                "every proposal in the falsification evidence provided."
-            ),
-            model_override=self._f.valves.cot_model_level3,
-            max_tokens=600,
-            temperature=0.9,
-            label=f"{label}_abductive" if label else "sci_abductive",
-        )
-        if not response:
-            return []
-        return MetacognitiveReasoningEngine._parse_hypotheses_from_response(response)
-
-    async def _generate_divergent_hypotheses(
-        self,
-        best: "ScoredHypothesis",
-        max_hypotheses: int,
-        project_id: str,
-        label: str = "",
-    ) -> List[Tuple[str, float]]:
-        """
-        Break out of local optima by generating radically alternative
-        hypotheses using a contrarian, high-temperature prompt.
-        ITERATION LEVEL — stagnation escape.
-
-        Intentionally ignores the current best hypothesis to avoid
-        anchoring on a failed direction. Uses temperature=0.9 for
-        maximum diversity.
-
-        The LLM is asked to ignore its previous reasoning — this is
-        NOT self-evaluation, it is a forced context reset.
-        """
-        neg = self.negative_evidence(best.evidence)
-
-        prompt = (
-            f"The following hypothesis has stagnated at score {best.score:.2f}:\n"
-            f"'{best.text}'\n\n"
-            f"Structural contradictions that block it:\n"
-            f"  Missing symbols: {neg['symbols_missing']}\n"
-            f"  Invalid relations: {neg['relations_invalid']}\n\n"
-            f"IGNORE the current hypothesis entirely.\n"
-            f"Propose {max_hypotheses} RADICALLY DIFFERENT explanations. "
-            f"Think contrarian: consider indirect paths, alternative root causes, "
-            f"or completely different modules as the source.\n\n"
-            f"For each:\n"
-            f"Hypothesis: <one concise sentence>\n"
-            f"Confidence: <0.0-1.0>"
-        )
-
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=(
-                "You are a divergent thinking engine for software architecture. "
-                "Your goal is to break out of local optima. "
-                "Propose the most contrarian, unexpected hypotheses grounded "
-                "in the structural evidence provided."
-            ),
-            model_override=self._f.valves.cot_model_level3,
-            max_tokens=600,
-            temperature=0.9,
-            label=f"{label}_divergent" if label else "sci_divergent",
-        )
-
-        if not response:
-            return []
-
-        new_hypotheses = self._parse_hypotheses_from_response(response)
-        if new_hypotheses:
-            self._f._log_debug(
-                f"_generate_divergent_hypotheses: {len(new_hypotheses)} "
-                f"divergent hypotheses generated"
-            )
-        return new_hypotheses if len(new_hypotheses) >= 2 else []
-
-    async def _refine_hypotheses(
-        self,
-        best: "ScoredHypothesis",
-        max_hypotheses: int,
-        project_id: str,
-        label: str = "",
-        constraints: str = "",
-    ) -> List[Tuple[str, float]]:
-        """
-        Refine hypotheses based on evidence feedback.
-        ITERATION LEVEL — convergent refinement.
-
-        Constraints from _build_refinement_constraints() are prepended
-        to the prompt. The LLM receives them as context restrictions,
-        never as self-evaluation requests.
-        """
-        neg = self.negative_evidence(best.evidence)
-        pos = self.positive_evidence(best.evidence)
-
-        evidence_feedback = (
-            f"Previous best hypothesis "
-            f"(score {best.score:.2f}, coverage {best.coverage_score:.2f}):\n"
-            f"{best.text}\n\n"
-            f"Structural evidence:\n"
-            f"- Symbols confirmed: {pos['symbols_confirmed']}\n"
-            f"- Relations confirmed: {pos['relations_confirmed']}\n"
-            f"- Symbols missing: {neg['symbols_missing']}\n"
-            f"- Relations invalid: {neg['relations_invalid']}\n"
-            f"- Recent changes: {best.evidence.recent_changes}\n"
-            f"- Objective score: {best.evidence.objective_score:.2f}\n\n"
-            f"Based on this evidence, propose {max_hypotheses} improved hypotheses. "
-            f"Address the structural contradictions. Be specific."
-        )
-
-        full_prompt = (
-            f"{constraints}\n\n{evidence_feedback}"
-            if constraints
-            else evidence_feedback
-        )
-
-        refine_prompt = (
-            f"{full_prompt}\n\n"
-            f"Output the same format:\n"
-            f"Hypothesis: <one concise sentence>\n"
-            f"Confidence: <0.0-1.0>"
-        )
-
-        refine_response = await self._f._llm_orchestrator.call_llm(
-            prompt=refine_prompt,
-            system_prompt=(
-                "You are a scientific reasoning engine refining hypotheses "
-                "based on structural evidence from the codebase."
-            ),
-            model_override=self._f.valves.cot_model_level3,
-            max_tokens=600,
-            temperature=0.4,
-            label=f"{label}_refine" if label else "sci_refine",
-        )
-
-        if not refine_response:
-            return []
-
-        new_hypotheses = self._parse_hypotheses_from_response(refine_response)
-        return new_hypotheses if len(new_hypotheses) >= 2 else []
-
-    async def compete_hypotheses(
-        self,
-        hypotheses: List[Tuple[str, float]],
-        project_id: str,
-        max_iters: int = 3,
-        threshold: float = 0.75,
-        label: str = "",
-        obj_weight: float = 0.5,
-        llm_weight: float = 0.5,
-        question: str = "",
-    ) -> Tuple[str, float, "StaticEvidence", Optional["PeerReviewResult"]]:
-        """
-        Full scientific hypothesis competition loop.
-
-        Temporal hierarchy (H5):
-        ITERATION:     stagnation detection on obj_score_history (NOT combined —
-                       llm_conf excluded as self-reported signal),
-                       _build_refinement_constraints (PID output → LLM input),
-                       divergent thinking on stagnation escape
-        TURN:          design_critical_experiment, generate_predictions (iter 1),
-                       gather_evidence, Active Learning (H4),
-                       is_falsified (with coverage guard), compute_weighted_score,
-                       _compute_epistemic_uncertainty
-        CONVERSATION:  experimentum_crucis (tiebreaker when top-2 within threshold),
-                       devil's advocate (signal: score > 0.8, overconfidence risk),
-                       peer_review (antithesis, gated by uncertainty + valve),
-                       delimit_scope (synthesis, H6 dialectical order —
-                       always AFTER peer_review so critique informs synthesis)
-        PROJECT:       _debrief_competition → _performance_history (all iterations,
-                       including total-failure case)
-                       → _get_adaptive_strategy (next call)
-
-        H6 (Dialectical order): peer_review BEFORE delimit_scope.
-        The antithesis (critique) must be known before synthesis (scope).
-
-        obj_weight / llm_weight:
-            0.5/0.5 default — verification: evidence and LLM equally weighted
-            0.4/0.6 for architecture — proposing changes, design judgment > evidence
-
-        The competition is unclocked by design. It used to accept a
-        deadline_s ceiling that could stop it between hypotheses before
-        convergence — a clock-based quality cut that the GOVERNING
-        PRINCIPLES rule out: iterations 2+ only run when no hypothesis
-        convinced, so cutting them removes exploration exactly where it
-        is needed most. The natural bounds are sufficient and stay: a
-        finite hypothesis set, max_iters, the convergence threshold on a
-        measured score, and call_llm's anti-hang backstop under every
-        call.
-
-        Returns (best_hypothesis_text, best_score, best_evidence, peer_review).
-        """
-        max_hypotheses = len(hypotheses)
-
-        # Parked pool (park, don't kill): falsified hypotheses are never
-        # deleted — all_scored already keeps them for the debrief — but
-        # until now they were unreachable afterwards. This run-scoped list
-        # exposes them (text + falsification reason) so the refutation
-        # retry in the orchestrator can offer them as recoverable rivals:
-        # a statically-falsified hypothesis becomes worth revisiting
-        # precisely when the verify step later refutes the WINNER, i.e.
-        # when the static evidence that killed it proved misleading.
-        self._last_parked: List[Tuple[str, str]] = []
-
-        # Null hypothesis baseline — always included as floor comparison
-        null_hyp = (
-            "The behavior follows the most direct structural path "
-            "without additional indirection or hidden dependencies.",
-            0.5,
-        )
-        if not any(h[0] == null_hyp[0] for h in hypotheses):
-            hypotheses = [null_hyp] + list(hypotheses)
-
-        # PROJECT LEVEL: adaptive strategy from history
-        strategy = self._get_adaptive_strategy(project_id)
-        if strategy.get("suggest_divergent_start"):
-            self._f._log_debug(
-                "compete_hypotheses: adaptive strategy suggests divergent start "
-                "(high stagnation rate in project history)"
-            )
-
-        best_scored: Optional["ScoredHypothesis"] = None
-        runner_up: Optional["ScoredHypothesis"] = None
-        obj_score_history: List[float] = []  # obj_score ONLY — no llm_conf
-        stagnated_this_run = False
-        abductive_used = False
-        _ec10_exempted = 0  # EC-10: funnel-prune exemptions used
-        # EC-6 (explanatory power): the question's anchor identifiers —
-        # words that name symbols the index actually knows. A rival
-        # whose CONFIRMED checks touch more anchors explains more of
-        # what the user asked about; at equal verification and equal
-        # parsimony, that breadth is the remaining honest
-        # discriminator. Computed once per competition, capped so a
-        # keyword-stuffed question cannot dominate the tie-break.
-        _ec6_anchors: Set[str] = set()
-        if question:
-            try:
-                for _w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question):
-                    if len(_ec6_anchors) >= 12:
-                        break
-                    if self._qid_exists(_w, project_id):
-                        _ec6_anchors.add(_w)
-            except Exception:
-                _ec6_anchors = set()
-        valid_scored: List["ScoredHypothesis"] = []
-        all_scored: List["ScoredHypothesis"] = []  # Bug 7: all iterations
-        # R30: sanitize the ENTRY pool the same way later iterations are.
-        # dedup+cap was applied to the caller's initial set and to the
-        # refine/divergent/abductive pools inside the loop (via
-        # _sanitize_pool), but iteration 1 consumed 'hypotheses' raw — so a
-        # generator that emitted more rivals than the cap (claim inflation
-        # on the first enumeration) surfaced as 'Evaluating 13' in the
-        # status even though the cap is 7. Running the same _sanitize_pool
-        # here makes the first iteration obey the same ceiling as every
-        # other, and the emitted count reflects what is actually scored.
-        # The null baseline is prepended AFTER, so it is never dropped by
-        # the cap and the floor comparison always runs.
-        hypotheses = [h for h in hypotheses if h[0] != null_hyp[0]]
-        hypotheses = self._sanitize_pool(hypotheses, label, "initial")
-        if not any(h[0] == null_hyp[0] for h in hypotheses):
-            hypotheses = [null_hyp] + list(hypotheses)
-        iteration = 0
-
-        while iteration < max_iters:
-            iteration += 1
-            current_scored: List["ScoredHypothesis"] = []
-
-            await self._f._emit_status(
-                f"🔬 Evaluating {len(hypotheses)} hypotheses "
-                f"(iteration {iteration}/{max_iters}) — "
-                + self._strategy_label(
-                    strategy,
-                    stagnated_this_run,
-                    self._f.valves.hypothesis_principles_charter,
-                )
-            )
-
-            # ITERATION LEVEL: PID constraints from previous iteration's results
-            _constraints = self._build_refinement_constraints(
-                coverage_score=best_scored.coverage_score if best_scored else 1.0,
-                strategy=strategy,
-                stagnated=stagnated_this_run,
-            )
-
-            # TURN LEVEL: evaluate each hypothesis
-            for hyp_text, llm_conf in hypotheses:
-
-                # ① Gather evidence FIRST — it is free (no LLM, no GPU) and
-                # it is what lets the design step below know which claims
-                # this graph can actually settle. Designing blind and then
-                # gathering was the original order, and it produced 44
-                # claims across 7 designs with zero of them resolvable.
-                evidence = self.gather_evidence(hyp_text, project_id)
-
-                # EC-8 (the funnel): differential-diagnosis elimination —
-                # spend the least to discard the most improbable. The
-                # evidence above is FREE; the design call below is the
-                # expensive step (~20s of GPU each). A hypothesis whose
-                # free evidence shows a rich check base with multiple
-                # refutations and NOTHING confirmed is the invented-
-                # citation profile (the run's 29 falsifications, all
-                # 'relation does not exist') — every observed instance
-                # paid its design call and died anyway. Prune it here
-                # for free. Conservative: one confirmed check, or a
-                # sparse base (<3 checks — mirrors the coverage guard's
-                # distrust of thin evidence), exempts the hypothesis.
-                if getattr(self._f.valves, "agentic_funnel_prune", True):
-                    _n_conf = sum(
-                        1 for v in evidence.symbols_found.values() if v
-                    ) + sum(1 for v in evidence.call_relations_valid.values() if v)
-                    _n_checked = len(evidence.symbols_found) + len(
-                        evidence.call_relations_valid
-                    )
-                    _n_refuted = _n_checked - _n_conf
-                    if _n_checked >= 3 and _n_refuted >= 2 and _n_conf == 0:
-                        # EC-10 (precaution): a hypothesis implying
-                        # catastrophic consequences never gets pruned
-                        # unexamined, however improbable — dismissing a
-                        # data-corruption mechanism on cheap static
-                        # checks alone is the one mistake this engine
-                        # must not make. Capped at 2 per competition so
-                        # keyword over-matching can never neuter the
-                        # funnel wholesale.
-                        if _ec10_exempted < 2 and _EC10_CRITICAL_RE.search(hyp_text):
-                            _ec10_exempted += 1
-                            self._f._log_debug(
-                                f"EC-10 precaution: critical-severity "
-                                f"hypothesis exempted from the funnel "
-                                f"prune ({_ec10_exempted}/2): "
-                                f"'{hyp_text[:60]}'"
-                            )
-                        else:
-                            _reason = (
-                                f"EC-8 funnel: {_n_refuted}/{_n_checked} "
-                                f"static checks refuted, 0 confirmed — "
-                                f"pruned before the design call"
-                            )
-                            self._f._log_debug(
-                                f"compete_hypotheses iter {iteration}: "
-                                f"{_reason} ('{hyp_text[:60]}')"
-                            )
-                            current_scored.append(
-                                ScoredHypothesis(
-                                    text=hyp_text,
-                                    score=0.0,
-                                    llm_conf=llm_conf,
-                                    obj_score=0.0,
-                                    evidence=evidence,
-                                    design=ExperimentDesign(
-                                        critical_claims=[],
-                                        supportive_claims=[],
-                                        unknown_claims=[],
-                                    ),
-                                    falsified=True,
-                                    falsification_reason=_reason,
-                                    coverage_score=0.0,
-                                    epistemic_uncertainty=1.0,
-                                )
-                            )
-                            continue
-
-                # ② Design experiment, bounded by that evidence (cached
-                # after first occurrence, keyed on hypothesis + evidence)
-                design = await self.design_critical_experiment(
-                    hyp_text, project_id, evidence=evidence
-                )
-
-                # ③ Generate predictions (first iteration only — costly LLM call)
-                predictions: List[str] = []
-                if iteration == 1:
-                    predictions = await self.generate_predictions(hyp_text, project_id)
-
-                # ④ Verify predictions via secondary evidence pass
-                pred_verified = 0
-                pred_total = 0
-                if predictions:
-                    pred_evidence = self.gather_evidence(
-                        " ".join(predictions), project_id
-                    )
-                    pred_verified = sum(
-                        1 for v in pred_evidence.symbols_found.values() if v
-                    ) + sum(1 for v in pred_evidence.call_relations_valid.values() if v)
-                    pred_total = len(pred_evidence.symbols_found) + len(
-                        pred_evidence.call_relations_valid
-                    )
-
-                # ⑤ Active Learning (H4) — reclassify unknown claims
-                # Signal: initial coverage below threshold AND unknown claims
-                # mention verifiable symbols
-                initial_coverage = self._compute_coverage_score(design)
-                if initial_coverage < self._f.valves.low_coverage_threshold:
-                    resolvable = self._identify_missing_information(design, project_id)
-                    if resolvable:
-                        design = self._resolve_unknown_claims(
-                            design, resolvable, project_id
-                        )
-                        # ⑥ Re-gather with improved design (more claims verifiable)
-                        evidence = self.gather_evidence(hyp_text, project_id)
-                        self._f._log_debug(
-                            f"active_learning: re-gathered after reclassification "
-                            f"(was coverage={initial_coverage:.2f})"
-                        )
-
-                # ⑦ Falsification with coverage guard
-                # The guard asks "did we inspect enough of this hypothesis
-                # to trust a refutation?", so it must be fed what was
-                # actually resolved, not what the classifier promised was
-                # resolvable. Active Learning above keeps the DECLARED
-                # number on purpose: it reasons about the unknown bucket.
-                current_coverage, _cov_res, _cov_tot = self._compute_effective_coverage(
-                    design, evidence, project_id
-                )
-                falsified, reason = self.is_falsified(
-                    evidence,
-                    design,
-                    coverage_score=current_coverage,
-                    project_id=project_id,
-                )
-
-                if falsified:
-                    self._f._log_debug(
-                        f"compete_hypotheses iter {iteration}: " f"FALSIFIED — {reason}"
-                    )
-                    current_scored.append(
-                        ScoredHypothesis(
-                            text=hyp_text,
-                            score=0.0,
-                            llm_conf=llm_conf,
-                            obj_score=0.0,
-                            evidence=evidence,
-                            design=design,
-                            falsified=True,
-                            falsification_reason=reason,
-                            coverage_score=current_coverage,
-                            epistemic_uncertainty=1.0,
-                        )
-                    )
-                    continue
-
-                # Downgrade: reason returned but not killed (coverage guard active)
-                downgraded_reason = reason if (not falsified and reason) else None
-
-                # ⑧ Weighted scoring with obj/llm balance
-                obj_score, combined, coverage_score = self.compute_weighted_score(
-                    evidence,
-                    design,
-                    llm_conf,
-                    pred_verified,
-                    pred_total,
-                    downgraded_reason=downgraded_reason,
-                    obj_weight=obj_weight,
-                    llm_weight=llm_weight,
-                    project_id=project_id,
-                )
-
-                # ⑨ Epistemic uncertainty (H2 — Bayesian-inspired, deterministic)
-                epistemic_uncertainty = self._compute_epistemic_uncertainty(
-                    obj_score, coverage_score, pred_verified, pred_total
-                )
-
-                self._f._log_debug(
-                    f"compete_hypotheses iter {iteration}: "
-                    f"'{hyp_text[:60]}...' "
-                    f"score={combined:.3f} "
-                    f"(obj={obj_score:.3f}, llm_conf={llm_conf:.3f}, "
-                    f"coverage={coverage_score:.2f}, "
-                    f"uncertainty={epistemic_uncertainty:.2f}, "
-                    f"pred={pred_verified}/{pred_total})"
-                )
-
-                current_scored.append(
-                    ScoredHypothesis(
-                        text=hyp_text,
-                        score=combined,
-                        llm_conf=llm_conf,
-                        obj_score=obj_score,
-                        evidence=evidence,
-                        design=design,
-                        falsified=False,
-                        falsification_reason=downgraded_reason,
-                        predictions_verified=pred_verified,
-                        predictions_total=pred_total,
-                        coverage_score=coverage_score,
-                        epistemic_uncertainty=epistemic_uncertainty,
-                    )
-                )
-
-            # Bug 7: accumulate ALL iterations for project-level debriefing
-            all_scored.extend(current_scored)
-
-            # Refresh the parked pool from everything scored so far: newest
-            # last, deduplicated by text, capped. Updated every iteration so
-            # every return path below leaves it populated.
-            _seen_parked: set = set()
-            self._last_parked = []
-            for _ps in all_scored:
-                if _ps.falsified and _ps.text not in _seen_parked:
-                    _seen_parked.add(_ps.text)
-                    self._last_parked.append(
-                        (_ps.text, _ps.falsification_reason or "falsified")
-                    )
-            self._last_parked = self._last_parked[-5:]
-
-            # Sort: non-falsified by combined score descending
-            valid_scored = [s for s in current_scored if not s.falsified]
-            valid_scored.sort(key=lambda x: x.score, reverse=True)
-            # EC-3 (parsimony): Occam's tie-break. EC-4 widened the
-            # score spread, but survivors can still land within noise
-            # of each other — and a ratio-plus-count score has no
-            # opinion on which of two equally-verified rivals is the
-            # SIMPLER explanation. The parsimony principle does: prefer
-            # the hypothesis needing fewer assumptions. An assumption
-            # is a claim the graph could not resolve — derived
-            # deterministically from the already-computed coverage
-            # (unresolvable fraction x claims declared), zero new
-            # checks. Only the group within epsilon of the leader is
-            # reordered; everything below keeps pure score order, so
-            # this can never promote a clearly-worse hypothesis.
-            _eps = float(getattr(self._f.valves, "agentic_parsimony_epsilon", 0.05))
-            if _eps > 0.0 and len(valid_scored) >= 2:
-                _top = valid_scored[0].score
-                _tied = [s for s in valid_scored if _top - s.score <= _eps]
-                if len(_tied) > 1:
-
-                    def _assumptions(s: "ScoredHypothesis") -> int:
-                        _n = len(getattr(s.design, "critical_claims", [])) + len(
-                            getattr(s.design, "supportive_claims", [])
-                        )
-                        _cov = max(0.0, min(1.0, s.coverage_score or 0.0))
-                        return max(0, round((1.0 - _cov) * _n))
-
-                    # EC-6: at equal simplicity, prefer the rival whose
-                    # CONFIRMED checks touch more of the question's
-                    # anchors — the one explaining more of what was
-                    # actually asked. Endpoints of confirmed relation
-                    # checks count, including EC-5's negatives (knowing
-                    # X does NOT call Y is explanatory too).
-                    def _explanatory(s: "ScoredHypothesis") -> int:
-                        if not _ec6_anchors:
-                            return 0
-                        _touched: Set[str] = set()
-                        for _k, _v in s.evidence.symbols_found.items():
-                            if _v:
-                                _touched.add(_k)
-                        for _k, _v in s.evidence.call_relations_valid.items():
-                            if not _v:
-                                continue
-                            _sep = "_not_calls_" if "_not_calls_" in _k else "_calls_"
-                            _a, _, _b = _k.partition(_sep)
-                            _touched.add(_a)
-                            _touched.add(_b)
-                        return len(_touched & _ec6_anchors)
-
-                    _before = _tied[0]
-                    _tied.sort(
-                        key=lambda s: (
-                            _assumptions(s),
-                            -_explanatory(s),
-                            -s.score,
-                        )
-                    )
-                    if _tied[0] is not _before:
-                        self._f._log_debug(
-                            f"EC-3 parsimony: {len(_tied)} survivors "
-                            f"within eps={_eps:.2f} — tie broken by "
-                            f"fewest assumptions "
-                            f"({_assumptions(_tied[0])} vs "
-                            f"{_assumptions(_before)}): "
-                            f"'{_tied[0].text[:60]}' overtakes "
-                            f"'{_before.text[:60]}'"
-                        )
-                    _tied_ids = {id(s) for s in _tied}
-                    valid_scored = _tied + [
-                        s for s in valid_scored if id(s) not in _tied_ids
-                    ]
-
-            if not valid_scored:
-                # COMPETITION LEVEL — epistemic bankruptcy: every hypothesis
-                # died this iteration. Before surrendering, try one abductive
-                # escape that negates the assumption they all shared. Fires at
-                # most once, only with iterations left; on success the escaped
-                # hypotheses re-enter the same falsification machinery below.
-                if (
-                    self._f.valves.enable_abductive_escape
-                    and not abductive_used
-                    and iteration < max_iters
-                ):
-                    abductive_used = True
-                    await self._f._emit_status(
-                        "🕵️ All hypotheses falsified — abductive escape…"
-                    )
-                    self._f._log_debug(
-                        f"compete_hypotheses iter {iteration}: all falsified "
-                        f"→ abductive escape"
-                    )
-                    escaped = await self._generate_abductive_hypotheses(
-                        current_scored, max_hypotheses, project_id, label
-                    )
-                    if escaped:
-                        hypotheses = self._sanitize_pool(escaped, label, "abductive")
-                        obj_score_history = []  # inverted world, new baseline
-                        continue
-                self._f._log_debug(
-                    f"compete_hypotheses iter {iteration}: all hypotheses falsified"
-                )
-                break
-
-            best_scored = valid_scored[0]
-            runner_up = valid_scored[1] if len(valid_scored) >= 2 else None
-
-            # ITERATION LEVEL: track obj_score ONLY (deterministic SymbolGraph signal)
-            # llm_conf excluded — self-reported by LLM, unreliable for convergence
-            obj_score_history.append(best_scored.obj_score)
-
-            # Convergence gate: a high ABSOLUTE score is necessary but not
-            # sufficient. A winner at 0.90 with a runner-up at 0.89 has not
-            # been discriminated from the field — it just scored well in
-            # isolation, and every hypothesis IS scored each iteration, so
-            # the field data to judge decisiveness is already in hand.
-            # agentic_competition_early_converge can disable the score-based
-            # exit entirely (run every iteration = full triage of the
-            # rivals); agentic_competition_converge_margin additionally
-            # requires the winner to beat the runner-up by a margin before
-            # declaring victory. Both default to the original behaviour.
-            _ec_on = self._f.valves.agentic_competition_early_converge
-            _margin = self._f.valves.agentic_competition_converge_margin
-            _runner_score = valid_scored[1].score if len(valid_scored) >= 2 else 0.0
-            _gap = best_scored.score - _runner_score
-            if best_scored.score >= threshold:
-                if _ec_on and _gap >= _margin:
-                    _mnote = (
-                        f", gap {_gap:.2f} ≥ {_margin:.2f} over runner-up"
-                        if _margin > 0.0
-                        else ""
-                    )
-                    await self._f._emit_status(
-                        f"🔬 Converged on iteration {iteration}/{max_iters} "
-                        f"— score {best_scored.score:.2f} ≥ {threshold:.2f}"
-                        f"{_mnote}, no further refinement needed"
-                    )
-                    self._f._log_debug(
-                        f"compete_hypotheses: converged at iteration "
-                        f"{iteration}/{max_iters} — combined score "
-                        f"{best_scored.score:.2f} >= threshold "
-                        f"{threshold:.2f} (obj={best_scored.obj_score:.2f}, "
-                        f"llm_conf={best_scored.llm_conf:.2f}, gap over "
-                        f"runner-up {_gap:.2f}) — no refinement"
-                    )
-                    break
-                # Threshold met but NOT exiting — say why, then keep going.
-                if not _ec_on:
-                    self._f._log_debug(
-                        f"compete_hypotheses iter {iteration}: score "
-                        f"{best_scored.score:.2f} ≥ threshold but early "
-                        f"convergence disabled — continuing full triage"
-                    )
-                else:
-                    self._f._log_debug(
-                        f"compete_hypotheses iter {iteration}: score "
-                        f"{best_scored.score:.2f} ≥ threshold but gap over "
-                        f"runner-up {_gap:.2f} < margin {_margin:.2f} — not "
-                        f"decisive, continuing to discriminate"
-                    )
-            if iteration >= max_iters:
-                await self._f._emit_status(
-                    f"🔬 Iteration budget exhausted ({max_iters}) — best "
-                    f"score {best_scored.score:.2f} < {threshold:.2f}, "
-                    f"keeping the leading hypothesis"
-                )
-                self._f._log_debug(
-                    f"compete_hypotheses: iteration budget exhausted "
-                    f"({max_iters}) — best combined score "
-                    f"{best_scored.score:.2f} < threshold {threshold:.2f}"
-                )
-                break
-
-            # ITERATION LEVEL: stagnation detection → diverge or refine
-            # Note: requires len(obj_score_history) >= stagnation_window + 1.
-            # Only effective when agentic_metacog_max_iters >= stagnation_window + 2.
-            # See _validate_valve_coherence for the coherence warning (Bug C).
-            if self._f.valves.enable_stagnation_detection and self._detect_stagnation(
-                obj_score_history,
-                window=self._f.valves.stagnation_window,
-                min_delta=self._f.valves.stagnation_min_delta,
-            ):
-                stagnated_this_run = True
-                self._f._log_debug(
-                    f"compete_hypotheses: stagnation detected "
-                    f"(obj_scores={obj_score_history[-3:]}) → divergent thinking"
-                )
-                await self._f._emit_status(
-                    "💡 Stagnation detected — exploring alternative hypotheses..."
-                )
-                refined = await self._generate_divergent_hypotheses(
-                    best_scored, max_hypotheses, project_id, label
-                )
-                if not refined:
-                    self._f._log_debug(
-                        f"compete_hypotheses: stopped at iteration "
-                        f"{iteration}/{max_iters} — divergent generation "
-                        f"produced no parseable hypotheses"
-                    )
-                    break
-                hypotheses = self._sanitize_pool(refined, label, "divergent")
-                # R9: keep the LAST score as the new baseline instead of
-                # wiping history. A full reset needs window+1 fresh
-                # iterations to re-arm the detector; with max_iters=4 and
-                # window=2 the reset lands at iteration 3 and the budget is
-                # exhausted before it can fire again, so a stagnated run
-                # ALWAYS burns all four iterations. Seeding the new
-                # direction with one baseline point lets the detector
-                # re-arm one iteration sooner, giving divergence a chance
-                # to show progress within budget. (The deeper cause —
-                # obj_score = verified/verifiable saturating at 1.0 when a
-                # hypothesis cites symbols that merely EXIST, so the score
-                # measures citation validity rather than causal
-                # correctness — is R8, a scoring-semantics change that
-                # needs its own validation run and is left untouched here.)
-                obj_score_history = obj_score_history[-1:]
-
-            else:
-                # Convergent refinement with deterministic PID constraints
-                refined = await self._refine_hypotheses(
-                    best_scored,
-                    max_hypotheses,
-                    project_id,
-                    label,
-                    constraints=_constraints,
-                )
-                if not refined:
-                    self._f._log_debug(
-                        f"compete_hypotheses: stopped at iteration "
-                        f"{iteration}/{max_iters} — refinement produced no "
-                        f"parseable hypotheses"
-                    )
-                    break
-                hypotheses = self._sanitize_pool(refined, label, "refine")
-
-        # ── Post-loop guard ───────────────────────────────────────────────
-        if best_scored is None:
-            self._f._log_debug(
-                "compete_hypotheses: no valid hypothesis survived — "
-                "all falsified across all iterations"
-            )
-            # Record total-failure in performance history so
-            # _get_adaptive_strategy can learn from this failure mode.
-            # Without this, the project's persistent failure pattern
-            # (e.g., always falsified by call_relations) is invisible.
-            _avg_cov = (
-                sum(s.coverage_score for s in all_scored) / len(all_scored)
-                if all_scored
-                else 0.0
-            )
-            await self._debrief_competition(
-                scored_list=all_scored,
-                final_score=0.0,
-                coverage_score=_avg_cov,
-                score_trajectory=obj_score_history,
-                stagnated=stagnated_this_run,
-                project_id=project_id,
-                abductive_used=abductive_used,
-            )
-            # Honest abstention: separate "actively refuted" (high coverage —
-            # the evidence contradicts every hypothesis) from "cannot decide"
-            # (low coverage — the indexed code does not carry enough evidence
-            # to rule anything in or out). Popper's falsified-vs-not-testable,
-            # surfaced instead of a flat failure. Verdict itself unchanged.
-            _abstain = getattr(
-                self._f.valves, "enable_abstention", False
-            ) and _avg_cov < float(
-                getattr(self._f.valves, "abstention_coverage_floor", 0.35)
-            )
-            if _abstain:
-                await self._f._emit_status("🤔 Insufficient evidence — abstaining")
-                self._f._log_debug(
-                    f"compete_hypotheses: abstaining (avg coverage "
-                    f"{_avg_cov:.2f} < floor) — evidence insufficient, not "
-                    f"refutation"
-                )
-                _msg = (
-                    "The indexed code does not carry enough evidence to "
-                    "confirm or rule out any hypothesis here (low coverage). "
-                    "This is insufficient evidence, not a refutation — the "
-                    "relevant code may be outside the index, or the behavior "
-                    "may depend on runtime state not visible statically. "
-                    "State this honestly rather than guessing a cause."
-                )
-            else:
-                self._f._log_debug(
-                    f"compete_hypotheses: no hypothesis survived — all "
-                    f"falsified (avg coverage {_avg_cov:.2f})"
-                )
-                _msg = (
-                    "Unable to validate any hypothesis against the codebase "
-                    "structure."
-                )
-            return (
-                _msg,
-                0.0,
-                StaticEvidence(
-                    symbols_found={},
-                    call_relations_valid={},
-                    recent_changes=[],
-                    entry_points_mentioned=[],
-                    objective_score=0.0,
-                ),
-                None,
-            )
-
-        # CONVERSATION LEVEL: experimentum crucis
-        # Signal: top-2 hypotheses within crucis_threshold of each other
-        if (
-            self._f.valves.enable_experimentum_crucis
-            and runner_up is not None
-            and abs(best_scored.score - runner_up.score)
-            < self._f.valves.crucis_threshold
-        ):
-            await self._f._emit_status("⚖️ Running tiebreaker experiment...")
-            crucis_winner = await self.find_experimentum_crucis(
-                best_scored.text, runner_up.text, project_id
-            )
-            if crucis_winner and crucis_winner != best_scored.text:
-                self._f._log_debug(
-                    "compete_hypotheses: experimentum crucis promoted runner-up"
-                )
-                best_scored, runner_up = runner_up, best_scored
-
-        # CONVERSATION LEVEL: devil's advocate
-        # Signal: score above agentic_devil_advocate_threshold
-        # (overconfidence risk) AND peer_review disabled. When
-        # enable_peer_review=True, challenge_hypothesis() runs internally
-        # inside the degraded peer review path — no duplication needed.
-        # Result stored as PeerReviewResult so delimit_scope (H6) can use
-        # the critique as antithesis material. The threshold was a
-        # hardcoded 0.8; it is a valve now (default 0.75) per GOVERNING
-        # PRINCIPLES Principle 3: this pass is conditional-cost,
-        # asymmetric-value insurance against the single most expensive
-        # failure — a confident-and-wrong hypothesis promoted to the
-        # final analysis — so firing it a little more often is the
-        # cheapest quality lever the competition has.
-        peer_review: Optional["PeerReviewResult"] = None
-
-        _da_thr = float(self._f.valves.agentic_devil_advocate_threshold)
-        if (
-            self._f.valves.enable_devil_advocate
-            and not self._f.valves.enable_peer_review
-            and best_scored.score > _da_thr
-        ):
-            self._f._log_debug(
-                f"compete_hypotheses: devil's advocate triggered "
-                f"(score={best_scored.score:.3f} > {_da_thr:.2f}, "
-                f"overconfidence risk)"
-            )
-            await self._f._emit_status("😈 Running devil's advocate...")
-            critique = await self.challenge_hypothesis(
-                best_scored.text, best_scored.evidence, project_id
-            )
-            if critique:
-                peer_review = PeerReviewResult(
-                    verdict="QUALIFY",
-                    critiques=[critique],
-                    reviewer_model="internal_devil_advocate",
-                    is_external=False,
-                )
-                self._f._log_debug(
-                    "compete_hypotheses: devil's advocate found flaw — "
-                    "will inform dialectical scope delimitation"
-                )
-
-        # CONVERSATION LEVEL: peer review (antithesis)
-        # Signal: enable_peer_review=True AND uncertainty >= threshold.
-        # Epistemic uncertainty gate:
-        #   score < 0.4 → uncertainty high but hypothesis already failed → noise
-        #   score > 0.85 → uncertainty low, hypothesis won clearly → wasteful
-        #   useful range [0.4, 0.85] maps to uncertainty >= threshold
-        if self._f.valves.enable_peer_review:
-            _uncertainty_justifies_review = (
-                best_scored.epistemic_uncertainty
-                >= self._f.valves.peer_review_uncertainty_threshold
-            )
-            if _uncertainty_justifies_review:
-                peer_review = await self.peer_review_hypothesis(
-                    best_scored.text,
-                    best_scored.evidence,
-                    best_scored.design,
-                    project_id,
-                )
-            else:
-                self._f._log_debug(
-                    f"compete_hypotheses: peer review skipped — "
-                    f"uncertainty={best_scored.epistemic_uncertainty:.2f} < "
-                    f"threshold={self._f.valves.peer_review_uncertainty_threshold:.2f} "
-                    f"(hypothesis result is clear enough)"
-                )
-
-        # Promote runner-up if peer review rejects winner
-        if (
-            peer_review is not None
-            and peer_review.verdict == "REJECT"
-            and runner_up is not None
-        ):
-            self._f._log_debug(
-                f"compete_hypotheses: winner REJECTED by peer review, "
-                f"promoting runner-up. "
-                f"Critiques (about demoted winner): {peer_review.critiques}"
-            )
-            best_scored = runner_up
-            # peer_review critiques describe the DEMOTED winner,
-            # not the promoted runner-up. Passing them to delimit_scope would
-            # synthesize scope for the wrong hypothesis using irrelevant critiques.
-            # Clear peer_review — the runner-up has not been independently reviewed.
-            peer_review = PeerReviewResult(
+            return PeerReviewResult(
                 verdict="APPROVE",
                 critiques=[],
-                reviewer_model="runner_up_promotion",
-                is_external=False,
+                reviewer_model=self._f.valves.peer_review_model,
+                is_external=True,
             )
 
-        # CONVERSATION LEVEL: delimit_scope (synthesis — H6)
-        # Receives peer_review AFTER antithesis is known.
-        # If peer_review is APPROVE (or runner-up was promoted), only
-        # negative structural evidence informs the scope.
-        final_text = best_scored.text
-        if self._f.valves.enable_scope_delimitation:
-            await self._f._emit_status("📐 Synthesizing scope and critique...")
-            scoped = await self.delimit_scope(
-                best_scored.text,
-                best_scored.evidence,
-                best_scored.design,
-                project_id,
-                peer_review=peer_review,  # H6: antithesis informs synthesis
+        try:
+            data = json.loads(response)
+            raw_verdict = str(data.get("verdict", "APPROVE")).strip().upper()
+            if raw_verdict not in ("APPROVE", "REJECT", "QUALIFY"):
+                raw_verdict = "APPROVE"
+            result = PeerReviewResult(
+                verdict=raw_verdict,
+                critiques=[str(c) for c in data.get("critiques", []) if c],
+                reviewer_model=self._f.valves.peer_review_model,
+                is_external=True,
             )
-            if scoped:
-                final_text = scoped
-
-        # PROJECT LEVEL: debriefing with ALL iterations (Bug 7)
-        # all_scored includes hypotheses from every iteration — gives accurate
-        # picture of failure patterns across the full competition, not just
-        # the final iteration.
-        await self._debrief_competition(
-            scored_list=all_scored,
-            final_score=best_scored.score,
-            coverage_score=best_scored.coverage_score,
-            score_trajectory=obj_score_history,
-            stagnated=stagnated_this_run,
-            project_id=project_id,
-            abductive_used=abductive_used,
-        )
-
-        self._f._log_debug(
-            f"compete_hypotheses: winner score={best_scored.score:.3f}, "
-            f"coverage={best_scored.coverage_score:.2f}, "
-            f"uncertainty={best_scored.epistemic_uncertainty:.2f}, "
-            f"stagnated={stagnated_this_run}, "
-            f"total_evaluated={len(all_scored)} across {iteration} iter(s)"
-        )
-
-        return final_text, best_scored.score, best_scored.evidence, peer_review
+            self._f._log_debug(
+                f"peer_review: verdict={result.verdict}, "
+                f"critiques={len(result.critiques)}"
+            )
+            return result
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(f"peer_review: parse error — {response[:200]!r}")
+            return PeerReviewResult(
+                verdict="APPROVE",
+                critiques=[],
+                reviewer_model=self._f.valves.peer_review_model,
+                is_external=True,
+            )
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 5. Post-competition tools
+    # 7. QueryDecomposition (Capa 1)
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def find_experimentum_crucis(
+
+
+    async def challenge_hypothesis(
         self,
-        h1: str,
-        h2: str,
+        hypothesis: str,
+        evidence: "StaticEvidence",
         project_id: str,
     ) -> Optional[str]:
         """
-        Design the minimal structural verification that distinguishes H1 from H2.
-        CONVERSATION LEVEL (H5).
+        Devil's advocate — internal reviewer with contrarian prompt.
 
-        Returns the winning hypothesis text, or None if inconclusive.
-        Returns None when the tiebreaker claim is unverifiable in the SymbolGraph
-        — an unverifiable claim gives no information and must not be used to decide.
+        ⚠️ LIMITATION: Uses the same model as the primary reasoner.
+        LLMs are poor self-evaluators (overconfidence, hallucinated
+        rationalizations). This method adds value only when the
+        contrarian prompt forces structurally different angles based
+        on evidence facts — NOT subjective quality assessment.
+
+        The prompt is designed to elicit structural contradictions from
+        the SymbolGraph, not opinions about reasoning quality.
+        Gated by enable_devil_advocate valve.
         """
+        if not self._f.valves.enable_devil_advocate:
+            return None
+
+        neg = self.negative_evidence(evidence)
+        pos = self.positive_evidence(evidence)
+        evidence_summary = (
+            f"Confirmed: {pos['symbols_confirmed'][:5]}\n"
+            f"Missing: {neg['symbols_missing'][:5]}\n"
+            f"Invalid relations: {neg['relations_invalid'][:5]}"
+        )
+
         prompt = (
-            f"Two competing hypotheses with similar scores:\n\n"
-            f"H1: {h1}\n\nH2: {h2}\n\n"
-            f"What is the single simplest structural claim that:\n"
-            f"  - Would be TRUE if H1 is correct and FALSE if H2 is correct\n"
-            f"  - OR: TRUE if H2 is correct and FALSE if H1 is correct\n"
-            f"The claim must be verifiable in a symbol graph "
-            f"(e.g. 'X calls Y', 'Z exists', 'A inherits B').\n\n"
-            f'Output only: {{"claim": "...", "supports": "H1" or "H2"}}'
+            f"Hypothesis to challenge:\n{hypothesis}\n\n"
+            f"Structural evidence:\n{evidence_summary}\n\n"
+            f"Find the STRONGEST structural argument AGAINST this hypothesis:\n"
+            f"1. What structural fact does the evidence directly contradict?\n"
+            f"2. What simpler structural explanation exists?\n"
+            f"3. What critical assumption is structurally unverifiable?\n\n"
+            f'Output only: {{"has_flaw": true/false, "critique": "..."}}'
         )
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
-                "You are a scientific experiment designer for software architecture. "
-                "Output ONLY a valid JSON object with 'claim' (string) and "
-                "'supports' ('H1' or 'H2'). "
+                "You are a devil's advocate for software architecture hypotheses. "
+                "Find real structural flaws grounded in the evidence provided. "
+                "Output ONLY a valid JSON object with 'has_flaw' (bool) and "
+                "'critique' (string). "
                 "Your entire response must start with { and end with }."
             ),
             model_override=self._f.valves.cot_model_level3,
             max_tokens=0,
-            temperature=0.0,
-            label="experimentum_crucis",
+            temperature=0.5,
+            label="devil_advocate",
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
@@ -29021,47 +27352,13 @@ class MetacognitiveReasoningEngine:
 
         try:
             data = json.loads(response)
-            claim = str(data.get("claim", "")).strip()
-            supports = str(data.get("supports", "")).strip().upper()
-            if not claim or supports not in ("H1", "H2"):
-                return None
-
-            evidence = self.gather_evidence(claim, project_id)
-
-            # If claim mentions no symbols or relations from the SymbolGraph,
-            # it is unverifiable — returning a winner would be arbitrary.
-            if not evidence.symbols_found and not evidence.call_relations_valid:
-                self._f._log_debug(
-                    f"experimentum_crucis: claim '{claim[:60]}' is unverifiable "
-                    f"in SymbolGraph — inconclusive, returning None"
-                )
-                return None
-
-            pos = self.positive_evidence(evidence)
-            claim_true = (
-                len(pos["symbols_confirmed"]) > 0 or len(pos["relations_confirmed"]) > 0
-            )
-
-            self._f._log_debug(
-                f"experimentum_crucis: claim='{claim[:60]}', "
-                f"supports={supports}, claim_true={claim_true}"
-            )
-
-            if claim_true and supports == "H1":
-                return h1
-            elif claim_true and supports == "H2":
-                return h2
-            elif not claim_true and supports == "H1":
-                return h2
-            elif not claim_true and supports == "H2":
-                return h1
+            if data.get("has_flaw", False):
+                critique = str(data.get("critique", "")).strip()
+                return critique if critique else None
             return None
-
         except (json.JSONDecodeError, Exception):
-            self._f._log_debug(
-                f"find_experimentum_crucis: parse error — {response[:200]!r}"
-            )
             return None
+
 
     async def delimit_scope(
         self,
@@ -29171,6 +27468,191 @@ class MetacognitiveReasoningEngine:
             return hypothesis
 
     @staticmethod
+
+    async def generate_predictions(
+        self,
+        hypothesis: str,
+        project_id: str,
+    ) -> List[str]:
+        """
+        Deduce structural consequences of the hypothesis.
+        TURN LEVEL (H5 temporal hierarchy).
+        Gated by enable_generate_predictions valve.
+
+        Asks: 'If this hypothesis is correct, what OTHER structural facts
+        should be true in the codebase?' beyond what it explicitly states.
+
+        These predictions are verified by gather_evidence() in the next
+        iteration, closing the hypothetico-deductive cycle.
+
+        Note: skeleton context is fetched via _format_skeleton (synchronous).
+        If unavailable, predictions are generated without code structure
+        context and will be more generic. This degrades gracefully —
+        the absence is logged explicitly.
+        """
+        if not self._f.valves.enable_generate_predictions:
+            return []
+
+        skeleton_ctx = ""
+        try:
+            skeleton = self._f._ctx_builder._format_skeleton(
+                project_id
+            )  # sync — no await
+            skeleton_ctx = skeleton[:2000] if skeleton else ""
+        except Exception as e:
+            self._f._log_debug(
+                f"generate_predictions: skeleton unavailable "
+                f"({type(e).__name__}: {e}) — "
+                f"predictions generated without code structure context"
+            )
+
+        prompt = (
+            f"Hypothesis:\n{hypothesis}\n\n"
+            + (
+                f"Code structure (signatures only):\n{skeleton_ctx}\n\n"
+                if skeleton_ctx
+                else ""
+            )
+            + "If this hypothesis is correct, what additional structural facts "
+            "MUST be true in the codebase?\n"
+            "List 2-3 concrete, directly verifiable claims "
+            "(e.g. 'X calls Y', 'Z exists', 'A inherits from B').\n"
+            "Only include claims checkable against the symbol graph.\n"
+            "Do NOT repeat claims already explicit in the hypothesis.\n\n"
+            'Output only the JSON object: {"predictions": ["claim1", "claim2"]}'
+        )
+
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a structural prediction generator for software architecture. "
+                "Output ONLY a valid JSON object with key 'predictions' "
+                "(list of strings). "
+                "Your entire response must start with { and end with }."
+            ),
+            model_override=self._f.valves.cot_model_level3,
+            max_tokens=0,
+            temperature=0.3,
+            label="generate_predictions",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+        )
+
+        if not response:
+            return []
+
+        data, how = self._parse_json_contract(response)
+        if data is None:
+            self._f._log_debug(
+                f"generate_predictions: parse error — {response[:200]!r}"
+            )
+            return []
+        # The prompt asks for 2-3; 5 tolerates enthusiasm, the dedupe kills
+        # the repetition loop's copies.
+        predictions = self._dedupe_claims(data.get("predictions", []) or [], 5)
+        self._f._log_debug(
+            f"generate_predictions: {len(predictions)} prediction(s) "
+            f"(skeleton_ctx={'yes' if skeleton_ctx else 'no'})"
+            + (
+                " (salvaged from a truncated/fenced response)"
+                if how == "salvaged"
+                else ""
+            )
+        )
+        return predictions
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 3. Active Learning (H4)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    async def find_experimentum_crucis(
+        self,
+        h1: str,
+        h2: str,
+        project_id: str,
+    ) -> Optional[str]:
+        """
+        Design the minimal structural verification that distinguishes H1 from H2.
+        CONVERSATION LEVEL (H5).
+
+        Returns the winning hypothesis text, or None if inconclusive.
+        Returns None when the tiebreaker claim is unverifiable in the SymbolGraph
+        — an unverifiable claim gives no information and must not be used to decide.
+        """
+        prompt = (
+            f"Two competing hypotheses with similar scores:\n\n"
+            f"H1: {h1}\n\nH2: {h2}\n\n"
+            f"What is the single simplest structural claim that:\n"
+            f"  - Would be TRUE if H1 is correct and FALSE if H2 is correct\n"
+            f"  - OR: TRUE if H2 is correct and FALSE if H1 is correct\n"
+            f"The claim must be verifiable in a symbol graph "
+            f"(e.g. 'X calls Y', 'Z exists', 'A inherits B').\n\n"
+            f'Output only: {{"claim": "...", "supports": "H1" or "H2"}}'
+        )
+
+        response = await self._f._llm_orchestrator.call_llm(
+            prompt=prompt,
+            system_prompt=(
+                "You are a scientific experiment designer for software architecture. "
+                "Output ONLY a valid JSON object with 'claim' (string) and "
+                "'supports' ('H1' or 'H2'). "
+                "Your entire response must start with { and end with }."
+            ),
+            model_override=self._f.valves.cot_model_level3,
+            max_tokens=0,
+            temperature=0.0,
+            label="experimentum_crucis",
+            response_format={"type": "json_object"},
+            enable_thinking=False,
+        )
+
+        if not response:
+            return None
+
+        try:
+            data = json.loads(response)
+            claim = str(data.get("claim", "")).strip()
+            supports = str(data.get("supports", "")).strip().upper()
+            if not claim or supports not in ("H1", "H2"):
+                return None
+
+            evidence = self.gather_evidence(claim, project_id)
+
+            # If claim mentions no symbols or relations from the SymbolGraph,
+            # it is unverifiable — returning a winner would be arbitrary.
+            if not evidence.symbols_found and not evidence.call_relations_valid:
+                self._f._log_debug(
+                    f"experimentum_crucis: claim '{claim[:60]}' is unverifiable "
+                    f"in SymbolGraph — inconclusive, returning None"
+                )
+                return None
+
+            pos = self.positive_evidence(evidence)
+            claim_true = (
+                len(pos["symbols_confirmed"]) > 0 or len(pos["relations_confirmed"]) > 0
+            )
+
+            self._f._log_debug(
+                f"experimentum_crucis: claim='{claim[:60]}', "
+                f"supports={supports}, claim_true={claim_true}"
+            )
+
+            if claim_true and supports == "H1":
+                return h1
+            elif claim_true and supports == "H2":
+                return h2
+            elif not claim_true and supports == "H1":
+                return h2
+            elif not claim_true and supports == "H2":
+                return h1
+            return None
+
+        except (json.JSONDecodeError, Exception):
+            self._f._log_debug(
+                f"find_experimentum_crucis: parse error — {response[:200]!r}"
+            )
+            return None
+
     def _verify_contract_claim(
         claim: str,
         expanded_bodies: List[str],
@@ -29269,20 +27751,31 @@ class MetacognitiveReasoningEngine:
         carry no critical/supportive split): two refutations, or one
         with nothing confirmed, kill. Calibratable after validation.
         """
-        # Region: kill gates (facts against the hypothesis)
+        # Region: kill gates — facts AGAINST the hypothesis kill on
+        # any cycle (refutation is evidence, not absence of it)
         resolvable = confirmed + refuted
         if refuted >= 2 or (refuted >= 1 and confirmed == 0):
             return "dead", "falsified"
-        if resolvable == 0:
-            return "dead", "unfounded"
         # Region: maturity (facts for the hypothesis)
         if confirmed >= maturity_need and coverage >= cov_threshold:
             return "plausible", "mature"
-        # Region: budget and progress (0 = unlimited cycles)
-        if cycles_max > 0 and cycle >= cycles_max:
-            return "plausible", "budget"
-        if resolvable <= resolvable_prev:
-            return "plausible", "stalled"
+        # Region: end of this hypothesis's iterations. Operator's
+        # rule: LACK of foundation may only be judged at the END of
+        # the hypothesis's iterations, never on an early cycle — a
+        # zero-fact cycle 1 earns a deeper cycle 2 (the probe
+        # carries the analysis forward and EXPAND digs further),
+        # not a verdict. The iterations end when the cycle budget
+        # is exhausted or progress stalls (resolvable facts did not
+        # grow between cycles); only THEN does zero foundation kill.
+        _budget_end = cycles_max > 0 and cycle >= cycles_max
+        _stalled = resolvable <= resolvable_prev
+        if _budget_end or _stalled:
+            if resolvable == 0:
+                return "dead", "unfounded"
+            return (
+                "plausible",
+                "budget" if _budget_end else "stalled",
+            )
         return "continue", ""
 
     async def _generate_serial_candidate(
@@ -29449,6 +27942,14 @@ class MetacognitiveReasoningEngine:
             pass
         _broker = AgenticToolBroker(self._f)
         _last_analysis = ""
+        # Hypothetico-deductive cycle: predictions deduced at the END
+        # of cycle N are structural consequences the hypothesis has
+        # NOT yet been credited for. Cycle N+1 probes them, so a
+        # confirmation is a RISKY one (the prediction could have
+        # failed) rather than a restatement of the evidence the
+        # hypothesis was built from. Empty on cycle 1 by
+        # construction — nothing has been deduced yet.
+        _predictions: List[str] = []
         _resolvable_prev = -1
         _cycles_max = int(self._f.valves.agentic_serial_cycles_max)
         _need = int(self._f.valves.agentic_serial_maturity_confirmed)
@@ -29469,7 +27970,19 @@ class MetacognitiveReasoningEngine:
                 )
                 break
             # ── Step 2: investigate — deterministic evidence + code ──
-            _probe = hyp_text + ("\n" + _last_analysis[:600])
+            # The probe carries the previous analysis AND the
+            # deduced predictions: gather_evidence verifies them
+            # structurally against the graph, which is what closes
+            # the deductive half of the cycle.
+            _probe = (
+                hyp_text
+                + ("\n" + _last_analysis[:600])
+                + (
+                    "\n" + "\n".join(_predictions[:3])
+                    if _predictions
+                    else ""
+                )
+            )
             evidence = self.gather_evidence(_probe, project_id)
             _sym_true = [k for k, v in evidence.symbols_found.items() if v]
             _expanded_parts: List[str] = []
@@ -29540,6 +28053,18 @@ class MetacognitiveReasoningEngine:
             # S11: the framing assumptions enter the FIRST cycle as
             # claims to check — the graph verdicts them like any
             # other claim; they are never pre-confirmed.
+            # The deduced predictions are presented to the analyst
+            # as claims to CHECK, never as established facts — the
+            # same discipline S11 applies to framing assumptions.
+            _pred_blk = ""
+            if _predictions:
+                _plines = "\n".join(f"- {p}" for p in _predictions[:3])
+                _pred_blk = (
+                    "\n\nDeduced predictions from the previous cycle "
+                    "(if the hypothesis holds these should be true; "
+                    "verify each against the evidence, and say so "
+                    "plainly when one FAILS):\n" + _plines
+                )
             _assump = list(getattr(self._f, "_preplanner_assumptions", []) or [])[:4]
             _assump_blk = ""
             if _cycle == 1 and _assump:
@@ -29552,6 +28077,7 @@ class MetacognitiveReasoningEngine:
                 f"Question:\n{question[:300]}\n\n"
                 f"Hypothesis under test:\n{hyp_text}\n\n"
                 + _assump_blk
+                + _pred_blk
                 + (
                     f"Prior analysis:\n{_last_analysis[:800]}\n\n"
                     if _last_analysis
@@ -29704,6 +28230,30 @@ class MetacognitiveReasoningEngine:
                 _dossier.status = "plausible"
                 break
             _resolvable_prev = _conf_n + _ref_n
+            # ── Step 7b: deduce consequences for the NEXT cycle ──
+            # Only on a continuing cycle: a sealed dossier would
+            # never probe them, so generating there would buy an
+            # LLM call for nothing. This is the deductive half of
+            # the method — the forge was purely retrodictive
+            # before, accumulating corroboration only from the
+            # evidence each hypothesis was BUILT to explain.
+            try:
+                _predictions = await self.generate_predictions(
+                    hyp_text, project_id
+                )
+            except Exception as _e_pred:
+                _predictions = []
+                self._f._log_debug(
+                    f"forge predictions: skipped ({_e_pred})"
+                )
+            if _predictions:
+                if "deduction" not in _dossier.strategy_trace:
+                    _dossier.strategy_trace.append("deduction")
+                self._f._log_debug(
+                    f"forge deduction c{_cycle}: "
+                    f"{len(_predictions)} prediction(s) to probe "
+                    f"next cycle — {_predictions[:2]}"
+                )
         # ── Step 8: seal; bury the dead ──
         self._f._log_debug(
             f"forge sealed '{hyp_text[:50]}' in "
@@ -29760,6 +28310,15 @@ class MetacognitiveReasoningEngine:
             self._f._log_debug(
                 f"_forge_all: {len(_exclusions)} graveyard "
                 f"exclusion(s) loaded for this era"
+            )
+            # Strategy visibility: the graveyard is the method
+            # LEARNING across turns — mechanisms already ruled out
+            # in this era will not be re-proposed. Server-log only
+            # until now; one line makes the cross-turn memory
+            # visible to the user watching the chat.
+            await self._f._emit_status(
+                f"🪦 Excluding {len(_exclusions)} mechanism(s) "
+                f"already ruled out"
             )
         _queue: List[str] = [t for t, _c in seed_pool if t and len(t.strip()) >= 20]
         # S3: class-prior ordering. When R33's history shows call-
@@ -30156,6 +28715,92 @@ class MetacognitiveReasoningEngine:
                 )
             return None, _note
         _note += f" | null bar PASS: {_winner.corroboration:.2f} >= " f"{_margin:.2f}"
+        # ── Layer 4: adversarial review of the surviving winner ──
+        # The three layers above are DETERMINISTIC: they rank, they
+        # discriminate, they hold a null bar. None of them attacks
+        # the winner on its own terms. Peer review does — blind,
+        # from raw structural evidence only, with the primary
+        # reasoning chain withheld so the reviewer cannot anchor on
+        # it. With peer_review_model set to a genuinely different
+        # model this is real epistemic orthogonality; with one model
+        # it degrades to the internal devil's advocate, which is
+        # weaker but still adversarial. Either way the verdict only
+        # ANNOTATES — the deterministic layers decided, and a
+        # self-reporting reviewer does not get to overturn measured
+        # corroboration. REJECT is surfaced loudly for the reader.
+        try:
+            _pr_evidence = self.gather_evidence(
+                _winner.hypothesis, project_id
+            )
+            _pr_design = ExperimentDesign(
+                critical_claims=list(_winner.confirmed_claims[:5]),
+                supportive_claims=[],
+                unknown_claims=list(_winner.unresolved_claims[:5]),
+            )
+            _review = await self.peer_review_hypothesis(
+                _winner.hypothesis,
+                _pr_evidence,
+                _pr_design,
+                project_id,
+            )
+        except Exception as _e_pr:
+            _review = None
+            self._f._log_debug(f"judge: peer review skipped ({_e_pr})")
+        if _review is not None and _review.verdict:
+            _kind = "peer" if _review.is_external else "devil's advocate"
+            _note += f" | {_kind}: {_review.verdict}"
+            if _review.critiques:
+                _note += " — " + "; ".join(
+                    f"'{c[:80]}'" for c in _review.critiques[:2]
+                )
+            if "review" not in _winner.strategy_trace:
+                _winner.strategy_trace.append("review")
+            if _review.verdict == "REJECT":
+                await self._f._emit_status(
+                    f"⚖️ Adversarial review REJECTS the winner "
+                    f"({_kind}) — reported, not overridden"
+                )
+            self._f._log_debug(
+                f"judge L4 {_kind}: {_review.verdict} "
+                f"(external={_review.is_external}, "
+                f"{len(_review.critiques)} critique(s))"
+            )
+            # ── Layer 5: dialectical scoping (thesis/antithesis) ──
+            # The review supplies the antithesis the synthesis needs,
+            # so scoping only runs when a review exists and had
+            # something to say. It narrows an overclaiming winner to
+            # its domain of validity ('X causes Y' → 'X causes Y
+            # when Z') rather than letting a qualified truth stand
+            # as a general one. The scoped text REPLACES the
+            # winner's hypothesis for reporting; the measured
+            # numbers behind it are untouched, and delimit_scope
+            # returns the original unchanged when there is nothing
+            # to qualify.
+            if _review.verdict in ("REJECT", "QUALIFY") and (
+                _review.critiques
+            ):
+                try:
+                    _scoped = await self.delimit_scope(
+                        _winner.hypothesis,
+                        _pr_evidence,
+                        _pr_design,
+                        project_id,
+                        peer_review=_review,
+                    )
+                except Exception as _e_sc:
+                    _scoped = ""
+                    self._f._log_debug(
+                        f"judge: scoping skipped ({_e_sc})"
+                    )
+                if _scoped and _scoped.strip() != _winner.hypothesis.strip():
+                    self._f._log_debug(
+                        f"judge L5 scoped: '{_winner.hypothesis[:60]}' "
+                        f"→ '{_scoped[:60]}'"
+                    )
+                    _winner.hypothesis = _scoped
+                    if "scoped" not in _winner.strategy_trace:
+                        _winner.strategy_trace.append("scoped")
+                    _note += " | scoped to its domain of validity"
         return _winner, _note
 
     async def _record_serial_competition(
@@ -30342,139 +28987,6 @@ class MetacognitiveReasoningEngine:
             self._f._log_debug(f"_load_graveyard: skipped ({_e!r})")
             return []
 
-    async def _debrief_competition(
-        self,
-        scored_list: List["ScoredHypothesis"],
-        final_score: float,
-        coverage_score: float,
-        score_trajectory: List[float],
-        stagnated: bool,
-        project_id: str,
-        abductive_used: bool = False,
-    ) -> None:
-        """
-        Post-competition metacognitive analysis.
-        PROJECT LEVEL (H5 temporal hierarchy).
-
-        Extracts failure patterns from competition results using ONLY
-        deterministic SymbolGraph-derived data:
-        - falsification_reason strings (from is_falsified — deterministic)
-        - coverage_score (mathematical ratio)
-        - score_trajectory (obj_score per iteration — no llm_conf)
-
-        No LLM calls. The SymbolGraph is the ground truth mirror.
-        The LLM never evaluates itself — the graph evaluates the LLM.
-
-        Results stored in _performance_history[project_id] and consumed
-        by _get_adaptive_strategy() on the next competition call.
-        """
-        if not self._f.valves.enable_metacognitive_debriefing:
-            return
-
-        call_failures = 0
-        symbol_failures = 0
-        low_cov_count = 0
-
-        for s in scored_list:
-            if s.falsification_reason:
-                if "relation" in s.falsification_reason:
-                    call_failures += 1
-                elif "symbol" in s.falsification_reason:
-                    symbol_failures += 1
-            if s.coverage_score < self._f.valves.low_coverage_threshold:
-                low_cov_count += 1
-
-        primary = "none"
-        if call_failures > symbol_failures:
-            primary = "call_relations"
-        elif symbol_failures > call_failures:
-            primary = "symbols"
-
-        record = CompetitionRecord(
-            timestamp=time.time(),
-            n_hypotheses_initial=len(scored_list),
-            n_falsified=sum(1 for s in scored_list if s.falsified),
-            primary_falsification_type=primary,
-            final_score=final_score,
-            coverage_score=coverage_score,
-            iterations_used=len(score_trajectory),
-            stagnated=stagnated,
-            score_trajectory=score_trajectory,
-            call_relation_failures=call_failures,
-            symbol_failures=symbol_failures,
-            low_coverage_count=low_cov_count,
-            abductive_used=abductive_used,
-        )
-
-        if project_id not in self._performance_history:
-            self._performance_history[project_id] = []
-
-        history = self._performance_history[project_id]
-        history.append(record)
-
-        if len(history) > 20:
-            self._performance_history[project_id] = history[-20:]
-        # R33: persist the record so the adaptive strategy survives
-        # Filter recreation. Without this the in-memory history reset
-        # every turn, never reached the 3-record activation threshold,
-        # and the strategy engine never ran. Fire-and-forget through the
-        # existing write queue; a failed persist only costs adaptivity,
-        # never correctness, so it never raises into the competition.
-        try:
-            import json as _json
-            import dataclasses as _dc
-
-            _rec_json = _json.dumps(_dc.asdict(record))
-
-            def _persist_competition(rj=_rec_json, pid=project_id):
-                self._f._db_conn.execute(
-                    "INSERT INTO competition_history "
-                    "(project_id, record_json, created_at) "
-                    "VALUES (?, ?, ?)",
-                    (pid, rj, time.time()),
-                )
-                self._f._db_conn.execute(
-                    "DELETE FROM competition_history WHERE "
-                    "project_id = ? AND id NOT IN (SELECT id FROM "
-                    "competition_history WHERE project_id = ? ORDER BY "
-                    "created_at DESC LIMIT 20)",
-                    (pid, pid),
-                )
-
-            await self._f._state_store._db_enqueue(_persist_competition)
-        except Exception as _e:
-            self._f._log_debug(f"_debrief_competition: persist skipped ({_e!r})")
-
-        self._f._log_debug(
-            f"_debrief_competition: project={project_id}, "
-            f"primary_failure={primary}, coverage={coverage_score:.2f}, "
-            f"stagnated={stagnated}, score={final_score:.3f}, "
-            f"call_failures={call_failures}, symbol_failures={symbol_failures}"
-        )
-
-    def _sanitize_pool(
-        self, pool: List[Tuple[str, float]], label: str, stage: str
-    ) -> List[Tuple[str, float]]:
-        """
-        R7: enforce the distinct-rival ceiling on a REGENERATED pool.
-
-        Each competition iteration replaces the hypothesis list with the
-        parseable output of refine/divergent/abductive, whose size is
-        whatever the model emitted (observed live: 9 then 5 then 8 within
-        one competition — the 'Evaluating N' count breathing). Dedup then
-        cap so the pool the next iteration scores stays within the
-        configured target instead of drifting up with every regeneration.
-        """
-        cap = int(getattr(self._f.valves, "hypothesis_hard_cap", 10) or 0)
-        before = len(pool)
-        out = self._dedupe_hypotheses(pool, cap=cap)
-        if len(out) != before:
-            self._f._log_debug(
-                f"compete_hypotheses [{label}] {stage}: pool "
-                f"{before} → {len(out)} (dedup+cap {cap})"
-            )
-        return out
-
     def _get_adaptive_strategy(self, project_id: str) -> Dict[str, Any]:
         """
         Derive strategy adjustments from competition history.
@@ -30653,75 +29165,6 @@ class MetacognitiveReasoningEngine:
     # 6. Peer review
     # ═══════════════════════════════════════════════════════════════════════
 
-    async def challenge_hypothesis(
-        self,
-        hypothesis: str,
-        evidence: "StaticEvidence",
-        project_id: str,
-    ) -> Optional[str]:
-        """
-        Devil's advocate — internal reviewer with contrarian prompt.
-
-        ⚠️ LIMITATION: Uses the same model as the primary reasoner.
-        LLMs are poor self-evaluators (overconfidence, hallucinated
-        rationalizations). This method adds value only when the
-        contrarian prompt forces structurally different angles based
-        on evidence facts — NOT subjective quality assessment.
-
-        The prompt is designed to elicit structural contradictions from
-        the SymbolGraph, not opinions about reasoning quality.
-        Gated by enable_devil_advocate valve.
-        """
-        if not self._f.valves.enable_devil_advocate:
-            return None
-
-        neg = self.negative_evidence(evidence)
-        pos = self.positive_evidence(evidence)
-        evidence_summary = (
-            f"Confirmed: {pos['symbols_confirmed'][:5]}\n"
-            f"Missing: {neg['symbols_missing'][:5]}\n"
-            f"Invalid relations: {neg['relations_invalid'][:5]}"
-        )
-
-        prompt = (
-            f"Hypothesis to challenge:\n{hypothesis}\n\n"
-            f"Structural evidence:\n{evidence_summary}\n\n"
-            f"Find the STRONGEST structural argument AGAINST this hypothesis:\n"
-            f"1. What structural fact does the evidence directly contradict?\n"
-            f"2. What simpler structural explanation exists?\n"
-            f"3. What critical assumption is structurally unverifiable?\n\n"
-            f'Output only: {{"has_flaw": true/false, "critique": "..."}}'
-        )
-
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=(
-                "You are a devil's advocate for software architecture hypotheses. "
-                "Find real structural flaws grounded in the evidence provided. "
-                "Output ONLY a valid JSON object with 'has_flaw' (bool) and "
-                "'critique' (string). "
-                "Your entire response must start with { and end with }."
-            ),
-            model_override=self._f.valves.cot_model_level3,
-            max_tokens=0,
-            temperature=0.5,
-            label="devil_advocate",
-            response_format={"type": "json_object"},
-            enable_thinking=False,
-        )
-
-        if not response:
-            return None
-
-        try:
-            data = json.loads(response)
-            if data.get("has_flaw", False):
-                critique = str(data.get("critique", "")).strip()
-                return critique if critique else None
-            return None
-        except (json.JSONDecodeError, Exception):
-            return None
-
     def _format_raw_evidence_for_review(
         self,
         evidence: "StaticEvidence",
@@ -30748,133 +29191,6 @@ class MetacognitiveReasoningEngine:
         if design.critical_claims:
             lines.append("Critical claims: " + "; ".join(design.critical_claims[:5]))
         return "\n".join(lines)
-
-    async def peer_review_hypothesis(
-        self,
-        hypothesis: str,
-        evidence: "StaticEvidence",
-        design: "ExperimentDesign",
-        project_id: str,
-    ) -> Optional["PeerReviewResult"]:
-        """
-        External peer review of the winning hypothesis.
-        CONVERSATION LEVEL (H5).
-
-        Three execution paths:
-
-        Path 1 — enable_peer_review=False:
-            Returns None. Synthesis unaffected.
-
-        Path 2 — same model or no model set:
-            Degrades to challenge_hypothesis() (devil's advocate).
-            Returns PeerReviewResult(is_external=False).
-
-        Path 3 — different model (genuine peer review):
-            Blind review — context excludes primary reasoning chain
-            to prevent anchoring bias.
-            Returns PeerReviewResult(is_external=True).
-
-        Designed for future activation — peer_review_model is expected
-        to be empty under current hardware constraints.
-        """
-        if not self._f.valves.enable_peer_review:
-            return None
-
-        _same_model = (
-            not self._f.valves.peer_review_model
-            or self._f.valves.peer_review_model == self._f.valves.cot_model_level3
-        )
-
-        if _same_model:
-            self._f._log_debug(
-                "peer_review: degrading to devil's advocate "
-                "(peer_review_model not set or identical to cot_model_level3)"
-            )
-            critique = await self.challenge_hypothesis(hypothesis, evidence, project_id)
-            return PeerReviewResult(
-                verdict="QUALIFY" if critique else "APPROVE",
-                critiques=[critique] if critique else [],
-                reviewer_model="internal_devil_advocate",
-                is_external=False,
-            )
-
-        self._f._log_debug(
-            f"peer_review: using external model "
-            f"'{self._f.valves.peer_review_model}'"
-        )
-        await self._f._emit_status(
-            f"🔍 Peer review with {self._f.valves.peer_review_model}..."
-        )
-
-        evidence_summary = self._format_raw_evidence_for_review(evidence, design)
-
-        prompt = (
-            f"Hypothesis under review:\n{hypothesis}\n\n"
-            f"Verified structural evidence from the codebase:\n"
-            f"{evidence_summary}\n\n"
-            f"Find structural flaws:\n"
-            f"1. Does the hypothesis assume relations the evidence contradicts?\n"
-            f"2. Does it ignore critical symbols present in the evidence?\n"
-            f"3. Is there a simpler structural explanation?\n\n"
-            f'Output only the JSON object, e.g. {{"verdict": "QUALIFY", '
-            f'"critiques": ["X calls Y but edge not found"]}}'
-        )
-
-        response = await self._f._llm_orchestrator.call_llm(
-            prompt=prompt,
-            system_prompt=(
-                "You are an independent software architecture auditor. "
-                "You have NOT seen the reasoning that generated this hypothesis — "
-                "only the hypothesis and raw structural evidence. "
-                "Output ONLY a valid JSON object with 'verdict' "
-                "(APPROVE | REJECT | QUALIFY) and 'critiques' (list of strings). "
-                "Your entire response must start with { and end with }."
-            ),
-            model_override=self._f.valves.peer_review_model,
-            max_tokens=0,
-            temperature=0.0,
-            label="peer_review_llm",
-            response_format={"type": "json_object"},
-            enable_thinking=False,
-        )
-
-        if not response:
-            return PeerReviewResult(
-                verdict="APPROVE",
-                critiques=[],
-                reviewer_model=self._f.valves.peer_review_model,
-                is_external=True,
-            )
-
-        try:
-            data = json.loads(response)
-            raw_verdict = str(data.get("verdict", "APPROVE")).strip().upper()
-            if raw_verdict not in ("APPROVE", "REJECT", "QUALIFY"):
-                raw_verdict = "APPROVE"
-            result = PeerReviewResult(
-                verdict=raw_verdict,
-                critiques=[str(c) for c in data.get("critiques", []) if c],
-                reviewer_model=self._f.valves.peer_review_model,
-                is_external=True,
-            )
-            self._f._log_debug(
-                f"peer_review: verdict={result.verdict}, "
-                f"critiques={len(result.critiques)}"
-            )
-            return result
-        except (json.JSONDecodeError, Exception):
-            self._f._log_debug(f"peer_review: parse error — {response[:200]!r}")
-            return PeerReviewResult(
-                verdict="APPROVE",
-                critiques=[],
-                reviewer_model=self._f.valves.peer_review_model,
-                is_external=True,
-            )
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # 7. QueryDecomposition (Capa 1)
-    # ═══════════════════════════════════════════════════════════════════════
-
 
 class HistoryCompressor:
     """
@@ -43701,31 +42017,6 @@ class Filter:
                 "the aligned prefill and the main inference."
             ),
         )
-        agentic_hypothesize_compete: str = Field(
-            default="on",
-            description=(
-                "0030: run the full hypothesis COMPETITION "
-                "(compete_hypotheses) on a hypothesize step PROACTIVELY, when "
-                "the step enumerated rival root causes (>= 2 hypotheses) or "
-                "the turn intent is debugging. Unlike the reactive per-claim "
-                "reinforcement, this fires because the step's PURPOSE is to "
-                "weigh rivals — it does not wait for a fabricated identifier. "
-                "The claims of the hypothesize step become the rival "
-                "hypotheses; the surviving verdict (with its scope and peer "
-                "review) annotates the step output before synthesis. 'off' = "
-                "never (hypothesize runs as a plain generative step). "
-                "'shadow' = log '[COMPETE-SHADOW] would compete' with the "
-                "hypothesis count WITHOUT running it, to calibrate first "
-                "(the shadow phase confirmed the trigger live: 3 rivals, "
-                "debug intent, would-compete logged correctly). 'on' "
-                "(default) = run it, bounded by the remaining budget; it adds "
-                "auxiliary LLM calls between the aligned prefill and the main "
-                "inference. "
-                "Expect hypothesize turns to be noticeably slower when on — "
-                "the competition adds several LLM calls (experiment design "
-                "and predictions per rival, challenge, possible tiebreaker)."
-            ),
-        )
         agentic_metacog_confidence_floor: float = Field(
             default=0.55,
             ge=0.0,
@@ -43962,18 +42253,6 @@ class Filter:
                 "hypothesize LLM call plus a deterministic verify."
             ),
         )
-        compete_on_cached_hypothesize: bool = Field(
-            default=True,
-            description=(
-                "Run the hypothesis competition when a hypothesize step is "
-                "served from the step cache. The cache-hit path used to "
-                "skip the entire competition (charter, convergence, "
-                "crucis), creating a silent quality asymmetry between "
-                "cached and fresh turns; the restored claims are exactly "
-                "what the competition consumes. Off restores the old "
-                "skip — cheaper, but a cached turn's rivals go uncompeted."
-            ),
-        )
         agentic_retry_router: str = Field(
             default="on",
             description=(
@@ -44014,39 +42293,6 @@ class Filter:
                 "via [REPLICATE-SHADOW]. 'on' = replicate. Cost when it "
                 "fires: one harness-generation LLM call plus one sandbox "
                 "execution."
-            ),
-        )
-        hypothesis_principles_charter: bool = Field(
-            default=True,
-            description=(
-                "Prepend the epistemic principles charter to hypothesis "
-                "generation/refinement constraints: falsification asymmetry "
-                "(state what would disprove first), diagnosticity (prefer "
-                "claims that distinguish rivals), explanatory power (must "
-                "cover ALL observed symptoms), testability preference "
-                "(checkable structural predictions rank above unfalsifiable "
-                "prose), parsimony as tiebreaker only, the severity "
-                "exception (silent-corruption hypotheses tested early even "
-                "at low prior), and the domain-extension discipline "
-                "(Fase 7: ONE conditional clause may save a hypothesis if "
-                "the clause names its own checkable anchor; an uncheckable "
-                "clause is an ad-hoc rescue, and a SECOND rescue means the "
-                "hypothesis is degenerating — rank it down instead of "
-                "patching again). Deterministic text through the same PID "
-                "channel as the adaptive constraints."
-            ),
-        )
-        agentic_competition_early_converge: bool = Field(
-            default=False,
-            description=(
-                "When on, the hypothesis competition stops as soon as the "
-                "leading hypothesis reaches the confidence threshold. Off "
-                "disables that exit entirely: every iteration runs, so all "
-                "rivals are triaged before a winner is declared. A high "
-                "absolute score does not mean the winner is correct — it "
-                "may just have scored well in isolation — so turning this "
-                "off (or setting agentic_competition_converge_margin) trades "
-                "iterations for confidence that the field was searched."
             ),
         )
         agentic_competition_converge_margin: float = Field(
@@ -44212,20 +42458,6 @@ class Filter:
                 "check, not the hypothesis narrative — was audited and is "
                 "already structurally satisfied: _elicit_tests receives "
                 "body + testability verdict only."
-            ),
-        )
-        hypothesis_hard_cap: int = Field(
-            default=7,
-            ge=0,
-            le=20,
-            description=(
-                "Safety ceiling on DISTINCT rivals entering the hypothesis "
-                "competition, applied AFTER deterministic dedup (claims "
-                "restating one mechanism collapse first, so the cap counts "
-                "ideas, not claims). First-N keeps the model's own "
-                "likelihood ranking. Governs the initial set only — the "
-                "divergent pool and abductive escape are recovery nets and "
-                "stay exempt. 0 disables."
             ),
         )
         agentic_generative_eval: str = Field(
@@ -44431,6 +42663,30 @@ class Filter:
                 "to have any effect. Adds N LLM calls in iter 1 only (cached)."
             ),
         )
+        enable_peer_review: bool = Field(
+            default=False,  # ← ROI=0 without 2nd model
+            description=(
+                "Enable peer review using a different model architecture. "
+                "ROI=0 when peer_review_model is empty or same as cot_model_level3 "
+                "(degrades to devil_advocate which is already enabled). "
+                "Only activate when a genuinely different model is available."
+            ),
+        )
+        peer_review_model: str = Field(
+            default="",
+            description=(
+                "Model for peer review. Must differ from cot_model_level3 for "
+                "genuine epistemic orthogonality. Empty → degrades to devil_advocate."
+            ),
+        )
+        enable_scope_delimitation: bool = Field(
+            default=True,  # ← ROI=0.117: good communication quality gain
+            description=(
+                "After selecting the winning hypothesis, add conditions of validity. "
+                "ROI=0.117: 0.60 expected calls, +7% quality. "
+                "Triggers when negative structural evidence OR devil_advocate critique exists."
+            ),
+        )
         enable_generate_predictions: bool = Field(
             default=True,  # ← marginal ROI=0.027 but structurally complete
             description=(
@@ -44441,38 +42697,12 @@ class Filter:
                 "max_iters 2→3. Disable first if latency is critical."
             ),
         )
-        enable_weighted_scoring: bool = Field(
-            default=True,  # ← NEVER disable: free, depends on experiment_design
-            description=(
-                "Weight critical claims 10x in objective_score. "
-                "Zero additional cost — uses experiment_design output. "
-                "Disabling reverts to equal-weight ratio, losing the entire "
-                "value of asymmetric falsification."
-            ),
-        )
-        enable_experimentum_crucis: bool = Field(
-            default=True,  # ← ROI=0.455: best non-free ROI in the system
-            description=(
-                "When top-2 hypotheses score within crucis_threshold, "
-                "design and verify a minimal tiebreaker experiment. "
-                "Best non-free ROI feature: 0.455 (0.33 expected calls, +15% quality). "
-                "Most valuable in genuinely ambiguous multi-cause bugs."
-            ),
-        )
         crucis_threshold: float = Field(
             default=0.12,  # ← 0.12 vs 0.10: catches 10-12% margin ties worth investigating
             description=(
                 "Score difference below which experimentum crucis is triggered. "
                 "0.12 vs 0.10: triggers ~33% more often, catching borderline ties "
                 "where the information gain is still positive."
-            ),
-        )
-        enable_scope_delimitation: bool = Field(
-            default=True,  # ← ROI=0.117: good communication quality gain
-            description=(
-                "After selecting the winning hypothesis, add conditions of validity. "
-                "ROI=0.117: 0.60 expected calls, +7% quality. "
-                "Triggers when negative structural evidence OR devil_advocate critique exists."
             ),
         )
         enable_devil_advocate: bool = Field(
@@ -44506,22 +42736,6 @@ class Filter:
         # ROI=0.000 without a second model (degrades to devil_advocate which
         # is already enabled). Activate only when peer_review_model differs
         # from cot_model_level3.
-        enable_peer_review: bool = Field(
-            default=False,  # ← ROI=0 without 2nd model
-            description=(
-                "Enable peer review using a different model architecture. "
-                "ROI=0 when peer_review_model is empty or same as cot_model_level3 "
-                "(degrades to devil_advocate which is already enabled). "
-                "Only activate when a genuinely different model is available."
-            ),
-        )
-        peer_review_model: str = Field(
-            default="",
-            description=(
-                "Model for peer review. Must differ from cot_model_level3 for "
-                "genuine epistemic orthogonality. Empty → degrades to devil_advocate."
-            ),
-        )
         peer_review_uncertainty_threshold: float = Field(
             default=0.5,
             description=(
@@ -44587,31 +42801,6 @@ class Filter:
                 "divergent thinking (high temperature, contrarian prompt). "
                 "Harmless with agentic_metacog_max_iters=2 (cannot fire). "
                 "Set agentic_metacog_max_iters=4 to enable effectively."
-            ),
-        )
-        enable_abductive_escape: bool = Field(
-            default=True,
-            description=(
-                "Capa 3: when EVERY hypothesis in a competition is falsified "
-                "(epistemic bankruptcy — previously an immediate surrender), "
-                "run one abductive generation that names the assumption all "
-                "dead hypotheses shared and negates it, then re-enters the "
-                "same falsification machinery. At most once per competition; "
-                "worst case equals the old behavior plus one LLM call."
-            ),
-        )
-        hypothesis_include_null: bool = Field(
-            default=True,
-            description=(
-                "Popperian null hypothesis: when the divergent pool is built "
-                "(Capa 1), instruct the model to include — if plausible — the "
-                "hypothesis that the observed behavior has NO code cause "
-                "(non-determinism, coincidence, or a misread symptom), with "
-                "its discriminating observable. The competition falsifies it "
-                "like any other; if it survives, that is a strong signal the "
-                "pipeline should stop and say 'this is probably not a bug'. "
-                "Needs hypothesis_divergent_n > 0 (rides the same pool, no "
-                "extra call)."
             ),
         )
         enable_abstention: bool = Field(
@@ -44801,13 +42990,6 @@ class Filter:
                 "fixes language around turn 6. Lower settles faster on less "
                 "evidence; higher waits for more before committing. 1 runs it "
                 "every turn (most responsive, most calls)."
-            ),
-        )
-        stagnation_window: int = Field(
-            default=2,
-            description=(
-                "Iterations without obj_score improvement to trigger stagnation. "
-                "Requires agentic_metacog_max_iters >= stagnation_window + 2 = 4."
             ),
         )
         stagnation_min_delta: float = Field(
@@ -45969,30 +44151,6 @@ class Filter:
                     f"code_block_overflow_action='summarize' never produces a summary "
                     f"(every oversized block also exceeds the ceiling and is skipped). "
                     f"Raise block_summary_max_source_tokens above max_code_block_tokens."
-                )
-
-        # ------------------------------------------------------------------
-        # 9. MetacognitiveReasoningEngine coherence
-        # ------------------------------------------------------------------
-        if (
-            self.valves.enable_weighted_scoring
-            and not self.valves.enable_experiment_design
-        ):
-            warnings.append(  # ← era issues.append (bug)
-                "enable_weighted_scoring=True requires enable_experiment_design=True. "
-                "Weighted scoring needs critical/supportive claim classification."
-            )
-        if self.valves.enable_peer_review:
-            if not self.valves.peer_review_model:
-                self._log_debug(
-                    "Valve notice: enable_peer_review=True but peer_review_model "
-                    "is empty. Peer review will degrade to internal devil's advocate."
-                )
-            elif self.valves.peer_review_model == self.valves.cot_model_level3:
-                self._log_debug(
-                    "Valve notice: peer_review_model == cot_model_level3. "
-                    "Same model architecture provides no epistemic orthogonality. "
-                    "Peer review will degrade to internal devil's advocate."
                 )
 
         # Log all warnings
