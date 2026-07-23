@@ -13353,7 +13353,9 @@ class AgenticEvidenceLedger:
             _masked = text or ""
             for _m in self._NEG_RELATION_RE.finditer(_masked):
                 _nc, _ne = _m.group(1), _m.group(2)
-                _present = self._relation_in_graph(_nc, _ne, project_id)
+                _present = self._f._meta_reasoning._relation_in_graph(
+                    _nc, _ne, project_id
+                )
                 _masked = _masked.replace(_m.group(0), " ")
                 if _present is True:
                     invalid.append(f"{_nc}_not_calls_{_ne}")
@@ -17860,11 +17862,28 @@ class AgenticOrchestrator:
             return False
 
         # Region: run the competition
-        await self._f._emit_status(f"{status_prefix}: competing {n_found} hypotheses")
-        self._f._log_debug(
-            f"🤖 Agentic: step {step.id} competes {n_found} rival "
-            f"hypotheses (debug_intent={_intent_debug})"
-        )
+        # The status must not lie in serial mode: the enumerated pool is
+        # the forge's SEED QUEUE (candidates are forged one at a time,
+        # and the forge generates its own when the queue runs dry), not
+        # a set of rivals competing in parallel. Announcing 'competing
+        # 7 hypotheses' right before '🧪 Hypothesis 1/3' was the
+        # parallel path's wording surviving into a serial run.
+        if _serial:
+            await self._f._emit_status(
+                f"{status_prefix}: {n_found} hypothesis seed(s) "
+                f"enumerated → serial forge"
+            )
+            self._f._log_debug(
+                f"🤖 Agentic: step {step.id} enumerated {n_found} seed "
+                f"hypotheses for the serial forge "
+                f"(debug_intent={_intent_debug})"
+            )
+        else:
+            await self._f._emit_status(f"{status_prefix}: competing {n_found} hypotheses")
+            self._f._log_debug(
+                f"🤖 Agentic: step {step.id} competes {n_found} rival "
+                f"hypotheses (debug_intent={_intent_debug})"
+            )
         # Capa 1 — planner-gated divergent pool: this path is reached ONLY on
         # a planner-chosen hypothesize step, so widening the rival set here is
         # exactly the "planner decides when it needs this" behavior. The
@@ -26666,6 +26685,25 @@ class MetacognitiveReasoningEngine:
         r"\s+`?(\w+)`?",
         re.IGNORECASE,
     )
+
+    def _qid_exists(self, qid: str, project_id: str) -> bool:
+        """
+        O(1) existence check via the SymbolIndex block maps.
+
+        Defined on THIS class because the EC-6 anchor collection and the
+        serial forge's anchor pass both call self._qid_exists;
+        AgenticEvidenceLedger's copy is not in scope here. A live
+        AttributeError ('MetacognitiveReasoningEngine' object has no
+        attribute '_qid_exists') crashed the agentic pipeline on every
+        turn until this was added. Same body as the ledger's: identical
+        semantics, and both classes hold self._f._symbol_index.
+        """
+        try:
+            return bool(
+                self._f._symbol_index.find_blocks(qid, project_id)
+            )
+        except Exception:
+            return False
 
     def _relation_in_graph(
         self,
