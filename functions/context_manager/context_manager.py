@@ -26364,6 +26364,29 @@ class MetacognitiveReasoningEngine:
     structural data — never from LLM introspection.
     """
 
+    # Relation regexes used by gather_evidence, which runs on the forge's
+    # screening path (_forge_all) and on every forge cycle. Both must be
+    # attributes of THIS class: AgenticEvidenceLedger holds its own copies
+    # and those are not in scope here. This has now bitten twice in live
+    # runs — 'MetacognitiveReasoningEngine object has no attribute
+    # _NEG_RELATION_RE' crashed the pipeline at the first slot's screen,
+    # so the forge was entered and exited without forging anything. The
+    # positive form matches 'X calls Y'; the negated form matches
+    # 'X never calls Y' (English and Spanish), whose refutation is the
+    # edge EXISTING.
+    _CALL_RELATION_RE = re.compile(
+        r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|reads?|writes?|depends on)"
+        r"\s+`?(\w+)`?",
+        re.IGNORECASE,
+    )
+    _NEG_RELATION_RE = re.compile(
+        r"`?(\w+)`?\s+(?:does\s+not|doesn'?t|never|no\s+longer|"
+        r"cannot|can'?t|no|nunca)\s+"
+        r"(?:calls?|invokes?|uses?|reads?|writes?|depends\s+on|"
+        r"llama\s+a|invoca\s+a|usa)\s+`?(\w+)`?",
+        re.IGNORECASE,
+    )
+
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
         # ExperimentDesign cache keyed by hypothesis MD5.
