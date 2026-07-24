@@ -28054,6 +28054,8 @@ class MetacognitiveReasoningEngine:
         cycles_max: int,
         maturity_need: int,
         cov_threshold: float,
+        rungs_walked: int = 99,
+        min_rungs: int = 1,
     ) -> Tuple[str, str]:
         """
         Deterministic forge verdict for one completed cycle.
@@ -28067,14 +28069,35 @@ class MetacognitiveReasoningEngine:
         The falsification gate is criticality-blind (forge claims
         carry no critical/supportive split): two refutations, or one
         with nothing confirmed, kill. Calibratable after validation.
+
+        Maturity also requires breadth, not only count. A validation
+        run showed why: four of five hypotheses sealed 'mature' on
+        cycle 1 having read a SINGLE body, because confirming four
+        cheap consequences off the symbols rung was enough to stop.
+        Their confirmations were real but undiscriminating — nothing
+        the hypothesis was at risk of failing. Meanwhile the one
+        hypothesis that walked three rungs produced the run's only
+        refutation, and won. The old gate rewarded cheap agreement
+        with an early exit and paid exploration only to hypotheses
+        whose experiments had FAILED, which is the incentive exactly
+        inverted. rungs_walked defaults high so callers that do not
+        pass it (tests, any future caller) keep the old behaviour.
         """
         # Region: kill gates — facts AGAINST the hypothesis kill on
         # any cycle (refutation is evidence, not absence of it)
         resolvable = confirmed + refuted
         if refuted >= 2 or (refuted >= 1 and confirmed == 0):
             return "dead", "falsified"
-        # Region: maturity (facts for the hypothesis)
-        if confirmed >= maturity_need and coverage >= cov_threshold:
+        # Region: maturity (facts for the hypothesis) — enough
+        # confirmations, over enough of the tree. A hypothesis that
+        # has not yet looked at who CALLS the code it blames has not
+        # earned a verdict, however much it agreed with itself on
+        # the first rung.
+        if (
+            confirmed >= maturity_need
+            and coverage >= cov_threshold
+            and rungs_walked >= min_rungs
+        ):
             return "plausible", "mature"
         # Region: end of this hypothesis's iterations. Operator's
         # rule: LACK of foundation may only be judged at the END of
@@ -28820,6 +28843,16 @@ class MetacognitiveReasoningEngine:
                 cycles_max=_cycles_max,
                 maturity_need=_need,
                 cov_threshold=_cov_thr,
+                rungs_walked=len(
+                    {
+                        t.split(":", 1)[1]
+                        for t in _dossier.strategy_trace
+                        if t.startswith("investigate:")
+                    }
+                ),
+                min_rungs=int(
+                    self._f.valves.agentic_serial_maturity_min_rungs
+                ),
             )
             _strat_tag = (
                 f" [{', '.join(_dossier.strategy_trace)}]"
@@ -43085,6 +43118,26 @@ class Filter:
                 "coverage over low_coverage_threshold) for a dossier "
                 "to seal as MATURE. Deterministic — model confidence "
                 "plays no role in maturity."
+            ),
+        )
+        agentic_serial_maturity_min_rungs: int = Field(
+            default=2,
+            ge=1,
+            le=5,
+            description=(
+                "Distinct investigation rungs a hypothesis must have "
+                "walked before it may be sealed 'mature'. Counts "
+                "alongside agentic_serial_maturity_confirmed: enough "
+                "confirmations, over enough of the call tree. A run "
+                "with this at 1 (the old behaviour) sealed four of "
+                "five hypotheses on cycle 1 having read ONE body — "
+                "cheap agreement on the symbols rung bought an early "
+                "exit, while the only hypothesis that walked three "
+                "rungs produced the run's only refutation and won. 2 "
+                "means a verdict requires at least having looked at "
+                "who CALLS the code it blames. Raise for more "
+                "breadth per hypothesis at the cost of cycles; 1 "
+                "restores the count-only gate."
             ),
         )
         agentic_serial_design_max_tokens: int = Field(
