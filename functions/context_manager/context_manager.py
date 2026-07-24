@@ -242,6 +242,10 @@ class HypothesisDossier:
     # directive and any later step can AIM at the gap instead of
     # rediscovering it.
     nodes_read: int = 0
+    # WHICH nodes, not just how many. The count says a hypothesis was
+    # tested against six bodies; the names say which six, which is the
+    # difference between auditing a verdict and taking its word.
+    nodes_expanded: List[str] = field(default_factory=list)
     blind_spots: List[str] = field(default_factory=list)
     # RS-4: how a surviving rival relates to the winner, set at
     # judgment time (competing / complementary / independent).
@@ -12233,24 +12237,57 @@ class LLMOrchestrator:
         # never touched, while a repeated sentence — the loop's signature —
         # is. That is what lets the temperature come down for format
         # adherence without the loop coming back.
+        # models.ini is the single source of truth for the SHAPE of the
+        # sampler — dry_allowed_length, dry_base, dry_penalty_last_n,
+        # repeat_penalty, top_k, min_p, temp. The operator tunes those
+        # for the model they are actually running; a plugin shipping
+        # its own copy makes that file a lie, and the router log proved
+        # it: 80 of 111 calls ran with the server's allowed_length=17
+        # and 31 with a hardcoded 8, from one binary, in one run, with
+        # nothing in our own logs to say which was which.
+        #
+        # Only the multiplier stays overridable, because it is the one
+        # dimension models.ini cannot express: a global file has no way
+        # to say 'stronger on JSON contracts than on prose'. Everything
+        # else is omitted, and llama.cpp fills an omitted sampler field
+        # from its CLI defaults — which is exactly models.ini.
         _extra_body: Optional[Dict[str, Any]] = None
         if response_format is not None:
             _dry = float(getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0)
         else:
             _dry = float(getattr(self._f.valves, "llm_long_dry_multiplier", 0.0) or 0.0)
-            if _dry > 0 and (max_tokens or 0) < int(
+            # max_tokens None or 0 means UNLIMITED, and an unlimited
+            # call is the one MOST in need of loop control, not the
+            # least: it is the only kind that can generate until the
+            # context window runs out. `(max_tokens or 0)` read 'no
+            # ceiling' as 'a ceiling of zero' and therefore skipped
+            # every uncapped pipeline call — the 57907-token
+            # generations among them — as if they were the short
+            # auxiliaries this guard was written to spare.
+            _ceiling = max_tokens if (max_tokens and max_tokens > 0) else None
+            if _dry > 0 and _ceiling is not None and _ceiling < int(
                 getattr(self._f.valves, "llm_long_dry_min_tokens", 1200)
             ):
                 # Short auxiliary calls cannot loop their way into a cap they
                 # would never reach; leave their sampling alone.
                 _dry = 0.0
         if _dry > 0:
-            _extra_body = {
-                "dry_multiplier": _dry,
-                "dry_base": 1.75,
-                "dry_allowed_length": 8,
-                "dry_penalty_last_n": 1024,
-            }
+            _extra_body = {"dry_multiplier": _dry}
+        # Say what was decided. Establishing that DRY had been armed
+        # with the server's shape rather than the plugin's took
+        # correlating 111 router-log sampler dumps against this
+        # function, because nothing on our side recorded it. One line
+        # per call makes the same question a grep.
+        self._f._log_debug(
+            f"sampler ({label}): "
+            + (
+                f"dry_multiplier={_dry} sent, shape from server config"
+                if _extra_body
+                else "no dry override sent — server config governs"
+            )
+            + f" [max_tokens={max_tokens if max_tokens else 'unlimited'}, "
+            f"json={response_format is not None}]"
+        )
 
         dedup_key = hashlib.md5(
             f"{prompt}|{system_prompt}|{temperature}|{max_tokens}|{model_override}"
@@ -12480,6 +12517,40 @@ class LLMOrchestrator:
                             f"took {time.monotonic() - t_start:.3f}s"
                             f"{' [TRUNCATED]' if result.truncated else ''}"
                         )
+                        # Agent forensics. One hook covers every agent
+                        # in the file: all 43 call sites funnel through
+                        # here and each already passes a label naming
+                        # itself, so nothing needs instrumenting twice.
+                        # The output is capped per record — a capped
+                        # record is itself a finding, since a healthy
+                        # auxiliary call is a few hundred tokens and
+                        # anything near the cap was already degenerate.
+                        self._f._record_agent_act(
+                            str(label or "unlabelled"),
+                            "call",
+                            {
+                                "in_tokens": in_tokens,
+                                "out_tokens": out_tokens,
+                                "seconds": round(
+                                    time.monotonic() - t_start, 2
+                                ),
+                                "finish_reason": getattr(
+                                    result, "finish_reason", ""
+                                ),
+                                "truncated": bool(result.truncated),
+                                "max_tokens": (
+                                    max_tokens if max_tokens else "unlimited"
+                                ),
+                                "sampler": (
+                                    _extra_body
+                                    if _extra_body
+                                    else "server config (no override)"
+                                ),
+                                "json_declared": response_format is not None,
+                                "output": content[:12000],
+                                "output_capped": len(content) > 12000,
+                            },
+                        )
                         return result if return_meta else content
                     else:
                         if not future.done():
@@ -12687,6 +12758,12 @@ class AgenticStep:
     cached: bool = False
     skip_reason: str = ""
     truncated: bool = False  # generation hit max_tokens: output is incomplete
+    # Which INSTRUCTION set this step gets, when the plan's intent
+    # demands something other than the default for its kind. Kind says
+    # what the step does in the plan and drives the synthesis lookup;
+    # instruction_set says how to instruct it. Empty means 'the default for
+    # this kind', which is every step the pipeline has ever built.
+    instruction_set: str = ""
     display_no: int = (
         0  # 1-based execution position for user-facing labels; id stays the stable cache/ledger key
     )
@@ -16076,6 +16153,190 @@ class AgenticPlanner:
             i = end
         return salvaged
 
+    # RT-4: "dame el diff" names two different operations, and the
+    # words barely differ. "el diff que acabas de aplicar" points at an
+    # artifact already written to napmem_diffs when the index updated —
+    # a fetch. "dame el diff de ese codigo" points at nothing stored at
+    # all: the model emitted code into the chat, nothing was applied,
+    # and the diff has to be COMPUTED against the indexed original.
+    # Sending the second down the first path returns an empty table and
+    # invites the model to explain the absence, which is how the
+    # validation run produced a theory about napmem_diffs instead of a
+    # diff.
+    _RETRIEVAL_DIFF_RE = re.compile(
+        r"\b(diffs?|diferencias?|cambios?|changes?)\b", re.I
+    )
+    _RETRIEVAL_APPLIED_RE = re.compile(
+        # Stem-wide on purpose: Spanish conjugates this verb across the
+        # whole paradigm and a user says "aplicaste", "aplicó",
+        # "aplicado" or "aplicar" with no change of meaning. Matching
+        # fixed forms missed "los cambios que aplicaste" and routed a
+        # stored diff to the computation branch — caught in testing.
+        r"(aplic\w*|appl\w*|persist\w*|guardad\w*|stored)",
+        re.I,
+    )
+    _EMITTED_SYMBOL_RE = re.compile(
+        r"^[ \t]*(?:async[ \t]+)?(?:def|class)[ \t]+([A-Za-z_]\w*)", re.M
+    )
+
+    @classmethod
+    def _retrieval_kind(cls, target: str) -> str:
+        """
+        Which operation a retrieval request actually names.
+
+        'diff_stored'  — a diff that was applied and persisted; fetch it.
+        'diff_compute' — a diff against code the model just emitted;
+                         nothing is stored, it must be computed.
+        'artifact'     — anything else (a symbol body, a file, a value).
+
+        Lexical and deterministic: the classification already happened
+        once this turn, and re-asking a model to sort four words is
+        latency spent on a decision a regex settles.
+        """
+        _t = target or ""
+        if not cls._RETRIEVAL_DIFF_RE.search(_t):
+            return "artifact"
+        if cls._RETRIEVAL_APPLIED_RE.search(_t):
+            return "diff_stored"
+        return "diff_compute"
+
+    @classmethod
+    def _slice_emitted_symbol(cls, code: str, name: str) -> str:
+        """
+        Cut one top-level def/class out of a block of emitted code.
+
+        Without this the comparison is lopsided: the index yields one
+        symbol body while the answer may carry several, and diffing one
+        function against a three-function blob reports every other
+        function as an addition. Ends at the next declaration sitting at
+        the same indent or shallower.
+        """
+        _lines = code.split("\n")
+        _start = None
+        for _i, _l in enumerate(_lines):
+            _m = cls._EMITTED_SYMBOL_RE.match(_l)
+            if _m and _m.group(1) == name:
+                _start = _i
+                break
+        if _start is None:
+            return ""
+        _indent = len(_lines[_start]) - len(_lines[_start].lstrip())
+        _end = len(_lines)
+        for _j in range(_start + 1, len(_lines)):
+            _l = _lines[_j]
+            if not _l.strip():
+                continue
+            _ind = len(_l) - len(_l.lstrip())
+            if _ind <= _indent and cls._EMITTED_SYMBOL_RE.match(_l):
+                _end = _j
+                break
+        return "\n".join(_lines[_start:_end]).rstrip()
+
+    def _diff_emitted_against_index(self, project_id: str) -> str:
+        """
+        Unified diff between the code last emitted and the index.
+
+        Computed here rather than requested from the model. The tool to
+        do it was always available and the guidance told the executor to
+        reach for memory on questions about previous changes; across a
+        whole validation run it never did, on the one turn that was
+        literally about a previous change. A harness is the answer for
+        now: the turn has already been classified as retrieval, so
+        leaving the retrieval itself to model judgement reintroduces the
+        uncertainty the gate exists to remove.
+
+        Every failure is stated, never guessed around. An unresolvable
+        counterpart yields a note saying so: a diff against the wrong
+        original is worse than no diff, because it looks right.
+        """
+        # ── Step 1: the code the previous answer carried ──
+        _prev = self._f._project_state_manager.get_last_assistant_response(
+            project_id
+        )
+        _emitted = AgenticDynamicVerifier.extract_code_blocks(_prev or "")
+        if not _emitted.strip():
+            return (
+                "[No diff: the previous answer carried no fenced code "
+                "block, so there is nothing to compare against the index.]"
+            )
+        _names = list(dict.fromkeys(self._EMITTED_SYMBOL_RE.findall(_emitted)))
+        if not _names:
+            return (
+                "[No diff: the emitted code declares no top-level function "
+                "or class, so its counterpart in the index cannot be "
+                "identified without guessing which original it belongs to.]"
+            )
+
+        # ── Step 2: each symbol against its live indexed body ──
+        _broker = AgenticToolBroker(self._f)
+        _state = self._f._conversation_state_manager.get(project_id)
+        _parts: List[str] = []
+        _missing: List[str] = []
+        for _name in _names[:4]:
+            _qid = _broker._qid_for(_name, project_id)
+            _block = None
+            if _qid:
+                for _bh in self._f._symbol_index.find_blocks(_qid, project_id):
+                    _blk = _state.active_blocks.get(_bh)
+                    if _blk and not _blk.obsolete:
+                        _block = _blk
+                        break
+            _orig = ""
+            if _block is not None and _qid:
+                _orig = CodeBlockManager.extract_symbol_body(_block, _qid) or ""
+            if not _orig.strip():
+                _missing.append(_name)
+                continue
+            _new = self._slice_emitted_symbol(_emitted, _name)
+            if not _new.strip():
+                _missing.append(_name)
+                continue
+            _d = "".join(
+                difflib.unified_diff(
+                    _orig.splitlines(keepends=True),
+                    _new.splitlines(keepends=True),
+                    fromfile=f"indexed/{_qid}",
+                    tofile=f"emitted/{_name}",
+                    n=3,
+                )
+            )
+            if _d.strip():
+                _parts.append(_d.rstrip())
+            else:
+                # Not a failure and worth saying plainly: this is what a
+                # diff looks like after the change was already applied to
+                # the index, and silence here would read as a broken tool.
+                _parts.append(
+                    f"# {_qid}: no differences — the emitted body matches "
+                    f"the indexed version (already applied, or unchanged)."
+                )
+
+        # ── Step 3: report, including what could not be matched ──
+        if not _parts:
+            return (
+                "[No diff: none of the emitted symbols ("
+                + ", ".join(_names[:4])
+                + ") has a live counterpart in the index. This is new "
+                "code, or the block holding it is not indexed — there is "
+                "no original to diff against.]"
+            )
+        _out = "\n\n".join(_parts)
+        # Bounded because this text travels as both output and digest;
+        # the marker keeps a cut diff from reading as a complete one.
+        if len(_out) > 8000:
+            _out = (
+                _out[:8000]
+                + "\n[diff truncated at 8000 chars — the symbols above "
+                "are complete up to this point, the rest was not shown]"
+            )
+        if _missing:
+            _out += (
+                "\n\n[Not compared: "
+                + ", ".join(_missing)
+                + " — no live indexed counterpart found.]"
+            )
+        return _out
+
     async def plan(
         self,
         question: str,
@@ -16108,6 +16369,178 @@ class AgenticPlanner:
             "fallback_fixed".
         """
         # Region: gates — slot availability
+        # ── RT-3: the retrieval gate — a direct request must not be ──
+        # ── forced through the forge ──
+        # 'dame el diff que acabas de aplicar' is retrieval, not
+        # diagnosis; the validation run routed it through the full
+        # pipeline, forged three hypotheses about an irrelevant method
+        # and answered with a theory about why the artifact might not
+        # exist instead of fetching it. The scientific method answers
+        # 'why does X happen'; it buries 'give me X'.
+        #
+        # Detection is the LLM turn classifier — NOT the CrossEncoder,
+        # which scores semantic similarity and is structurally unable
+        # to separate 'give me the diff' from 'why is the diff wrong'
+        # (they share every content word). classify_turn already runs
+        # once per turn and is cached by content hash, so this reads a
+        # field that already exists: zero added calls.
+        #
+        # A misfire here is catastrophic in exactly one direction — a
+        # diagnostic question skipping the pipeline — so the gate
+        # demands FIVE independent signals agree, all from the same
+        # single classification: the flag itself; a named target (a
+        # retrieval with nothing to retrieve is a misparse); intent
+        # 'explain' (debug/modify/refactor veto — a debugging turn
+        # stays in the pipeline no matter what the flag says); not
+        # multiclause (chained commands need planning); and cot_level
+        # 1, the classifier's own independent statement that a direct
+        # answer suffices. Every failure mode — stale cache, parse
+        # error, absent field, exception — lands on the pipeline path,
+        # which is the pre-RT-3 behaviour unchanged.
+        try:
+            _cls_rt = self._f._project_state_manager.get_pstate(
+                project_id
+            ).get("turn_classification") or {}
+            _rt_target = str(_cls_rt.get("retrieval_target", "") or "").strip()
+            _rt_ok = (
+                _cls_rt.get("direct_retrieval") is True
+                and bool(_rt_target)
+                and str(_cls_rt.get("intent", "")) == "explain"
+                and _cls_rt.get("multiclause") is not True
+                and int(_cls_rt.get("cot_level", 1) or 1) == 1
+            )
+        except Exception:
+            _rt_ok = False
+            _rt_target = ""
+            _cls_rt = {}
+        # A gate that declines in silence is undiagnosable: five
+        # conditions must agree, and 'it did not fire' says nothing
+        # about which one dissented. Logged only when the classifier
+        # DID flag a retrieval, so an ordinary diagnostic turn stays
+        # quiet while a near-miss names the signal that blocked it.
+        if _cls_rt.get("direct_retrieval") is True and not _rt_ok:
+            _rt_why = [
+                _n
+                for _n, _pass in (
+                    ("no target named", bool(_rt_target)),
+                    (
+                        f"intent={_cls_rt.get('intent', '?')} (needs "
+                        f"explain)",
+                        str(_cls_rt.get("intent", "")) == "explain",
+                    ),
+                    ("multiclause", _cls_rt.get("multiclause") is not True),
+                    (
+                        f"cot_level={_cls_rt.get('cot_level', '?')} "
+                        f"(needs 1)",
+                        int(_cls_rt.get("cot_level", 1) or 1) == 1,
+                    ),
+                )
+                if not _pass
+            ]
+            self._f._log_debug(
+                "planner RT-3 gate: classifier flagged a retrieval but "
+                "the turn stays in the pipeline — blocked by: "
+                + "; ".join(_rt_why)
+            )
+        if _rt_ok:
+            await self._f._emit_status(
+                f"⤵️ Direct request (target: {_rt_target[:60]}) — "
+                f"retrieval plan, no hypothesis forging"
+            )
+            self._f._log_debug(
+                f"planner RT-3 gate: retrieval plan for "
+                f"'{_rt_target[:80]}' (intent=explain, cot=1, "
+                f"single-clause) — forge skipped"
+            )
+            # RT-4: dispatch by what the artifact IS. A diff against
+            # freshly emitted code is not a lookup — it is difflib over
+            # two texts already in hand, so the harness computes it and
+            # hands the step its result. The executor skips a step that
+            # is already done, so the answer sees a real diff instead of
+            # an instruction to go find one.
+            _rt_kind = self._retrieval_kind(_rt_target)
+            _rt_precomputed = ""
+            if _rt_kind == "diff_compute":
+                try:
+                    _rt_precomputed = self._diff_emitted_against_index(
+                        project_id
+                    )
+                except Exception as _e_rt:
+                    _rt_precomputed = ""
+                    self._f._log_debug(
+                        f"planner RT-4: diff computation failed "
+                        f"({_e_rt!r}) — falling back to a tool-driven "
+                        f"retrieval step"
+                    )
+            if _rt_precomputed:
+                self._f._log_debug(
+                    f"planner RT-4: computed diff for '{_rt_target[:60]}' "
+                    f"({len(_rt_precomputed)} chars) — step 1 pre-filled"
+                )
+                await self._f._emit_status(
+                    "\U0001f9ee Diff computed against the index "
+                    "(no investigation needed)"
+                )
+            _step1 = AgenticStep(
+                id=1,
+                goal=(
+                    f"Retrieve and present: {_rt_target[:160]}. "
+                    "Locate the artifact itself (the diff, the "
+                    "body, the value) via the available tools "
+                    "and bring it into the workspace verbatim."
+                ),
+                kind="investigate",
+            )
+            if _rt_precomputed:
+                _step1.goal = (
+                    f"Diff of the last emitted code against the indexed "
+                    f"original, computed by the pipeline: {_rt_target[:80]}"
+                )
+                _step1.output = _rt_precomputed
+                # The per-step workspace renders DIGEST, not output, so a
+                # pre-filled step that sets only output is invisible to
+                # the analyze step that has to present it — the whole
+                # computation would arrive nowhere. Set here rather than
+                # through _digest() on purpose: that helper truncates to
+                # agentic_digest_max_tokens (400), and a diff cut at 400
+                # tokens is a diff that lies by omission.
+                _step1.digest = _rt_precomputed
+                _step1.status = "done"
+            return AgenticPlan(
+                steps=[
+                    _step1,
+                    AgenticStep(
+                        id=2,
+                        goal=(
+                            (
+                                "The diff is already in the workspace, "
+                                "computed by the pipeline. Present it "
+                                "verbatim inside a fenced block and say "
+                                "in one sentence what changed. Do not "
+                                "recompute it, do not summarise it away, "
+                                "and do not explain why it might be "
+                                "wrong."
+                            )
+                            if _rt_precomputed
+                            else (
+                                "Present the retrieved artifact itself, "
+                                "verbatim where it is text. If it could "
+                                "not be located, say so plainly and stop "
+                                "— do NOT hypothesize about causes the "
+                                "user did not ask for."
+                            )
+                        ),
+                        kind="analyze",
+                        # Kind stays analyze: the synthesis lookup that
+                        # feeds the final prompt selects on it. Only the
+                        # instruction set changes.
+                        instruction_set="present",
+                    ),
+                ],
+                source="retrieval_fixed",
+                rationale="RT-3: direct request routed to retrieval",
+            )
+
         if not slot_free:
             fp = AgenticOrchestrator.build_fixed_plan(
                 question,
@@ -16849,6 +17282,29 @@ class AgenticStepExecutor:
         "their diffs)\n"
     )
 
+    # The whole instruction for a step whose job is to hand over an
+    # artifact the pipeline already produced. No tool menu: the artifact
+    # is in the workspace and offering EXPAND/GREP invites a hunt for
+    # something already found. No conclusion charter: a diff has no
+    # residual risk to type. No claims contract: a retrieval turn has no
+    # claims by construction, and the ledger is exempted for these plans.
+    _PRESENT_INSTRUCTION = (
+        "You are executing step {sid}, the final step of a retrieval "
+        "request.\nGoal: {goal}\n\n"
+        "The workspace above already contains what the user asked for. "
+        "Your job is to HAND IT OVER, not to analyse it:\n"
+        "- Reproduce the artifact exactly as it appears, inside a fenced "
+        "block. Do not reformat it, shorten it, or describe it instead "
+        "of showing it.\n"
+        "- Add at most one sentence saying what it is or what changed.\n"
+        "- If the workspace says the artifact could not be produced, say "
+        "exactly that and stop. Do not explain what might have gone "
+        "wrong, do not propose causes, and do not substitute a "
+        "description of the machinery that would have stored it — the "
+        "user asked to see a thing, and the honest answer to a missing "
+        "thing is that it is missing."
+    )
+
     _TOOLS_TAIL = "Results will be appended and you will continue the step."
 
     _MEMORY_GUIDANCE = (
@@ -16885,13 +17341,207 @@ class AgenticStepExecutor:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    # ── Instruction recipes ──────────────────────────────────────────
+    # A recipe is the ORDERED list of instruction fragments a step
+    # receives, with the gate that decides whether each one lands.
+    # Every entry documents WHERE it is used and WHAT FOR, because the
+    # cost of getting this wrong is invisible: a fragment that
+    # contradicts the step's goal produces a confident wrong answer,
+    # not an error.
+    #
+    # Order is load-bearing. The claims contract must be the LAST thing
+    # read and the memory guidance must precede it. Before this table
+    # those invariants lived only in the sequence of append statements,
+    # where nothing declared them and nothing could check them.
+    _INSTRUCTION_RECIPES: Dict[str, Tuple[Tuple[str, str], ...]] = {
+        # DEFAULT — used by every step of every plan the planner emits
+        # (investigate, analyze, hypothesize, design_tests and any
+        # unknown kind, which borrows the analyze template). For a step
+        # that must reason over code and may need tools to do it.
+        "": (
+            ("kind_template", "always"),
+            ("_SWEEP_METHODOLOGY", "sweep_goal"),
+            ("_ANALYZE_METHODOLOGY", "analyze_charter"),
+            ("focus_symbols", "has_symbols"),
+            ("_TOOLS_MENU", "always"),
+            ("_MEMORY_MENU_LINE", "memory_on"),
+            ("_TOOLS_TAIL", "always"),
+            ("_MEMORY_GUIDANCE", "memory_on"),
+            ("_JSON_CONTRACT", "always"),
+        ),
+        # PRESENT — used by the final step of the retrieval plan built
+        # in AgenticPlanner.plan()'s RT-3 gate, and nowhere else. For
+        # handing over an artifact the pipeline already produced (a
+        # computed diff, a fetched body). Carries no tool menu because
+        # the artifact is already in the workspace, no conclusion
+        # charter because a diff has no residual risk to type, and no
+        # claims contract because a retrieval turn has none by
+        # construction — _render_workspace exempts these plans from the
+        # zero-claims abstention for the same reason.
+        "present": (("_PRESENT_INSTRUCTION", "always"),),
+    }
+
+    # What a fragment ASSERTS, for the contradiction check in
+    # audit_instruction_recipes(). Deliberately sparse: only claims strong enough
+    # that a second fragment can genuinely negate them are listed, so
+    # the audit reports real conflicts rather than stylistic tension.
+    _FRAGMENT_DIRECTIVES: Dict[str, frozenset] = {
+        "analyze_template": frozenset({"synthesize_not_paste"}),
+        "_PRESENT_INSTRUCTION": frozenset({"paste_verbatim"}),
+    }
+
+    # Directive pairs that must never share a recipe. The first pair is
+    # not hypothetical: the retrieval step was shipped receiving both,
+    # so the instruction telling it to reproduce an artifact verbatim
+    # sat under a template forbidding exactly that.
+    _OPPOSED_DIRECTIVES: Tuple[Tuple[str, str], ...] = (
+        ("synthesize_not_paste", "paste_verbatim"),
+    )
+
+    @classmethod
+    def audit_instruction_recipes(cls) -> str:
+        """
+        Report what every harness recipe composes, and flag conflicts.
+
+        Answers in one screen the question that previously took reading
+        a hundred lines of conditionals and simulating them: what does
+        a step of this harness and this kind actually receive. Pure and
+        instance-free, so it can be called from a test, a REPL or a
+        debug command without a live pipeline.
+
+        The conflict check is the part that earns its keep. A recipe
+        combining fragments whose directives are opposed is reported as
+        CONFLICT — that is the defect class that shipped once already,
+        where a step was told to reproduce an artifact verbatim by its
+        goal and forbidden from pasting raw evidence by its template.
+
+        Returns:
+            A multi-line report, one row per (recipe, kind).
+        """
+        _out = ["Instruction-recipe audit — composition and conflicts", ""]
+        _bad = 0
+        for _h, _recipe in sorted(cls._INSTRUCTION_RECIPES.items()):
+            _uses_kind = any(_n == "kind_template" for _n, _ in _recipe)
+            _kinds = (
+                sorted(cls._INSTRUCTION_TEMPLATES) if _uses_kind else ["-"]
+            )
+            for _k in _kinds:
+                _labels: List[str] = []
+                _chars = 0
+                _dirs: set = set()
+                for _n, _g in _recipe:
+                    if _n == "kind_template":
+                        _txt = cls._INSTRUCTION_TEMPLATES.get(
+                            _k, cls._INSTRUCTION_TEMPLATES["analyze"]
+                        )
+                        _label = f"template[{_k}]"
+                        _dirs |= cls._FRAGMENT_DIRECTIVES.get(
+                            f"{_k}_template", frozenset()
+                        )
+                    elif _n == "focus_symbols":
+                        _txt, _label = "", "focus_symbols"
+                    else:
+                        _txt = str(getattr(cls, _n, ""))
+                        _label = _n
+                        _dirs |= cls._FRAGMENT_DIRECTIVES.get(_n, frozenset())
+                    _chars += len(_txt)
+                    _labels.append(f"{_label}[{_g}]")
+                _clash = [
+                    f"{_a} vs {_b}"
+                    for _a, _b in cls._OPPOSED_DIRECTIVES
+                    if _a in _dirs and _b in _dirs
+                ]
+                if _clash:
+                    _bad += 1
+                _out.append(
+                    f"recipe={_h or '(default)':<9} kind={_k:<13} "
+                    f"{_chars:>5} chars  {len(_labels)} fragment(s)"
+                )
+                _out.append("    " + " + ".join(_labels))
+                if _dirs:
+                    _out.append("    asserts: " + ", ".join(sorted(_dirs)))
+                if _clash:
+                    _out.append("    *** CONFLICT: " + "; ".join(_clash))
+                _out.append("")
+        _out.append(
+            "CONFLICTS: none" if not _bad else f"CONFLICTS: {_bad} recipe(s)"
+        )
+        return "\n".join(_out)
+
+    def _hypothesis_range(self, step: "AgenticStep") -> str:
+        """
+        How many rival hypotheses the hypothesize step asks for.
+
+        hypothesis_target_count is the single source of truth: "auto"
+        derives a band from the pre-planner's difficulty verdict (low
+        2-3 / medium 3-5 / high 4-6), a positive integer pins it, and
+        anything else keeps the historical "2-4". The number is a
+        request in the prompt and never a truncation, so a model with
+        one more genuinely distinct mechanism can still surface it;
+        hypothesis_hard_cap is the real ceiling.
+        """
+        if step.kind != "hypothesize":
+            return "2-4"
+        _raw = (
+            str(getattr(self._f.valves, "hypothesis_target_count", "auto") or "auto")
+            .strip()
+            .lower()
+        )
+        if _raw == "auto":
+            try:
+                _diff = str(
+                    getattr(self._f._agentic._preplanner, "last_stats", {}).get(
+                        "difficulty", ""
+                    )
+                    or ""
+                )
+            except Exception:
+                _diff = ""
+            return {"low": "2-3", "medium": "3-5", "high": "4-6"}.get(_diff, "2-4")
+        if _raw.isdigit() and int(_raw) > 0:
+            return str(int(_raw))
+        return "2-4"
+
+    def _render_fragment(self, name: str, step: "AgenticStep") -> str:
+        """
+        Resolve one recipe entry to its text.
+
+        Two entries are computed rather than stored, because they
+        interpolate per-step values: kind_template (the base
+        instruction for the step's kind) and focus_symbols. Everything
+        else is a class constant looked up by name, which is what lets
+        the recipe table stay a table.
+        """
+        if name == "kind_template":
+            return self._INSTRUCTION_TEMPLATES.get(
+                step.kind, self._INSTRUCTION_TEMPLATES["analyze"]
+            ).format(
+                sid=step.id,
+                goal=step.goal,
+                hyp_range=self._hypothesis_range(step),
+            )
+        if name == "focus_symbols":
+            return "\nFocus symbols suggested by the planner: " + ", ".join(
+                step.symbols
+            )
+        if name == "_PRESENT_INSTRUCTION":
+            return self._PRESENT_INSTRUCTION.format(sid=step.id, goal=step.goal)
+        return str(getattr(self, name, ""))
+
     def build_prompt(self, step: AgenticStep, workspace: str) -> str:
         """
-        Render the user-turn prompt for a step.
+        Render the user-turn prompt for a step, from its instruction recipe.
 
-        The workspace block (digests of previous steps) comes FIRST so that
-        consecutive steps share it as an incremental prefix on top of the
-        aligned system prompt; the per-step instruction follows.
+        The workspace block (digests of previous steps) comes FIRST so
+        that consecutive steps share it as an incremental prefix on top
+        of the aligned system prompt; the per-step instruction follows.
+
+        Composition is table-driven rather than a sequence of appends.
+        The difference is not tidiness: with the fragments chosen by
+        scattered conditionals, no single place stated what a given
+        step actually receives, and a contradiction between two of them
+        was invisible until it produced a wrong answer in production.
+        _INSTRUCTION_RECIPES states it, and audit_instruction_recipes() checks it.
 
         Args:
             step: The step to render.
@@ -16901,96 +17551,51 @@ class AgenticStepExecutor:
         Returns:
             The user-turn prompt text.
         """
-        template = self._INSTRUCTION_TEMPLATES.get(
-            step.kind, self._INSTRUCTION_TEMPLATES["analyze"]
+        # ── Step 1: the recipe this step's instruction_set selects ──
+        _recipe = self._INSTRUCTION_RECIPES.get(
+            step.instruction_set or "", self._INSTRUCTION_RECIPES[""]
         )
-        # Region: difficulty-adaptive enumeration range (Fase 0). The
-        # hypothesize instruction sizes its request from the pre-planner's
-        # difficulty verdict instead of a blind constant: a simple bug does
-        # not need six rivals, a gnarly one deserves more than four. Soft
-        # by construction — it is a request in the prompt, never a
-        # truncation, so a model that genuinely has one more distinct
-        # mechanism can still emit it. Falls back to the historical "2-4"
-        # when auto-sizing is off or difficulty is unknown.
-        _hyp_range = "2-4"
-        # hypothesis_target_count is the single source of truth for how many
-        # rivals the hypothesize step requests. It accepts either "auto"
-        # (difficulty-derived band: low 2-3 / medium 3-5 / high 4-6, the
-        # historical behaviour) or a fixed integer as a string (e.g. "4" for
-        # a focused competition — enough rivals to discriminate a real cause,
-        # few enough that each is scored without the pool drifting toward the
-        # hard cap). The number is requested in the prompt, never enforced by
-        # truncation, so a model with one more genuinely distinct mechanism
-        # can still surface it; hypothesis_hard_cap is the real ceiling.
-        if step.kind == "hypothesize":
-            _target_raw = (
-                str(
-                    getattr(self._f.valves, "hypothesis_target_count", "auto") or "auto"
-                )
-                .strip()
-                .lower()
-            )
-            if _target_raw == "auto":
-                # Difficulty-derived band. Falls back to "2-4" when the
-                # difficulty is unknown (cold pre-planner stats).
-                try:
-                    _diff = str(
-                        getattr(self._f._agentic._preplanner, "last_stats", {}).get(
-                            "difficulty", ""
-                        )
-                        or ""
-                    )
-                except Exception:
-                    _diff = ""
-                _hyp_range = {
-                    "low": "2-3",
-                    "medium": "3-5",
-                    "high": "4-6",
-                }.get(_diff, "2-4")
-            elif _target_raw.isdigit() and int(_target_raw) > 0:
-                _hyp_range = str(int(_target_raw))
-            # Any other value (empty, non-numeric) leaves the "2-4" default.
-        instruction = template.format(sid=step.id, goal=step.goal, hyp_range=_hyp_range)
-        # Fase 3: methodology selection for investigate steps. The
-        # selector is a deterministic word-bounded regex over the goal —
-        # the model is TOLD which discipline applies, it never chooses its
-        # own methodology (principio rector). Fires only for absence /
-        # universal goals; every other investigate keeps the historical
-        # instruction byte-identical, so the KV prefix of ordinary steps
-        # is untouched and the A/B is clean.
-        if (
+        # ── Step 2: every gate, evaluated once ──
+        # Named conditions rather than inline tests: the recipe reads as
+        # a list of what-and-when, and a gate that changes meaning
+        # changes in one place for every recipe that uses it.
+        _sweep = bool(
             step.kind == "investigate"
             and self._f.valves.investigate_methodology
             and self._SWEEP_GOAL_RE.search(step.goal or "")
-        ):
-            instruction += self._SWEEP_METHODOLOGY
+        )
+        _gates = {
+            "always": True,
+            # Fase 3: the model is TOLD which discipline applies and
+            # never chooses its own. Fires only for absence/universal
+            # goals, so every other investigate keeps its instruction
+            # byte-identical and the KV prefix of ordinary steps is
+            # untouched.
+            "sweep_goal": _sweep,
+            # Fase 5: gated on the exact kind, not the template
+            # fallback, so an unknown kind borrowing the analyze
+            # template does not inherit the conclusion charter.
+            "analyze_charter": bool(
+                step.kind == "analyze"
+                and self._f.valves.analyze_methodology_charter
+            ),
+            "has_symbols": bool(step.symbols),
+            "memory_on": bool(
+                getattr(self._f.valves, "napmem_tool_enable", False)
+            ),
+        }
+        # ── Step 3: assemble in the recipe's declared order ──
+        _parts: List[str] = []
+        for _name, _gate in _recipe:
+            if not _gates.get(_gate, False):
+                continue
+            _parts.append(self._render_fragment(_name, step))
+        if _sweep:
             self._f._log_debug(
                 f"🤖 Agentic: step {step.id} (investigate) — systematic "
                 f"sweep methodology selected (absence/universal goal)"
             )
-        # Fase 5: the terminal analyze always gets the conclusion-quality
-        # methodology (no selector needed — every conclusion benefits from
-        # naming its load-bearing evidence and typing its residual risk).
-        # Gated on the exact kind, not the template fallback, so an
-        # unknown kind that borrows the analyze template stays untouched.
-        if step.kind == "analyze" and self._f.valves.analyze_methodology_charter:
-            instruction += self._ANALYZE_METHODOLOGY
-        if step.symbols:
-            instruction += "\nFocus symbols suggested by the planner: " + ", ".join(
-                step.symbols
-            )
-        # Region: assemble the step contract (MEMORY joins the tool menu so
-        # the model sees it as a peer option, and its usage guidance lands
-        # BEFORE the JSON finishing contract, which must stay the last thing
-        # read).
-        instruction += self._TOOLS_MENU
-        _memory_on = getattr(self._f.valves, "napmem_tool_enable", False)
-        if _memory_on:
-            instruction += self._MEMORY_MENU_LINE
-        instruction += self._TOOLS_TAIL
-        if _memory_on:
-            instruction += self._MEMORY_GUIDANCE
-        instruction += self._JSON_CONTRACT
+        instruction = "".join(_parts)
         if workspace:
             return f"{workspace}## Step instruction\n{instruction}"
         return f"## Step instruction\n{instruction}"
@@ -17326,11 +17931,22 @@ class AgenticSynthesisComposer:
             for s in done
             if s.kind in ("investigate", "hypothesize", "verify_dynamic")
         ]
+        # A retrieval turn has no claims BY DESIGN: it fetched or computed
+        # an artifact instead of investigating, and the pipeline pre-filled
+        # the step rather than running an LLM that could produce citations.
+        # Without this exemption the guard fires on exactly the turns that
+        # succeeded, telling the model the relevant code could not be
+        # retrieved while a correct computed diff sits in the workspace
+        # beside the warning. Same principle as the architecture exemption
+        # above: the abstention must fire on retrieval FAILURE, never on a
+        # turn that was never going to produce claims.
+        _is_retrieval_plan = getattr(plan, "source", "") == "retrieval_fixed"
         if (
             _claims_total == 0
             and _investigative_done
             and not _all_citations_invalid
             and not _is_architecture_turn
+            and not _is_retrieval_plan
         ):
             lines.insert(
                 1,
@@ -18093,23 +18709,41 @@ class AgenticOrchestrator:
                 # the final answer. Pipeline→user channel: it never
                 # enters a prompt. The unwalked rungs of the winner
                 # are stashed alongside for the answer directive.
-                self._f._serial_investigation_record = (
-                    self._f._meta_reasoning._render_investigation_record(
-                        _dossiers, _winner
+                # Guarded as a block: this is the audit trail, and an
+                # audit trail must never be able to destroy the thing
+                # it audits. Unprotected, a rendering error here would
+                # propagate out of the judge and cost the turn its
+                # conclusion — the competition ran, a winner was
+                # chosen, and the answer would be lost to a failure in
+                # the appendix describing it. On failure the turn
+                # proceeds with no record, which is a smaller loss than
+                # no answer.
+                try:
+                    self._f._serial_investigation_record = (
+                        self._f._meta_reasoning._render_investigation_record(
+                            _dossiers, _winner
+                        )
                     )
-                )
-                self._f._serial_blind_spots = (
-                    list(_winner.blind_spots) if _winner is not None else []
-                )
-                self._f._serial_unwalked_rungs = (
-                    [
-                        b.split(":", 1)[1]
-                        for b in _winner.blind_spots
-                        if b.startswith("rung:")
-                    ]
-                    if _winner is not None
-                    else []
-                )
+                    self._f._serial_blind_spots = (
+                        list(_winner.blind_spots) if _winner is not None else []
+                    )
+                    self._f._serial_unwalked_rungs = (
+                        [
+                            b.split(":", 1)[1]
+                            for b in _winner.blind_spots
+                            if b.startswith("rung:") and ":" in b
+                        ]
+                        if _winner is not None
+                        else []
+                    )
+                except Exception as _e_rec:
+                    self._f._serial_investigation_record = ""
+                    self._f._serial_blind_spots = []
+                    self._f._serial_unwalked_rungs = []
+                    self._f._log_debug(
+                        f"judge: investigation record skipped "
+                        f"({_e_rec!r}) — the conclusion is unaffected"
+                    )
                 if _winner is not None:
                     await self._f._emit_status(
                         f"🏁 Conclusion: accepted — "
@@ -20798,6 +21432,12 @@ class CommandRouter:
             "cot_level": 1,
             "negates_reasoning": False,
             "multiclause": False,
+            # RT-3. Both default to the SAFE side: absent, invalid,
+            # stale-cached or unparseable classifications all read as
+            # 'not a retrieval', which routes to the pipeline exactly
+            # as before this field existed.
+            "direct_retrieval": False,
+            "retrieval_target": "",
             "_key": cache_key,
             "_source": "default",
         }
@@ -20880,6 +21520,17 @@ class CommandRouter:
             "'don't overthink').\n"
             "- multiclause: true if it chains several distinct commands "
             "(e.g. 'analiza X, luego mejora Y, y optimiza Z').\n"
+            "- direct_retrieval: true ONLY if the user asks to be GIVEN "
+            "a concrete existing artifact — a diff, a file, a symbol's "
+            "body, a stored value. Imperative or implicit phrasing both "
+            "count ('dame el diff', 'muestra X', 'el diff de ese "
+            "bloque'). false for ANY question about cause, behaviour, "
+            "correctness or why — 'por qué el diff está vacío' is "
+            "diagnosis, not retrieval, even though it names the same "
+            "artifact. When in doubt: false.\n"
+            "- retrieval_target: the artifact asked for, as a short "
+            "phrase taken from the message; empty string when "
+            "direct_retrieval is false.\n"
         )
         prompt = f"User message:\n{cleaned[:2000]}\n\nClassify it."
 
@@ -20952,6 +21603,12 @@ class CommandRouter:
                     result["negates_reasoning"] = data["negates_reasoning"]
                 if isinstance(data.get("multiclause"), bool):
                     result["multiclause"] = data["multiclause"]
+                if isinstance(data.get("direct_retrieval"), bool):
+                    result["direct_retrieval"] = data["direct_retrieval"]
+                if isinstance(data.get("retrieval_target"), str):
+                    result["retrieval_target"] = data[
+                        "retrieval_target"
+                    ].strip()[:120]
         except Exception as exc:
             self._f._log_debug(
                 f"classify_turn: parse error ({exc}) — using neutral default"
@@ -28757,7 +29414,7 @@ class MetacognitiveReasoningEngine:
             if _by_graph:
                 _instr.append(f"graph {_by_graph}")
             if _by_contract:
-                _instr.append(f"S12-contract {_by_contract}")
+                _instr.append(f"contract-check {_by_contract}")
             if _dossier.refuted_relation_checks:
                 _instr.append("relation-check")
             await self._f._emit_status(
@@ -28889,6 +29546,7 @@ class MetacognitiveReasoningEngine:
             # are different outcomes and the reader deserves to know
             # which one produced the verdict.
             _dossier.nodes_read = len(_expanded_qids)
+            _dossier.nodes_expanded = sorted(_expanded_qids)[:40]
             await self._f._emit_status(
                 f"⚖️ Verdict (cycle {_cycle}){_strat_tag}: {_verdict}"
                 + (f" ({_cause})" if _cause else "")
@@ -28945,6 +29603,34 @@ class MetacognitiveReasoningEngine:
             f"symbol:{s[:60]}"
             for s in _dossier.unresolved_claims[:3]
         ]
+        # The sealed contract, recorded in execution order right after
+        # the calls that produced it. This is the pair that makes the
+        # dump forensic rather than archival: the calls above show what
+        # the model asserted, and this shows which of those assertions
+        # the graph confirmed, refuted or could not decide. The refuted
+        # and unresolved lists are a deterministic verdict on the
+        # model's own claims — a labelled hallucination set, computed
+        # by machinery that already had to run.
+        self._f._record_agent_act(
+            f"{label}_sealed",
+            "contract",
+            {
+                "hypothesis": _dossier.hypothesis,
+                "status": _dossier.status,
+                "cause_of_death": _dossier.cause_of_death,
+                "cycles_used": _dossier.cycles_used,
+                "corroboration": round(_dossier.corroboration, 3),
+                "coverage_score": round(_dossier.coverage_score, 3),
+                "confirmed_claims": _dossier.confirmed_claims,
+                "refuted_claims": _dossier.refuted_claims,
+                "unresolved_claims": _dossier.unresolved_claims,
+                "strategy_trace": _dossier.strategy_trace,
+                "nodes_read": _dossier.nodes_read,
+                "nodes_expanded": _dossier.nodes_expanded,
+                "blind_spots": _dossier.blind_spots,
+                "analysis": _dossier.analysis[:1200],
+            },
+        )
         self._f._log_debug(
             f"forge sealed '{hyp_text[:50]}' in "
             f"{time.time() - _dossier.timestamp:.1f}s "
@@ -39310,6 +39996,26 @@ class ContextDumper:
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)
 
+        # ── 2b. Write the agent forensics sibling ────────────────────────────
+        # Same prefix as its context dump on purpose: one file says what
+        # the model SAW this turn, the other what the pipeline DID with
+        # it, and neither answers alone whether a wrong answer came from
+        # missing context or from an agent inventing around good context.
+        # Guarded whole — forensics never cost a turn its dump.
+        try:
+            if self._f.valves.enable_agent_dump and self._f._agent_records:
+                _ag_path = os.path.join(
+                    project_dir, f"{timestamp_str}_turn_{turn:04d}.agents.md"
+                )
+                with open(_ag_path, "w", encoding="utf-8") as _af:
+                    _af.write(
+                        self._render_agent_records(
+                            self._f._agent_records, turn, timestamp_str
+                        )
+                    )
+        except Exception as _e_ag:
+            self._f._log_debug(f"agent dump skipped ({_e_ag!r})")
+
         # ── 3. Update latest.md symlink (or copy) ──────────────────────────
         latest_path = os.path.join(project_dir, "latest.md")
         try:
@@ -39390,6 +40096,70 @@ class ContextDumper:
     # ═══════════════════════════════════════════════════════════════════════
     # 4. Rendering
     # ═══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _render_agent_records(
+        records: List[Dict[str, Any]],
+        turn: int,
+        timestamp_str: str,
+    ) -> str:
+        """
+        Render this turn's agent acts as readable Markdown.
+
+        Execution order, never grouped by agent: what you read this file
+        for is the causal chain — the planner decided this, so the step
+        investigated that, so the forge derived the other. Grouping
+        would destroy exactly the information that makes it useful.
+
+        Each act shows what the agent produced and, where a
+        deterministic layer ruled on it, what survived. The gap between
+        those two is the hallucination, already labelled by machinery
+        that had to run anyway.
+        """
+        _L: List[str] = [
+            f"# Agent acts — turn {turn:04d} ({timestamp_str})",
+            "",
+            f"{len(records)} act(s), in execution order. Pair this file "
+            f"with {timestamp_str}_turn_{turn:04d}.md, which holds the "
+            "context these agents were given.",
+            "",
+        ]
+        for _r in records:
+            _p = _r.get("payload") or {}
+            _L.append(
+                f"## {_r.get('seq')} · {_r.get('agent')} "
+                f"[{_r.get('kind')}]"
+            )
+            if _r.get("kind") == "call":
+                _L.append(
+                    f"in {_p.get('in_tokens')} · out {_p.get('out_tokens')} "
+                    f"· {_p.get('seconds')}s · finish={_p.get('finish_reason')}"
+                    + ("  **TRUNCATED**" if _p.get("truncated") else "")
+                )
+                _L.append(
+                    f"ceiling: {_p.get('max_tokens')} · sampler: "
+                    f"{_p.get('sampler')} · json_declared: "
+                    f"{_p.get('json_declared')}"
+                )
+                _L.append("")
+                _L.append("```")
+                _L.append(str(_p.get("output", "")))
+                if _p.get("output_capped"):
+                    _L.append(
+                        "[output capped at 12000 chars — a record this "
+                        "long was already degenerate]"
+                    )
+                _L.append("```")
+            else:
+                _L.append("")
+                _L.append("```json")
+                try:
+                    _L.append(json.dumps(_p, indent=2, ensure_ascii=False))
+                except Exception:
+                    _L.append(str(_p))
+                _L.append("```")
+            _L.append("")
+        return "\n".join(_L)
 
     def _render_markdown(
         self,
@@ -42086,19 +42856,18 @@ class Filter:
                 "json_object grammar constrains STRUCTURE, not CONTENT, and "
                 "production shows these calls riding a verbatim-repeated "
                 "claim into the token cap (nine truncated experiment designs "
-                "in one session). The companion constants are chosen for "
-                "this domain: dry_allowed_length=8 leaves every identifier "
-                "untouched (repeating `_get_or_compute_ppr_scores` across "
-                "claims is the JOB, and identifiers stay under 8 tokens) "
-                "while sentence-length verbatim runs — the loop's signature "
-                "— are penalised; dry_penalty_last_n=1024 confines the "
-                "window to recent generation instead of the server default "
-                "131072, which would penalise echoing the 70k-token aligned "
-                "prompt itself. Folded into the dedup and cache keys. 0 "
-                "disables. Caveat: per-request sampler fields travel the "
-                "same road as response_format, which this stack's router is "
-                "already suspected of dropping — if the fences persist, "
-                "verify the router forwards dry_* before judging this valve."
+                "in one session). ONLY the multiplier is sent: "
+                "dry_allowed_length, dry_base and dry_penalty_last_n come "
+                "from the server's own configuration (models.ini), which is "
+                "the single source of truth for sampler shape — an omitted "
+                "field keeps the CLI default, so tuning the file is enough "
+                "and nothing here silently contradicts it. Folded into the "
+                "dedup and cache keys. 0 disables the override, leaving the "
+                "server's multiplier in force too. Caveat: per-request "
+                "sampler fields travel the same road as response_format, "
+                "which this stack's router is already suspected of dropping "
+                "— if the fences persist, verify the router forwards dry_* "
+                "before judging this valve."
             ),
         )
         llm_long_dry_multiplier: float = Field(
@@ -42124,16 +42893,19 @@ class Filter:
                 "correct markdown, which is the reported symptom: unfenced "
                 "code and malformed diffs, worse at the temperature that "
                 "suppresses the loop. DRY punishes repeated SEQUENCES with "
-                "a penalty exponential in length, and dry_allowed_length=8 "
-                "puts the line where this domain needs it — identifiers and "
-                "one-line statements pass, repeated sentences do not. With "
-                "DRY carrying the anti-loop duty, repeat_penalty can go back "
-                "to 1.0 and the temperature can come down for format "
-                "adherence without the loop returning. "
+                "a penalty exponential in length, and the server's "
+                "dry_allowed_length draws the line for this domain — set "
+                "it in models.ini, not here: this valve sends the "
+                "multiplier and nothing else. With DRY carrying the "
+                "anti-loop duty, repeat_penalty can go back to 1.0 and the "
+                "temperature can come down for format adherence without "
+                "the loop returning. "
                 "\n\n"
-                "Only applies to calls whose max_tokens reaches "
-                "llm_long_dry_min_tokens: a short auxiliary call cannot loop "
-                "its way into a cap it would never reach. 0 disables."
+                "Skipped only for calls with a FINITE max_tokens below "
+                "llm_long_dry_min_tokens: a short auxiliary call cannot "
+                "loop its way into a cap it would never reach. An "
+                "uncapped call is never skipped — it is the one that can "
+                "generate until the context window ends. 0 disables."
             ),
         )
         llm_long_dry_min_tokens: int = Field(
@@ -42142,7 +42914,9 @@ class Filter:
             description=(
                 "Minimum max_tokens for llm_long_dry_multiplier to apply. "
                 "Below this a call is too short to spiral, so its sampling "
-                "is left alone."
+                "is left alone. Applies to FINITE ceilings only: a call "
+                "with no max_tokens is unlimited, not short, and always "
+                "gets the multiplier."
             ),
         )
         llm_uncapped_max_tokens: int = Field(
@@ -44715,6 +45489,34 @@ class Filter:
             default=True,
             description="Append a compact metrics line per turn to evolution.jsonl.",
         )
+        enable_agent_dump: bool = Field(
+            default=False,
+            description=(
+                "Write a sibling of each context dump named "
+                "<timestamp>_turn_NNNN.agents.md, recording what every "
+                "agent of that turn was asked, what it produced, and what "
+                "survived the deterministic filters. The context dump "
+                "shows what the model SAW; this shows what the pipeline "
+                "DID with it, and the shared filename prefix pairs them. "
+                "\n\n"
+                "Its purpose is hallucination forensics per agent. Every "
+                "LLM call in this file routes through one choke point and "
+                "already carries a label naming its agent, so a record is "
+                "captured for all of them: the raw output, the sampler "
+                "actually in force, prompt and completion sizes, whether "
+                "the generation was truncated, and — for the forge — the "
+                "sealed dossier, whose confirmed/refuted/unresolved split "
+                "is a deterministic verdict on the model's own assertions. "
+                "Reading output against contract is how you learn WHICH "
+                "agent invents what, which is the input to designing its "
+                "instruction recipe. "
+                "\n\n"
+                "Off by default: the records carry your project's code and "
+                "a runaway generation can make one turn weigh hundreds of "
+                "kilobytes (capped per record, with the truncation marked "
+                "— a record that hits the cap is itself diagnostic)."
+            ),
+        )
 
         # ── 14.3 Weighting & decay ────────────────────────────────────────────
         raw_file_priority_boost: float = Field(default=2.0)
@@ -44988,6 +45790,13 @@ class Filter:
         # -- Original user system prompt --
         self._original_system_prompt: str = ""
 
+        # Agent forensics for the current turn (enable_agent_dump).
+        # One entry per agent act, in execution order, so the file
+        # reads as the causal chain it was: the planner decided this,
+        # the step produced that, the forge sealed the other. Cleared
+        # at inlet and written beside the context dump at outlet.
+        self._agent_records: List[Dict[str, Any]] = []
+
         # -- C6: LTM store completion event --
         self._ltm_store_complete: asyncio.Event = asyncio.Event()
         self._ltm_store_complete.set()  # initially "complete"
@@ -45011,6 +45820,44 @@ class Filter:
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Logging utilities
     # ═══════════════════════════════════════════════════════════════════════════
+
+    def _record_agent_act(
+        self,
+        agent: str,
+        kind: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """
+        Append one agent act to this turn's forensic record.
+
+        Never raises: a diagnostic that can break the pipeline it
+        observes is worse than no diagnostic, a lesson this codebase has
+        already paid for twice. Silently does nothing when the valve is
+        off, and drops the oldest entries rather than let one turn grow
+        without bound.
+
+        Args:
+            agent: The call label, which is already this agent's name
+                everywhere else — server log, status line, this dump.
+            kind: "call" for an LLM act, "contract" for a sealed
+                deterministic artifact such as a dossier.
+            payload: Whatever that kind carries.
+        """
+        try:
+            if not getattr(self.valves, "enable_agent_dump", False):
+                return
+            if len(self._agent_records) >= 400:
+                del self._agent_records[:100]
+            self._agent_records.append(
+                {
+                    "seq": len(self._agent_records) + 1,
+                    "agent": agent,
+                    "kind": kind,
+                    "payload": payload,
+                }
+            )
+        except Exception:  # noqa: BLE001 - forensics never raise
+            pass
 
     def _log_debug(self, msg: str):
         if self.valves.debug:
@@ -45384,6 +46231,12 @@ class Filter:
             # id (e.g. 'llamacpp/<name>' in aux calls vs '<name>' in body).
             self._main_model_this_turn = str((body or {}).get("model") or "").strip()
             self._align_reject_logged_this_turn = False
+            # Agent forensics belong to ONE turn. Cleared here rather
+            # than after writing, because the write happens on a path
+            # that several inlet exits skip — a turn served from cache
+            # would otherwise inherit the previous turn's acts and the
+            # file would attribute them to the wrong question.
+            self._agent_records = []
 
             # ------------------------------------------------------------------
             # Region: stop background tasks gracefully before any inlet work
