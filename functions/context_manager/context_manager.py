@@ -15804,7 +15804,8 @@ class AgenticPreplanner:
             # framing with no hint that its load-bearing assumptions
             # enter the forge as claims-to-verify.
             await self._f._emit_status(
-                f"🧭 Testing {len(self._f._preplanner_assumptions)} "
+                f"🧭 [framing] Testing "
+                f"{len(self._f._preplanner_assumptions)} "
                 f"framing assumption(s) in the forge"
             )
         # difficulty is the pre-planner's semantic judgment of how much
@@ -18068,7 +18069,8 @@ class AgenticOrchestrator:
             )
             _plausible = [d for d in _dossiers if d.status == "plausible"]
             await self._f._emit_status(
-                f"⚔️ Final competition: {len(_plausible)} plausible "
+                f"⚔️ Final competition [ranked by corroboration, "
+                f"parsimony, anchors]: {len(_plausible)} plausible "
                 f"dossier(s) of {len(_dossiers)} sealed"
             )
             if _plausible:
@@ -28531,7 +28533,7 @@ class MetacognitiveReasoningEngine:
                             _broker._writers(_sus_name, project_id),
                             f"writers:{_sus_name}",
                         ):
-                            self._tag_strategy(_dossier, "S14-writers")
+                            self._tag_strategy(_dossier, "state-writers")
                     except Exception:
                         continue
                 if not _expanded_parts:
@@ -28555,9 +28557,9 @@ class MetacognitiveReasoningEngine:
             if _EC10_CRITICAL_RE.search(hyp_text) or (
                 _EC10_NEAR_MISS_RE.search(hyp_text)
             ):
-                self._tag_strategy(_dossier, "EC-10-precaution")
+                self._tag_strategy(_dossier, "high-severity")
             await self._f._emit_status(
-                f"🔍 Investigate c{_cycle} [{_line}]"
+                f"🔍 Investigate (cycle {_cycle}) [{_line}]"
                 + (" (widened)" if _widened else "")
                 + f": {len(_sym_true)} symbol(s) resolved, "
                 f"{len(_expanded_parts)} new body/bodies read"
@@ -28700,8 +28702,17 @@ class MetacognitiveReasoningEngine:
             # experiment's outcome: deterministic, and unavailable to
             # the model that produced the claims.
             _conf_n, _ref_n = 0, 0
+            # Which mechanism DECIDED each consequence, counted for
+            # this cycle. The verdict line carries the cumulative
+            # strategy trace, which cannot say WHICH cycle a
+            # mechanism fired in — S12 firing once in cycle 1 looks
+            # identical on every later verdict. The experiment must
+            # report its own instruments.
+            _by_graph, _by_contract = 0, 0
             for _c in _claims:
                 _v = self._claim_verified(_c, evidence, project_id)
+                if _v is not None:
+                    _by_graph += 1
                 # S12: the graph abstained — a contract claim may
                 # still be deterministically decidable from the AST
                 # of the expanded bodies. Graph first, contract
@@ -28709,10 +28720,11 @@ class MetacognitiveReasoningEngine:
                 if _v is None:
                     _v = self._verify_contract_claim(_c, _expanded_parts)
                     if _v is not None:
+                        _by_contract += 1
                         # Tagged only on a real verdict: the contract
                         # checker ran on every abstention, but it only
                         # CONTRIBUTED when it settled one.
-                        self._tag_strategy(_dossier, "S12-contract")
+                        self._tag_strategy(_dossier, "contract-check")
                 if _v is True:
                     _conf_n += 1
                     if len(_dossier.confirmed_claims) < 8:
@@ -28738,11 +28750,20 @@ class MetacognitiveReasoningEngine:
                 # EC-5 external coherence: an asserted call edge the
                 # graph contradicts. Tagged only when one was actually
                 # refuted, which is when the criterion did work.
-                self._tag_strategy(_dossier, "EC-5-relation")
+                self._tag_strategy(_dossier, "relation-check")
             _total = len(_claims) or 1
             _dossier.coverage_score = (_conf_n + _ref_n) / _total
+            _instr = []
+            if _by_graph:
+                _instr.append(f"graph {_by_graph}")
+            if _by_contract:
+                _instr.append(f"S12-contract {_by_contract}")
+            if _dossier.refuted_relation_checks:
+                _instr.append("relation-check")
             await self._f._emit_status(
-                f"⚗️ Experiment c{_cycle}: {len(_claims)} consequence(s) "
+                f"⚗️ Experiment (cycle {_cycle})"
+                + (f" [{', '.join(_instr)}]" if _instr else "")
+                + f": {len(_claims)} consequence(s) "
                 f"tested → {_conf_n} confirmed, {_ref_n} refuted, "
                 f"{len(_claims) - _conf_n - _ref_n} undecidable"
             )
@@ -28854,11 +28875,14 @@ class MetacognitiveReasoningEngine:
                     self._f.valves.agentic_serial_maturity_min_rungs
                 ),
             )
-            _strat_tag = (
-                f" [{', '.join(_dossier.strategy_trace)}]"
-                if _dossier.strategy_trace
-                else ""
-            )
+            # Rung tags key internally as 'investigate:callers';
+            # the reader sees 'investigated callers'. Other tags
+            # already read as plain names and pass through.
+            _shown = [
+                t.replace("investigate:", "investigated ")
+                for t in _dossier.strategy_trace
+            ]
+            _strat_tag = f" [{', '.join(_shown)}]" if _shown else ""
             # The cycle's verdict closes the loop the three phases
             # opened. Coverage is reported alongside it because 'ran
             # out of cycles' and 'exhausted the reachable call tree'
@@ -28866,7 +28890,7 @@ class MetacognitiveReasoningEngine:
             # which one produced the verdict.
             _dossier.nodes_read = len(_expanded_qids)
             await self._f._emit_status(
-                f"⚖️ Verdict c{_cycle}{_strat_tag}: {_verdict}"
+                f"⚖️ Verdict (cycle {_cycle}){_strat_tag}: {_verdict}"
                 + (f" ({_cause})" if _cause else "")
                 + f" — {len(_expanded_qids)} node(s) of the call tree "
                 f"read so far"
@@ -28983,8 +29007,8 @@ class MetacognitiveReasoningEngine:
             # until now; one line makes the cross-turn memory
             # visible to the user watching the chat.
             await self._f._emit_status(
-                f"🪦 Excluding {len(_exclusions)} mechanism(s) "
-                f"already ruled out"
+                f"🪦 [recalled] Excluding {len(_exclusions)} "
+                f"mechanism(s) already ruled out"
             )
         _queue: List[str] = [t for t, _c in seed_pool if t and len(t.strip()) >= 20]
         # S3: class-prior ordering. When R33's history shows call-
@@ -29143,8 +29167,9 @@ class MetacognitiveReasoningEngine:
                     )
                 if _fatal and not (_crit_re or _crit_tag):
                     await self._f._emit_status(
-                        f"ⓧ Hypothesis {_slot}/{_n_target} screened "
-                        f"out — funnel: {_t_n - _c_n}/{_t_n} checks "
+                        f"ⓧ [screening] Hypothesis "
+                        f"{_slot}/{_n_target} screened "
+                        f"out — {_t_n - _c_n} of {_t_n} checks "
                         f"refuted, 0 confirmed"
                     )
                     _d = HypothesisDossier(
@@ -29190,11 +29215,11 @@ class MetacognitiveReasoningEngine:
             # point of use. Recording them here keeps the cycle
             # status honest about what steered this candidate.
             if _guidance:
-                self._tag_strategy(_dossier, "S15-counterfactual")
+                self._tag_strategy(_dossier, "counterfactual")
             if _nudged:
-                self._tag_strategy(_dossier, "S9-class-nudge")
+                self._tag_strategy(_dossier, "class-prior")
             if _exclusions:
-                self._tag_strategy(_dossier, "S7-graveyard")
+                self._tag_strategy(_dossier, "past-exclusions")
             # S15 (counterfactual generation): a dossier that
             # SURVIVED but thin — plausible with coverage under the
             # low bar — is exactly where the proactive rival lives:
@@ -29478,7 +29503,7 @@ class MetacognitiveReasoningEngine:
                 # close was not refuted, it was out-ranked, and the
                 # difference matters to whoever has to act on it.
                 await self._f._emit_status(
-                    f"🧷 Also survived (corr {_rv.corroboration:.2f}, "
+                    f"🧷 Also survived (corroboration {_rv.corroboration:.2f}, "
                     f"{_rv.confirmed_checks} confirmed"
                     + (
                         f", {_rv.relation_to_winner}"
