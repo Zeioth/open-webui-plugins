@@ -234,6 +234,19 @@ class HypothesisDossier:
     strategy_trace: List[str] = field(default_factory=list)
     structure_hash: str = ""
     timestamp: float = 0.0
+    # How much of the call tree this hypothesis was actually tested
+    # against, and what it never looked at. nodes_read is the count
+    # of distinct bodies expanded across all cycles; blind_spots
+    # holds the ladder rungs never walked plus the claim symbols
+    # that never resolved. Recorded so the record, the answer
+    # directive and any later step can AIM at the gap instead of
+    # rediscovering it.
+    nodes_read: int = 0
+    blind_spots: List[str] = field(default_factory=list)
+    # RS-4: how a surviving rival relates to the winner, set at
+    # judgment time (competing / complementary / independent).
+    # Reporting metadata only — it never touches the ranking.
+    relation_to_winner: str = ""
 
 
 @dataclass
@@ -17568,7 +17581,12 @@ class AgenticSynthesisComposer:
             ("```" in (s.output or "")) or ("```" in (s.digest or ""))
             for s in plan.steps
         )
-        lines += self._answer_format_directive(ok, bad, _has_code)
+        lines += self._answer_format_directive(
+            ok,
+            bad,
+            _has_code,
+            getattr(self._f, "_serial_unwalked_rungs", None),
+        )
         return "\n".join(lines).rstrip()
 
     @staticmethod
@@ -17576,6 +17594,7 @@ class AgenticSynthesisComposer:
         n_valid: int,
         n_invalid: int,
         has_code: bool,
+        unwalked_rungs: Optional[List[str]] = None,
     ) -> List[str]:
         """
         Instruct the final model on the SHAPE of its answer.
@@ -17612,7 +17631,15 @@ class AgenticSynthesisComposer:
             "unverified claim the same voice as a verified one.",
         ]
         # ── Step 2: the honest gap, only when there is one ──
-        if n_invalid > 0 or n_valid == 0:
+        # A winner sealed having walked under two rungs of the
+        # investigation ladder is a scope gap even when every claim
+        # verified: whole regions of the call tree were never read,
+        # and the reader must know the conclusion's evidence stops
+        # at the first rung. Rung names are enums — nothing here is
+        # confabulable.
+        _unw = unwalked_rungs or []
+        _scope_gap = len(_unw) >= 4
+        if n_invalid > 0 or n_valid == 0 or _scope_gap:
             out += [
                 "",
                 "**What was not verified** — what this investigation "
@@ -17622,6 +17649,17 @@ class AgenticSynthesisComposer:
                 "acknowledged gap is worth more to the reader than a "
                 "confident sentence papering over it.",
             ]
+            if _scope_gap:
+                out += [
+                    "",
+                    "The investigation sealed its verdict having "
+                    "examined only part of the call tree; these "
+                    "lines of enquiry were never read: "
+                    + ", ".join(_unw)
+                    + ". State this plainly in that section — the "
+                    "conclusion's evidence stops where the "
+                    "investigation stopped.",
+                ]
         # ── Step 3: code, with an explicit fencing contract ──
         if has_code:
             out += [
@@ -18047,6 +18085,28 @@ class AgenticOrchestrator:
                 )
                 await self._f._meta_reasoning._record_serial_competition(
                     _dossiers, _winner, project_id
+                )
+                # The record is rendered NOW, while the dossiers are
+                # in hand, and stashed for the outlet to append to
+                # the final answer. Pipeline→user channel: it never
+                # enters a prompt. The unwalked rungs of the winner
+                # are stashed alongside for the answer directive.
+                self._f._serial_investigation_record = (
+                    self._f._meta_reasoning._render_investigation_record(
+                        _dossiers, _winner
+                    )
+                )
+                self._f._serial_blind_spots = (
+                    list(_winner.blind_spots) if _winner is not None else []
+                )
+                self._f._serial_unwalked_rungs = (
+                    [
+                        b.split(":", 1)[1]
+                        for b in _winner.blind_spots
+                        if b.startswith("rung:")
+                    ]
+                    if _winner is not None
+                    else []
                 )
                 if _winner is not None:
                     await self._f._emit_status(
@@ -19526,9 +19586,34 @@ class AgenticOrchestrator:
                 and inserted < 2
             )
             if _needs_capacity:
+                # IR-2: a gap-fill investigation is pointed at the
+                # competition's recorded blind spots alongside the
+                # verify step's own needs — the unwalked rungs and
+                # unresolved symbols are exactly the ground a
+                # gap-fill exists to cover, and without this the
+                # step re-derives from scratch what the dossiers
+                # already measured. Consume-once: a blind spot
+                # handed to a step is that step's job now, and
+                # feeding it to a second extension would send two
+                # steps over the same gap.
+                _bs = getattr(self._f, "_serial_blind_spots", None) or []
+                _bs_goal = ""
+                if _bs:
+                    _bs_names = [
+                        b.split(":", 1)[1] for b in _bs[:4]
+                    ]
+                    _bs_goal = (
+                        " — and cover the competition's blind "
+                        f"spots: {', '.join(_bs_names)}"
+                    )
+                    self._f._serial_blind_spots = []
                 new_step = AgenticStep(
                     id=max(s.id for s in plan.steps) + 1,
-                    goal="Investigate: " + "; ".join(control["needs"][:2]),
+                    goal=(
+                        "Investigate: "
+                        + "; ".join(control["needs"][:2])
+                        + _bs_goal
+                    ),
                     kind="investigate",
                 )
                 plan.steps.insert(idx + 1, new_step)
@@ -28746,6 +28831,7 @@ class MetacognitiveReasoningEngine:
             # out of cycles' and 'exhausted the reachable call tree'
             # are different outcomes and the reader deserves to know
             # which one produced the verdict.
+            _dossier.nodes_read = len(_expanded_qids)
             await self._f._emit_status(
                 f"⚖️ Verdict c{_cycle}{_strat_tag}: {_verdict}"
                 + (f" ({_cause})" if _cause else "")
@@ -28785,6 +28871,23 @@ class MetacognitiveReasoningEngine:
                     f"next cycle — {_predictions[:2]}"
                 )
         # ── Step 8: seal; bury the dead ──
+        # The dossier records what it never looked at, in two
+        # registers: ladder rungs never walked (whole regions of the
+        # tree unexamined) and claim symbols the graph never
+        # resolved (named by the hypothesis, still unlocated). A
+        # sealed verdict with blind spots is still a verdict — but
+        # one whose scope travels with it.
+        _walked = {
+            t.split(":", 1)[1]
+            for t in _dossier.strategy_trace
+            if t.startswith("investigate:")
+        }
+        _dossier.blind_spots = [
+            f"rung:{r}" for r in self._INVESTIGATION_LADDER if r not in _walked
+        ] + [
+            f"symbol:{s[:60]}"
+            for s in _dossier.unresolved_claims[:3]
+        ]
         self._f._log_debug(
             f"forge sealed '{hyp_text[:50]}' in "
             f"{time.time() - _dossier.timestamp:.1f}s "
@@ -29250,6 +29353,23 @@ class MetacognitiveReasoningEngine:
             # verifiable, exactly what deciding this needs). With
             # nothing unresolved to name, no plan is invented.
             _plan_items = [c for c in _winner.unresolved_claims[:3] if c.strip()]
+            # IR-2: the strongest dossier's unwalked rungs ARE the
+            # next investigation, stated as such. An abstention that
+            # says 'check these claims' but not 'and read the regions
+            # nobody read' sends the next run back over covered
+            # ground.
+            _unw_plan = [
+                b.split(":", 1)[1]
+                for b in _winner.blind_spots
+                if b.startswith("rung:")
+            ]
+            if _unw_plan:
+                # Worded to fit the plan formatter's 80-char item
+                # cap with all five rung names intact — a truncated
+                # blind-spot list defeats its own purpose.
+                _plan_items.append(
+                    f"walk the unwalked rungs: {', '.join(_unw_plan)}"
+                )
             if _plan_items:
                 _note += (
                     " | to decide this, the next investigation "
@@ -29257,6 +29377,19 @@ class MetacognitiveReasoningEngine:
                 )
             return None, _note
         _note += f" | null bar PASS: {_winner.corroboration:.2f} >= " f"{_margin:.2f}"
+        # IR-2: the winner's scope travels in the note so the verify
+        # and analyze steps downstream see HOW MUCH tree stands under
+        # the verdict. Rung names and counts only — identifiers and
+        # enums, not rival prose, so R34 holds.
+        _unw_note = [
+            b.split(":", 1)[1]
+            for b in _winner.blind_spots
+            if b.startswith("rung:")
+        ]
+        _note += (
+            f" | scope: {_winner.nodes_read} node(s) read"
+            + (f"; rungs never walked: {', '.join(_unw_note)}" if _unw_note else "")
+        )
         # ── Surviving rivals ──
         # A winner is chosen, but the accounts it beat do not stop
         # being corroborated. Complex bugs often have more than one
@@ -29274,20 +29407,52 @@ class MetacognitiveReasoningEngine:
         # accounts are both true of their own system.
         _rivals = [d for d in _pool if d is not _winner and d.status == "plausible"]
         if _rivals:
+            # RS-4: each survivor is classified against the winner
+            # BEFORE reporting, so both the reader and the final model
+            # learn whether it was a second account of the same
+            # mechanism or a candidate co-cause. The label never
+            # touches the ranking — the winner was already chosen.
+            for _rv in _rivals[:3]:
+                try:
+                    _rv.relation_to_winner, _ = (
+                        self._classify_rival_relation(
+                            _winner, _rv, project_id
+                        )
+                    )
+                except Exception:
+                    _rv.relation_to_winner = ""
             _note += (
                 f" | {len(_rivals)} rival account(s) also survived "
                 f"(corroboration "
                 + ", ".join(f"{d.corroboration:.2f}" for d in _rivals[:3])
                 + ")"
             )
+            _rel_labels = [
+                d.relation_to_winner for d in _rivals[:3] if d.relation_to_winner
+            ]
+            if _rel_labels:
+                _note += f"; relation to winner: {', '.join(_rel_labels)}"
+            if any(_l == "complementary" for _l in _rel_labels):
+                # The one enum the final model most needs: the bug may
+                # be multi-cause, and the fix that addresses only the
+                # winner may be half a fix.
+                _note += (
+                    " | note: a complementary account survived — the "
+                    "mechanism may be multi-cause"
+                )
             for _rv in _rivals[:2]:
                 # Deliberately not framed as a runner-up: a rival this
                 # close was not refuted, it was out-ranked, and the
                 # difference matters to whoever has to act on it.
                 await self._f._emit_status(
                     f"🧷 Also survived (corr {_rv.corroboration:.2f}, "
-                    f"{_rv.confirmed_checks} confirmed): "
-                    f"{_rv.hypothesis[:100]}"
+                    f"{_rv.confirmed_checks} confirmed"
+                    + (
+                        f", {_rv.relation_to_winner}"
+                        if _rv.relation_to_winner
+                        else ""
+                    )
+                    + f"): {_rv.hypothesis[:100]}"
                 )
             self._f._log_debug(
                 f"judge: {len(_rivals)} rival(s) survived alongside the "
@@ -29398,6 +29563,181 @@ class MetacognitiveReasoningEngine:
                         "validity (dialectical synthesis)"
                     )
         return _winner, _note
+
+    _DOSSIER_SYM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{2,}")
+
+    @classmethod
+    def _dossier_symbols(cls, d: "HypothesisDossier") -> Set[str]:
+        """
+        The identifiers a dossier's VERIFIED content stands on.
+
+        Drawn from the confirmed claims first — those passed the
+        graph — with the hypothesis text as fallback when a dossier
+        confirmed nothing. Filtered to identifier-shaped tokens
+        (underscore or dotted or CamelCase), capped so the pairwise
+        adjacency check below stays trivially bounded.
+        """
+        _texts = d.confirmed_claims or [d.hypothesis]
+        _out: Set[str] = set()
+        for _t in _texts:
+            for _m in cls._DOSSIER_SYM_RE.findall(_t or ""):
+                if "_" in _m or "." in _m or _m[0].isupper():
+                    _out.add(_m.split("(")[0])
+                if len(_out) >= 8:
+                    return _out
+        return _out
+
+    def _classify_rival_relation(
+        self,
+        winner: "HypothesisDossier",
+        rival: "HypothesisDossier",
+        project_id: str,
+    ) -> Tuple[str, float]:
+        """
+        Deterministic relatedness of a surviving rival to the winner.
+
+        Three verdicts, none of which touches the ranking:
+        'competing'     — high symbol overlap: two accounts of the
+                          SAME mechanism; the ranking already
+                          resolved them.
+        'complementary' — low overlap but the graph connects their
+                          symbol sets: candidate CO-CAUSES; both
+                          may be true of one bug, and discarding
+                          the rival may discard half the fix.
+        'independent'   — disjoint and unconnected.
+
+        Deliberately NOT a fusion: P(A and B) never exceeds either
+        conjunct, so no composite is scored — the classification
+        changes what gets REPORTED, and only that. Zero LLM: the
+        overlap is set arithmetic and the adjacency is the edge
+        graph the pipeline already maintains.
+        """
+        # ── Step 1: the symbol sets ──
+        _a = self._dossier_symbols(winner)
+        _b = self._dossier_symbols(rival)
+        if not _a or not _b:
+            return "independent", 0.0
+        _inter = _a & _b
+        _overlap = len(_inter) / len(_a | _b)
+        # ── Step 2: high overlap = same mechanism ──
+        if _overlap >= 0.3:
+            return "competing", _overlap
+        # ── Step 3: graph adjacency between the DISTINCT parts ──
+        # Shared symbols prove nothing about co-causation (both
+        # accounts touching build_block_a is expected); an edge
+        # between what they DON'T share is what suggests two
+        # mechanisms wired into one path.
+        _only_a = list(_a - _inter)[:6]
+        _only_b = list(_b - _inter)[:6]
+        for _x in _only_a:
+            for _y in _only_b:
+                try:
+                    if (
+                        self._relation_in_graph(_x, _y, project_id)
+                        or self._relation_in_graph(_y, _x, project_id)
+                    ):
+                        return "complementary", _overlap
+                except Exception:
+                    continue
+        return "independent", _overlap
+
+    @staticmethod
+    def _render_investigation_record(
+        dossiers: List["HypothesisDossier"],
+        winner: Optional["HypothesisDossier"],
+    ) -> str:
+        """
+        Render the competition's audit trail, deterministically.
+
+        Appended to the final answer by the outlet, AFTER the model
+        has written it — the model never sees this text, before or
+        after. That is the whole design: every field comes straight
+        from a dossier (corroboration, checks, walked rungs, nodes
+        read, cause of death), no LLM sits in the path, so nothing
+        here CAN be confabulated. The record audits the answer from
+        outside: a reply claiming exhaustive verification next to a
+        record reading 'investigated: symbols · 1 node' contradicts
+        itself in front of the reader.
+
+        Rival hypothesis text appears here in full. That is safe
+        precisely because this is a pipeline→user channel: R34
+        forbids rival prose in PROMPTS, and no prompt is involved.
+        """
+        # ── Step 1: nothing to record without a competition ──
+        if not dossiers:
+            return ""
+
+        def _scope(d: "HypothesisDossier") -> str:
+            _walked = [
+                t.split(":", 1)[1]
+                for t in d.strategy_trace
+                if t.startswith("investigate:")
+            ]
+            _un = [
+                b.split(":", 1)[1]
+                for b in d.blind_spots
+                if b.startswith("rung:")
+            ]
+            _s = (
+                f"  investigated: {', '.join(_walked) or '(none)'}"
+                f" \u00b7 {d.nodes_read} node(s) of the call tree read"
+            )
+            if _un:
+                _s += "\n" + f"  never examined: {', '.join(_un)}"
+            return _s
+
+        _L: List[str] = [
+            "---",
+            "\U0001f4cb **Investigation record** \u2014 rendered from "
+            "the run's own data, not written by the model",
+            "",
+        ]
+        # ── Step 2: the winner, with its scope ──
+        if winner is not None:
+            _L.append(
+                f"**Winner** (corr {winner.corroboration:.2f} \u00b7 "
+                f"{winner.confirmed_checks} confirmed, "
+                f"{winner.refuted_checks} refuted)"
+            )
+            _L.append(_scope(winner))
+            _L.append("")
+        # ── Step 3: survivors that were out-ranked, not refuted ──
+        for d in dossiers:
+            if d is winner or d.status != "plausible":
+                continue
+            _L.append(
+                f"**Also survived** (corr {d.corroboration:.2f} \u00b7 "
+                f"{d.confirmed_checks} confirmed) \u2014 out-ranked, "
+                f"NOT refuted"
+            )
+            if d.relation_to_winner:
+                _gloss = {
+                    "competing": "same mechanism, different account",
+                    "complementary": (
+                        "possible co-cause \u2014 both may be true; a "
+                        "fix addressing only the winner may be half "
+                        "a fix"
+                    ),
+                    "independent": "unrelated account",
+                }.get(d.relation_to_winner, "")
+                _L.append(
+                    f"  relation to winner: {d.relation_to_winner}"
+                    + (f" ({_gloss})" if _gloss else "")
+                )
+            _L.append(f'  "{d.hypothesis[:140]}"')
+            _L.append(_scope(d))
+            _L.append("")
+        # ── Step 4: the dead, with their causes ──
+        for d in dossiers:
+            if d.status != "dead":
+                continue
+            _L.append(
+                f"**Died**: {d.cause_of_death or 'unknown'} after "
+                f"{d.cycles_used} cycle(s)"
+            )
+            _L.append(f'  "{d.hypothesis[:140]}"')
+            _L.append("")
+        return "\n".join(_L).rstrip()
 
     async def _record_serial_competition(
         self,
@@ -45826,6 +46166,46 @@ class Filter:
                         )
         except Exception as _e:
             self._log_debug(f"outlet: scaffolding guard skipped ({_e!r})")
+
+        # ------------------------------------------------------------------
+        # Region: investigation record appendix
+        #
+        # Appended AFTER the echo guard has finished cutting, so the
+        # record is never truncated by it — and after the model has
+        # written its answer, so the model never saw it. Consume-once:
+        # the stash is cleared on append (and set fresh each pipeline
+        # turn), so a later non-pipeline turn cannot inherit a stale
+        # record from an earlier question.
+        # ------------------------------------------------------------------
+        try:
+            _rec = getattr(self, "_serial_investigation_record", "")
+            if _rec:
+                self._serial_investigation_record = ""
+                _msgs = body.get("messages") or []
+                _lastr = next(
+                    (
+                        m
+                        for m in reversed(_msgs)
+                        if isinstance(m, dict) and m.get("role") == "assistant"
+                    ),
+                    None,
+                )
+                if (
+                    _lastr is not None
+                    and isinstance(_lastr.get("content"), str)
+                    and _lastr["content"].strip()
+                ):
+                    _lastr["content"] = (
+                        _lastr["content"].rstrip()
+                        + "\n\n"
+                        + _rec
+                    )
+                    self._log_debug(
+                        f"outlet: investigation record appended "
+                        f"({len(_rec)} chars)"
+                    )
+        except Exception as _e:
+            self._log_debug(f"outlet: record append skipped ({_e!r})")
 
         # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
