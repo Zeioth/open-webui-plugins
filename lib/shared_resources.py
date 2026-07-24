@@ -487,6 +487,93 @@ _REDACT_KEYS = frozenset({"authorization", "api_key", "api_token", "token", "bea
 _TRUNCATION_REASONS = frozenset({"length", "max_tokens"})
 
 
+def _describe_output_tail(text: str, lines_back: int = 20) -> str:
+    """
+    Classify the line-level repetition at the end of a generation.
+
+    Written for the one question a truncation log cannot otherwise
+    answer: what SHAPE was the loop. A token count says a call ran
+    to 57907 tokens; it cannot say whether the model repeated a
+    block verbatim or walked a template substituting one identifier
+    per line. The two call for opposite responses, because DRY's
+    penalty grows with the length of the MATCHING run: a verbatim
+    repeat lengthens its own match every iteration and is strangled
+    as soon as it passes dry_allowed_length, while a varying line
+    resets the match at the token that varies and stays invisible at
+    any allowed_length. Lowering the threshold fixes the first and
+    merely taxes legitimate code in the second.
+
+    Deterministic and bounded: a fixed tail window, a fixed line
+    count, and character comparison only.
+
+    Args:
+        text: The generation to inspect. Only its tail is read.
+        lines_back: How many trailing non-blank lines to compare.
+
+    Returns:
+        A one-line description, or "" when the tail carries no
+        line-level repetition worth reporting.
+    """
+    # Nothing this helper can hit is worth an exception escaping it.
+    # It runs inside call_llm's truncation branch, whose surrounding
+    # try catches only transport errors — a TypeError from a
+    # non-string body or an IndexError from an unexpected shape would
+    # propagate straight out of a call that had ALREADY SUCCEEDED and
+    # merely hit a ceiling. A diagnostic must never be able to turn a
+    # usable truncated response into a failed call.
+    try:
+        return _describe_output_tail_inner(text, lines_back)
+    except Exception:  # noqa: BLE001 - diagnostics never raise
+        return ""
+
+
+def _describe_output_tail_inner(text: str, lines_back: int) -> str:
+    """Body of _describe_output_tail; see that function for intent."""
+    # ── Step 1: the tail, as comparable non-blank lines ──
+    rows = [r.rstrip() for r in (text or "")[-6000:].split("\n")]
+    rows = [r for r in rows if r.strip()][-max(4, lines_back):]
+    if len(rows) < 4:
+        return ""
+
+    # ── Step 2: the two signatures ──
+    # Exact duplicates say 'verbatim repeat'. Adjacent lines that
+    # share a long prefix without being equal say 'template walk',
+    # which is the shape DRY cannot reach.
+    exact = len(rows) - len(set(rows))
+    prefixes = []
+    for a, b in zip(rows, rows[1:]):
+        n = 0
+        for ca, cb in zip(a, b):
+            if ca != cb:
+                break
+            n += 1
+        prefixes.append(n)
+    shared = sorted(p for p in prefixes if p >= 12)
+    if exact == 0 and not shared:
+        return ""
+
+    # ── Step 3: name the shape and show one line of it ──
+    median = shared[len(shared) // 2] if shared else 0
+    if exact >= max(2, len(rows) // 3):
+        shape = (
+            "VERBATIM repeat — DRY penalises this as the match "
+            "lengthens; a lower dry_allowed_length bites sooner"
+        )
+    elif len(shared) >= max(2, (len(rows) - 1) // 2):
+        shape = (
+            "TEMPLATE walk (lines vary after a shared prefix) — DRY "
+            "cannot see this at any dry_allowed_length, since the "
+            "varying token resets the match"
+        )
+    else:
+        shape = "partial repetition"
+    return (
+        "tail of %d lines: %d exact duplicate(s), %d adjacent pair(s) "
+        "sharing >=12 chars (median %d) — %s | last line: %r"
+        % (len(rows), exact, len(shared), median, shape, rows[-1][:120])
+    )
+
+
 def _resolve_backend(
     backend: Optional[str], base_url: str, model: str
 ) -> Literal["ollama", "llamacpp", "openai"]:
@@ -1086,11 +1173,45 @@ async def call_llm(
 
             truncated = (finish_reason or "") in _TRUNCATION_REASONS
             if truncated:
-                _logger.warning(
-                    "LLM output truncated (finish_reason=%s, label=%s, model=%s); "
-                    "consider raising max_tokens.",
-                    finish_reason, tag, model_str,
-                )
+                # The shape of what was generated, not just how much.
+                # Computed only on the truncation path, so a healthy
+                # call pays nothing.
+                _tail = _describe_output_tail(content)
+                # A length stop means two very different things, and the
+                # old message assumed the first. When a finite ceiling was
+                # forwarded, the caller's own max_tokens cut the call and
+                # raising it is the fix. When none was forwarded
+                # (max_tokens None/0 — the caller deliberately disabled
+                # every cap), nothing of ours cut anything: the generation
+                # ran until it hit the server's context window. Advising
+                # 'raise max_tokens' there is worse than useless — it
+                # points the operator at a control they already turned off,
+                # which reads as the disablement having failed. Observed
+                # exactly this way: a 57907-token completion under an
+                # intentionally uncapped valve, reported as if a cap had
+                # fired.
+                if forward_max_tokens is None:
+                    _logger.warning(
+                        "LLM output hit the CONTEXT WINDOW, not a configured "
+                        "cap (finish_reason=%s, label=%s, model=%s, "
+                        "completion_tokens=%s): no max_tokens was sent, so "
+                        "the model generated until the server's n_ctx ran "
+                        "out. Raising max_tokens cannot help; a generation "
+                        "this long is a degenerate loop or a prompt that "
+                        "invites unbounded output.%s",
+                        finish_reason, tag, model_str, ctok,
+                        (" " + _tail) if _tail else "",
+                    )
+                else:
+                    _logger.warning(
+                        "LLM output truncated by the configured cap "
+                        "(finish_reason=%s, label=%s, model=%s, "
+                        "max_tokens=%s, completion_tokens=%s); consider "
+                        "raising max_tokens.%s",
+                        finish_reason, tag, model_str,
+                        forward_max_tokens, ctok,
+                        (" " + _tail) if _tail else "",
+                    )
             elif finish_reason == "content_filter":
                 _logger.warning("LLM output filtered (content_filter, label=%s).", tag)
 
