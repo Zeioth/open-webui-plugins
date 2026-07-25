@@ -39920,6 +39920,14 @@ class ContextDumper:
             "frontier_hwm": frontier_hwm,
             "n_summaries_l1": n_summaries_l1,
             "n_summaries_l2": n_summaries_l2,
+            # Snapshotted here for the reason this whole method exists:
+            # the write runs later, in a worker thread, and the next
+            # turn's inlet clears this list. Reading it at write time
+            # would be a race whose loser is a file attributing one
+            # turn's acts to another — the kind of wrong that looks
+            # right. Shallow copy: the dicts inside are written once
+            # and never mutated after.
+            "agent_records": list(getattr(self._f, "_agent_records", []) or []),
         }
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -40003,14 +40011,15 @@ class ContextDumper:
         # missing context or from an agent inventing around good context.
         # Guarded whole — forensics never cost a turn its dump.
         try:
-            if self._f.valves.enable_agent_dump and self._f._agent_records:
+            _ag_recs = payload.get("agent_records") or []
+            if self._f.valves.enable_agent_dump and _ag_recs:
                 _ag_path = os.path.join(
                     project_dir, f"{timestamp_str}_turn_{turn:04d}.agents.md"
                 )
                 with open(_ag_path, "w", encoding="utf-8") as _af:
                     _af.write(
                         self._render_agent_records(
-                            self._f._agent_records, turn, timestamp_str
+                            _ag_recs, turn, timestamp_str
                         )
                     )
         except Exception as _e_ag:
@@ -45490,7 +45499,7 @@ class Filter:
             description="Append a compact metrics line per turn to evolution.jsonl.",
         )
         enable_agent_dump: bool = Field(
-            default=False,
+            default=True,
             description=(
                 "Write a sibling of each context dump named "
                 "<timestamp>_turn_NNNN.agents.md, recording what every "
