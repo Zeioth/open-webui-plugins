@@ -12391,58 +12391,33 @@ class LLMOrchestrator:
                 )
         return _aligned
 
-    async def call_llm(
-        self,
-        prompt: str,
-        system_prompt: str = "",
-        max_tokens: Optional[int] = None,
-        model_override: Optional[str] = None,
-        temperature: Optional[float] = None,
-        label: str = "",
-        total_timeout: Optional[float] = None,
-        endpoint_type: str = "chat",
-        response_format: Optional[Dict[str, Any]] = None,
-        enable_thinking: bool = False,
-        log_raw_response: bool = False,
-        return_meta: bool = False,
-    ) -> Optional[Union[str, "LLMResult"]]:
+    async def call_llm(self, *args, **kwargs):
         """
         Make one LLM call, and make it again if the answer degenerated.
 
-        A thin wrapper over _call_llm_once for one structural reason: the
-        call itself runs inside _llm_semaphore, which has a capacity of
-        one. Retrying from in there deadlocks — the second call waits for
-        a permit the first is still holding, forever, with no timeout and
-        no error. That is not hypothetical: it shipped, and a run died on
-        it mid-turn, the server idle and the plugin waiting on itself.
-        The retry has to happen after the permit is released, which means
-        outside the method that holds it.
+        Takes *args/**kwargs and forwards them untouched, which is not
+        laziness but the fix for how this wrapper broke the pipeline the
+        first time. Written with the signature copied out by hand, it
+        silently disagreed with _call_llm_once on four defaults —
+        temperature None against 0.3, enable_thinking False against
+        True, and two more — so every caller that had relied on a
+        default got a different one. The forge stopped producing
+        candidates at all: two generation attempts, both dying on
+        "'<' not supported between instances of 'NoneType' and 'int'",
+        and a turn that forged zero hypotheses. A wrapper that restates
+        a signature is a copy that will drift; one that forwards cannot.
 
-        One retry, never two. A second degenerate answer says something
-        about the model or the prompt rather than about luck, and the
-        retry carries the SHAPE that was detected so the second attempt
-        is a different prompt rather than the same dice thrown again.
+        The retry lives here rather than inside because _call_llm_once
+        runs its whole body holding _llm_semaphore, an
+        asyncio.Semaphore(1). Retrying from in there waits on a permit
+        the caller still holds — no timeout, no error, the turn simply
+        stops. That shipped too.
 
-        Args:
-            Everything _call_llm_once takes; see it for the details.
-
-        Returns:
-            Whatever _call_llm_once returns, from whichever attempt was
-            kept.
+        One retry, never two, carrying the SHAPE that was detected so
+        the second attempt is a different prompt rather than the same
+        dice thrown again.
         """
-        _kw = dict(
-            system_prompt=system_prompt,
-            max_tokens=max_tokens,
-            model_override=model_override,
-            temperature=temperature,
-            total_timeout=total_timeout,
-            endpoint_type=endpoint_type,
-            response_format=response_format,
-            enable_thinking=enable_thinking,
-            log_raw_response=log_raw_response,
-            return_meta=return_meta,
-        )
-        _res = await self._call_llm_once(prompt=prompt, label=label, **_kw)
+        _res = await self._call_llm_once(*args, **kwargs)
         if not getattr(self._f.valves, "enable_degeneracy_retry", False):
             return _res
         # return_meta hands back an LLMResult; the text is on .content.
@@ -12450,25 +12425,33 @@ class LLMOrchestrator:
         _degen = _output_is_degenerate(_text if isinstance(_text, str) else "")
         if not _degen:
             return _res
+        # The prompt is the first positional or the "prompt" keyword;
+        # rebuild whichever form the caller used rather than assuming.
+        _label = str(kwargs.get("label", "") or "unlabelled")
+        _prefix = (
+            "Your previous answer was discarded: "
+            f"{_degen}. It repeated instead of answering. Reply again, "
+            "shorter, and stop as soon as you have said the thing "
+            "once.\n\n"
+        )
+        _args = list(args)
+        _kwargs = dict(kwargs)
+        if _args:
+            _args[0] = _prefix + str(_args[0] or "")
+        elif "prompt" in _kwargs:
+            _kwargs["prompt"] = _prefix + str(_kwargs["prompt"] or "")
+        else:
+            return _res
+        _kwargs["label"] = f"{_label}_degen_retry"
         self._f._log_debug(
-            f"[LLM] ({label or 'unlabelled'}) degenerate output "
-            f"({_degen}) — retrying once"
+            f"[LLM] ({_label}) degenerate output ({_degen}) — retrying once"
         )
         try:
-            return await self._call_llm_once(
-                prompt=(
-                    "Your previous answer was discarded: "
-                    f"{_degen}. It repeated instead of answering. Reply "
-                    "again, shorter, and stop as soon as you have said "
-                    "the thing once.\n\n" + (prompt or "")
-                ),
-                label=f"{label or 'unlabelled'}_degen_retry",
-                **_kw,
-            )
+            return await self._call_llm_once(*_args, **_kwargs)
         except Exception as _e_rt:
             self._f._log_debug(
-                f"[LLM] ({label or 'unlabelled'}) retry failed "
-                f"({_e_rt!r}) — keeping the degenerate answer"
+                f"[LLM] ({_label}) retry failed ({_e_rt!r}) — keeping the "
+                f"degenerate answer"
             )
             return _res
 
@@ -21492,7 +21475,26 @@ class CommandRouter:
         ce = self._f._cross_encoder
 
         def _predict_safely():
-            return ce.predict(self._truncate_pairs_for_cross_encoder(ce, pairs))
+            # The module lock, not the instance one, and it has to be
+            # taken HERE rather than around the await below. This body
+            # runs in a worker thread, and an asyncio.Lock serialises
+            # coroutines, not threads — it cannot exclude anything
+            # running outside the event loop. _is_likely_code reaches
+            # the same CrossEncoder through _get_cross_encoder() and
+            # guards it with _CROSS_ENCODER_LOCK, so two different lock
+            # objects of two different kinds were each protecting one
+            # side of the same shared tokenizer and neither excluded
+            # the other.
+            #
+            # The tokenizer underneath is Rust-backed and raises
+            # RuntimeError('Already borrowed') on concurrent use. It did:
+            # an inlet overlapping the previous turn's outlet took the
+            # whole turn down through inlet's fail-open path, and the
+            # user got a degraded answer with no indication why.
+            with _CROSS_ENCODER_LOCK:
+                return ce.predict(
+                    self._truncate_pairs_for_cross_encoder(ce, pairs)
+                )
 
         async with self._f._cross_encoder_lock:
             preds = await anyio.to_thread.run_sync(_predict_safely)
