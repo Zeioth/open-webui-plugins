@@ -12391,71 +12391,7 @@ class LLMOrchestrator:
                 )
         return _aligned
 
-    async def call_llm(self, *args, **kwargs):
-        """
-        Make one LLM call, and make it again if the answer degenerated.
-
-        Takes *args/**kwargs and forwards them untouched, which is not
-        laziness but the fix for how this wrapper broke the pipeline the
-        first time. Written with the signature copied out by hand, it
-        silently disagreed with _call_llm_once on four defaults —
-        temperature None against 0.3, enable_thinking False against
-        True, and two more — so every caller that had relied on a
-        default got a different one. The forge stopped producing
-        candidates at all: two generation attempts, both dying on
-        "'<' not supported between instances of 'NoneType' and 'int'",
-        and a turn that forged zero hypotheses. A wrapper that restates
-        a signature is a copy that will drift; one that forwards cannot.
-
-        The retry lives here rather than inside because _call_llm_once
-        runs its whole body holding _llm_semaphore, an
-        asyncio.Semaphore(1). Retrying from in there waits on a permit
-        the caller still holds — no timeout, no error, the turn simply
-        stops. That shipped too.
-
-        One retry, never two, carrying the SHAPE that was detected so
-        the second attempt is a different prompt rather than the same
-        dice thrown again.
-        """
-        _res = await self._call_llm_once(*args, **kwargs)
-        if not getattr(self._f.valves, "enable_degeneracy_retry", False):
-            return _res
-        # return_meta hands back an LLMResult; the text is on .content.
-        _text = getattr(_res, "content", _res) if _res else ""
-        _degen = _output_is_degenerate(_text if isinstance(_text, str) else "")
-        if not _degen:
-            return _res
-        # The prompt is the first positional or the "prompt" keyword;
-        # rebuild whichever form the caller used rather than assuming.
-        _label = str(kwargs.get("label", "") or "unlabelled")
-        _prefix = (
-            "Your previous answer was discarded: "
-            f"{_degen}. It repeated instead of answering. Reply again, "
-            "shorter, and stop as soon as you have said the thing "
-            "once.\n\n"
-        )
-        _args = list(args)
-        _kwargs = dict(kwargs)
-        if _args:
-            _args[0] = _prefix + str(_args[0] or "")
-        elif "prompt" in _kwargs:
-            _kwargs["prompt"] = _prefix + str(_kwargs["prompt"] or "")
-        else:
-            return _res
-        _kwargs["label"] = f"{_label}_degen_retry"
-        self._f._log_debug(
-            f"[LLM] ({_label}) degenerate output ({_degen}) — retrying once"
-        )
-        try:
-            return await self._call_llm_once(*_args, **_kwargs)
-        except Exception as _e_rt:
-            self._f._log_debug(
-                f"[LLM] ({_label}) retry failed ({_e_rt!r}) — keeping the "
-                f"degenerate answer"
-            )
-            return _res
-
-    async def _call_llm_once(
+    async def call_llm(
         self,
         prompt: str,
         system_prompt: str,
@@ -12933,6 +12869,51 @@ class LLMOrchestrator:
                             if self._f.tokenizer
                             else "?"
                         )
+                        # Degeneracy is REPORTED, never retried. The
+                        # retry shipped, worked mechanically, and was
+                        # still the wrong idea: detection happens after
+                        # the generation completes, so the 225 seconds
+                        # of garbage are already spent by the time
+                        # anyone knows. Retrying bought a second 235
+                        # seconds and a second degenerate answer. What
+                        # stops this is the prompt, and the ceiling
+                        # bounds the damage; a retry only doubles it.
+                        #
+                        # Reporting is free and is what found the
+                        # problem in the first place, so it stays — and
+                        # it lives here rather than in a wrapper, which
+                        # removes the third layer over an LLM call that
+                        # only ever existed to escape this method's
+                        # semaphore.
+                        _degen = (
+                            _output_is_degenerate(content)
+                            if getattr(
+                                self._f.valves,
+                                "enable_degeneracy_retry",
+                                False,
+                            )
+                            else ""
+                        )
+                        if _degen:
+                            # The head and the tail, both, because they
+                            # answer different questions: the head shows
+                            # what the call was trying to do before it
+                            # lost the thread, the tail shows what it
+                            # was repeating when it hit the ceiling.
+                            # Neither is recoverable from anywhere else
+                            # when a turn hangs or dies: the agent dump
+                            # is written at the END of a turn, so the
+                            # generations most worth reading are exactly
+                            # the ones no dump ever records.
+                            _head = content[:400].replace("\n", "\u23ce")
+                            _tail = content[-400:].replace("\n", "\u23ce")
+                            self._f._log_debug(
+                                f"[LLM]{label_str} DEGENERATE output "
+                                f"({_degen}) — kept as-is; the prompt is "
+                                f"what needs fixing, not this call\n"
+                                f"    HEAD: {_head}\n"
+                                f"    TAIL: {_tail}"
+                            )
                         self._f._log_debug(
                             f"[LLM] {model}{label_str} – "
                             f"in:{in_tokens} out:{out_tokens} "
@@ -44346,7 +44327,7 @@ class Filter:
             ),
         )
         agentic_runaway_token_cap: int = Field(
-            default=16000,
+            default=8000,
             ge=0,
             description=(
                 "Ceiling passed as max_tokens on pipeline calls when "
@@ -46838,7 +46819,15 @@ class Filter:
                 for _n in _AGENTIC_GEN_BUDGETS
                 if int(getattr(v, _n, 0) or 0) > 0
             }
-            _over = {_n: _b for _n, _b in _budgets.items() if _b >= _cap}
+            # Strictly below, not at-or-below. A ceiling EQUAL to the
+            # largest budget is exactly right: that label keeps the
+            # budget it was designed with, every smaller one is
+            # untouched, and a degenerate generation costs the least
+            # wall clock consistent with never cutting legitimate work.
+            # Flagging equality would have forced the ceiling higher
+            # than anything needs, and a degenerate step at 16000 took
+            # 225 seconds where the same step at 8000 takes half that.
+            _over = {_n: _b for _n, _b in _budgets.items() if _b > _cap}
             if _over:
                 _names = ", ".join(
                     f"{_n}={_b}" for _n, _b in sorted(_over.items())
