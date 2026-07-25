@@ -12394,6 +12394,87 @@ class LLMOrchestrator:
     async def call_llm(
         self,
         prompt: str,
+        system_prompt: str = "",
+        max_tokens: Optional[int] = None,
+        model_override: Optional[str] = None,
+        temperature: Optional[float] = None,
+        label: str = "",
+        total_timeout: Optional[float] = None,
+        endpoint_type: str = "chat",
+        response_format: Optional[Dict[str, Any]] = None,
+        enable_thinking: bool = False,
+        log_raw_response: bool = False,
+        return_meta: bool = False,
+    ) -> Optional[Union[str, "LLMResult"]]:
+        """
+        Make one LLM call, and make it again if the answer degenerated.
+
+        A thin wrapper over _call_llm_once for one structural reason: the
+        call itself runs inside _llm_semaphore, which has a capacity of
+        one. Retrying from in there deadlocks — the second call waits for
+        a permit the first is still holding, forever, with no timeout and
+        no error. That is not hypothetical: it shipped, and a run died on
+        it mid-turn, the server idle and the plugin waiting on itself.
+        The retry has to happen after the permit is released, which means
+        outside the method that holds it.
+
+        One retry, never two. A second degenerate answer says something
+        about the model or the prompt rather than about luck, and the
+        retry carries the SHAPE that was detected so the second attempt
+        is a different prompt rather than the same dice thrown again.
+
+        Args:
+            Everything _call_llm_once takes; see it for the details.
+
+        Returns:
+            Whatever _call_llm_once returns, from whichever attempt was
+            kept.
+        """
+        _kw = dict(
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            model_override=model_override,
+            temperature=temperature,
+            total_timeout=total_timeout,
+            endpoint_type=endpoint_type,
+            response_format=response_format,
+            enable_thinking=enable_thinking,
+            log_raw_response=log_raw_response,
+            return_meta=return_meta,
+        )
+        _res = await self._call_llm_once(prompt=prompt, label=label, **_kw)
+        if not getattr(self._f.valves, "enable_degeneracy_retry", False):
+            return _res
+        # return_meta hands back an LLMResult; the text is on .content.
+        _text = getattr(_res, "content", _res) if _res else ""
+        _degen = _output_is_degenerate(_text if isinstance(_text, str) else "")
+        if not _degen:
+            return _res
+        self._f._log_debug(
+            f"[LLM] ({label or 'unlabelled'}) degenerate output "
+            f"({_degen}) — retrying once"
+        )
+        try:
+            return await self._call_llm_once(
+                prompt=(
+                    "Your previous answer was discarded: "
+                    f"{_degen}. It repeated instead of answering. Reply "
+                    "again, shorter, and stop as soon as you have said "
+                    "the thing once.\n\n" + (prompt or "")
+                ),
+                label=f"{label or 'unlabelled'}_degen_retry",
+                **_kw,
+            )
+        except Exception as _e_rt:
+            self._f._log_debug(
+                f"[LLM] ({label or 'unlabelled'}) retry failed "
+                f"({_e_rt!r}) — keeping the degenerate answer"
+            )
+            return _res
+
+    async def _call_llm_once(
+        self,
+        prompt: str,
         system_prompt: str,
         model_override: Optional[str] = None,
         max_tokens: Optional[int] = None,
@@ -12405,7 +12486,6 @@ class LLMOrchestrator:
         enable_thinking: bool = True,
         log_raw_response: bool = False,
         return_meta: bool = False,
-        _degeneracy_retry: bool = False,
     ) -> Optional[Union[str, "LLMResult"]]:
         """
         Call the LLM with in-memory response cache and call deduplication.
@@ -12910,55 +12990,6 @@ class LLMOrchestrator:
                                 "output_capped": len(content) > 12000,
                             },
                         )
-                        # Degeneracy guard, at the one place every agent
-                        # passes through. A step that answers by repeating
-                        # itself corrupts the turn downstream: its output
-                        # becomes another step's workspace, and a run has
-                        # already been observed answering the user with a
-                        # block cycling twenty-three times. Detection is a
-                        # few hundred microseconds against a call that
-                        # costs seconds, so it runs on all of them rather
-                        # than on the ones guessed most at risk.
-                        #
-                        # One retry, enforced by a flag rather than a
-                        # counter: the recursive call sets it, so the
-                        # second attempt cannot trigger a third whatever
-                        # it returns. The retry carries the SHAPE that was
-                        # detected, which makes it a different prompt
-                        # instead of the same dice thrown twice.
-                        _degen = (
-                            ""
-                            if _degeneracy_retry
-                            else _output_is_degenerate(content)
-                        )
-                        if _degen and getattr(
-                            self._f.valves, "enable_degeneracy_retry", False
-                        ):
-                            self._f._log_debug(
-                                f"[LLM]{label_str} degenerate output "
-                                f"({_degen}) — retrying once"
-                            )
-                            return await self.call_llm(
-                                prompt=(
-                                    "Your previous answer was discarded: "
-                                    f"{_degen}. It repeated instead of "
-                                    "answering. Reply again, shorter, and "
-                                    "stop as soon as you have said the "
-                                    "thing once.\n\n" + (prompt or "")
-                                ),
-                                system_prompt=system_prompt,
-                                max_tokens=max_tokens,
-                                model_override=model_override,
-                                temperature=temperature,
-                                label=f"{label or 'unlabelled'}_degen_retry",
-                                total_timeout=total_timeout,
-                                endpoint_type=endpoint_type,
-                                response_format=response_format,
-                                enable_thinking=enable_thinking,
-                                log_raw_response=log_raw_response,
-                                return_meta=return_meta,
-                                _degeneracy_retry=True,
-                            )
                         return result if return_meta else content
                     else:
                         if not future.done():
@@ -13426,7 +13457,7 @@ class AgenticEvidenceLedger:
                 # evidence incomplete instead of silently passing.
                 self._f._log_debug(
                     f"🤖 Ledger: step {step.id} was TRUNCATED at "
-                    f"agentic_step_max_tokens before emitting its claims "
+                    f"its token ceiling before emitting its claims "
                     f"tail — prose kept, no claims recorded (raise the cap "
                     f"or tighten the step goal); output ends: {_tail!r}"
                 )
@@ -17534,9 +17565,12 @@ class AgenticStepExecutor:
             "needed to address the goal: relevant symbols (use their "
             "qualified names exactly as written), their responsibilities, "
             "call relationships, and any invariants or comments that "
-            "matter. Do NOT draw conclusions or propose fixes yet.\n"
-            "End with a section titled 'NOT FOUND:' listing what you looked "
-            "for but could not find in the context."
+            "matter. Do NOT draw conclusions and do NOT propose fixes: "
+            "that is a later step's job, and a step doing it anyway "
+            "spends its budget writing what will be discarded.\n"
+            "Anything you looked for and could not find goes in the "
+            "JSON \"needs\" field. There is exactly ONE way to end this "
+            "answer, and it is the fenced JSON block."
         ),
         "analyze": (
             "You are executing step {sid} (analyze), the final step of an "
@@ -29407,6 +29441,49 @@ class MetacognitiveReasoningEngine:
         re.IGNORECASE,
     )
 
+    @staticmethod
+    def _drop_near_duplicates(claims: List[str]) -> Tuple[List[str], int]:
+        """
+        Collapse claims that are the same claim written twice.
+
+        Observed: "The PPR cache key includes code_state_hash or
+        structure_hash" and "The PPR cache key includes THE
+        code_state_hash or structure_hash" — one article apart, two of
+        the ten slots a cycle gets, and the graph rules on both
+        identically.
+
+        The threshold is 0.95, and it is deliberately far tighter than
+        the 0.85 this codebase uses for hypothesis collision. A looser
+        one was considered earlier and rejected on evidence: four claims
+        reading "returns early without calling X" / "without modifying
+        Y" / "without popping Z" scored up to 0.72 against each other and
+        are four DIFFERENT assertions about one code path. Collapsing
+        them would have destroyed real content. Measured against both
+        sets, the real duplicate sits at 0.968 and the tightest
+        legitimate pair at 0.719, so the gap is wide and the threshold
+        sits in it rather than at one edge.
+
+        Args:
+            claims: Claims as parsed, complement pairs already removed.
+
+        Returns:
+            Survivors in original order, and how many were collapsed.
+        """
+        _keep: List[str] = []
+        _norm: List[str] = []
+        _dropped = 0
+        for _c in claims:
+            _n = " ".join((_c or "").split()).lower()
+            if any(
+                difflib.SequenceMatcher(None, _n, _prev).ratio() > 0.95
+                for _prev in _norm
+            ):
+                _dropped += 1
+                continue
+            _norm.append(_n)
+            _keep.append(_c)
+        return _keep, _dropped
+
     @classmethod
     def _drop_complement_pairs(cls, claims: List[str]) -> Tuple[List[str], int]:
         """
@@ -29892,6 +29969,12 @@ class MetacognitiveReasoningEngine:
                 "the code DOES on that path instead — 'the early "
                 "return skips the reindex call' rather than 'when "
                 "the hashes match, nothing is reindexed'. "
+                "One thing per claim, and never an alternative: 'the "
+                "key includes A or B' asks the index a question it "
+                "cannot answer, because it decides one fact at a "
+                "time. If you believe both are possible, pick the one "
+                "your mechanism needs; if you need both, that is two "
+                "claims and you have the budget for them. "
                 f"Emit AT MOST {self._MAX_CLAIMS_PER_CYCLE} claims and "
                 "then stop. This is a hard limit, not a target: "
                 "anything past it is discarded unread, so a longer "
@@ -29971,6 +30054,12 @@ class MetacognitiveReasoningEngine:
             # and the coverage score would each read the certain
             # confirmation of one half as evidence.
             _claims, _n_contra = self._drop_complement_pairs(_claims)
+            _claims, _n_dup = self._drop_near_duplicates(_claims)
+            if _n_dup:
+                self._f._log_debug(
+                    f"forge experiment c{_cycle}: collapsed {_n_dup} "
+                    f"claim(s) restating one already in the list"
+                )
             if _n_contra:
                 self._tag_strategy(_dossier, "self-contradiction")
                 self._f._log_debug(
@@ -44255,38 +44344,36 @@ class Filter:
             ),
         )
         agentic_runaway_token_cap: int = Field(
-            default=4500,
+            default=16000,
             ge=0,
             description=(
                 "Ceiling passed as max_tokens on pipeline calls when "
-                "agentic_unlimited_tokens is on. 0 sends no ceiling at "
-                "all, which is not the same as a large one: the request "
-                "then carries no max_tokens and the model generates "
-                "until the server's context window ends."
+                "agentic_unlimited_tokens is on. 0 sends none at all, "
+                "which is not the same as a large one: the request then "
+                "carries no max_tokens and the model generates until the "
+                "server's context window ends."
                 "\n\n"
-                "Sized from measurement, not caution. Across 53 healthy "
-                "calls in two instrumented turns the median was 174 "
-                "tokens, the 90th percentile 527, and the largest "
-                "3683 — an agentic_step that finished on its own. 4500 "
-                "is that maximum plus twenty per cent, so every "
-                "legitimate call ever measured completes untouched, "
-                "with the third-largest sitting at less than a third of "
-                "the ceiling."
+                "MUST stay above every per-label budget, and the reason "
+                "is a mistake this valve has already made. Sized at 4500 "
+                "from a sample of healthy calls that happened to top out "
+                "at 3683, it sat below agentic_step_max_tokens (8000) and "
+                "quietly became the step budget instead of a backstop for "
+                "it. Seven of thirteen steps in one run were cut, three "
+                "of them mid-`TOOL:` line, and each cut cost more than it "
+                "saved: the step lost its claims tail, the recovery call "
+                "fired, and that was cut too. Truncating legitimate work "
+                "does not prevent corruption, it causes it."
                 "\n\n"
-                "This is a backstop, not a budget, and the distinction "
-                "is why an earlier 8000 had to be removed: that one was "
-                "applied per label to calls that legitimately needed "
-                "more, and truncated 37 of them in a single session. A "
-                "ceiling above everything observed cannot do that, and "
-                "it is the only mechanism confidence cannot outvote. "
-                "DRY was armed at dry_allowed_length 17 through five "
-                "separate generations of roughly sixty thousand tokens: "
-                "its penalty is subtracted from a logit, and a "
-                "degenerate loop's confidence has no ceiling to subtract "
-                "from. A hard stop does not argue."
+                "16000 is twice the largest per-label budget, so no "
+                "legitimate call can reach it, while still bounding a "
+                "runaway to roughly four minutes against the fifteen a "
+                "context-window-length generation takes. The budgets are "
+                "what shape quality; this is only here to stop "
+                "hallucinated verbosity, and _validate_valve_coherence "
+                "now warns if it is ever lowered back under one."
                 "\n\n"
-                "Raise it if a legitimate call is ever seen finishing "
-                "on length rather than stop; the agent dump reports "
+                "Raise it if a legitimate call is seen finishing on "
+                "length rather than stop; the agent dump reports "
                 "finish_reason per call, so that is one grep."
             ),
         )
@@ -46705,6 +46792,62 @@ class Filter:
         """
         v = self.valves
         warnings: List[str] = []
+
+        # ------------------------------------------------------------------
+        # 0. The runaway backstop must sit ABOVE every per-label budget
+        # ------------------------------------------------------------------
+        # Below one, it stops being a backstop and becomes the budget —
+        # silently, for whichever label it undercuts. Shipped once at 4500
+        # against an 8000 step budget: seven of thirteen steps in a single
+        # run were cut, three mid-`TOOL:` line, and each cut cost more than
+        # it saved, because the lost claims tail triggered a recovery call
+        # that was cut in turn. The budgets shape quality; this only stops
+        # hallucinated verbosity, and it cannot do that from underneath
+        # them.
+        # The list is explicit, and has to be. This file uses the
+        # _max_tokens suffix for two unrelated things: ten valves are
+        # GENERATION budgets, passed as max_tokens to a call, and fifteen
+        # are CONTEXT budgets deciding how much to include in a prompt.
+        # Matching on the suffix caught both and would have warned on
+        # every startup that a 16000 ceiling sits below
+        # history_max_tokens=60000, which compares a generation limit
+        # against a context one and means nothing.
+        #
+        # Scoped further to the agentic budgets, because the runaway cap
+        # only applies to labels starting with "agentic_" — a summary or
+        # a seed-inference budget is never overridden by it.
+        #
+        # Adding a generation budget means adding it here. The suffix
+        # cannot be trusted to find it, and neither can an AST sweep for
+        # `max_tokens=`: agentic_serial_design_max_tokens reaches the call
+        # through an intermediate variable and a sweep misses it.
+        _AGENTIC_GEN_BUDGETS = (
+            "agentic_step_max_tokens",
+            "agentic_verify_max_tokens",
+            "agentic_planner_max_tokens",
+            "agentic_harness_max_tokens",
+            "agentic_preplanner_max_tokens",
+            "agentic_serial_design_max_tokens",
+        )
+        _cap = int(getattr(v, "agentic_runaway_token_cap", 0) or 0)
+        if _cap > 0:
+            _budgets = {
+                _n: int(getattr(v, _n, 0) or 0)
+                for _n in _AGENTIC_GEN_BUDGETS
+                if int(getattr(v, _n, 0) or 0) > 0
+            }
+            _over = {_n: _b for _n, _b in _budgets.items() if _b >= _cap}
+            if _over:
+                _names = ", ".join(
+                    f"{_n}={_b}" for _n, _b in sorted(_over.items())
+                )
+                warnings.append(
+                    f"agentic_runaway_token_cap={_cap} is at or below "
+                    f"per-label budget(s) [{_names}] — it will silently "
+                    f"REPLACE them, cutting legitimate work mid-answer "
+                    f"instead of guarding against runaway generation. Set "
+                    f"it above the largest, or to 0 to disable it."
+                )
 
         window = v.context_window_tokens
 
