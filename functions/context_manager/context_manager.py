@@ -295,6 +295,230 @@ class CompetitionRecord:
     question_type: str = ""
 
 
+class DetectionCatalog:
+    """
+    Everything this pipeline can DETECT about a turn, in one place.
+
+    Detection is spread across three unrelated mechanisms by necessity —
+    one LLM classification per turn, a cascade of regexes and a
+    CrossEncoder, plus content patterns that fire deep inside the
+    reasoning — and until this table there was nowhere to see the whole
+    of it. A reader had to know which of thirty regexes across twelve
+    classes mattered, and which of the classifier's ten fields anything
+    consumed.
+
+    This is documentation with a check attached, on the same reasoning
+    as the instruction recipes: a table nobody verifies drifts from the
+    code it claims to describe, and a stale map is worse than none
+    because it is believed. audit() resolves every mechanism named here
+    and reports the ones that no longer exist.
+
+    Nothing reads this catalogue at runtime. It changes no behaviour;
+    it exists so that "what can this system notice, and what happens
+    when it does" is one screen rather than a week of reading.
+    """
+
+    # (signal, what detects it, possible values, what changes because of it)
+    SIGNALS: Tuple[Tuple[str, str, str, str], ...] = (
+        # ── Per-turn LLM classification ──────────────────────────────
+        # One call per turn, cached by content hash. Every field below
+        # arrives from that single call; nothing here costs an extra one.
+        (
+            "intent",
+            "classify_turn (LLM)",
+            "explain | modify | debug | refactor",
+            "What the turn is ABOUT. Vetoes the retrieval gate only "
+            "when debug, since diagnosis is what the pipeline is for.",
+        ),
+        (
+            "use_case",
+            "classify_use_case cascade (see UseCase)",
+            "A architecture | B planning | C programming | "
+            "D refactoring | E scaffolding",
+            "The LOD profile: how much code, how many callers. "
+            "ARCHITECTURE also exempts the zero-claims abstention.",
+        ),
+        (
+            "cot_level",
+            "classify_turn (LLM)",
+            "1 | 2 | 3",
+            "Reasoning depth. 1 is the classifier saying a direct "
+            "answer suffices, and is one of the retrieval gate's five "
+            "conditions.",
+        ),
+        (
+            "direct_retrieval + retrieval_target",
+            "classify_turn (LLM)",
+            "bool + free text",
+            "Routes the turn to retrieval instead of the forge. "
+            "Requires four other signals to agree before it diverts.",
+        ),
+        (
+            "is_code_only",
+            "classify_turn (LLM)",
+            "bool",
+            "A paste with no question: ingested, acknowledged, no "
+            "pipeline.",
+        ),
+        (
+            "has_request",
+            "classify_turn (LLM)",
+            "bool",
+            "Whether anything is being asked at all.",
+        ),
+        (
+            "multiclause",
+            "classify_turn (LLM)",
+            "bool",
+            "Chained commands need planning, so they never take the "
+            "retrieval shortcut.",
+        ),
+        (
+            "negates_reasoning",
+            "classify_turn (LLM)",
+            "bool",
+            "The user asked for no reasoning; the pipeline obeys.",
+        ),
+        # ── Explicit user control ────────────────────────────────────
+        (
+            "use-case command prefix",
+            "ContextBuilder._UC_COMMAND_RE",
+            "/arch /plan /code /refactor /scaffold",
+            "Overrides every other use-case signal, including the LLM. "
+            "Matched on the RAW query so a paste cannot bury it.",
+        ),
+        # ── Content patterns that gate reasoning ─────────────────────
+        (
+            "high-severity vocabulary",
+            "_EC10_CRITICAL_RE / _EC10_NEAR_MISS_RE",
+            "corruption, data loss, race, silent failure…",
+            "Promotes the writers rung of the investigation ladder and "
+            "exempts the hypothesis from early pruning.",
+        ),
+        (
+            "absence / universal goal",
+            "AgenticStepExecutor._SWEEP_GOAL_RE",
+            "'all callers of', 'anywhere', 'no place where'…",
+            "Selects the systematic sweep methodology for that step, "
+            "where enumeration must be exhaustive to mean anything.",
+        ),
+        (
+            "retrieval kind",
+            "AgenticPlanner._RETRIEVAL_DIFF_RE / _RETRIEVAL_APPLIED_RE",
+            "diff_stored | diff_compute | artifact",
+            "Whether a retrieval is a lookup of something stored or a "
+            "diff to be computed against the index.",
+        ),
+        (
+            "claim shape",
+            "MetacognitiveReasoningEngine._CALL_RELATION_RE / "
+            "_NEG_RELATION_RE, _CONTRACT_RETURN_RE / _CONTRACT_ASSERT_RE",
+            "'A calls B', 'A does not call B', 'X returns int'…",
+            "Which deterministic check rules on a claim: the call "
+            "graph, or the AST contract checker.",
+        ),
+        (
+            "self-contradiction",
+            "MetacognitiveReasoningEngine._CLAIM_NEGATION_RE",
+            "a claim asserted alongside its own opposite",
+            "Both members are dropped before anything counts them: the "
+            "graph would confirm one whatever the hypothesis is worth.",
+        ),
+        (
+            "echoed scaffolding",
+            "_TIER_POINTER_RE / _SKELETON_RULE_RE",
+            "rendered context markers reappearing in the answer",
+            "The outlet cuts them: the model reciting its own context "
+            "is not an answer.",
+        ),
+        (
+            "pasted upload",
+            "_PASTED_UPLOAD_RE",
+            "an attachment rendered into the message",
+            "Routes to ingestion rather than to a question.",
+        ),
+        (
+            "anomaly / deliverable framing",
+            "AgenticPreplanner._ANOMALY_RE / _DELIVERABLE_RE",
+            "symptom reports against build requests",
+            "Chooses the framing the pre-planner explores, which "
+            "decides what the whole turn treats as the question.",
+        ),
+    )
+
+    @classmethod
+    def audit(cls) -> str:
+        """
+        Report the catalogue, and flag entries whose mechanism is gone.
+
+        A name here is checked against the live module: a class-owned
+        pattern must still be an attribute of that class, a module-level
+        one must still be a global. Renaming a regex without updating
+        this table therefore shows up as MISSING instead of quietly
+        making the map wrong.
+        """
+        _out = ["Detection catalogue", ""]
+        _missing = 0
+        for _name, _mech, _vals, _effect in cls.SIGNALS:
+            _bad = []
+            # "Class.FIRST_RE / SECOND_RE" is the natural shorthand for a
+            # pair owned by one class, and reading SECOND_RE as a global
+            # reported three false MISSINGs on the first run. An
+            # unqualified name inherits the last qualifier seen in the
+            # same entry, and only falls back to module scope when the
+            # entry named no class at all.
+            # A comma starts a fresh group, so a module-level pair listed
+            # after a class-owned one does not inherit that class.
+            _toks = [
+                (_g, _t)
+                for _g in _mech.split(",")
+                for _t in re.findall(r"[A-Za-z_][A-Za-z0-9_.]*_RE\b", _g)
+            ]
+            _last_owner = ""
+            _last_group = None
+            for _group, _tok in _toks:
+                if _group is not _last_group:
+                    _last_owner = ""
+                    _last_group = _group
+                _owner, _, _attr = _tok.rpartition(".")
+                if _owner:
+                    _last_owner = _owner
+                else:
+                    _owner = _last_owner
+                if _owner:
+                    _cls = globals().get(_owner)
+                    _ok = _cls is not None and hasattr(_cls, _attr)
+                else:
+                    _ok = _attr in globals()
+                if not _ok:
+                    _bad.append(_tok)
+            _missing += len(_bad)
+            _out.append(f"{_name}")
+            _out.append(f"    detected by : {_mech}")
+            _out.append(f"    values      : {_vals}")
+            _out.append(f"    changes     : {_effect}")
+            if _bad:
+                _joined = ", ".join(_bad)
+                _out.append(f"    *** MISSING : {_joined}")
+            _out.append("")
+        _out.append(
+            f"{len(cls.SIGNALS)} signal(s); "
+            + ("all mechanisms resolve" if not _missing
+               else f"{_missing} mechanism(s) MISSING")
+        )
+        return "\n".join(_out)
+
+
+# The two sides of an experimentum crucis round. The model answers
+# "if_true_supports": "A" or "B", meaning the FIRST or the SECOND of the
+# two rival dossiers being compared — nothing to do with UseCase, whose
+# wire values happen to include the same letters. Naming them stops a
+# reader (or a grep for == "A") from conflating a turn mode with a
+# hypothesis slot.
+_CRUCIS_FIRST = "A"
+_CRUCIS_SECOND = "B"
+
+
 class UseCase(str, Enum):
     """
     Use case categories for intent classification.
@@ -304,11 +528,52 @@ class UseCase(str, Enum):
     for logging and prompts.
     """
 
+    # WHAT EACH MODE MEANS, AND WHAT CHANGES BECAUSE OF IT.
+    #
+    # These are the turn MODES, detected separately from intent by
+    # classify_use_case and carried through the pipeline as the single
+    # letter below. The letter is the wire format and nothing else:
+    # never compare against it directly, because "A" reads as nothing
+    # at a call site and this file already uses "A" for a second,
+    # unrelated meaning (the first rival in an experimentum crucis).
+    # Compare against the member — UseCase is a str Enum, so
+    # `use_case == UseCase.REFACTORING` is both correct and readable.
+
+    # Design and structure questions. Widens the context: pulls more
+    # callers into view and raises the inference boost, because an
+    # architectural answer depends on relationships rather than on any
+    # single body. Also exempts a turn from the zero-claims abstention,
+    # since a design question legitimately produces no verifiable claims.
     ARCHITECTURE = "A"
+
+    # Roadmap and sequencing questions. No LOD adjustment of its own;
+    # present so the classifier has somewhere honest to put a turn that
+    # plans rather than programs.
     PLANNING = "B"
+
+    # The default, and the fallback when the classifier returns anything
+    # unrecognised. Ordinary programming work.
     PROGRAMMING = "C"
+
+    # Refactoring and impact analysis. The only mode that changes the
+    # caller budget (lod_intent_refactor_callers_max), because knowing
+    # who calls a symbol is the whole question when moving it, and it
+    # shares ARCHITECTURE's inference boost for the same reason.
     REFACTORING = "D"
+
+    # Boilerplate generation. Narrow by nature: the answer rarely
+    # depends on the surrounding call graph.
     SCAFFOLDING = "E"
+
+    @classmethod
+    def keys(cls) -> frozenset:
+        """
+        Every valid wire value, for validating what a classifier returned.
+
+        Derived from the members rather than written out, so adding a mode
+        cannot leave a validation list silently rejecting it.
+        """
+        return frozenset(_m.value for _m in cls)
 
     @property
     def label(self) -> str:
@@ -4652,6 +4917,55 @@ class ContextBuilder:
     * LOD-3 semantic relevance filtering with cascade.
     """
 
+    # ── Use-case detection patterns ──────────────────────────────
+    # Class-level because they are constants: instance attributes
+    # recompiled the same five patterns for every ContextBuilder, and
+    # left them invisible to DetectionCatalog.audit(), which resolves
+    # a documented mechanism against the class that owns it. Every
+    # other pattern in this file already lives at class or module
+    # scope; these were the exception.
+    # Refactor (D) is tested BEFORE architecture (A).
+    _UC_COMMAND_RE = re.compile(
+        r"^\s*/(arch|plan|code|refactor|scaffold)\b", re.IGNORECASE
+    )
+    _UC_SCAFFOLD_RE = re.compile(
+        r"\b(esqueleto|skeleton|stubs?|scaffold(?:ing)?|solo\s+firmas|"
+        r"signatures?\s+only|boilerplate|plantilla\s+de\s+(?:clase|c[oó]digo))\b",
+        re.IGNORECASE,
+    )
+    _UC_REFACTOR_RE = re.compile(
+        r"\brefactor\w*|"
+        r"\brenombr\w*|\brename\w*|"
+        r"extrae\s+la\s+(?:validaci[oó]n|l[oó]gica)|"
+        r"extrae\s+(?:el\s+)?(?:m[eé]todo|funci[oó]n)|"
+        r"extract\s+(?:a\s+)?(?:method|function)|"
+        r"mueve\s+\w+\s+a|move\s+\w+\s+to|\binline\b|deduplic\w*|"
+        r"reorganiz\w*|restructur\w*|"
+        r"split\s+(?:this|the|el|la)\b|"
+        r"an[aá]lisis\s+de\s+impacto|"
+        r"nueva\s+estructura|"
+        r"demasiado\s+larg[oa]|"
+        r"limpiar\s+(?:el\s+)?(?:m[eé]todo|c[oó]digo)|"
+        r"separar\s+responsabilidades",
+        re.IGNORECASE,
+    )
+    _UC_ARCH_RE = re.compile(
+        r"\b(arquitectura|architecture|dise[ñn]o|design|"
+        r"c[oó]mo\s+(?:estructurar|organizar|dividir)|"
+        r"qu[eé]\s+(?:clases|m[oó]dulos|componentes)\s+"
+        r"(?:necesito|crear|a[ñn]adir)|"
+        r"abstract\s+(?:base\s+)?class|interface\s+design|"
+        r"propuesta\s+de\s+dise[ñn]o|API\s+surface)\b",
+        re.IGNORECASE,
+    )
+    _UC_PLAN_RE = re.compile(
+        r"\b(plan\s+de\s+(?:implementaci[oó]n|cambios)|implementation\s+plan|"
+        r"pasos\s+para|steps\s+to|roadmap|"
+        r"c[oó]mo\s+implementar|how\s+to\s+implement)\b",
+        re.IGNORECASE,
+    )
+
+
     def __init__(self, filter_ref: "Filter") -> None:
         """Initialize the ContextBuilder with a reference to the parent Filter."""
         self._f = filter_ref
@@ -4713,46 +5027,6 @@ class ContextBuilder:
                 "activation_direction": "callees",
             },
         }
-        # Use-case detection. Refactor (D) is tested BEFORE architecture (A).
-        self._UC_COMMAND_RE = re.compile(
-            r"^\s*/(arch|plan|code|refactor|scaffold)\b", re.IGNORECASE
-        )
-        self._UC_SCAFFOLD_RE = re.compile(
-            r"\b(esqueleto|skeleton|stubs?|scaffold(?:ing)?|solo\s+firmas|"
-            r"signatures?\s+only|boilerplate|plantilla\s+de\s+(?:clase|c[oó]digo))\b",
-            re.IGNORECASE,
-        )
-        self._UC_REFACTOR_RE = re.compile(
-            r"\brefactor\w*|"
-            r"\brenombr\w*|\brename\w*|"
-            r"extrae\s+la\s+(?:validaci[oó]n|l[oó]gica)|"
-            r"extrae\s+(?:el\s+)?(?:m[eé]todo|funci[oó]n)|"
-            r"extract\s+(?:a\s+)?(?:method|function)|"
-            r"mueve\s+\w+\s+a|move\s+\w+\s+to|\binline\b|deduplic\w*|"
-            r"reorganiz\w*|restructur\w*|"
-            r"split\s+(?:this|the|el|la)\b|"
-            r"an[aá]lisis\s+de\s+impacto|"
-            r"nueva\s+estructura|"
-            r"demasiado\s+larg[oa]|"
-            r"limpiar\s+(?:el\s+)?(?:m[eé]todo|c[oó]digo)|"
-            r"separar\s+responsabilidades",
-            re.IGNORECASE,
-        )
-        self._UC_ARCH_RE = re.compile(
-            r"\b(arquitectura|architecture|dise[ñn]o|design|"
-            r"c[oó]mo\s+(?:estructurar|organizar|dividir)|"
-            r"qu[eé]\s+(?:clases|m[oó]dulos|componentes)\s+"
-            r"(?:necesito|crear|a[ñn]adir)|"
-            r"abstract\s+(?:base\s+)?class|interface\s+design|"
-            r"propuesta\s+de\s+dise[ñn]o|API\s+surface)\b",
-            re.IGNORECASE,
-        )
-        self._UC_PLAN_RE = re.compile(
-            r"\b(plan\s+de\s+(?:implementaci[oó]n|cambios)|implementation\s+plan|"
-            r"pasos\s+para|steps\s+to|roadmap|"
-            r"c[oó]mo\s+implementar|how\s+to\s+implement)\b",
-            re.IGNORECASE,
-        )
 
     # ═══════════════════════════════════════════════════════════════════════
     # 1. Block A – static, KV‑cache‑anchoring content
@@ -6116,7 +6390,7 @@ class ContextBuilder:
         _cls = await self._f._commands._classify_turn_cached_for(q, project_id)
         if _cls is not None:
             _uc = str(_cls.get("use_case", "C")).upper()
-            if _uc not in ("A", "B", "C", "D", "E"):
+            if _uc not in UseCase.keys():
                 _uc = "C"
             _case_key = UseCase(_uc)
             self._f._log_debug(f"classify_use_case [unified]: '{_case_key.label}'")
@@ -6420,7 +6694,7 @@ class ContextBuilder:
                 data = json.loads(response)
                 raw = str(data.get("use_case", "")).strip().lower()
                 case_key = _label_map.get(raw, "C")
-                if case_key == "C" and raw not in _label_map:
+                if case_key == UseCase.PROGRAMMING and raw not in _label_map:
                     self._f._log_debug(
                         f"_classify_use_case_with_llm: unknown value {raw!r}, "
                         f"defaulting to Programming"
@@ -6728,7 +7002,7 @@ class ContextBuilder:
         # ------------------------------------------------------------------
         if (
             self._f.valves.enable_lod_by_intent
-            and active_use_case == "D"
+            and active_use_case == UseCase.REFACTORING
             and self._f.valves.lod_intent_refactor_callers_max != 0
         ):
             max_callers = self._f.valves.lod_intent_refactor_callers_max
@@ -7035,7 +7309,7 @@ class ContextBuilder:
         # because the full body is already injected.
         # ------------------------------------------------------------------
         if self._f.valves.enable_cfg_skeletons and (
-            active_use_case == "D"
+            active_use_case == UseCase.REFACTORING
             or intent_vector.get("debug", 0.0)
             >= self._f.valves.cfg_skeleton_debug_intent_threshold
         ):
@@ -7164,7 +7438,7 @@ class ContextBuilder:
 
                 cfg_skeleton = ""
                 if self._f.valves.enable_cfg_skeletons and (
-                    active_use_case == "D"
+                    active_use_case == UseCase.REFACTORING
                     or intent_vector.get("debug", 0.0)
                     >= self._f.valves.cfg_skeleton_debug_intent_threshold
                 ):
@@ -16232,6 +16506,100 @@ class AgenticPlanner:
                 break
         return "\n".join(_lines[_start:_end]).rstrip()
 
+    async def _fetch_stored_diffs(self, project_id: str, limit: int = 3) -> str:
+        """
+        The most recently applied diffs, newest first.
+
+        "El diff que acabas de aplicar" is a RECENCY question, and the
+        answer is one indexed query: napmem_diffs carries turn_number
+        and created_at with an index on (project_id, turn_number). The
+        pipeline asked the model to find it instead, and the model
+        answered with a theory about the table — after inventing a
+        get_diff_for_block method that does not exist. Semantic search
+        would not have helped either: "the one you just applied" has no
+        content to match, only a position in time.
+
+        Args:
+            project_id: Scope of the query.
+            limit: How many of the most recent diffs to return.
+
+        Returns:
+            The diffs as text, or a note saying plainly that none is
+            stored — never a guess about why.
+        """
+        # ── Step 1: the query, newest first ──
+        try:
+            _sql = (
+                "SELECT file_path, turn_number, diff_text "
+                "FROM napmem_diffs WHERE project_id=? "
+                "ORDER BY turn_number DESC, id DESC LIMIT ?"
+            )
+            _rows = await self._f._state_store._db_read(
+                lambda s=_sql, p=(project_id, int(limit)): (
+                    self._f._db_conn.execute(s, p).fetchall()
+                )
+            )
+        except Exception as _e_q:
+            self._f._log_debug(f"RT-4 stored-diff query failed ({_e_q!r})")
+            return ""
+
+        # ── Step 2: report, including the empty case ──
+        if not _rows:
+            return (
+                "[No stored diff: nothing has been applied to the index "
+                "in this project yet, so there is no recorded change to "
+                "show. This is not a lookup failure — the table is "
+                "empty for this project.]"
+            )
+        _parts: List[str] = []
+        for _fp, _turn, _text in _rows:
+            _head = f"# {_fp or '(unknown file)'} — applied on turn {_turn}"
+            _parts.append(_head + "\n" + str(_text or "").rstrip())
+        _out = "\n\n".join(_parts)
+        if len(_out) > 8000:
+            _out = (
+                _out[:8000]
+                + "\n[truncated at 8000 chars — the entries above are "
+                "complete up to this point]"
+            )
+        return _out
+
+    def _fetch_named_artifact(self, target: str, project_id: str) -> str:
+        """
+        The body of a symbol the user asked to see, by name.
+
+        "Dame el cuerpo de X" needs no investigation: the broker
+        resolves a name to a qualified id and returns the body. Leaving
+        it to the executor means the model must choose EXPAND on its
+        own, and a whole validation run showed it choosing no tool at
+        all on the one turn that most needed one.
+
+        Identifier-shaped tokens are tried in the order they appear,
+        because the user usually names the thing first. A target that
+        resolves to nothing returns "" so the gate can fall through to
+        the ordinary tool-driven step rather than assert an absence it
+        has not established — the broker not finding a name is not proof
+        the user meant a symbol at all.
+        """
+        # ── Step 1: candidate names, in the order written ──
+        _cands = [
+            _t
+            for _t in re.findall(r"[A-Za-z_][A-Za-z0-9_.]{2,}", target or "")
+            if "_" in _t or "." in _t or _t[0].isupper()
+        ][:3]
+        if not _cands:
+            return ""
+        # ── Step 2: first one the index knows ──
+        _broker = AgenticToolBroker(self._f)
+        for _name in _cands:
+            try:
+                _body = _broker._expand(_name, project_id)
+            except Exception:
+                continue
+            if _body and not _body.startswith("["):
+                return _body
+        return ""
+
     def _diff_emitted_against_index(self, project_id: str) -> str:
         """
         Unified diff between the code last emitted and the index.
@@ -16405,7 +16773,23 @@ class AgenticPlanner:
             _rt_ok = (
                 _cls_rt.get("direct_retrieval") is True
                 and bool(_rt_target)
-                and str(_cls_rt.get("intent", "")) == "explain"
+                # intent answers 'what is this turn ABOUT', not 'what
+                # does it ASK FOR', and requiring 'explain' conflated
+                # the two. A validation run classified 'dame el diff
+                # que acabas de aplicar' as intent=modify — correctly,
+                # the turn concerns a modification — and the gate
+                # refused a textbook retrieval, sending it through the
+                # forge to spend three hypotheses and answer that it
+                # could not produce the diff.
+                #
+                # Only 'debug' still vetoes, and for a reason about the
+                # ACT rather than the subject: diagnosis is what the
+                # pipeline exists for, so a turn the classifier read as
+                # diagnostic stays in it whatever the flag says. The
+                # other four conditions are unchanged and still carry
+                # the weight — the flag, a named target, single clause,
+                # and the classifier's own cot_level of 1.
+                and str(_cls_rt.get("intent", "")) != "debug"
                 and _cls_rt.get("multiclause") is not True
                 and int(_cls_rt.get("cot_level", 1) or 1) == 1
             )
@@ -16424,9 +16808,9 @@ class AgenticPlanner:
                 for _n, _pass in (
                     ("no target named", bool(_rt_target)),
                     (
-                        f"intent={_cls_rt.get('intent', '?')} (needs "
-                        f"explain)",
-                        str(_cls_rt.get("intent", "")) == "explain",
+                        f"intent={_cls_rt.get('intent', '?')} "
+                        f"(diagnosis stays in the pipeline)",
+                        str(_cls_rt.get("intent", "")) != "debug",
                     ),
                     ("multiclause", _cls_rt.get("multiclause") is not True),
                     (
@@ -16460,26 +16844,47 @@ class AgenticPlanner:
             # an instruction to go find one.
             _rt_kind = self._retrieval_kind(_rt_target)
             _rt_precomputed = ""
-            if _rt_kind == "diff_compute":
-                try:
+            # Each kind has its own deterministic fetch. Any failure
+            # leaves _rt_precomputed empty and the plan falls back to
+            # the tool-driven step, which is what shipped before any
+            # of this existed — a prefetch that breaks costs the turn
+            # nothing it had.
+            try:
+                if _rt_kind == "diff_compute":
                     _rt_precomputed = self._diff_emitted_against_index(
                         project_id
                     )
-                except Exception as _e_rt:
-                    _rt_precomputed = ""
-                    self._f._log_debug(
-                        f"planner RT-4: diff computation failed "
-                        f"({_e_rt!r}) — falling back to a tool-driven "
-                        f"retrieval step"
+                elif _rt_kind == "diff_stored":
+                    _rt_precomputed = await self._fetch_stored_diffs(
+                        project_id
                     )
+                elif _rt_kind == "artifact":
+                    _rt_precomputed = self._fetch_named_artifact(
+                        _rt_target, project_id
+                    )
+            except Exception as _e_rt:
+                _rt_precomputed = ""
+                self._f._log_debug(
+                    f"planner RT-4 [{_rt_kind}]: prefetch failed "
+                    f"({_e_rt!r}) — falling back to a tool-driven "
+                    f"retrieval step"
+                )
             if _rt_precomputed:
                 self._f._log_debug(
                     f"planner RT-4: computed diff for '{_rt_target[:60]}' "
                     f"({len(_rt_precomputed)} chars) — step 1 pre-filled"
                 )
                 await self._f._emit_status(
-                    "\U0001f9ee Diff computed against the index "
-                    "(no investigation needed)"
+                    {
+                        "diff_compute": (
+                            "\U0001f9ee Diff computed against the index"
+                        ),
+                        "diff_stored": (
+                            "\U0001f5c2\ufe0f Applied diff retrieved from "
+                            "the change log"
+                        ),
+                    }.get(_rt_kind, "\U0001f4c4 Artifact retrieved")
+                    + " (no investigation needed)"
                 )
             _step1 = AgenticStep(
                 id=1,
@@ -16493,8 +16898,8 @@ class AgenticPlanner:
             )
             if _rt_precomputed:
                 _step1.goal = (
-                    f"Diff of the last emitted code against the indexed "
-                    f"original, computed by the pipeline: {_rt_target[:80]}"
+                    f"Retrieved by the pipeline [{_rt_kind}]: "
+                    f"{_rt_target[:100]}"
                 )
                 _step1.output = _rt_precomputed
                 # The per-step workspace renders DIGEST, not output, so a
@@ -16513,13 +16918,16 @@ class AgenticPlanner:
                         id=2,
                         goal=(
                             (
-                                "The diff is already in the workspace, "
-                                "computed by the pipeline. Present it "
-                                "verbatim inside a fenced block and say "
-                                "in one sentence what changed. Do not "
-                                "recompute it, do not summarise it away, "
-                                "and do not explain why it might be "
-                                "wrong."
+                                "What the user asked for is already in "
+                                "the workspace above, retrieved by the "
+                                "pipeline. Present it verbatim inside a "
+                                "fenced block and add at most one "
+                                "sentence saying what it is. Do not "
+                                "fetch it again, do not summarise it "
+                                "away, and do not explain why it might "
+                                "be wrong. If the workspace says it "
+                                "could not be produced, say exactly "
+                                "that and stop."
                             )
                             if _rt_precomputed
                             else (
@@ -17925,7 +18333,7 @@ class AgenticSynthesisComposer:
                 ).upper()
             except Exception:
                 _use_case = ""
-        _is_architecture_turn = _use_case == "A"
+        _is_architecture_turn = _use_case == UseCase.ARCHITECTURE
         _investigative_done = [
             s
             for s in done
@@ -21591,7 +21999,7 @@ class CommandRouter:
                     "refactor",
                 ):
                     result["intent"] = str(data["intent"]).lower()
-                if str(data.get("use_case", "")).upper() in ("A", "B", "C", "D", "E"):
+                if str(data.get("use_case", "")).upper() in UseCase.keys():
                     result["use_case"] = str(data["use_case"]).upper()
                 try:
                     lvl = int(data.get("cot_level", 1))
@@ -28921,6 +29329,157 @@ class MetacognitiveReasoningEngine:
         "contracts",
     )
 
+    # The negation forms this codebase already recognises, reused so
+    # the filter below and the graph agree on what "not" looks like.
+    # How many claims one experiment may contribute. Used BOTH in the
+    # prompt and in the slice that trims the response, because they
+    # were two numbers and only one of them was ever said out loud:
+    # the code kept the first ten and the prompt named no figure at
+    # all, so a model with nothing to stop it enumerated. One observed
+    # generation produced ninety-eight claims, of which eighty-eight
+    # were parsed and thrown away — after riding the context window
+    # for fifteen minutes to produce them.
+    _MAX_CLAIMS_PER_CYCLE = 10
+
+    _CLAIM_NEGATION_RE = re.compile(
+        r"\b(?:does\s+not|doesn'?t|do\s+not|don'?t|is\s+not|isn'?t|"
+        r"never|no\s+longer|cannot|can'?t|fails\s+to|nunca|no\s+)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _output_is_degenerate(cls, text: str) -> str:
+        """
+        Name the degeneracy in a generation, or return "" if it is sane.
+
+        Deterministic on purpose. Every corruption this pipeline has
+        produced is repetition — a block cycling verbatim, or a template
+        walked with one identifier changing per line — and repetition is
+        measurable without asking anyone. An auxiliary LLM call would
+        add latency, a second thing that can fail, and no coverage the
+        counting does not already give.
+
+        Two signatures, because the two observed shapes look nothing
+        alike at the line level. A cycling block repeats lines exactly,
+        so its distinct-line ratio collapses: one captured generation
+        held 143 claims of which 24 were distinct. A template walk
+        repeats no line at all, and shows instead as neighbours sharing
+        a long prefix.
+
+        Length is what keeps the second test honest. Ten legitimate
+        claims about one method share prefixes too, and nothing in the
+        shape separates them from a walk — but a legitimate response
+        cannot be long, because the prompt caps the list at
+        _MAX_CLAIMS_PER_CYCLE. The check therefore only looks at
+        outputs far past any budget, where length alone has already
+        settled the question.
+
+        Returns:
+            A short reason for the log and the dossier tag, or "".
+        """
+        _t = text or ""
+        if len(_t) < 1500:
+            return ""
+        _rows = [r.strip() for r in _t.split("\n")]
+        _rows = [r for r in _rows if len(r) > 12]
+        if len(_rows) < 12:
+            return ""
+        # ── Signature 1: the same lines over and over ──
+        _distinct = len(set(_rows))
+        if _distinct <= len(_rows) * 0.5:
+            return (
+                f"cycling: {_distinct} distinct of {len(_rows)} lines"
+            )
+        # ── Signature 2: a template walked past any plausible budget ──
+        if len(_rows) >= 25:
+            _shared = 0
+            for _a, _b in zip(_rows, _rows[1:]):
+                _n = 0
+                for _x, _y in zip(_a, _b):
+                    if _x != _y:
+                        break
+                    _n += 1
+                if _n >= 25:
+                    _shared += 1
+            if _shared >= (len(_rows) - 1) * 0.8:
+                return (
+                    f"template walk: {_shared} of {len(_rows) - 1} "
+                    f"neighbouring lines share a 25-char prefix across "
+                    f"{len(_rows)} lines"
+                )
+        return ""
+
+    @classmethod
+    def _drop_complement_pairs(cls, claims: List[str]) -> Tuple[List[str], int]:
+        """
+        Remove claims that appear together with their own opposite.
+
+        Asserting both "A calls B" and "A does not call B" is not an
+        experiment: the graph confirms exactly one of them whatever the
+        hypothesis is worth, so corroboration rises and nothing is
+        learned. An outcome certain in advance carries no information,
+        and counting it as evidence is how a dossier reaches a verdict
+        it has not earned.
+
+        Observed in production before it was guarded: one generation
+        walked an object's attributes emitting the positive and negative
+        form of each, ninety-eight lines of them, until it hit the
+        context window. Truncation broke the JSON and hid the damage
+        that time; a completed generation would have carried an inflated
+        verdict to the judge.
+
+        Both members are dropped, not one. Keeping either would mean
+        choosing a side the model declined to choose, and the honest
+        reading of a contradiction is that the model has no position.
+
+        Matching is similarity-based rather than exact because the two
+        forms rarely differ only by the negation: English conjugates
+        around it ("pops" against "does not pop"), and the tail of the
+        sentence often drifts. Comparison is on the negation-stripped
+        text, so the conjugation and the missing words are absorbed.
+
+        Args:
+            claims: The claims as parsed from the experiment response.
+
+        Returns:
+            The surviving claims in their original order, and how many
+            were dropped.
+        """
+        # ── Step 1: split by polarity, keeping positions ──
+        _neg: List[Tuple[int, str]] = []
+        _pos: List[Tuple[int, str]] = []
+        for _i, _c in enumerate(claims):
+            _text = " ".join((_c or "").split()).lower()
+            if cls._CLAIM_NEGATION_RE.search(_text):
+                _neg.append((_i, cls._CLAIM_NEGATION_RE.sub(" ", _text)))
+            else:
+                _pos.append((_i, _text))
+        if not _neg or not _pos:
+            return list(claims), 0
+
+        # ── Step 2: pair each negative with its closest positive ──
+        _drop: set = set()
+        for _ni, _ntext in _neg:
+            _nt = " ".join(_ntext.split())
+            for _pi, _ptext in _pos:
+                if _pi in _drop:
+                    continue
+                if (
+                    difflib.SequenceMatcher(None, _nt, _ptext).ratio()
+                    > 0.9
+                ):
+                    _drop.add(_ni)
+                    _drop.add(_pi)
+                    break
+
+        # ── Step 3: survivors, original order ──
+        if not _drop:
+            return list(claims), 0
+        return (
+            [c for i, c in enumerate(claims) if i not in _drop],
+            len(_drop),
+        )
+
     def _select_investigation(
         self,
         cycle: int,
@@ -29293,11 +29852,48 @@ class MetacognitiveReasoningEngine:
                 + "Derive the checkable consequences of this "
                 "hypothesis against the evidence shown. Each claim "
                 "must be decidable from the code index: name "
-                "identifiers, assert 'A calls B' / 'A does not call "
-                "B' relations, or state contracts visible in the "
-                "bodies above ('X returns int', 'X asserts y is not "
-                "None'). Prefer claims that could FAIL: a consequence "
-                "the hypothesis shares with its rivals tests nothing. "
+                "identifiers, assert a call relation such as "
+                "'A calls B' (or its negative form where THAT is "
+                "what you believe), or state contracts visible in "
+                "the bodies above ('X returns int', 'X asserts y is "
+                "not None'). "
+                "Before writing each claim, apply this test: WOULD IT "
+                "STILL BE TRUE IF THE HYPOTHESIS WERE FALSE? If yes, "
+                "it tests nothing and does not belong in the list. "
+                "Reading a fact back out of the code shown above — "
+                "'get_x returns y', 'set_x writes y' — passes the "
+                "decidability bar and fails this one: those hold "
+                "whatever the mechanism turns out to be, so "
+                "confirming them moves nothing. A consequence the "
+                "hypothesis shares with its rivals is worth as "
+                "little. Decidability is the CONSTRAINT; "
+                "discrimination is the point. "
+                "NEVER assert a claim and its opposite in the same "
+                "list. Stating both 'A calls B' and 'A does not call "
+                "B' guarantees one of them is confirmed and teaches "
+                "nothing about the hypothesis — an experiment whose "
+                "outcome is certain in advance is not an experiment. "
+                "Commit to the side you believe. "
+                "State each claim as a FACT ABOUT THE CODE, never as "
+                "a condition about a run. The index can answer 'does "
+                "A call B', 'does X return int', 'does this body "
+                "assign Y' — it cannot answer anything beginning "
+                "'when', 'if' or 'once', because those describe a "
+                "moment during execution and no static index has "
+                "one. A claim it cannot decide is not evidence "
+                "against you, it is a slot spent: your budget is a "
+                "few claims per cycle, and one worded so it cannot "
+                "be ruled on buys nothing either way. If the "
+                "mechanism really turns on a condition, assert what "
+                "the code DOES on that path instead — 'the early "
+                "return skips the reindex call' rather than 'when "
+                "the hashes match, nothing is reindexed'. "
+                f"Emit AT MOST {self._MAX_CLAIMS_PER_CYCLE} claims and "
+                "then stop. This is a hard limit, not a target: "
+                "anything past it is discarded unread, so a longer "
+                "list costs you time and buys nothing. Choose the "
+                "few that would most change your mind if they came "
+                "back false, and leave the rest unsaid. "
                 "Keep the analysis to one sentence naming the "
                 "mechanism — the reasoning comes after the results."
             )
@@ -29322,6 +29918,56 @@ class MetacognitiveReasoningEngine:
             except Exception as _e:
                 self._f._log_debug(f"_forge_hypothesis: analyze failed ({_e!r})")
                 _resp = ""
+            # A degenerate answer is worth one more attempt, and exactly
+            # one. The three corruptions on record all came back as
+            # repetition; the deterministic check names the shape, and a
+            # retry carrying that name is a materially different prompt
+            # rather than the same dice thrown twice. A second failure
+            # says something about the model or the instruction, and
+            # spending more cycles on it would hide that rather than fix
+            # it — so the second answer is kept whatever it looks like,
+            # and the tag records that this dossier needed the retry.
+            _degen = (
+                self._output_is_degenerate(_resp)
+                if getattr(self._f.valves, "enable_degeneracy_retry", False)
+                else ""
+            )
+            if _degen:
+                self._tag_strategy(_dossier, "degenerate-retry")
+                self._f._log_debug(
+                    f"forge experiment c{_cycle}: output degenerate "
+                    f"({_degen}) — retrying once"
+                )
+                await self._f._emit_status(
+                    f"\u267b\ufe0f Retrying (cycle {_cycle}): the answer "
+                    f"came back repeating itself"
+                )
+                try:
+                    _resp = await self._f._llm_orchestrator.call_llm(
+                        prompt=(
+                            "Your previous answer to this was discarded: "
+                            f"{_degen}. It repeated instead of "
+                            "reasoning. Answer again, shorter, and stop "
+                            "as soon as you have said the few things "
+                            "that actually distinguish this hypothesis "
+                            "from its rivals.\n\n" + _prompt
+                        ),
+                        system_prompt=(
+                            "You are the analyze step of a scientific "
+                            "forge. Output ONLY a JSON object: "
+                            '{"analysis": "<mechanism, own words>", '
+                            '"claims": ["<checkable claim>", ...]}. '
+                            "Start with { and end with }."
+                        ),
+                        model_override=self._f.valves.cot_model_level3,
+                        label=f"{label}_forge_c{_cycle}_retry",
+                        **_kw,
+                    )
+                except Exception as _e_rt:
+                    self._f._log_debug(
+                        f"forge experiment c{_cycle}: retry failed "
+                        f"({_e_rt!r}) — keeping the degenerate answer"
+                    )
             import json as _json
 
             _analysis, _claims = "", []
@@ -29334,10 +29980,46 @@ class MetacognitiveReasoningEngine:
                 try:
                     _obj = _json.JSONDecoder().raw_decode(_t[_pos:])[0]
                     _analysis = str(_obj.get("analysis", ""))
-                    _claims = [str(c) for c in (_obj.get("claims") or [])][:10]
+                    _claims = [
+                        str(c) for c in (_obj.get("claims") or [])
+                    ][: self._MAX_CLAIMS_PER_CYCLE]
                     break
                 except Exception:
                     continue
+            # The analysis comes FIRST in the object, so a response cut
+            # off mid-claims still carries a complete one — and losing it
+            # costs more than the claims did. Observed: a cycle whose
+            # prose correctly refuted its own hypothesis ran on into 143
+            # repeated claims, hit the context window, failed to parse,
+            # and sealed "dead (unfounded)" — the verdict for a
+            # hypothesis nothing could be derived about, when it had in
+            # fact been refuted in the same breath. Recovering the field
+            # alone cannot restore the claims, but it keeps reasoning
+            # that was already complete when the generation ran away.
+            if not _analysis and _t:
+                _m_an = re.search(r'"analysis"\s*:\s*("(?:[^"\\]|\\.)*")', _t)
+                if _m_an:
+                    try:
+                        _analysis = str(_json.loads(_m_an.group(1)))
+                        self._f._log_debug(
+                            f"forge analyze c{_cycle}: JSON unparseable, "
+                            f"recovered the analysis field alone "
+                            f"({len(_analysis)} chars) — claims lost"
+                        )
+                    except Exception:
+                        _analysis = ""
+            # A claim asserted alongside its own opposite is filtered
+            # out BEFORE anything counts it — the ledger, the tally
+            # and the coverage score would each read the certain
+            # confirmation of one half as evidence.
+            _claims, _n_contra = self._drop_complement_pairs(_claims)
+            if _n_contra:
+                self._tag_strategy(_dossier, "self-contradiction")
+                self._f._log_debug(
+                    f"forge experiment c{_cycle}: dropped {_n_contra} "
+                    f"claim(s) asserted alongside their own opposite "
+                    f"— {len(_claims)} testable claim(s) remain"
+                )
             # DIAG: parsed-claims visibility — a claims=[] cycle can
             # mean a garbage response OR a parser miss; head + counts
             # make the two distinguishable in the validation logs.
@@ -29410,6 +30092,22 @@ class MetacognitiveReasoningEngine:
                 self._tag_strategy(_dossier, "relation-check")
             _total = len(_claims) or 1
             _dossier.coverage_score = (_conf_n + _ref_n) / _total
+            # A cycle whose claims were mostly undecidable spent its
+            # budget on questions no static index can answer. Not
+            # dropped — a conditional claim is badly worded, not false,
+            # and no rule separates it from a legitimate one reliably
+            # enough to delete on sight. Tagged instead, so the agent
+            # dump shows which agent wastes its slots and how often,
+            # which is what tells us whether the prompt fixed it.
+            _undecided = len(_claims) - _conf_n - _ref_n
+            if _claims and _undecided > len(_claims) / 2:
+                self._tag_strategy(_dossier, "mostly-undecidable")
+                self._f._log_debug(
+                    f"forge experiment c{_cycle}: {_undecided} of "
+                    f"{len(_claims)} claim(s) undecidable from the "
+                    f"index — the cycle spent its budget on questions "
+                    f"the graph cannot answer"
+                )
             _instr = []
             if _by_graph:
                 _instr.append(f"graph {_by_graph}")
@@ -30047,7 +30745,7 @@ class MetacognitiveReasoningEngine:
                     break
                 except Exception:
                     continue
-            if not _claim or _fav not in ("A", "B"):
+            if not _claim or _fav not in (_CRUCIS_FIRST, _CRUCIS_SECOND):
                 break
             # The GRAPH judges — the model never does.
             _ev = self.gather_evidence(_claim, project_id)
@@ -30056,7 +30754,7 @@ class MetacognitiveReasoningEngine:
                 # Non-discriminating round: no elimination, stop.
                 _crucis_log.append(f"round {_round}: claim unverifiable — stopped")
                 break
-            _loser = _b if (_v is (_fav == "A")) else _a
+            _loser = _b if (_v is (_fav == _CRUCIS_FIRST)) else _a
             _winner_of_round = _a if _loser is _b else _b
             _crucis_log.append(
                 f"round {_round}: '{_claim[:60]}' → "
@@ -31532,6 +32230,33 @@ Code context (recent symbols referenced):
             f"and fully, never with that confirmation line.)_"
         )
 
+    # The instruction the ingestion stub carries is scoped to "THIS
+    # message". It stops being true the moment another user message
+    # arrives, but the stub is cached in state and replayed verbatim on
+    # every later turn, so the model keeps reading a standing order to
+    # answer with a short confirmation line. A validation run ended with
+    # exactly that: a full pipeline ran, three hypotheses were forged, a
+    # judge reached a conclusion, and the reply was "The code is
+    # indexed." The docstring of _build_user_stub already records this
+    # failure happening once before, when the two stub wordings matched;
+    # differentiating them treated the symptom, because an instruction
+    # outliving its message is the cause.
+    _STUB_ORDER_MARK = "_(If THIS message contains no question"
+
+    @classmethod
+    def _stub_without_standing_order(cls, stub: str) -> str:
+        """
+        Drop the ingestion instruction from a stub that is no longer the
+        current message.
+
+        Everything above the instruction stays — the user's own prose and
+        the "code is internally available" note remain true of a past
+        paste. Only the sentence telling the model how to REPLY is
+        removed, and only where it no longer applies.
+        """
+        _i = stub.find(cls._STUB_ORDER_MARK)
+        return stub[:_i].rstrip() if _i > 0 else stub
+
     def ensure_compressed_user_messages(
         self,
         messages: list,
@@ -31571,8 +32296,15 @@ Code context (recent symbols referenced):
         if symbol_count < 20:
             return messages
 
+        # Which message is the one being ingested RIGHT NOW. Only its
+        # stub may carry the reply instruction; every earlier paste is
+        # history, and history must not issue orders.
+        _cur_user_idx = -1
+        for _i, _m in enumerate(messages):
+            if _m.get("role") == "user":
+                _cur_user_idx = _i
         new_messages = []
-        for msg in messages:
+        for _idx, msg in enumerate(messages):
             if msg.get("role") != "user":
                 new_messages.append(msg)
                 continue
@@ -31590,6 +32322,8 @@ Code context (recent symbols referenced):
             # Reuse existing stub if available
             if content_hash in state.compressed_user_messages:
                 stub = state.compressed_user_messages[content_hash]
+                if _idx != _cur_user_idx:
+                    stub = self._stub_without_standing_order(stub)
                 new_messages.append({**msg, "content": stub})
                 continue
 
@@ -31605,8 +32339,13 @@ Code context (recent symbols referenced):
                 stub = f"{prose.strip()}\n\n{stub}"
 
             # Store in state and mark dirty for persistence
+            # Cached WITH the instruction and emitted without it when
+            # stale: the cache is keyed by content and outlives the
+            # turn, so the decision belongs at render time, not here.
             state.compressed_user_messages[content_hash] = stub
             self._f._conversation_state_manager.mark_dirty(project_id)
+            if _idx != _cur_user_idx:
+                stub = self._stub_without_standing_order(stub)
 
             # Replace the message content with the stub
             new_messages.append({**msg, "content": stub})
@@ -42060,7 +42799,7 @@ class SemanticSeedInferencer:
         heuristic_boost = (
             0.2 if any(kw in content_lower for kw in infer_keywords) else 0.0
         )
-        if use_case in ("A", "D"):
+        if use_case in (UseCase.ARCHITECTURE, UseCase.REFACTORING):
             heuristic_boost += 0.15
         heuristic_boost *= h_weight
 
@@ -42112,7 +42851,7 @@ class SemanticSeedInferencer:
         # ------------------------------------------------------------------
         if any(kw in query.lower() for kw in infer_keywords):
             return True
-        if use_case in ("A", "D"):
+        if use_case in (UseCase.ARCHITECTURE, UseCase.REFACTORING):
             return True
         return False
 
@@ -43491,32 +44230,66 @@ class Filter:
                 "calls that leave max_tokens open."
             ),
         )
-        agentic_runaway_token_cap: int = Field(
-            default=0,
-            ge=0,
-            le=32000,
+        enable_degeneracy_retry: bool = Field(
+            default=True,
             description=(
-                "R18 runaway safety ceiling for agentic/scientific-method "
-                "calls when agentic_unlimited_tokens is on. Healthy "
-                "reasoning finishes far below it (observed sane calls run "
-                "a few hundred to ~900 output tokens, worst legitimate "
-                "step ~8000); it exists only to "
-                "cut a degenerate generation loop — observed live, "
-                "design_critical_experiment ran ~50k tokens (765-846s) "
-                "four times in one session, with ROCm silently dropping "
-                "the top-k op and DRY breakers disabled leaving nothing "
-                "to strangle the loop. Raised 8000 → 32000 after a run "
-                "where 8000 truncated healthy forge cycles and claims "
-                "recovery 37 times: at 8000 this was a quality budget "
-                "wearing a safety label, which is what the unlimited "
-                "switch exists to abolish. 32000 sits 4x above the "
-                "worst legitimate step and still cuts the ~50k loop. "
-                "Now 0 by operator decision: TRUE unlimited. Any non-zero "
-                "value is a ceiling healthy reasoning can eventually meet, "
-                "which is the thing the unlimited switch exists to abolish. "
-                "The remaining protections are the anti-hang connection "
-                "backstop and sampler-side loop control. Set a positive "
-                "value only to re-arm the R18 ceiling."
+                "Re-run a forge experiment whose output came back "
+                "degenerate: a block cycling verbatim, or a template "
+                "walked far past the claim budget. Detection is "
+                "deterministic and costs nothing — every corruption this "
+                "pipeline has produced is repetition, and repetition is "
+                "countable. An auxiliary LLM check was considered and "
+                "left out: it would add latency and a second thing that "
+                "can fail, for no coverage the counting does not already "
+                "give."
+                "\n\n"
+                "Validated against the corruptions themselves: it names "
+                "both observed shapes and fires on neither of the 53 "
+                "healthy calls recorded alongside them, including the "
+                "hard case of ten legitimate claims sharing one prefix — "
+                "which stays safe because the claim budget makes any "
+                "long list suspect on length alone."
+                "\n\n"
+                "One retry, never more: a second degenerate answer is "
+                "evidence about the model or the prompt, not bad luck, "
+                "and burning cycles on it hides that. Turn off when the "
+                "model no longer needs the scaffolding."
+            ),
+        )
+        agentic_runaway_token_cap: int = Field(
+            default=4500,
+            ge=0,
+            description=(
+                "Ceiling passed as max_tokens on pipeline calls when "
+                "agentic_unlimited_tokens is on. 0 sends no ceiling at "
+                "all, which is not the same as a large one: the request "
+                "then carries no max_tokens and the model generates "
+                "until the server's context window ends."
+                "\n\n"
+                "Sized from measurement, not caution. Across 53 healthy "
+                "calls in two instrumented turns the median was 174 "
+                "tokens, the 90th percentile 527, and the largest "
+                "3683 — an agentic_step that finished on its own. 4500 "
+                "is that maximum plus twenty per cent, so every "
+                "legitimate call ever measured completes untouched, "
+                "with the third-largest sitting at less than a third of "
+                "the ceiling."
+                "\n\n"
+                "This is a backstop, not a budget, and the distinction "
+                "is why an earlier 8000 had to be removed: that one was "
+                "applied per label to calls that legitimately needed "
+                "more, and truncated 37 of them in a single session. A "
+                "ceiling above everything observed cannot do that, and "
+                "it is the only mechanism confidence cannot outvote. "
+                "DRY was armed at dry_allowed_length 17 through five "
+                "separate generations of roughly sixty thousand tokens: "
+                "its penalty is subtracted from a logit, and a "
+                "degenerate loop's confidence has no ceiling to subtract "
+                "from. A hard stop does not argue."
+                "\n\n"
+                "Raise it if a legitimate call is ever seen finishing "
+                "on length rather than stop; the agent dump reports "
+                "finish_reason per call, so that is one grep."
             ),
         )
         agentic_unlimited_tokens: bool = Field(
