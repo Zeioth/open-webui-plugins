@@ -15,6 +15,7 @@ import re
 import anyio
 import hashlib
 import difflib
+import zlib
 import sqlite3
 import ast
 import json
@@ -295,6 +296,88 @@ class CompetitionRecord:
     question_type: str = ""
 
 
+# Compression ratio below which a generation is degenerate. Measured:
+# the most repetitive legitimate output of 25 samples compressed to
+# 0.149 and the median to 0.345; the three recorded corruptions to
+# 0.080, 0.082 and 0.113. 0.13 sits in the gap with margin on both
+# sides — no healthy sample falls below it, and no corrupt one above.
+_DEGENERACY_COMPRESSION_MAX = 0.13
+
+
+def _output_is_degenerate(text: str) -> str:
+    """
+    Name the degeneracy in a generation, or return "" if it is sane.
+
+    Deterministic, and structure-independent by design. An earlier
+    version counted repeated LINES, which worked on whichever
+    generations happened to be pretty-printed and missed the ones that
+    were not: a JSON array cycling a block of claims on ONE line scored
+    perfectly healthy, and an answer alternating a heading with a body
+    line scored healthy too, because neighbouring lines never match when
+    the pattern alternates. Both had corrupted a turn in production.
+
+    Compression settles it without assuming anything about shape.
+    Repetition is exactly what a compressor exploits, so a degenerate
+    generation shrinks far more than prose or code ever does. Measured
+    across 25 healthy samples — pipeline calls, chat answers and this
+    project's own source — the most repetitive legitimate output came in
+    at 0.149 and the median at 0.345, while the three recorded
+    corruptions sat at 0.080, 0.082 and 0.113. The threshold takes the
+    gap between them.
+
+    The line analysis stays, demoted to describing what was found. It
+    can no longer produce a false negative because it no longer decides
+    anything: compression decides, and this names the shape so the log
+    says "cycling" or "template walk" rather than a bare number.
+
+    Never raises: a diagnostic that can break the pipeline it observes
+    is worse than no diagnostic.
+
+    Args:
+        text: The generation to inspect.
+
+    Returns:
+        A short reason for the log and the dossier tag, or "".
+    """
+    try:
+        _t = text or ""
+        if len(_t) < 1500:
+            return ""
+        _b = _t.encode("utf-8", "ignore")
+        if len(_b) < 1500:
+            return ""
+        _ratio = len(zlib.compress(_b, 6)) / len(_b)
+        if _ratio >= _DEGENERACY_COMPRESSION_MAX:
+            return ""
+        # ── Degenerate. Name the shape, for the log only. ──
+        _rows = [r.strip() for r in _t.split("\n")]
+        _rows = [r for r in _rows if len(r) > 12]
+        _shape = "repetition"
+        if len(_rows) >= 12:
+            _distinct = len(set(_rows))
+            if _distinct <= len(_rows) * 0.5:
+                _shape = f"cycling, {_distinct} distinct of {len(_rows)} lines"
+            else:
+                _best, _period = 0, 0
+                for _p in range(1, 7):
+                    if len(_rows) <= _p + 8:
+                        continue
+                    _eq = sum(
+                        1
+                        for _k in range(len(_rows) - _p)
+                        if _rows[_k] == _rows[_k + _p]
+                    )
+                    if _eq > _best:
+                        _best, _period = _eq, _p
+                if _best:
+                    _shape = (
+                        f"a block of {_period} line(s) repeating "
+                        f"{_best} time(s)"
+                    )
+        return f"compression {_ratio:.3f} ({_shape})"
+    except Exception:  # noqa: BLE001 - diagnostics never raise
+        return ""
+
 class DetectionCatalog:
     """
     Everything this pipeline can DETECT about a turn, in one place.
@@ -405,7 +488,8 @@ class DetectionCatalog:
         (
             "retrieval kind",
             "AgenticPlanner._RETRIEVAL_DIFF_RE / _RETRIEVAL_APPLIED_RE",
-            "diff_stored | diff_compute | artifact",
+            "diff_stored | diff_compute (both served) | artifact "
+            "(sent to the pipeline)",
             "Whether a retrieval is a lookup of something stored or a "
             "diff to be computed against the index.",
         ),
@@ -12321,6 +12405,7 @@ class LLMOrchestrator:
         enable_thinking: bool = True,
         log_raw_response: bool = False,
         return_meta: bool = False,
+        _degeneracy_retry: bool = False,
     ) -> Optional[Union[str, "LLMResult"]]:
         """
         Call the LLM with in-memory response cache and call deduplication.
@@ -12825,6 +12910,55 @@ class LLMOrchestrator:
                                 "output_capped": len(content) > 12000,
                             },
                         )
+                        # Degeneracy guard, at the one place every agent
+                        # passes through. A step that answers by repeating
+                        # itself corrupts the turn downstream: its output
+                        # becomes another step's workspace, and a run has
+                        # already been observed answering the user with a
+                        # block cycling twenty-three times. Detection is a
+                        # few hundred microseconds against a call that
+                        # costs seconds, so it runs on all of them rather
+                        # than on the ones guessed most at risk.
+                        #
+                        # One retry, enforced by a flag rather than a
+                        # counter: the recursive call sets it, so the
+                        # second attempt cannot trigger a third whatever
+                        # it returns. The retry carries the SHAPE that was
+                        # detected, which makes it a different prompt
+                        # instead of the same dice thrown twice.
+                        _degen = (
+                            ""
+                            if _degeneracy_retry
+                            else _output_is_degenerate(content)
+                        )
+                        if _degen and getattr(
+                            self._f.valves, "enable_degeneracy_retry", False
+                        ):
+                            self._f._log_debug(
+                                f"[LLM]{label_str} degenerate output "
+                                f"({_degen}) — retrying once"
+                            )
+                            return await self.call_llm(
+                                prompt=(
+                                    "Your previous answer was discarded: "
+                                    f"{_degen}. It repeated instead of "
+                                    "answering. Reply again, shorter, and "
+                                    "stop as soon as you have said the "
+                                    "thing once.\n\n" + (prompt or "")
+                                ),
+                                system_prompt=system_prompt,
+                                max_tokens=max_tokens,
+                                model_override=model_override,
+                                temperature=temperature,
+                                label=f"{label or 'unlabelled'}_degen_retry",
+                                total_timeout=total_timeout,
+                                endpoint_type=endpoint_type,
+                                response_format=response_format,
+                                enable_thinking=enable_thinking,
+                                log_raw_response=log_raw_response,
+                                return_meta=return_meta,
+                                _degeneracy_retry=True,
+                            )
                         return result if return_meta else content
                     else:
                         if not future.done():
@@ -16461,7 +16595,12 @@ class AgenticPlanner:
         'diff_stored'  — a diff that was applied and persisted; fetch it.
         'diff_compute' — a diff against code the model just emitted;
                          nothing is stored, it must be computed.
-        'artifact'     — anything else (a symbol body, a file, a value).
+        'artifact'     — anything else, and NOT served by the gate: it
+                         goes to the pipeline. 'Dame X' can mean show
+                         it, explain it, or give it to me CHANGED, and
+                         only the first is retrieval. A run picked the
+                         wrong one and served an unfixed body for
+                         'dame build_block_a con el fix aplicado'.
 
         Lexical and deterministic: the classification already happened
         once this turn, and re-asking a model to sort four words is
@@ -16563,42 +16702,6 @@ class AgenticPlanner:
                 "complete up to this point]"
             )
         return _out
-
-    def _fetch_named_artifact(self, target: str, project_id: str) -> str:
-        """
-        The body of a symbol the user asked to see, by name.
-
-        "Dame el cuerpo de X" needs no investigation: the broker
-        resolves a name to a qualified id and returns the body. Leaving
-        it to the executor means the model must choose EXPAND on its
-        own, and a whole validation run showed it choosing no tool at
-        all on the one turn that most needed one.
-
-        Identifier-shaped tokens are tried in the order they appear,
-        because the user usually names the thing first. A target that
-        resolves to nothing returns "" so the gate can fall through to
-        the ordinary tool-driven step rather than assert an absence it
-        has not established — the broker not finding a name is not proof
-        the user meant a symbol at all.
-        """
-        # ── Step 1: candidate names, in the order written ──
-        _cands = [
-            _t
-            for _t in re.findall(r"[A-Za-z_][A-Za-z0-9_.]{2,}", target or "")
-            if "_" in _t or "." in _t or _t[0].isupper()
-        ][:3]
-        if not _cands:
-            return ""
-        # ── Step 2: first one the index knows ──
-        _broker = AgenticToolBroker(self._f)
-        for _name in _cands:
-            try:
-                _body = _broker._expand(_name, project_id)
-            except Exception:
-                continue
-            if _body and not _body.startswith("["):
-                return _body
-        return ""
 
     def _diff_emitted_against_index(self, project_id: str) -> str:
         """
@@ -16705,6 +16808,90 @@ class AgenticPlanner:
             )
         return _out
 
+    async def try_direct_retrieval(self, project_id: str) -> str:
+        """
+        Serve a retrieval request outright, or decline and return "".
+
+        Called BEFORE the pipeline, not inside the planner, and the
+        difference is the whole point. Routing a retrieval to a two-step
+        plan still cost a planner call, a verify step and an analyze
+        step: three model calls and most of a minute to hand back a row
+        already sitting in SQLite. Asking for a stored diff is not a
+        reasoning task at any depth, so the honest cost is one query and
+        no calls at all — the answer goes to the main model as context
+        and it simply presents it.
+
+        Six conditions must agree, all from the one classification the
+        turn already paid for. Five are the original gate: the flag, a
+        named target, an intent that is not diagnostic, a single clause,
+        and the classifier's own cot_level of 1. The sixth is the kind:
+        only a diff is served, because only a diff request has one
+        possible reading. Every failure — stale cache, wrong types, a
+        parse error, an exception anywhere — returns "" and the turn
+        proceeds exactly as it would have without this method.
+
+        Returns:
+            Injection text carrying the artifact, or "" to decline.
+        """
+        # ── Step 1: is this a retrieval, on six independent signals ──
+        try:
+            _cls = self._f._project_state_manager.get_pstate(
+                project_id
+            ).get("turn_classification") or {}
+            _target = str(_cls.get("retrieval_target", "") or "").strip()
+            _kind = self._retrieval_kind(_target)
+            _ok = (
+                _cls.get("direct_retrieval") is True
+                and bool(_target)
+                and str(_cls.get("intent", "")) != "debug"
+                and _cls.get("multiclause") is not True
+                and int(_cls.get("cot_level", 1) or 1) == 1
+                and _kind in ("diff_stored", "diff_compute")
+            )
+        except Exception:
+            return ""
+        if not _ok:
+            return ""
+
+        # ── Step 2: fetch, deterministically ──
+        try:
+            if _kind == "diff_stored":
+                _art = await self._fetch_stored_diffs(project_id)
+            else:
+                _art = self._diff_emitted_against_index(project_id)
+        except Exception as _e:
+            self._f._log_debug(
+                f"direct retrieval [{_kind}] failed ({_e!r}) — the turn "
+                f"continues through the pipeline"
+            )
+            return ""
+        if not _art:
+            return ""
+
+        # ── Step 3: hand it over ──
+        self._f._log_debug(
+            f"direct retrieval [{_kind}]: served '{_target[:60]}' "
+            f"({len(_art)} chars) without entering the pipeline"
+        )
+        await self._f._emit_status(
+            "\u23ed\ufe0f Direct answer: "
+            + (
+                "applied diff retrieved from the change log"
+                if _kind == "diff_stored"
+                else "diff computed against the index"
+            )
+            + " (no pipeline)"
+        )
+        return (
+            "## Retrieved for this turn\n\n"
+            "The user asked for an artifact and the pipeline fetched it "
+            "directly. Present it verbatim inside a fenced block and add "
+            "at most one sentence saying what it is. Do not investigate, "
+            "do not explain what might be wrong with it, and if the text "
+            "below says it could not be produced, say exactly that and "
+            "stop.\n\n" + _art
+        )
+
     async def plan(
         self,
         question: str,
@@ -16737,218 +16924,6 @@ class AgenticPlanner:
             "fallback_fixed".
         """
         # Region: gates — slot availability
-        # ── RT-3: the retrieval gate — a direct request must not be ──
-        # ── forced through the forge ──
-        # 'dame el diff que acabas de aplicar' is retrieval, not
-        # diagnosis; the validation run routed it through the full
-        # pipeline, forged three hypotheses about an irrelevant method
-        # and answered with a theory about why the artifact might not
-        # exist instead of fetching it. The scientific method answers
-        # 'why does X happen'; it buries 'give me X'.
-        #
-        # Detection is the LLM turn classifier — NOT the CrossEncoder,
-        # which scores semantic similarity and is structurally unable
-        # to separate 'give me the diff' from 'why is the diff wrong'
-        # (they share every content word). classify_turn already runs
-        # once per turn and is cached by content hash, so this reads a
-        # field that already exists: zero added calls.
-        #
-        # A misfire here is catastrophic in exactly one direction — a
-        # diagnostic question skipping the pipeline — so the gate
-        # demands FIVE independent signals agree, all from the same
-        # single classification: the flag itself; a named target (a
-        # retrieval with nothing to retrieve is a misparse); intent
-        # 'explain' (debug/modify/refactor veto — a debugging turn
-        # stays in the pipeline no matter what the flag says); not
-        # multiclause (chained commands need planning); and cot_level
-        # 1, the classifier's own independent statement that a direct
-        # answer suffices. Every failure mode — stale cache, parse
-        # error, absent field, exception — lands on the pipeline path,
-        # which is the pre-RT-3 behaviour unchanged.
-        try:
-            _cls_rt = self._f._project_state_manager.get_pstate(
-                project_id
-            ).get("turn_classification") or {}
-            _rt_target = str(_cls_rt.get("retrieval_target", "") or "").strip()
-            _rt_ok = (
-                _cls_rt.get("direct_retrieval") is True
-                and bool(_rt_target)
-                # intent answers 'what is this turn ABOUT', not 'what
-                # does it ASK FOR', and requiring 'explain' conflated
-                # the two. A validation run classified 'dame el diff
-                # que acabas de aplicar' as intent=modify — correctly,
-                # the turn concerns a modification — and the gate
-                # refused a textbook retrieval, sending it through the
-                # forge to spend three hypotheses and answer that it
-                # could not produce the diff.
-                #
-                # Only 'debug' still vetoes, and for a reason about the
-                # ACT rather than the subject: diagnosis is what the
-                # pipeline exists for, so a turn the classifier read as
-                # diagnostic stays in it whatever the flag says. The
-                # other four conditions are unchanged and still carry
-                # the weight — the flag, a named target, single clause,
-                # and the classifier's own cot_level of 1.
-                and str(_cls_rt.get("intent", "")) != "debug"
-                and _cls_rt.get("multiclause") is not True
-                and int(_cls_rt.get("cot_level", 1) or 1) == 1
-            )
-        except Exception:
-            _rt_ok = False
-            _rt_target = ""
-            _cls_rt = {}
-        # A gate that declines in silence is undiagnosable: five
-        # conditions must agree, and 'it did not fire' says nothing
-        # about which one dissented. Logged only when the classifier
-        # DID flag a retrieval, so an ordinary diagnostic turn stays
-        # quiet while a near-miss names the signal that blocked it.
-        if _cls_rt.get("direct_retrieval") is True and not _rt_ok:
-            _rt_why = [
-                _n
-                for _n, _pass in (
-                    ("no target named", bool(_rt_target)),
-                    (
-                        f"intent={_cls_rt.get('intent', '?')} "
-                        f"(diagnosis stays in the pipeline)",
-                        str(_cls_rt.get("intent", "")) != "debug",
-                    ),
-                    ("multiclause", _cls_rt.get("multiclause") is not True),
-                    (
-                        f"cot_level={_cls_rt.get('cot_level', '?')} "
-                        f"(needs 1)",
-                        int(_cls_rt.get("cot_level", 1) or 1) == 1,
-                    ),
-                )
-                if not _pass
-            ]
-            self._f._log_debug(
-                "planner RT-3 gate: classifier flagged a retrieval but "
-                "the turn stays in the pipeline — blocked by: "
-                + "; ".join(_rt_why)
-            )
-        if _rt_ok:
-            await self._f._emit_status(
-                f"⤵️ Direct request (target: {_rt_target[:60]}) — "
-                f"retrieval plan, no hypothesis forging"
-            )
-            self._f._log_debug(
-                f"planner RT-3 gate: retrieval plan for "
-                f"'{_rt_target[:80]}' (intent=explain, cot=1, "
-                f"single-clause) — forge skipped"
-            )
-            # RT-4: dispatch by what the artifact IS. A diff against
-            # freshly emitted code is not a lookup — it is difflib over
-            # two texts already in hand, so the harness computes it and
-            # hands the step its result. The executor skips a step that
-            # is already done, so the answer sees a real diff instead of
-            # an instruction to go find one.
-            _rt_kind = self._retrieval_kind(_rt_target)
-            _rt_precomputed = ""
-            # Each kind has its own deterministic fetch. Any failure
-            # leaves _rt_precomputed empty and the plan falls back to
-            # the tool-driven step, which is what shipped before any
-            # of this existed — a prefetch that breaks costs the turn
-            # nothing it had.
-            try:
-                if _rt_kind == "diff_compute":
-                    _rt_precomputed = self._diff_emitted_against_index(
-                        project_id
-                    )
-                elif _rt_kind == "diff_stored":
-                    _rt_precomputed = await self._fetch_stored_diffs(
-                        project_id
-                    )
-                elif _rt_kind == "artifact":
-                    _rt_precomputed = self._fetch_named_artifact(
-                        _rt_target, project_id
-                    )
-            except Exception as _e_rt:
-                _rt_precomputed = ""
-                self._f._log_debug(
-                    f"planner RT-4 [{_rt_kind}]: prefetch failed "
-                    f"({_e_rt!r}) — falling back to a tool-driven "
-                    f"retrieval step"
-                )
-            if _rt_precomputed:
-                self._f._log_debug(
-                    f"planner RT-4: computed diff for '{_rt_target[:60]}' "
-                    f"({len(_rt_precomputed)} chars) — step 1 pre-filled"
-                )
-                await self._f._emit_status(
-                    {
-                        "diff_compute": (
-                            "\U0001f9ee Diff computed against the index"
-                        ),
-                        "diff_stored": (
-                            "\U0001f5c2\ufe0f Applied diff retrieved from "
-                            "the change log"
-                        ),
-                    }.get(_rt_kind, "\U0001f4c4 Artifact retrieved")
-                    + " (no investigation needed)"
-                )
-            _step1 = AgenticStep(
-                id=1,
-                goal=(
-                    f"Retrieve and present: {_rt_target[:160]}. "
-                    "Locate the artifact itself (the diff, the "
-                    "body, the value) via the available tools "
-                    "and bring it into the workspace verbatim."
-                ),
-                kind="investigate",
-            )
-            if _rt_precomputed:
-                _step1.goal = (
-                    f"Retrieved by the pipeline [{_rt_kind}]: "
-                    f"{_rt_target[:100]}"
-                )
-                _step1.output = _rt_precomputed
-                # The per-step workspace renders DIGEST, not output, so a
-                # pre-filled step that sets only output is invisible to
-                # the analyze step that has to present it — the whole
-                # computation would arrive nowhere. Set here rather than
-                # through _digest() on purpose: that helper truncates to
-                # agentic_digest_max_tokens (400), and a diff cut at 400
-                # tokens is a diff that lies by omission.
-                _step1.digest = _rt_precomputed
-                _step1.status = "done"
-            return AgenticPlan(
-                steps=[
-                    _step1,
-                    AgenticStep(
-                        id=2,
-                        goal=(
-                            (
-                                "What the user asked for is already in "
-                                "the workspace above, retrieved by the "
-                                "pipeline. Present it verbatim inside a "
-                                "fenced block and add at most one "
-                                "sentence saying what it is. Do not "
-                                "fetch it again, do not summarise it "
-                                "away, and do not explain why it might "
-                                "be wrong. If the workspace says it "
-                                "could not be produced, say exactly "
-                                "that and stop."
-                            )
-                            if _rt_precomputed
-                            else (
-                                "Present the retrieved artifact itself, "
-                                "verbatim where it is text. If it could "
-                                "not be located, say so plainly and stop "
-                                "— do NOT hypothesize about causes the "
-                                "user did not ask for."
-                            )
-                        ),
-                        kind="analyze",
-                        # Kind stays analyze: the synthesis lookup that
-                        # feeds the final prompt selects on it. Only the
-                        # instruction set changes.
-                        instruction_set="present",
-                    ),
-                ],
-                source="retrieval_fixed",
-                rationale="RT-3: direct request routed to retrieval",
-            )
-
         if not slot_free:
             fp = AgenticOrchestrator.build_fixed_plan(
                 question,
@@ -18736,25 +18711,63 @@ class AgenticOrchestrator:
     # ── Command parsing ──────────────────────────────────────────────────
 
     @staticmethod
-    def parse_command(user_content: str) -> Tuple[Optional[str], str]:
+    def parse_command(
+        user_content: str,
+    ) -> Tuple[Optional[str], str, Optional[Tuple[int, int]]]:
         """
         Parse a /agent command.
 
+        Effort may be stated as leading integers, because the pipeline
+        cannot always tell how hard a question is and the person asking
+        usually can:
+
+            /agent 0 <question>      answer directly, no pipeline
+            /agent 3 <question>      three hypotheses, cycles automatic
+            /agent 3 2 <question>    three hypotheses, two cycles each
+            /agent <question>        everything automatic, as before
+
+        Zero is not "zero hypotheses" but "do not enter the pipeline at
+        all": a trivial question should not pay for a planner and three
+        steps to be told what one call would have said. The numbers are
+        a REQUEST, applied where the valves would otherwise decide, and
+        they last exactly one turn.
+
         Returns:
-            (mode, question) where mode is "run", "plan", "help", or None
-            when the message is not an /agent command at all.
+            (mode, question, effort) where mode is "run", "plan", "off",
+            "help", or None when the message is not an /agent command;
+            effort is (hypotheses, cycles) or None for automatic, with
+            cycles 0 meaning "let the valve decide".
         """
         content = user_content.strip()
         if not content.startswith("/agent"):
-            return None, ""
+            return None, "", None
         rest = content[len("/agent") :].strip()
         if not rest:
-            return "help", ""
+            return "help", "", None
         first, _, tail = rest.partition(" ")
         if first.lower() == "plan":
             tail = tail.strip()
-            return ("plan", tail) if tail else ("help", "")
-        return "run", rest
+            return ("plan", tail, None) if tail else ("help", "", None)
+        # ── Leading integers are an effort request ──
+        # At most two, and only while they keep parsing: a question that
+        # opens with a number of its own ("3 of the callers are stale")
+        # would otherwise lose its first word to the parser.
+        _nums: List[int] = []
+        _rest = rest
+        while len(_nums) < 2:
+            _tok, _, _after = _rest.partition(" ")
+            if not _tok.isdigit():
+                break
+            _nums.append(int(_tok))
+            _rest = _after.strip()
+        if not _nums:
+            return "run", rest, None
+        if not _rest:
+            return "help", "", None
+        if _nums[0] == 0:
+            return "off", _rest, None
+        _cycles = _nums[1] if len(_nums) > 1 else 0
+        return "run", _rest, (_nums[0], _cycles)
 
     # ── Plan construction (Fase 1: fixed) ────────────────────────────────
 
@@ -19697,7 +19710,7 @@ class AgenticOrchestrator:
             outcome) — the caller then skips the normal CoT path for this
             turn. False when the message is not an /agent command.
         """
-        mode, question = self.parse_command(user_content)
+        mode, question, _effort = self.parse_command(user_content)
         # Cap immediately: the 'plan' preview path below uses question in
         # injected text and calls the planner directly, bypassing the
         # run_pipeline frontier cap; parse_command returns the raw post-
@@ -19705,6 +19718,45 @@ class AgenticOrchestrator:
         question = (question or "")[:2000]
         if mode is None:
             return False
+
+        # Region: effort request — one turn only
+        # Stored rather than applied to the valves, which are the
+        # operator's standing configuration and must survive a turn that
+        # asked for something different. Cleared by whoever reads it.
+        self._f._agentic_effort_override = _effort
+
+        # Region: off mode — the question skips the pipeline entirely
+        # Not "zero hypotheses": no planner, no steps, no forge. A
+        # trivial question should not pay for three agentic steps to be
+        # told what one call would have said, and the person asking knows
+        # which questions those are better than any classifier does.
+        if mode == "off":
+            await self._f._emit_status(
+                "\u23ed\ufe0f /agent 0 — direct answer, no pipeline"
+            )
+            self._f._log_debug(
+                f"/agent 0: pipeline skipped by request "
+                f"(question: {question[:60]!r})"
+            )
+            # The prefix stays in the message the model reads, so it is
+            # told what to do with it rather than left to guess whether
+            # "/agent 0" is part of the question.
+            dynamic_injections.append(
+                (
+                    "trailing",
+                    "## Direct answer requested\n"
+                    "The user prefixed `/agent 0` to ask for an answer "
+                    "without investigation. Answer the question that "
+                    "follows the prefix, ignoring the prefix itself, "
+                    "using only the context already present.",
+                )
+            )
+            # True, not False: the caller returns on True and skips the
+            # detection cascade and the pipeline behind it. Returning
+            # False announced "not an /agent command" and let the turn
+            # walk straight into the machinery it had just asked to
+            # avoid — the switch did nothing at all.
+            return True
 
         # Region: help mode — usage note, no execution
         if mode == "help":
@@ -19718,10 +19770,18 @@ class AgenticOrchestrator:
                     "trailing",
                     "## 🤖 Agentic pipeline\n"
                     "The user sent a bare or malformed `/agent` command. "
-                    "Briefly explain the usage: `/agent <question>` runs an "
-                    "investigate→analyze pipeline before answering; "
-                    "`/agent plan <question>` previews the plan without "
-                    "running it.",
+                    "Briefly explain the usage:\n"
+                    "- `/agent <question>` runs an investigate→analyze "
+                    "pipeline before answering, deciding the effort "
+                    "itself.\n"
+                    "- `/agent 0 <question>` skips the pipeline and "
+                    "answers directly — for questions too simple to be "
+                    "worth investigating.\n"
+                    "- `/agent 3 <question>` forges three hypotheses.\n"
+                    "- `/agent 3 2 <question>` forges three, two cycles "
+                    "each — for questions worth the extra depth.\n"
+                    "- `/agent plan <question>` previews the plan "
+                    "without running it.",
                 )
             )
             return True
@@ -29348,68 +29408,6 @@ class MetacognitiveReasoningEngine:
     )
 
     @classmethod
-    def _output_is_degenerate(cls, text: str) -> str:
-        """
-        Name the degeneracy in a generation, or return "" if it is sane.
-
-        Deterministic on purpose. Every corruption this pipeline has
-        produced is repetition — a block cycling verbatim, or a template
-        walked with one identifier changing per line — and repetition is
-        measurable without asking anyone. An auxiliary LLM call would
-        add latency, a second thing that can fail, and no coverage the
-        counting does not already give.
-
-        Two signatures, because the two observed shapes look nothing
-        alike at the line level. A cycling block repeats lines exactly,
-        so its distinct-line ratio collapses: one captured generation
-        held 143 claims of which 24 were distinct. A template walk
-        repeats no line at all, and shows instead as neighbours sharing
-        a long prefix.
-
-        Length is what keeps the second test honest. Ten legitimate
-        claims about one method share prefixes too, and nothing in the
-        shape separates them from a walk — but a legitimate response
-        cannot be long, because the prompt caps the list at
-        _MAX_CLAIMS_PER_CYCLE. The check therefore only looks at
-        outputs far past any budget, where length alone has already
-        settled the question.
-
-        Returns:
-            A short reason for the log and the dossier tag, or "".
-        """
-        _t = text or ""
-        if len(_t) < 1500:
-            return ""
-        _rows = [r.strip() for r in _t.split("\n")]
-        _rows = [r for r in _rows if len(r) > 12]
-        if len(_rows) < 12:
-            return ""
-        # ── Signature 1: the same lines over and over ──
-        _distinct = len(set(_rows))
-        if _distinct <= len(_rows) * 0.5:
-            return (
-                f"cycling: {_distinct} distinct of {len(_rows)} lines"
-            )
-        # ── Signature 2: a template walked past any plausible budget ──
-        if len(_rows) >= 25:
-            _shared = 0
-            for _a, _b in zip(_rows, _rows[1:]):
-                _n = 0
-                for _x, _y in zip(_a, _b):
-                    if _x != _y:
-                        break
-                    _n += 1
-                if _n >= 25:
-                    _shared += 1
-            if _shared >= (len(_rows) - 1) * 0.8:
-                return (
-                    f"template walk: {_shared} of {len(_rows) - 1} "
-                    f"neighbouring lines share a 25-char prefix across "
-                    f"{len(_rows)} lines"
-                )
-        return ""
-
-    @classmethod
     def _drop_complement_pairs(cls, claims: List[str]) -> Tuple[List[str], int]:
         """
         Remove claims that appear together with their own opposite.
@@ -29626,6 +29624,12 @@ class MetacognitiveReasoningEngine:
         _predictions: List[str] = []
         _resolvable_prev = -1
         _cycles_max = int(self._f.valves.agentic_serial_cycles_max)
+        _eff_c = getattr(self._f, "_agentic_effort_override", None)
+        if _eff_c and len(_eff_c) > 1 and _eff_c[1] > 0:
+            _cycles_max = int(_eff_c[1])
+            self._f._log_debug(
+                f"/agent effort: max {_cycles_max} cycle(s) by request"
+            )
         _need = int(self._f.valves.agentic_serial_maturity_confirmed)
         _cov_thr = float(self._f.valves.low_coverage_threshold)
         _cycle = 0
@@ -29918,56 +29922,10 @@ class MetacognitiveReasoningEngine:
             except Exception as _e:
                 self._f._log_debug(f"_forge_hypothesis: analyze failed ({_e!r})")
                 _resp = ""
-            # A degenerate answer is worth one more attempt, and exactly
-            # one. The three corruptions on record all came back as
-            # repetition; the deterministic check names the shape, and a
-            # retry carrying that name is a materially different prompt
-            # rather than the same dice thrown twice. A second failure
-            # says something about the model or the instruction, and
-            # spending more cycles on it would hide that rather than fix
-            # it — so the second answer is kept whatever it looks like,
-            # and the tag records that this dossier needed the retry.
-            _degen = (
-                self._output_is_degenerate(_resp)
-                if getattr(self._f.valves, "enable_degeneracy_retry", False)
-                else ""
-            )
-            if _degen:
-                self._tag_strategy(_dossier, "degenerate-retry")
-                self._f._log_debug(
-                    f"forge experiment c{_cycle}: output degenerate "
-                    f"({_degen}) — retrying once"
-                )
-                await self._f._emit_status(
-                    f"\u267b\ufe0f Retrying (cycle {_cycle}): the answer "
-                    f"came back repeating itself"
-                )
-                try:
-                    _resp = await self._f._llm_orchestrator.call_llm(
-                        prompt=(
-                            "Your previous answer to this was discarded: "
-                            f"{_degen}. It repeated instead of "
-                            "reasoning. Answer again, shorter, and stop "
-                            "as soon as you have said the few things "
-                            "that actually distinguish this hypothesis "
-                            "from its rivals.\n\n" + _prompt
-                        ),
-                        system_prompt=(
-                            "You are the analyze step of a scientific "
-                            "forge. Output ONLY a JSON object: "
-                            '{"analysis": "<mechanism, own words>", '
-                            '"claims": ["<checkable claim>", ...]}. '
-                            "Start with { and end with }."
-                        ),
-                        model_override=self._f.valves.cot_model_level3,
-                        label=f"{label}_forge_c{_cycle}_retry",
-                        **_kw,
-                    )
-                except Exception as _e_rt:
-                    self._f._log_debug(
-                        f"forge experiment c{_cycle}: retry failed "
-                        f"({_e_rt!r}) — keeping the degenerate answer"
-                    )
+            # Degeneracy is guarded centrally in call_llm now: every
+            # agent passes through it, so a forge-specific retry here
+            # would be a second mechanism doing the same job — and two
+            # overlapping retries are how one call quietly becomes three.
             import json as _json
 
             _analysis, _claims = "", []
@@ -30424,7 +30382,17 @@ class MetacognitiveReasoningEngine:
                 )
         except Exception:
             pass
+        # An /agent effort request overrides the valve for this turn
+        # only. The valve is the operator's standing configuration and
+        # is never written to: a question that asked for more depth must
+        # not silently reconfigure the next hundred that did not.
+        _eff = getattr(self._f, "_agentic_effort_override", None)
         _n_target = int(self._f.valves.agentic_serial_hypothesis_count)
+        if _eff and _eff[0] > 0:
+            _n_target = int(_eff[0])
+            self._f._log_debug(
+                f"/agent effort: {_n_target} hypothesis slot(s) by request"
+            )
         _sealed: List["HypothesisDossier"] = []
 
         def _collides(cand: str) -> bool:
@@ -38902,6 +38870,27 @@ class MessageAssembler:
                 return
 
         # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Region: short-circuit 0.4 — a retrieval is served, not reasoned
+        # A stored diff is a row in SQLite. Routing that through the
+        # pipeline cost a planner call, a verify step and an analyze step
+        # to hand back something one query already had, and the run that
+        # proved the gate worked still spent most of a minute doing it.
+        # Served here the turn costs one query and no model calls beyond
+        # the answer itself.
+        # ------------------------------------------------------------------
+        if not is_continuation:
+            try:
+                _direct = await self._f._agentic._planner.try_direct_retrieval(
+                    project_id
+                )
+            except Exception as _e_dr:
+                _direct = ""
+                self._f._log_debug(f"direct retrieval skipped ({_e_dr!r})")
+            if _direct:
+                dynamic_injections.append(("trailing", _direct))
+                return
+
         # Region: short-circuit 0.5 — agentic 'always' BEFORE detection
         # The detection cascade (CE stages + cot_config LLM + decompose)
         # costs seconds and its verdict is discarded when the pipeline
@@ -44243,12 +44232,21 @@ class Filter:
                 "can fail, for no coverage the counting does not already "
                 "give."
                 "\n\n"
-                "Validated against the corruptions themselves: it names "
-                "both observed shapes and fires on neither of the 53 "
-                "healthy calls recorded alongside them, including the "
-                "hard case of ten legitimate claims sharing one prefix — "
-                "which stays safe because the claim budget makes any "
-                "long list suspect on length alone."
+                "Detection is a compression ratio, which assumes nothing "
+                "about how the output is formatted. A line-counting "
+                "version shipped first and missed two of the three "
+                "recorded corruptions: one cycled a block inside a "
+                "single-line JSON array, the other alternated a heading "
+                "with a body line so that neighbouring lines never "
+                "matched. Repetition is what a compressor exploits, so "
+                "it needs no such assumptions."
+                "\n\n"
+                "Validated on 77 samples — pipeline calls, chat answers "
+                "and this project's own source: all three corruptions "
+                "are named, zero healthy samples trip it, and the most "
+                "repetitive legitimate output sits 15% above the "
+                "threshold while the least repetitive corruption sits "
+                "13% below."
                 "\n\n"
                 "One retry, never more: a second degenerate answer is "
                 "evidence about the model or the prompt, not bad luck, "
@@ -46579,6 +46577,9 @@ class Filter:
         # at inlet and written beside the context dump at outlet.
         self._agent_records: List[Dict[str, Any]] = []
 
+        # An /agent effort request for the CURRENT turn, or None.
+        self._agentic_effort_override: Optional[Tuple[int, int]] = None
+
         # -- C6: LTM store completion event --
         self._ltm_store_complete: asyncio.Event = asyncio.Event()
         self._ltm_store_complete.set()  # initially "complete"
@@ -47019,6 +47020,9 @@ class Filter:
             # would otherwise inherit the previous turn's acts and the
             # file would attribute them to the wrong question.
             self._agent_records = []
+            # Same reason: an effort request belongs to the turn that
+            # made it, and a later question must not inherit it.
+            self._agentic_effort_override = None
 
             # ------------------------------------------------------------------
             # Region: stop background tasks gracefully before any inlet work
