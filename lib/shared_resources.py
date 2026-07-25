@@ -552,25 +552,58 @@ def _describe_output_tail_inner(text: str, lines_back: int) -> str:
     if exact == 0 and not shared:
         return ""
 
-    # ── Step 3: name the shape and show one line of it ──
+    # ── Step 3: name the shape, from the number that decides it ──
+    # The verdict follows the shared-prefix LENGTH, because that is what
+    # DRY actually measures. An earlier version keyed off the duplicate
+    # count alone and told the operator a template walk was beyond DRY's
+    # reach at any setting — advice that was exactly backwards for the
+    # first real runaway it saw, whose lines shared a 48-character
+    # prefix (~13 tokens) under a threshold of 17. Lowering the
+    # threshold was precisely the fix, and the instrument argued
+    # against it while printing the number that proved it wrong.
     median = shared[len(shared) // 2] if shared else 0
+    # Chars per token is a rough constant for prose and code alike;
+    # the estimate only has to be good enough to compare against a
+    # threshold expressed in tokens, and it is reported as approximate.
+    approx_tokens = int(median / 3.7)
     if exact >= max(2, len(rows) // 3):
         shape = (
-            "VERBATIM repeat — DRY penalises this as the match "
-            "lengthens; a lower dry_allowed_length bites sooner"
+            "VERBATIM repeat — the match grows with every iteration, so "
+            "DRY strangles this once it passes dry_allowed_length; a "
+            "lower threshold bites sooner"
         )
     elif len(shared) >= max(2, (len(rows) - 1) // 2):
-        shape = (
-            "TEMPLATE walk (lines vary after a shared prefix) — DRY "
-            "cannot see this at any dry_allowed_length, since the "
-            "varying token resets the match"
-        )
+        if approx_tokens >= 4:
+            shape = (
+                "TEMPLATE walk (lines vary after a shared prefix) — the "
+                "prefix is ~%d tokens, so DRY REACHES this whenever "
+                "dry_allowed_length is below that; at or above it the "
+                "match never crosses the threshold and nothing fires"
+                % approx_tokens
+            )
+        else:
+            shape = (
+                "TEMPLATE walk with a ~%d token prefix — too short for "
+                "DRY at any usable threshold, since lowering it far "
+                "enough would penalise ordinary repeated code; the fix "
+                "is not the sampler"
+                % approx_tokens
+            )
     else:
         shape = "partial repetition"
     return (
         "tail of %d lines: %d exact duplicate(s), %d adjacent pair(s) "
-        "sharing >=12 chars (median %d) — %s | last line: %r"
-        % (len(rows), exact, len(shared), median, shape, rows[-1][:120])
+        "sharing >=12 chars (median %d chars ~%d tokens) — %s "
+        "| last line: %r"
+        % (
+            len(rows),
+            exact,
+            len(shared),
+            median,
+            approx_tokens,
+            shape,
+            rows[-1][:120],
+        )
     )
 
 
@@ -1691,9 +1724,6 @@ def set_active_expert(expert_id: str) -> None:
         _ACTIVE_EXPERT = expert_id
 
 
-# ---------------------------------------------------------------------------
-# 5.2 Helper to safely unload all models from a llama.cpp server
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # 5.3 Helpers to parse a "backend/model" formatted model identifier
 # ---------------------------------------------------------------------------
