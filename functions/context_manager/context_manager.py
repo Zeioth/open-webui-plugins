@@ -335,6 +335,29 @@ class CompetitionRecord:
 #
 # 4 is not a new limit. It is the limit that already existed in the
 # parser, finally said out loud.
+# What sits between the KV prefix and whatever follows it. One constant,
+# because two places build that junction and they had drifted apart:
+# _align_system_to_prefix joined prelim + separator + role, while the six
+# agentic call sites passed the prelim BARE as their system prompt.
+#
+# Six tokens of difference, and it cost about ten minutes a run. A KV
+# checkpoint is only usable at or before the point where the new prompt
+# diverges from the cached one, and llama.cpp creates them where prompts
+# END. A checkpoint left by one route therefore sat past the other
+# route's divergence and was rejected: 248 of 345 checkpoint checks in
+# one run, several failing by a single token ("checkpoint@72213 against
+# 72212"), each rejection costing a 72k-token re-prefill at 80-98s.
+#
+# The junction is worse than a plain offset, which is why matching it
+# byte-for-byte matters. Qwen2 pre-tokenises punctuation together with
+# the newlines that follow it, so a prelim ending "prelim." emits the
+# chunk "." when bare and ".\n\n" when the separator follows — the two
+# routes diverge at the LAST token of the shared text, not after it.
+# Verified against the Qwen2 pre-tokeniser pattern: with the separator on
+# both sides the prefix chunks identically for every role tried, and
+# without it they never can.
+_PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
+
 _MAX_TOOLS_PER_ROUND = 4
 
 _MAX_CLAIMS_PER_STEP = 12
@@ -12417,7 +12440,7 @@ class LLMOrchestrator:
         # call shares. Appending leaves the prefix byte-identical (checkpoint
         # intact) and lets the later, more specific instruction win, which is
         # how the role already overrides Block A's general guidance.
-        _aligned = f"{_prelim}\n\n---\n\n{system_prompt}"
+        _aligned = f"{_prelim}{_PREFIX_ROLE_SEPARATOR}{system_prompt}"
         if response_format is not None:
             _suffix = (getattr(self._f.valves, "confidence_prompt", "") or "").strip()
             if _suffix and _suffix in _prelim:
@@ -19036,11 +19059,21 @@ class AgenticOrchestrator:
             - self._f.valves.response_reserve_tokens
             - 16000,
         )
+        # The separator is part of the prefix, not of the role. Without it
+        # this route ended one token earlier than every other aligned call
+        # — the prelim's final "." against their ".\n\n" — so neither
+        # route could ever use the other's KV checkpoint. Appending it
+        # here rather than at the six call sites keeps the junction in one
+        # place; a separator spelled out twice is a separator that will
+        # differ once.
         if self._f.tokenizer:
             if len(self._f.tokenizer.encode(prelim_system)) <= cap:
-                return prelim_system
-            return self._f._tokens.truncate_text_to_tokens(prelim_system, cap)
-        return prelim_system[: cap * 4]
+                return prelim_system + _PREFIX_ROLE_SEPARATOR
+            return (
+                self._f._tokens.truncate_text_to_tokens(prelim_system, cap)
+                + _PREFIX_ROLE_SEPARATOR
+            )
+        return prelim_system[: cap * 4] + _PREFIX_ROLE_SEPARATOR
 
     def _should_reinforce_step(
         self, step: AgenticStep, control: Dict[str, Any], project_id: str
