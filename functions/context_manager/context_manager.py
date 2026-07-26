@@ -301,6 +301,44 @@ class CompetitionRecord:
 # 0.149 and the median to 0.345; the three recorded corruptions to
 # 0.080, 0.082 and 0.113. 0.13 sits in the gap with margin on both
 # sides — no healthy sample falls below it, and no corrupt one above.
+# How many claims one agentic step may contribute. The forge has had a
+# budget since the experiment prompt gained one; the steps had none —
+# not in the prompt, not in the parser — and a step took the invitation:
+# 15203 tokens, 598 lines of claim objects, 88 of them distinct, 225
+# seconds. It had not lost the thread. It was emitting the claims array
+# it had been asked for, and was never told when to stop.
+#
+# 12 is measured rather than guessed: across the recorded dumps a healthy
+# step produces a median of 3 claims and at most 9, and a whole
+# seven-step turn totalled 20. The ceiling sits a third above the largest
+# honest step, so it can only cut a generation that has already left the
+# distribution.
+#
+# Module scope because two places need the SAME number: the JSON contract
+# every step reads, and the ledger that parses what comes back. Stating
+# it in one and enforcing it in the other from separate constants is how
+# the forge came to discard 88 of 98 claims without saying so.
+# How many tools one step may request in a single reply. The parser has
+# always deduplicated and taken the first four; the model was never told,
+# and a step took the invitation exactly as the claims list did: 7448
+# tokens over 114 seconds alternating
+#
+#     TOOL: EXPAND(ConversationStateManager._save_to_db)
+#     TOOL: EXPAND(ConversationStateManager._save_to_db_async)
+#
+# until it hit the ceiling. Two symbols, hundreds of times. The four that
+# would have been used were in the first two lines; the other 7400 tokens
+# were written, paid for and discarded — and the truncation cost the step
+# its claims, which cost the analyze step a usable workspace, which is
+# why the user was handed a function whose signature runs straight into
+# the middle of its own body.
+#
+# 4 is not a new limit. It is the limit that already existed in the
+# parser, finally said out loud.
+_MAX_TOOLS_PER_ROUND = 4
+
+_MAX_CLAIMS_PER_STEP = 12
+
 _DEGENERACY_COMPRESSION_MAX = 0.13
 
 
@@ -13433,7 +13471,10 @@ class AgenticEvidenceLedger:
             return control
         step.output = step.output[:tail_start].rstrip()
 
-        raw_claims = data.get("claims", [])
+        # Trimmed to the number the contract states, from the same
+        # constant. A limit enforced silently is how a generation gets
+        # to spend four minutes producing what will be thrown away.
+        raw_claims = (data.get("claims", []) or [])[:_MAX_CLAIMS_PER_STEP]
         if not isinstance(raw_claims, list):
             raw_claims = []
 
@@ -16226,10 +16267,18 @@ class AgenticPreplanner:
                     ),
                 )
             except Exception as e:
-                self._f._log_debug(f"🧭 Preplanner: call failed ({e})")
+                self._f._log_debug(f"\U0001f9ed Preplanner: call failed ({e})")
+                await self._f._emit_status(
+                    "\U0001f9ed Pre-planner: no framing — the call failed; "
+                    "the turn continues unframed"
+                )
                 return "", ""
             if not response:
-                self._f._log_debug("🧭 Preplanner: empty response — no brief")
+                self._f._log_debug("\U0001f9ed Preplanner: empty response — no brief")
+                await self._f._emit_status(
+                    "\U0001f9ed Pre-planner: no framing — it returned "
+                    "nothing; the turn continues unframed"
+                )
                 return "", ""
             queries = self._extract_tool_lines(response)
             if not queries or attempt >= max_rounds:
@@ -16256,7 +16305,21 @@ class AgenticPreplanner:
         # ── Region: parse-or-fail-open ──────────────────────────────────────
         data = self._parse(response)
         if data is None:
-            self._f._log_debug("🧭 Preplanner: unparseable output — no brief")
+            # Every status that opens must close. "exploring framings…" is
+            # emitted before the call and announced work the reader then
+            # watched vanish: no framing named, no failure shown, the next
+            # line simply about something else. A step that starts
+            # visibly and ends invisibly reads as a hang, and the reader
+            # has no way to tell a silent success from a silent failure.
+            #
+            # Fail-open is the right BEHAVIOUR here — a turn without a
+            # framing is still a turn — but silence is not the right
+            # report of it.
+            self._f._log_debug("\U0001f9ed Preplanner: unparseable output — no brief")
+            await self._f._emit_status(
+                "\U0001f9ed Pre-planner: no framing — its answer could not "
+                "be read; the turn continues unframed"
+            )
             return "", ""
         ask = str(data.get("ask", "") or "").strip()[:400]
         brief = self._render_brief(data)
@@ -16645,8 +16708,18 @@ class AgenticPlanner:
         The most recently applied diffs, newest first.
 
         "El diff que acabas de aplicar" is a RECENCY question, and the
-        answer is one indexed query: napmem_diffs carries turn_number
-        and created_at with an index on (project_id, turn_number). The
+        answer is one indexed query.
+
+        Ordered by id, NOT by turn_number. turn_number restarts at 1
+        with every session, so ordering by it first does not return the
+        most recent diff — it returns whichever session in the table's
+        history ran the most turns, which may be weeks old. That is not
+        a hypothetical: a user asked for the diff just applied and was
+        handed 8076 characters from another session, in a run where the
+        only diff persisted was 94 characters long. id is monotonic and
+        is what "most recent" means here.
+
+        The
         pipeline asked the model to find it instead, and the model
         answered with a theory about the table — after inventing a
         get_diff_for_block method that does not exist. Semantic search
@@ -16666,7 +16739,7 @@ class AgenticPlanner:
             _sql = (
                 "SELECT file_path, turn_number, diff_text "
                 "FROM napmem_diffs WHERE project_id=? "
-                "ORDER BY turn_number DESC, id DESC LIMIT ?"
+                "ORDER BY id DESC LIMIT ?"
             )
             _rows = await self._f._state_store._db_read(
                 lambda s=_sql, p=(project_id, int(limit)): (
@@ -16686,9 +16759,40 @@ class AgenticPlanner:
                 "empty for this project.]"
             )
         _parts: List[str] = []
+        _skipped = 0
         for _fp, _turn, _text in _rows:
+            # A stored diff carrying renderer scaffolding is not source
+            # and must not be handed back as if it were. The pointers
+            # `# ↑ see 'X' in this tier` are produced by the hub-bodies
+            # renderer and exist only inside rendered context; a row
+            # containing them was diffed against a render rather than
+            # against code, and one such row reached a user as an answer.
+            #
+            # Declined rather than cleaned. Removing lines from a unified
+            # diff shifts every @@ header below them, and a diff whose
+            # hunk offsets no longer match its body is worse than no diff
+            # at all: it looks applicable and is not.
+            if _TIER_POINTER_RE.search(str(_text or "")):
+                _skipped += 1
+                self._f._log_debug(
+                    f"RT-4 stored-diff: row for {_fp!r} contains renderer "
+                    f"scaffolding — declined rather than served"
+                )
+                continue
             _head = f"# {_fp or '(unknown file)'} — applied on turn {_turn}"
             _parts.append(_head + "\n" + str(_text or "").rstrip())
+        if not _parts:
+            return (
+                "[No usable stored diff: "
+                + (f"{_skipped} recorded entr(y/ies) were rejected because "
+                   "they contain rendered-context scaffolding rather than "
+                   "source, which means they were not diffed against code. "
+                   "This is a recording fault, not an absence of changes."
+                   if _skipped else
+                   "nothing has been applied to the index in this project "
+                   "yet, so there is no recorded change to show.")
+                + "]"
+            )
         _out = "\n\n".join(_parts)
         if len(_out) > 8000:
             _out = (
@@ -16958,7 +17062,13 @@ class AgenticPlanner:
         # needs both shapes forceable from one switch: 'full' overrides
         # budget to the valve ceiling and (below) replaces the type hint
         # with a full-method directive; 'fast' pins the budget to 3 and
-        # directs the quick shape. 'auto' (default) = the selectors above
+        # directs the quick shape. NOTE: this ships as 'full', not
+        # 'auto', so a descriptive lookup gets a forge it has no use
+        # for — a run spent both generation attempts on 'present this
+        # method in full' and both collided with the graveyard, ending
+        # in a conclusion that no cause was found for a question that
+        # never asked for one. Set 'auto' unless an A/B is running.
+        # 'auto' = the selectors above
         # decide, byte-identical to before.
         _profile = str(
             getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
@@ -17427,7 +17537,14 @@ _EC10_CRITICAL_RE = re.compile(
 # the quoting style because a model that parrots the block often drops
 # the '# ' or swaps backticks for quotes.
 _TIER_POINTER_RE = re.compile(
-    r"^[ \t]*#?[ \t]*\u2191 see [`'\"].+?[`'\"] in this tier[ \t]*$",
+    # The optional [-+ ] is what lets this see a pointer that has been
+    # carried into a unified diff. Anchored without it, the pattern
+    # matched a pointer sitting in rendered context and missed the same
+    # pointer one column right, prefixed by the diff's own marker — and
+    # that is the form that reached a user, inside a stored diff served
+    # back verbatim. A guard that only recognises its target in the
+    # place it was born is not a guard.
+    r"^[-+ ]?[ \t]*#?[ \t]*\u2191 see [`'\"].+?[`'\"] in this tier[ \t]*$",
     re.MULTILINE,
 )
 # A skeleton block opens with a box-drawing rule. Unlike the pointer
@@ -17655,6 +17772,14 @@ class AgenticStepExecutor:
         "TOOL: CALLEES(Qualified.Name) — what it calls\n"
         "TOOL: DOC(SymbolName)      — its docstring\n"
         "TOOL: GREP(pattern)        — matching lines in the code\n"
+        "Emit AT MOST {max_tools} TOOL lines, then STOP WRITING and "
+        "wait: only the first {max_tools} distinct ones are resolved "
+        "and every line past them is discarded unread. Never request a "
+        "symbol you have already been given — repeating one costs you "
+        "the round and returns the same text. If you need more than "
+        "{max_tools}, ask for the {max_tools} that unblock you and ask "
+        "again afterwards; the results come back and the step "
+        "continues.\n"
     )
 
     _MEMORY_MENU_LINE = (
@@ -17709,7 +17834,12 @@ class AgenticStepExecutor:
         "no checkable anchor cannot be verified as formulated and will be "
         "marked unoperationalizable — reformulate it as an atomic check "
         "instead (symbol existence, 'A calls B', inheritance). If you have "
-        'no claims, output {"claims": []}. Optional top-level fields in the '
+        "Emit AT MOST {max_claims} claims and then close the JSON. That "
+        "is a hard limit, not a target: anything past it is discarded "
+        "unread, so a longer list costs time and buys nothing. A step "
+        "that found three things worth stating should state three and "
+        "stop. "
+        'If you have no claims, output {"claims": []}. Optional top-level fields in the '
         'same JSON: "resolved": true plus "confidence": 0.0-1.0 when your '
         "findings ALONE fully answer the overall question; "
         '"needs": ["<missing symbol or sub-question>"] when a specific gap '
@@ -17905,6 +18035,15 @@ class AgenticStepExecutor:
             return "\nFocus symbols suggested by the planner: " + ", ".join(
                 step.symbols
             )
+        if name == "_TOOLS_MENU":
+            return self._TOOLS_MENU.replace(
+                "{max_tools}", str(_MAX_TOOLS_PER_ROUND)
+            )
+        if name == "_JSON_CONTRACT":
+            # The one fragment carrying a number the parser also uses.
+            return self._JSON_CONTRACT.replace(
+                "{max_claims}", str(_MAX_CLAIMS_PER_STEP)
+            )
         if name == "_PRESENT_INSTRUCTION":
             return self._PRESENT_INSTRUCTION.format(sid=step.id, goal=step.goal)
         return str(getattr(self, name, ""))
@@ -18056,6 +18195,7 @@ class AgenticStepExecutor:
             int(self._f.valves.agentic_ctx_size) - _prefix_tok - _gen_reserve - _margin,
         )
         _accum_tool_results: List[str] = []
+        _have: List[str] = []
         for round_no in range(max_rounds + 1):
             try:
                 # return_meta: the claims contract lives at the very END of
@@ -18090,7 +18230,9 @@ class AgenticStepExecutor:
             # Sequential on purpose: MEMORY is the only real awaitable and
             # DB writes are queue-serialized; gather would only interleave
             # log lines without saving wall-clock time.
-            seen = list(dict.fromkeys(requests))[:4]
+            # The same constant the menu quotes, so the number the model
+            # is told and the number honoured cannot drift apart.
+            seen = list(dict.fromkeys(requests))[:_MAX_TOOLS_PER_ROUND]
             results = [await broker.resolve_async(n, a, project_id) for n, a in seen]
             self._f._log_debug(
                 f"🤖 Agentic step {getattr(step, 'display_no', None) or step.id}"
@@ -18104,9 +18246,20 @@ class AgenticStepExecutor:
             # tight — the EXPANDed code survives, the verbose narration is
             # what gives way.
             _accum_tool_results.extend(results)
+            # Everything resolved so far, by name. "Do not ask twice" is
+            # unusable unless the model can see what it already has, and
+            # it cannot: tool results arrive as a wall of code under one
+            # heading with the symbol names buried inside it. The loop
+            # that cost a step 114 seconds alternated two symbols it had
+            # been handed in the first round.
+            _have.extend(f"{_n}({_a})" for _n, _a in seen)
             _base = self.build_prompt(step, workspace)
             _tail = (
-                "\n\nContinue this step using the tool results. You may "
+                "\n\nYou ALREADY HAVE: "
+                + ", ".join(dict.fromkeys(_have))
+                + ". Asking for any of those again returns the same text "
+                "and costs you a round.\n"
+                "Continue this step using the tool results. You may "
                 "request more tools with TOOL: lines, or finish now with "
                 "your prose and the required JSON claims block."
             )
@@ -19199,11 +19352,33 @@ class AgenticOrchestrator:
                     f"'{d.hypothesis[:40]}' " f"({d.cause_of_death or 'died'})"
                     for d in _dossiers[:4]
                 )
-                await self._f._emit_status(
-                    f"🏁 Conclusion: all {len(_dossiers)} "
-                    f"dossier(s) died — cause not identified "
-                    f"with confidence"
-                )
+                # Zero dossiers is not zero survivors: nothing died,
+                # nothing was allowed to live. A turn where every candidate
+                # collided with the graveyard is the method working —
+                # that mechanism WAS ruled out, in an earlier turn — and
+                # "all 0 died, cause not identified" tells the reader the
+                # opposite of what happened. One says we looked and found
+                # nothing; the other says we declined to look again. A run
+                # reported the first while the log recorded "2
+                # collision(s) this run".
+                _coll = int(getattr(self._f, "_serial_collisions", 0) or 0)
+                if not _dossiers and _coll:
+                    await self._f._emit_status(
+                        f"\U0001f3c1 Conclusion: no NEW mechanism to test — "
+                        f"{_coll} candidate(s) repeated one already ruled "
+                        f"out in an earlier turn"
+                    )
+                elif not _dossiers:
+                    await self._f._emit_status(
+                        "\U0001f3c1 Conclusion: no hypothesis could be "
+                        "forged for this question"
+                    )
+                else:
+                    await self._f._emit_status(
+                        f"\U0001f3c1 Conclusion: all {len(_dossiers)} "
+                        f"dossier(s) died — cause not identified "
+                        f"with confidence"
+                    )
                 # S13 extension: the all-dead terminal is exactly
                 # where an actionable queue helps most, and until
                 # now only the null-bar-FAILED branch carried one.
@@ -30679,6 +30854,10 @@ class MetacognitiveReasoningEngine:
                 f"(cause: {_dossier.cause_of_death or _dossier.status})"
             )
         if _collision_count:
+            # Kept for the conclusion status: a turn where every
+            # candidate collided is the graveyard working, and the
+            # reader has to be told that rather than 'all died'.
+            self._f._serial_collisions = _collision_count
             self._f._log_debug(f"_forge_all: {_collision_count} collision(s) this run")
         return _sealed
 
