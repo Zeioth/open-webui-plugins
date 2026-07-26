@@ -30370,7 +30370,12 @@ class MetacognitiveReasoningEngine:
                     "consequence of a true hypothesis is a contradiction "
                     "— say so rather than explaining it away), and what "
                     "remains open. Do not introduce new claims here; "
-                    "they cannot be tested this cycle."
+                    "they cannot be tested this cycle.\n"
+                    "ONE SHORT PARAGRAPH FOR EACH of those three, and "
+                    "then stop. A verdict you have already interpreted is "
+                    "not interpreted better by being interpreted again: "
+                    "the results above are at most ten lines, and reading "
+                    "them takes less room than reciting them."
                 )
                 try:
                     _an = await self._f._llm_orchestrator.call_llm(
