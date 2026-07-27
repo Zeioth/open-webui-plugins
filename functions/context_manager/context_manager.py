@@ -196,6 +196,7 @@ class PeerReviewResult:
     reviewer_model: str
     is_external: bool = False
 
+
 @dataclass
 class HypothesisDossier:
     """
@@ -432,12 +433,12 @@ def _output_is_degenerate(text: str) -> str:
                         _best, _period = _eq, _p
                 if _best:
                     _shape = (
-                        f"a block of {_period} line(s) repeating "
-                        f"{_best} time(s)"
+                        f"a block of {_period} line(s) repeating " f"{_best} time(s)"
                     )
         return f"compression {_ratio:.3f} ({_shape})"
     except Exception:  # noqa: BLE001 - diagnostics never raise
         return ""
+
 
 class DetectionCatalog:
     """
@@ -501,8 +502,7 @@ class DetectionCatalog:
             "is_code_only",
             "classify_turn (LLM)",
             "bool",
-            "A paste with no question: ingested, acknowledged, no "
-            "pipeline.",
+            "A paste with no question: ingested, acknowledged, no " "pipeline.",
         ),
         (
             "has_request",
@@ -648,8 +648,11 @@ class DetectionCatalog:
             _out.append("")
         _out.append(
             f"{len(cls.SIGNALS)} signal(s); "
-            + ("all mechanisms resolve" if not _missing
-               else f"{_missing} mechanism(s) MISSING")
+            + (
+                "all mechanisms resolve"
+                if not _missing
+                else f"{_missing} mechanism(s) MISSING"
+            )
         )
         return "\n".join(_out)
 
@@ -5109,7 +5112,6 @@ class ContextBuilder:
         r"c[oó]mo\s+implementar|how\s+to\s+implement)\b",
         re.IGNORECASE,
     )
-
 
     def __init__(self, filter_ref: "Filter") -> None:
         """Initialize the ContextBuilder with a reference to the parent Filter."""
@@ -12603,9 +12605,7 @@ class LLMOrchestrator:
             # sampler-side loop control, not by a ceiling that also
             # truncates the calls doing the actual thinking.
             max_tokens = None
-            _runaway = int(
-                getattr(self._f.valves, "agentic_runaway_token_cap", 0) or 0
-            )
+            _runaway = int(getattr(self._f.valves, "agentic_runaway_token_cap", 0) or 0)
             if _runaway > 0:
                 max_tokens = _runaway
         elif not max_tokens or max_tokens <= 0:
@@ -12684,8 +12684,11 @@ class LLMOrchestrator:
             # generations among them — as if they were the short
             # auxiliaries this guard was written to spare.
             _ceiling = max_tokens if (max_tokens and max_tokens > 0) else None
-            if _dry > 0 and _ceiling is not None and _ceiling < int(
-                getattr(self._f.valves, "llm_long_dry_min_tokens", 1200)
+            if (
+                _dry > 0
+                and _ceiling is not None
+                and _ceiling
+                < int(getattr(self._f.valves, "llm_long_dry_min_tokens", 1200))
             ):
                 # Short auxiliary calls cannot loop their way into a cap they
                 # would never reach; leave their sampling alone.
@@ -12995,12 +12998,8 @@ class LLMOrchestrator:
                             {
                                 "in_tokens": in_tokens,
                                 "out_tokens": out_tokens,
-                                "seconds": round(
-                                    time.monotonic() - t_start, 2
-                                ),
-                                "finish_reason": getattr(
-                                    result, "finish_reason", ""
-                                ),
+                                "seconds": round(time.monotonic() - t_start, 2),
+                                "finish_reason": getattr(result, "finish_reason", ""),
                                 "truncated": bool(result.truncated),
                                 "max_tokens": (
                                     max_tokens if max_tokens else "unlimited"
@@ -16479,9 +16478,7 @@ class AgenticPreplanner:
                     )
                     brief = self._render_brief(data)
                     if brief:
-                        _qt_tag = (
-                            f" [{question_type}]" if question_type else ""
-                        )
+                        _qt_tag = f" [{question_type}]" if question_type else ""
                         await self._f._emit_status(
                             f"🧭 Pre-planner: framing chosen (fallback) "
                             f"— {_fallback[:60]}{_qt_tag}"
@@ -16493,9 +16490,7 @@ class AgenticPreplanner:
                             f"type={question_type or 'untyped'}, "
                             f"chose='{_fallback[:80]}')"
                         )
-                        self._f._log_debug(
-                            f"🧭 Preplanner brief:\n{brief.strip()}"
-                        )
+                        self._f._log_debug(f"🧭 Preplanner brief:\n{brief.strip()}")
                         return brief, ""
                 self._f._log_debug(
                     "🧭 Preplanner: clarification suppressed — question "
@@ -16807,20 +16802,21 @@ class AgenticPlanner:
         if not _parts:
             return (
                 "[No usable stored diff: "
-                + (f"{_skipped} recorded entr(y/ies) were rejected because "
-                   "they contain rendered-context scaffolding rather than "
-                   "source, which means they were not diffed against code. "
-                   "This is a recording fault, not an absence of changes."
-                   if _skipped else
-                   "nothing has been applied to the index in this project "
-                   "yet, so there is no recorded change to show.")
+                + (
+                    f"{_skipped} recorded entr(y/ies) were rejected because "
+                    "they contain rendered-context scaffolding rather than "
+                    "source, which means they were not diffed against code. "
+                    "This is a recording fault, not an absence of changes."
+                    if _skipped
+                    else "nothing has been applied to the index in this project "
+                    "yet, so there is no recorded change to show."
+                )
                 + "]"
             )
         _out = "\n\n".join(_parts)
         if len(_out) > 8000:
             _out = (
-                _out[:8000]
-                + "\n[truncated at 8000 chars — the entries above are "
+                _out[:8000] + "\n[truncated at 8000 chars — the entries above are "
                 "complete up to this point]"
             )
         return _out
@@ -16843,9 +16839,7 @@ class AgenticPlanner:
         original is worse than no diff, because it looks right.
         """
         # ── Step 1: the code the previous answer carried ──
-        _prev = self._f._project_state_manager.get_last_assistant_response(
-            project_id
-        )
+        _prev = self._f._project_state_manager.get_last_assistant_response(project_id)
         _emitted = AgenticDynamicVerifier.extract_code_blocks(_prev or "")
         if not _emitted.strip():
             return (
@@ -16918,8 +16912,7 @@ class AgenticPlanner:
         # the marker keeps a cut diff from reading as a complete one.
         if len(_out) > 8000:
             _out = (
-                _out[:8000]
-                + "\n[diff truncated at 8000 chars — the symbols above "
+                _out[:8000] + "\n[diff truncated at 8000 chars — the symbols above "
                 "are complete up to this point, the rest was not shown]"
             )
         if _missing:
@@ -16957,9 +16950,12 @@ class AgenticPlanner:
         """
         # ── Step 1: is this a retrieval, on six independent signals ──
         try:
-            _cls = self._f._project_state_manager.get_pstate(
-                project_id
-            ).get("turn_classification") or {}
+            _cls = (
+                self._f._project_state_manager.get_pstate(project_id).get(
+                    "turn_classification"
+                )
+                or {}
+            )
             _target = str(_cls.get("retrieval_target", "") or "").strip()
             _kind = self._retrieval_kind(_target)
             _ok = (
@@ -17673,7 +17669,7 @@ class AgenticStepExecutor:
             "that is a later step's job, and a step doing it anyway "
             "spends its budget writing what will be discarded.\n"
             "Anything you looked for and could not find goes in the "
-            "JSON \"needs\" field. There is exactly ONE way to end this "
+            'JSON "needs" field. There is exactly ONE way to end this '
             "answer, and it is the fenced JSON block."
         ),
         "analyze": (
@@ -17956,9 +17952,7 @@ class AgenticStepExecutor:
         _bad = 0
         for _h, _recipe in sorted(cls._INSTRUCTION_RECIPES.items()):
             _uses_kind = any(_n == "kind_template" for _n, _ in _recipe)
-            _kinds = (
-                sorted(cls._INSTRUCTION_TEMPLATES) if _uses_kind else ["-"]
-            )
+            _kinds = sorted(cls._INSTRUCTION_TEMPLATES) if _uses_kind else ["-"]
             for _k in _kinds:
                 _labels: List[str] = []
                 _chars = 0
@@ -17997,9 +17991,7 @@ class AgenticStepExecutor:
                 if _clash:
                     _out.append("    *** CONFLICT: " + "; ".join(_clash))
                 _out.append("")
-        _out.append(
-            "CONFLICTS: none" if not _bad else f"CONFLICTS: {_bad} recipe(s)"
-        )
+        _out.append("CONFLICTS: none" if not _bad else f"CONFLICTS: {_bad} recipe(s)")
         return "\n".join(_out)
 
     def _hypothesis_range(self, step: "AgenticStep") -> str:
@@ -18059,9 +18051,7 @@ class AgenticStepExecutor:
                 step.symbols
             )
         if name == "_TOOLS_MENU":
-            return self._TOOLS_MENU.replace(
-                "{max_tools}", str(_MAX_TOOLS_PER_ROUND)
-            )
+            return self._TOOLS_MENU.replace("{max_tools}", str(_MAX_TOOLS_PER_ROUND))
         if name == "_JSON_CONTRACT":
             # The one fragment carrying a number the parser also uses.
             return self._JSON_CONTRACT.replace(
@@ -18119,13 +18109,10 @@ class AgenticStepExecutor:
             # fallback, so an unknown kind borrowing the analyze
             # template does not inherit the conclusion charter.
             "analyze_charter": bool(
-                step.kind == "analyze"
-                and self._f.valves.analyze_methodology_charter
+                step.kind == "analyze" and self._f.valves.analyze_methodology_charter
             ),
             "has_symbols": bool(step.symbols),
-            "memory_on": bool(
-                getattr(self._f.valves, "napmem_tool_enable", False)
-            ),
+            "memory_on": bool(getattr(self._f.valves, "napmem_tool_enable", False)),
         }
         # ── Step 3: assemble in the recipe's declared order ──
         _parts: List[str] = []
@@ -19274,10 +19261,7 @@ class AgenticOrchestrator:
             # EC-6's own rationale calls for ('explains more of
             # what the user asked about') and the better generation
             # prompt (the actual problem, not a meta-instruction).
-            _fq = (
-                str(getattr(self, "_turn_question", "") or "")
-                or (step.goal or "")
-            )
+            _fq = str(getattr(self, "_turn_question", "") or "") or (step.goal or "")
             _dossiers = await self._f._meta_reasoning._forge_all(
                 _fq,
                 hyps,
@@ -19431,8 +19415,7 @@ class AgenticOrchestrator:
                         break
                 _next = (
                     " | to decide this, the next investigation "
-                    "should check: "
-                    + "; ".join(f"'{c[:80]}'" for c in _dead_plan)
+                    "should check: " + "; ".join(f"'{c[:80]}'" for c in _dead_plan)
                     if _dead_plan
                     else ""
                 )
@@ -20905,9 +20888,7 @@ class AgenticOrchestrator:
                 _bs = getattr(self._f, "_serial_blind_spots", None) or []
                 _bs_goal = ""
                 if _bs:
-                    _bs_names = [
-                        b.split(":", 1)[1] for b in _bs[:4]
-                    ]
+                    _bs_names = [b.split(":", 1)[1] for b in _bs[:4]]
                     _bs_goal = (
                         " — and cover the competition's blind "
                         f"spots: {', '.join(_bs_names)}"
@@ -20915,11 +20896,7 @@ class AgenticOrchestrator:
                     self._f._serial_blind_spots = []
                 new_step = AgenticStep(
                     id=max(s.id for s in plan.steps) + 1,
-                    goal=(
-                        "Investigate: "
-                        + "; ".join(control["needs"][:2])
-                        + _bs_goal
-                    ),
+                    goal=("Investigate: " + "; ".join(control["needs"][:2]) + _bs_goal),
                     kind="investigate",
                 )
                 plan.steps.insert(idx + 1, new_step)
@@ -21687,9 +21664,7 @@ class CommandRouter:
             # whole turn down through inlet's fail-open path, and the
             # user got a degraded answer with no indication why.
             with _CROSS_ENCODER_LOCK:
-                return ce.predict(
-                    self._truncate_pairs_for_cross_encoder(ce, pairs)
-                )
+                return ce.predict(self._truncate_pairs_for_cross_encoder(ce, pairs))
 
         async with self._f._cross_encoder_lock:
             preds = await anyio.to_thread.run_sync(_predict_safely)
@@ -22305,9 +22280,7 @@ class CommandRouter:
                 if isinstance(data.get("direct_retrieval"), bool):
                     result["direct_retrieval"] = data["direct_retrieval"]
                 if isinstance(data.get("retrieval_target"), str):
-                    result["retrieval_target"] = data[
-                        "retrieval_target"
-                    ].strip()[:120]
+                    result["retrieval_target"] = data["retrieval_target"].strip()[:120]
         except Exception as exc:
             self._f._log_debug(
                 f"classify_turn: parse error ({exc}) — using neutral default"
@@ -28250,9 +28223,7 @@ class MetacognitiveReasoningEngine:
         semantics, and both classes hold self._f._symbol_index.
         """
         try:
-            return bool(
-                self._f._symbol_index.find_blocks(qid, project_id)
-            )
+            return bool(self._f._symbol_index.find_blocks(qid, project_id))
         except Exception:
             return False
 
@@ -28956,8 +28927,6 @@ class MetacognitiveReasoningEngine:
     # 7. QueryDecomposition (Capa 1)
     # ═══════════════════════════════════════════════════════════════════════
 
-
-
     async def challenge_hypothesis(
         self,
         hypothesis: str,
@@ -29026,7 +28995,6 @@ class MetacognitiveReasoningEngine:
             return None
         except (json.JSONDecodeError, Exception):
             return None
-
 
     async def delimit_scope(
         self,
@@ -29136,7 +29104,6 @@ class MetacognitiveReasoningEngine:
             return hypothesis
 
     @staticmethod
-
     async def generate_predictions(
         self,
         hypothesis: str,
@@ -29736,10 +29703,7 @@ class MetacognitiveReasoningEngine:
             for _pi, _ptext in _pos:
                 if _pi in _drop:
                     continue
-                if (
-                    difflib.SequenceMatcher(None, _nt, _ptext).ratio()
-                    > 0.9
-                ):
+                if difflib.SequenceMatcher(None, _nt, _ptext).ratio() > 0.9:
                     _drop.add(_ni)
                     _drop.add(_pi)
                     break
@@ -29789,11 +29753,13 @@ class MetacognitiveReasoningEngine:
             # Every rung walked: start again with a fresh budget,
             # which now buys depth on ground already mapped.
             _order = list(self._INVESTIGATION_LADDER)
+
         # ── Step 2: promote the rung the evidence is asking for ──
         def _promote(rung: str) -> None:
             if rung in _order:
                 _order.remove(rung)
                 _order.insert(0, rung)
+
         try:
             _strat = self._get_adaptive_strategy(project_id)
         except Exception:
@@ -29818,9 +29784,7 @@ class MetacognitiveReasoningEngine:
                 if _widen in _order:
                     _promote(_widen)
                     break
-        if _EC10_CRITICAL_RE.search(hyp_text) or _EC10_NEAR_MISS_RE.search(
-            hyp_text
-        ):
+        if _EC10_CRITICAL_RE.search(hyp_text) or _EC10_NEAR_MISS_RE.search(hyp_text):
             # State corruption is visible at the write sites and
             # nowhere else; the structural views cannot see it.
             _promote("writers")
@@ -29901,9 +29865,7 @@ class MetacognitiveReasoningEngine:
         _eff_c = getattr(self._f, "_agentic_effort_override", None)
         if _eff_c and len(_eff_c) > 1 and _eff_c[1] > 0:
             _cycles_max = int(_eff_c[1])
-            self._f._log_debug(
-                f"/agent effort: max {_cycles_max} cycle(s) by request"
-            )
+            self._f._log_debug(f"/agent effort: max {_cycles_max} cycle(s) by request")
         _need = int(self._f.valves.agentic_serial_maturity_confirmed)
         _cov_thr = float(self._f.valves.low_coverage_threshold)
         _cycle = 0
@@ -29929,18 +29891,12 @@ class MetacognitiveReasoningEngine:
             # structurally; what changed is that the CODE brought in
             # alongside is now chosen rather than whatever the last
             # analysis happened to name.
-            _line = self._select_investigation(
-                _cycle, _dossier, hyp_text, project_id
-            )
+            _line = self._select_investigation(_cycle, _dossier, hyp_text, project_id)
             self._tag_strategy(_dossier, f"investigate:{_line}")
             _probe = (
                 hyp_text
                 + ("\n" + _last_analysis[:600])
-                + (
-                    "\n" + "\n".join(_predictions[:3])
-                    if _predictions
-                    else ""
-                )
+                + ("\n" + "\n".join(_predictions[:3]) if _predictions else "")
             )
             evidence = self.gather_evidence(_probe, project_id)
             _sym_true = [k for k, v in evidence.symbols_found.items() if v]
@@ -29998,9 +29954,7 @@ class MetacognitiveReasoningEngine:
                     except Exception:
                         continue
                     _take(_nb, f"{_line}:{_sym}")
-                    for _n in re.findall(
-                        r"[A-Za-z_][A-Za-z0-9_.]{2,}", _nb or ""
-                    )[:3]:
+                    for _n in re.findall(r"[A-Za-z_][A-Za-z0-9_.]{2,}", _nb or "")[:3]:
                         if _budget <= 0:
                             break
                         try:
@@ -30218,9 +30172,9 @@ class MetacognitiveReasoningEngine:
                 try:
                     _obj = _json.JSONDecoder().raw_decode(_t[_pos:])[0]
                     _analysis = str(_obj.get("analysis", ""))
-                    _claims = [
-                        str(c) for c in (_obj.get("claims") or [])
-                    ][: self._MAX_CLAIMS_PER_CYCLE]
+                    _claims = [str(c) for c in (_obj.get("claims") or [])][
+                        : self._MAX_CLAIMS_PER_CYCLE
+                    ]
                     break
                 except Exception:
                     continue
@@ -30424,9 +30378,7 @@ class MetacognitiveReasoningEngine:
                     )
                 except Exception as _e_an:
                     _an = ""
-                    self._f._log_debug(
-                        f"forge analysis c{_cycle}: skipped ({_e_an!r})"
-                    )
+                    self._f._log_debug(f"forge analysis c{_cycle}: skipped ({_e_an!r})")
                 if _an and _an.strip():
                     _last_analysis = _an.strip()
                     _dossier.analysis = _last_analysis
@@ -30475,9 +30427,7 @@ class MetacognitiveReasoningEngine:
                         if t.startswith("investigate:")
                     }
                 ),
-                min_rungs=int(
-                    self._f.valves.agentic_serial_maturity_min_rungs
-                ),
+                min_rungs=int(self._f.valves.agentic_serial_maturity_min_rungs),
             )
             # Rung tags key internally as 'investigate:callers';
             # the reader sees 'investigated callers'. Other tags
@@ -30516,14 +30466,10 @@ class MetacognitiveReasoningEngine:
             # before, accumulating corroboration only from the
             # evidence each hypothesis was BUILT to explain.
             try:
-                _predictions = await self.generate_predictions(
-                    hyp_text, project_id
-                )
+                _predictions = await self.generate_predictions(hyp_text, project_id)
             except Exception as _e_pred:
                 _predictions = []
-                self._f._log_debug(
-                    f"forge predictions: skipped ({_e_pred})"
-                )
+                self._f._log_debug(f"forge predictions: skipped ({_e_pred})")
             if _predictions:
                 if "deduction" not in _dossier.strategy_trace:
                     _dossier.strategy_trace.append("deduction")
@@ -30546,10 +30492,7 @@ class MetacognitiveReasoningEngine:
         }
         _dossier.blind_spots = [
             f"rung:{r}" for r in self._INVESTIGATION_LADDER if r not in _walked
-        ] + [
-            f"symbol:{s[:60]}"
-            for s in _dossier.unresolved_claims[:3]
-        ]
+        ] + [f"symbol:{s[:60]}" for s in _dossier.unresolved_claims[:3]]
         # The sealed contract, recorded in execution order right after
         # the calls that produced it. This is the pair that makes the
         # dump forensic rather than archival: the calls above show what
@@ -31064,17 +31007,13 @@ class MetacognitiveReasoningEngine:
             # nobody read' sends the next run back over covered
             # ground.
             _unw_plan = [
-                b.split(":", 1)[1]
-                for b in _winner.blind_spots
-                if b.startswith("rung:")
+                b.split(":", 1)[1] for b in _winner.blind_spots if b.startswith("rung:")
             ]
             if _unw_plan:
                 # Worded to fit the plan formatter's 80-char item
                 # cap with all five rung names intact — a truncated
                 # blind-spot list defeats its own purpose.
-                _plan_items.append(
-                    f"walk the unwalked rungs: {', '.join(_unw_plan)}"
-                )
+                _plan_items.append(f"walk the unwalked rungs: {', '.join(_unw_plan)}")
             if _plan_items:
                 _note += (
                     " | to decide this, the next investigation "
@@ -31087,13 +31026,10 @@ class MetacognitiveReasoningEngine:
         # the verdict. Rung names and counts only — identifiers and
         # enums, not rival prose, so R34 holds.
         _unw_note = [
-            b.split(":", 1)[1]
-            for b in _winner.blind_spots
-            if b.startswith("rung:")
+            b.split(":", 1)[1] for b in _winner.blind_spots if b.startswith("rung:")
         ]
-        _note += (
-            f" | scope: {_winner.nodes_read} node(s) read"
-            + (f"; rungs never walked: {', '.join(_unw_note)}" if _unw_note else "")
+        _note += f" | scope: {_winner.nodes_read} node(s) read" + (
+            f"; rungs never walked: {', '.join(_unw_note)}" if _unw_note else ""
         )
         # ── Surviving rivals ──
         # A winner is chosen, but the accounts it beat do not stop
@@ -31119,10 +31055,8 @@ class MetacognitiveReasoningEngine:
             # touches the ranking — the winner was already chosen.
             for _rv in _rivals[:3]:
                 try:
-                    _rv.relation_to_winner, _ = (
-                        self._classify_rival_relation(
-                            _winner, _rv, project_id
-                        )
+                    _rv.relation_to_winner, _ = self._classify_rival_relation(
+                        _winner, _rv, project_id
                     )
                 except Exception:
                     _rv.relation_to_winner = ""
@@ -31152,11 +31086,7 @@ class MetacognitiveReasoningEngine:
                 await self._f._emit_status(
                     f"🧷 Also survived (corroboration {_rv.corroboration:.2f}, "
                     f"{_rv.confirmed_checks} confirmed"
-                    + (
-                        f", {_rv.relation_to_winner}"
-                        if _rv.relation_to_winner
-                        else ""
-                    )
+                    + (f", {_rv.relation_to_winner}" if _rv.relation_to_winner else "")
                     + f"): {_rv.hypothesis[:100]}"
                 )
             self._f._log_debug(
@@ -31181,9 +31111,7 @@ class MetacognitiveReasoningEngine:
         # self-reporting reviewer does not get to overturn measured
         # corroboration. REJECT is surfaced loudly for the reader.
         try:
-            _pr_evidence = self.gather_evidence(
-                _winner.hypothesis, project_id
-            )
+            _pr_evidence = self.gather_evidence(_winner.hypothesis, project_id)
             _pr_design = ExperimentDesign(
                 critical_claims=list(_winner.confirmed_claims[:5]),
                 supportive_claims=[],
@@ -31202,9 +31130,7 @@ class MetacognitiveReasoningEngine:
             _kind = "peer" if _review.is_external else "devil's advocate"
             _note += f" | {_kind}: {_review.verdict}"
             if _review.critiques:
-                _note += " — " + "; ".join(
-                    f"'{c[:80]}'" for c in _review.critiques[:2]
-                )
+                _note += " — " + "; ".join(f"'{c[:80]}'" for c in _review.critiques[:2])
             if "review" not in _winner.strategy_trace:
                 _winner.strategy_trace.append("review")
             # The verdict is announced whatever it says. Surfacing
@@ -31219,8 +31145,7 @@ class MetacognitiveReasoningEngine:
                 )
             else:
                 await self._f._emit_status(
-                    f"⚖️ Adversarial review ({_kind}): "
-                    f"{_review.verdict}"
+                    f"⚖️ Adversarial review ({_kind}): " f"{_review.verdict}"
                 )
             self._f._log_debug(
                 f"judge L4 {_kind}: {_review.verdict} "
@@ -31238,9 +31163,7 @@ class MetacognitiveReasoningEngine:
             # numbers behind it are untouched, and delimit_scope
             # returns the original unchanged when there is nothing
             # to qualify.
-            if _review.verdict in ("REJECT", "QUALIFY") and (
-                _review.critiques
-            ):
+            if _review.verdict in ("REJECT", "QUALIFY") and (_review.critiques):
                 try:
                     _scoped = await self.delimit_scope(
                         _winner.hypothesis,
@@ -31251,9 +31174,7 @@ class MetacognitiveReasoningEngine:
                     )
                 except Exception as _e_sc:
                     _scoped = ""
-                    self._f._log_debug(
-                        f"judge: scoping skipped ({_e_sc})"
-                    )
+                    self._f._log_debug(f"judge: scoping skipped ({_e_sc})")
                 if _scoped and _scoped.strip() != _winner.hypothesis.strip():
                     self._f._log_debug(
                         f"judge L5 scoped: '{_winner.hypothesis[:60]}' "
@@ -31337,10 +31258,9 @@ class MetacognitiveReasoningEngine:
         for _x in _only_a:
             for _y in _only_b:
                 try:
-                    if (
-                        self._relation_in_graph(_x, _y, project_id)
-                        or self._relation_in_graph(_y, _x, project_id)
-                    ):
+                    if self._relation_in_graph(
+                        _x, _y, project_id
+                    ) or self._relation_in_graph(_y, _x, project_id):
                         return "complementary", _overlap
                 except Exception:
                     continue
@@ -31378,11 +31298,7 @@ class MetacognitiveReasoningEngine:
                 for t in d.strategy_trace
                 if t.startswith("investigate:")
             ]
-            _un = [
-                b.split(":", 1)[1]
-                for b in d.blind_spots
-                if b.startswith("rung:")
-            ]
+            _un = [b.split(":", 1)[1] for b in d.blind_spots if b.startswith("rung:")]
             _s = (
                 f"  investigated: {', '.join(_walked) or '(none)'}"
                 f" \u00b7 {d.nodes_read} node(s) of the call tree read"
@@ -31832,6 +31748,7 @@ class MetacognitiveReasoningEngine:
         if design.critical_claims:
             lines.append("Critical claims: " + "; ".join(design.critical_claims[:5]))
         return "\n".join(lines)
+
 
 class HistoryCompressor:
     """
@@ -41040,11 +40957,7 @@ class ContextDumper:
                     project_dir, f"{timestamp_str}_turn_{turn:04d}.agents.md"
                 )
                 with open(_ag_path, "w", encoding="utf-8") as _af:
-                    _af.write(
-                        self._render_agent_records(
-                            _ag_recs, turn, timestamp_str
-                        )
-                    )
+                    _af.write(self._render_agent_records(_ag_recs, turn, timestamp_str))
         except Exception as _e_ag:
             self._f._log_debug(f"agent dump skipped ({_e_ag!r})")
 
@@ -41158,10 +41071,7 @@ class ContextDumper:
         ]
         for _r in records:
             _p = _r.get("payload") or {}
-            _L.append(
-                f"## {_r.get('seq')} · {_r.get('agent')} "
-                f"[{_r.get('kind')}]"
-            )
+            _L.append(f"## {_r.get('seq')} · {_r.get('agent')} " f"[{_r.get('kind')}]")
             if _r.get("kind") == "call":
                 _L.append(
                     f"in {_p.get('in_tokens')} · out {_p.get('out_tokens')} "
@@ -43821,7 +43731,7 @@ class Filter:
             description="Bearer token for the inference API. Leave empty for unauthenticated local servers.",
         )
         llm_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
             description="Primary LLM model identifier used for all in-context completions.",
         )
         llamacpp_endpoint_type: str = Field(
@@ -43987,7 +43897,7 @@ class Filter:
 
         # ── 2.4 Auxiliary models ──────────────────────────────────────────────
         code_block_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
             description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
         )
         # ── 2.5 Multi‑phase response ──────────────────────────────────────────
@@ -45250,7 +45160,7 @@ class Filter:
             ),
         )
         agentic_plan_profile: str = Field(
-            default="full",
+            default="auto",
             description=(
                 "A/B switch between the full scientific method and the "
                 "quick path, from one place. 'auto' (default): the "
@@ -45935,11 +45845,11 @@ class Filter:
 
         # ── 8.12 Generation models ───────────────────────────────────────────
         cot_model_level2: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
             description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
         )
         cot_model_level3: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
             description="Model used for CoT level 3 (scientific multi‑hypothesis).",
         )
 
@@ -46014,7 +45924,7 @@ class Filter:
         )
         raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
         raptor_summary_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
         )
         raptor_summary_max_tokens: int = Field(default=150)
         raptor_min_similarity: float = Field(
@@ -46218,7 +46128,7 @@ class Filter:
             description="Maximum summary blocks kept and re‑injected per request. 0 = keep all.",
         )
         summarization_model: str = Field(
-            default="llamacpp/Qwopus3.6-35B-A3B-Coder-APEX-MTP-I-Compact",
+            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
             description="Model used for all general-purpose summarization tasks.",
         )
         # ═════════════════════════════════════════════════════════════════════════
@@ -47052,9 +46962,7 @@ class Filter:
             # 225 seconds where the same step at 8000 takes half that.
             _over = {_n: _b for _n, _b in _budgets.items() if _b > _cap}
             if _over:
-                _names = ", ".join(
-                    f"{_n}={_b}" for _n, _b in sorted(_over.items())
-                )
+                _names = ", ".join(f"{_n}={_b}" for _n, _b in sorted(_over.items()))
                 warnings.append(
                     f"agentic_runaway_token_cap={_cap} is at or below "
                     f"per-label budget(s) [{_names}] — it will silently "
@@ -48269,14 +48177,9 @@ class Filter:
                     and isinstance(_lastr.get("content"), str)
                     and _lastr["content"].strip()
                 ):
-                    _lastr["content"] = (
-                        _lastr["content"].rstrip()
-                        + "\n\n"
-                        + _rec
-                    )
+                    _lastr["content"] = _lastr["content"].rstrip() + "\n\n" + _rec
                     self._log_debug(
-                        f"outlet: investigation record appended "
-                        f"({len(_rec)} chars)"
+                        f"outlet: investigation record appended " f"({len(_rec)} chars)"
                     )
         except Exception as _e:
             self._log_debug(f"outlet: record append skipped ({_e!r})")
