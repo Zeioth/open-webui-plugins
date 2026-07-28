@@ -6259,22 +6259,119 @@ class ContextBuilder:
         return body, lang
 
     def _inject_tier_xrefs(self, body: str, qid: str, kept_set: Set[str]) -> str:
-        """Add inline comments where this symbol calls another hub in the tier."""
-        lines = body.split("\n")
+        """Annotate call sites where this symbol calls another tier hub.
+
+        A pointer is emitted only when a call site resolves to exactly one
+        symbol of the tier.  Matching on the trailing segment of a qualified
+        id alone makes every ``data.get(...)`` resolve to whichever
+        ``Class.get`` is kept, which fills the rendered body with false
+        cross-references and misinforms the reader about the call graph, so
+        bare names shared by two kept symbols are dropped, definition lines
+        are never annotated, and comments and docstrings are masked out.
+        Resolution is conservative by design: a call whose receiver cannot be
+        tied to the target's own class is left alone, since a missing pointer
+        costs a reader one lookup while a false one teaches a wrong edge.
+
+        Each target is pointed at once per body, and the tier is walked in
+        sorted order, so the rendered text is identical across processes —
+        the tier is a cache prefix and must not depend on set iteration
+        order.
+        """
+        # ── Step 1: index the tier, dropping ambiguous bare names ──
+        by_bare = {}
+        ambiguous = set()
+        for other_qid in sorted(kept_set):
+            if other_qid == qid:
+                continue
+            bare = other_qid.rsplit(".", 1)[-1]
+            if bare in by_bare and by_bare[bare] != other_qid:
+                ambiguous.add(bare)
+                continue
+            by_bare[bare] = other_qid
+        for bare in ambiguous:
+            by_bare.pop(bare, None)
+        if not by_bare:
+            return body
+
+        # ── Step 2: walk the body, tracking docstring state ──
         result = []
-        for line in lines:
-            result.append(line)
-            for other_qid in kept_set:
-                if other_qid == qid:
-                    continue
-                bare = other_qid.rsplit(".", 1)[-1]
-                if (
-                    f"{bare}(" in line
-                    or f"self.{bare}(" in line
-                    or f"->{bare}(" in line
-                ):
-                    result.append(f"    # ↑ see `{other_qid}` in this tier")
+        emitted = set()
+        open_quote = ""
+        for raw_line in body.split("\n"):
+            result.append(raw_line)
+            line = raw_line.rstrip("\r")
+            stripped = line.lstrip()
+
+            rest, in_doc = line, bool(open_quote)
+            while True:
+                if open_quote:
+                    idx = rest.find(open_quote)
+                    if idx < 0:
+                        rest = ""
+                        break
+                    rest, open_quote = rest[idx + 3:], ""
+                else:
+                    match = re.search(r'"""|\'\'\'', rest)
+                    if not match:
+                        break
+                    open_quote, rest = match.group(0), rest[match.end():]
+                    in_doc = True
+            if in_doc:
+                continue
+            if stripped.startswith(("def ", "async def ", "class ", "@", "#")):
+                continue
+
+            # ── Step 3: mask string literals and trailing comments ──
+            code, quote, pos = [], "", 0
+            while pos < len(line):
+                char = line[pos]
+                if quote:
+                    if char == "\\":
+                        pos += 2
+                        continue
+                    if char == quote:
+                        quote = ""
+                elif char in "\"\'":
+                    quote = char
+                elif char == "#":
                     break
+                else:
+                    code.append(char)
+                pos += 1
+            code = "".join(code)
+
+            # ── Step 4: resolve one call site to one tier symbol ──
+            target = ""
+            pattern = (
+                r"(?:(?P<recv>[A-Za-z_][\w.]*)\.)?"
+                r"(?P<name>[A-Za-z_]\w*)\s*\("
+            )
+            for match in re.finditer(pattern, code):
+                candidate = by_bare.get(match.group("name"), "")
+                if not candidate or candidate in emitted:
+                    continue
+                owner = candidate.rsplit(".", 1)[0] if "." in candidate else ""
+                recv = match.group("recv") or ""
+                if recv:
+                    tail = recv.rsplit(".", 1)[-1]
+                    resolved = (
+                        recv == "self"
+                        or recv.startswith("self.")
+                        or bool(owner)
+                        and (tail == owner or recv.endswith(owner))
+                    )
+                else:
+                    resolved = not owner
+                if resolved:
+                    target = candidate
+                    break
+            if not target:
+                continue
+
+            # ── Step 5: emit at the annotated line's indentation ──
+            indent = line[: len(line) - len(stripped)]
+            emitted.add(target)
+            result.append(f"{indent}# ↑ see `{target}` in this tier")
         return "\n".join(result)
 
     def _build_hub_recency_pointers(
@@ -19228,6 +19325,29 @@ class AgenticOrchestrator:
                     "they respond.",
                 )
             )
+    def _symbols_named_in(self, text: str, project_id: str) -> Set[str]:
+        """Return the indexed symbols a free-text question names.
+
+        A step's question is evidence-seeking when it names code the index
+        can resolve: what it wants is a body the pipeline can fetch, not a
+        decision only the user can make. Only dotted or underscored tokens
+        are considered, because those are the shapes a symbol reference
+        takes and ordinary prose does not, and `find_blocks` answers with an
+        empty set for anything it does not know.
+        """
+        # ── Step 1: collect reference-shaped tokens ──
+        pattern = (
+            r"\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w+)+\b"
+            r"|\b[A-Za-z_]*_\w+\b"
+        )
+        candidates = {token.strip(".") for token in re.findall(pattern, text)}
+
+        # ── Step 2: keep the ones the symbol index resolves ──
+        found = set()
+        for name in candidates:
+            if self._f._symbol_index.find_blocks(name, project_id):
+                found.add(name)
+        return found
         # Removed for the same reason as its twin in the pipeline: a
         # trailing disclaimer displaces the clarifying question this
         # slot exists to put last, and gets copied instead of obeyed.
@@ -21096,6 +21216,27 @@ class AgenticOrchestrator:
                 f"in {step.seconds:.1f}s"
             )
 
+            # -- ASK TRIAGE: an ask naming project code is evidence -------
+            # Demoted before the NEEDS region below so the existing
+            # follow-up machinery turns the question into the investigation
+            # it wanted. Left as an ask it would reach the clarification
+            # short-circuit and end the run on a question whose answer is a
+            # body the broker can fetch — the pipeline would be asking the
+            # user to do its own reading.
+            if control["ask"] and len(control["ask"]) >= 8:
+                _named = self._symbols_named_in(control["ask"], project_id)
+                if _named:
+                    _shown = sorted(_named)[:3]
+                    self._f._log_debug(
+                        f"🤖 Agentic: step {step.id} asked about "
+                        f"{', '.join(_shown)} — that is evidence, not "
+                        f"ambiguity; routed to needs"
+                    )
+                    control["needs"] = list(control["needs"]) + [
+                        f"Read the body of {name}" for name in _shown[:2]
+                    ]
+                    control["ask"] = ""
+
             # -- NEEDS: insert ONE extra investigate step after this one ---
             # Optional extra work: a step that reported a concrete gap
             # inserts one follow-up investigate. Bounded by
@@ -21315,9 +21456,21 @@ class AgenticOrchestrator:
                     + " — continuing"
                 )
             if _ask_ok:
+                # Stamp what this clarification cancels. Without it the
+                # synthesis sees a workspace of two finished steps and no
+                # sign that three more were planned, and presents a partial
+                # investigation as a complete one.
+                _cancelled = [
+                    later
+                    for later in plan.steps[idx + 1:]
+                    if later.status not in ("done", "failed")
+                ]
+                for later in _cancelled:
+                    later.skip_reason = "cancelled by clarification"
                 self._f._log_debug(
                     f"🤖 Agentic: step {step.id} asked for clarification — "
-                    f"ending pipeline (stateless)"
+                    f"ending pipeline (stateless), cancelling "
+                    f"{len(_cancelled)} planned step(s)"
                 )
                 self._append_clarification_injections(
                     dynamic_injections, control["ask"]
@@ -39567,15 +39720,28 @@ class MessageAssembler:
         """
         Apply LLMLingua-2 compression to conversation history, with hard cap.
 
-        MIGRATED (step 12): Now gated by `enable_secondary_compaction`. When
-        enabled, it only compresses messages that were NOT already compressed
-        by the primary compactor (looks for markers like `[🗜️ PARTE` or
-        `## Código — Parte`). This prevents double-compression in cascade.
+        Gated by `enable_secondary_compaction`, which is off by default: the
+        compressor is a token classifier trained on natural language, and over
+        a technical transcript it removes exactly the tokens that carry the
+        record's meaning. Measured over one stored turn it dropped the hedges
+        that marked a hypothesis as a hypothesis, dropped one negation of
+        five, and fused five identifiers with the preceding word by removing
+        their backticks, in exchange for 0.34% of the prompt.
+
+        When enabled it still skips messages the primary compactor already
+        summarized (markers like `[🗜️ PARTE` or `## Código — Parte`) to
+        prevent double-compression, and additionally skips any message that
+        cites code — a fence, a backtick, or a bare snake_case or dotted
+        identifier — so that a citation the model may need to resolve later
+        is never rewritten. Users name symbols without backticks, so the
+        bare-identifier arm is what protects their own questions; in a code
+        session this leaves almost nothing eligible, which is the point.
         """
         # --- 1. Gate: secondary compaction is off by default ---
         if not self._f.valves.enable_secondary_compaction:
             self._f._log_debug(
-                "Secondary compaction disabled (enable_secondary_compaction=False)."
+                "Secondary compaction disabled "
+                "(enable_secondary_compaction=False)."
             )
             return messages
 
@@ -39586,27 +39752,47 @@ class MessageAssembler:
         ):
             return messages
 
-        # --- 3. Filter out messages already compressed by the primary compactor ---
+        # --- 3. Skip primary-compacted messages and anything citing code ---
         _PRIMARY_COMPACTED_MARKERS = (
             "[🗜️ PARTE",
             "## Código — Parte",
             "## Código - Parte",
         )
+        _CITATION_RE = re.compile(
+            r"```"
+            r"|`"
+            r"|\b[A-Za-z_]\w*_\w+\b"
+            r"|\b[A-Za-z_]\w*\.[A-Za-z_]\w+\b"
+        )
 
         def _is_primary_compacted(content: str) -> bool:
-            return any(marker in content for marker in _PRIMARY_COMPACTED_MARKERS)
+            return any(
+                marker in content for marker in _PRIMARY_COMPACTED_MARKERS
+            )
 
-        to_compress = []
-        for msg in messages:
+        def _is_eligible(msg: dict) -> bool:
             role = msg.get("role", "")
             content = msg.get("content", "")
-            if role in ("user", "assistant") and content:
-                if not _is_primary_compacted(content):
-                    to_compress.append(msg)
+            if role not in ("user", "assistant") or not content:
+                return False
+            if _is_primary_compacted(content):
+                return False
+            return not _CITATION_RE.search(content)
+
+        to_compress = [msg for msg in messages if _is_eligible(msg)]
+        _cites = sum(
+            1
+            for msg in messages
+            if msg.get("role", "") in ("user", "assistant")
+            and msg.get("content", "")
+            and not _is_primary_compacted(msg.get("content", ""))
+            and _CITATION_RE.search(msg.get("content", ""))
+        )
 
         if not to_compress:
             self._f._log_debug(
-                "Secondary compaction: no eligible messages (all already primary-compacted)."
+                f"Secondary compaction: no eligible messages "
+                f"({_cites} preserved for citing code)."
             )
             return messages
 
@@ -39622,23 +39808,16 @@ class MessageAssembler:
             query=user_question,
         )
 
+        # --- 4. Splice the compressed messages back in original order ---
         comp_iter = iter(compressed)
         out = []
         for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if (
-                role in ("user", "assistant")
-                and content
-                and not _is_primary_compacted(content)
-            ):
-                out.append(next(comp_iter))
-            else:
-                out.append(msg)
+            out.append(next(comp_iter) if _is_eligible(msg) else msg)
 
         self._f._log_debug(
             f"Secondary compaction: compressed {len(to_compress)} message(s) "
-            f"(skipped {len(messages) - len(to_compress)} already primary-compacted)."
+            f"(skipped {len(messages) - len(to_compress)}, of which "
+            f"{_cites} preserved for citing code)."
         )
 
         return out
@@ -46314,8 +46493,15 @@ class Filter:
             description="Number of recent turns exempt from aggressive compression.",
         )
         enable_secondary_compaction: bool = Field(
-            default=True,
-            description="Run LLMLingua (secondary compactor) after the primary compactor, restricted to prose that wasn't already summarized.",
+            default=False,
+            description=(
+                "Run LLMLingua (secondary compactor) after the primary "
+                "compactor. Off by default: it is a natural-language token "
+                "classifier and over a technical transcript it drops hedges, "
+                "negations and identifier delimiters, rewriting the record "
+                "for a fraction of a percent of the prompt. Messages citing "
+                "code are skipped even when this is on."
+            ),
         )
 
         # ── 10.2 Code compression (LLMLingua) ────────────────────────────────
