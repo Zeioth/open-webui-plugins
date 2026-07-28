@@ -12982,6 +12982,11 @@ class LLMOrchestrator:
         label_str = f" ({label})" if label else ""
 
         async with self._f._llm_semaphore:
+            # Taken immediately after the semaphore, because t_start above
+            # is taken before it: everything between the two is queueing
+            # behind another call, and reporting the sum as one number made
+            # a 12-token answer look like ninety seconds of generation.
+            t_acquired = time.monotonic()
             try:
                 model = model_override or self._f.valves.llm_model
                 if not model:
@@ -13001,7 +13006,8 @@ class LLMOrchestrator:
                         future.set_result(cached)
                     self._f._log_debug(
                         f"[LLM] {model}{label_str} (cached) "
-                        f"took {time.monotonic() - t_start:.3f}s"
+                        f"took {time.monotonic() - t_start:.3f}s "
+                        f"(waited {t_acquired - t_start:.3f}s)"
                     )
                     return cached if return_meta else cached.content
 
@@ -13195,7 +13201,8 @@ class LLMOrchestrator:
                         self._f._log_debug(
                             f"[LLM] {model}{label_str} – "
                             f"in:{in_tokens} out:{out_tokens} "
-                            f"took {time.monotonic() - t_start:.3f}s"
+                            f"took {time.monotonic() - t_start:.3f}s "
+                        f"(waited {t_acquired - t_start:.3f}s)"
                             f"{' [TRUNCATED]' if result.truncated else ''}"
                         )
                         # Agent forensics. One hook covers every agent
@@ -13213,6 +13220,12 @@ class LLMOrchestrator:
                                 "in_tokens": in_tokens,
                                 "out_tokens": out_tokens,
                                 "seconds": round(time.monotonic() - t_start, 2),
+                                "wait_seconds": round(
+                                    t_acquired - t_start, 2
+                                ),
+                                "gen_seconds": round(
+                                    time.monotonic() - t_acquired, 2
+                                ),
                                 "finish_reason": getattr(result, "finish_reason", ""),
                                 "truncated": bool(result.truncated),
                                 "max_tokens": (
@@ -13469,6 +13482,19 @@ class LedgerClaim:
     valid_qids: List[str] = field(default_factory=list)
     invalid_qids: List[str] = field(default_factory=list)
     evidence_type: str = "reasoning"
+    # What kind of proposition this is, as the model classified it:
+    # "structural" (existence, a call relation — the graph settles it) or
+    # "behavioural" (what the code returns, branches on, mutates — only the
+    # body settles it). Empty when the model did not say, which is read as
+    # behavioural: demanding evidence for a structural claim wastes a
+    # lookup, while accepting a graph edge as proof of behaviour is the
+    # failure this field exists to stop.
+    claim_kind: str = ""
+    # The symbol whose behaviour is asserted, as opposed to the symbols
+    # merely mentioned. Verifying "A calls B with x" needs A's body, not
+    # B's; without this the required evidence set is every cited symbol,
+    # which is far larger than what the claim actually rests on.
+    subject: str = ""
     verification: str = (
         ""  # "" | confirmed | refuted | unsupported | unverifiable | unoperationalizable
     )
@@ -13751,11 +13777,23 @@ class AgenticEvidenceLedger:
                 continue
             if not text:
                 continue
+            _kind = str(rc.get("kind", "")).strip().lower()
+            if _kind not in ("structural", "behavioural"):
+                _kind = ""
+            _subject = str(rc.get("subject", "")).strip()
             claim = LedgerClaim(
                 step_id=step.id,
                 text=text,
                 qids=qids[:8],
                 confidence=max(0.0, min(1.0, conf)),
+                claim_kind=_kind,
+                # Falls back to the first cited symbol, which matched the
+                # stated subject in 87% of the run's claims — good enough
+                # to aim the evidence fetch, never good enough to decide a
+                # verdict, which is why the judge is told which body it is
+                # looking at and may answer that the body does not settle
+                # the claim.
+                subject=_subject or (qids[0] if qids else ""),
             )
             for qid in claim.qids:
                 # Stored canonical, not as cited: everything downstream
@@ -13969,6 +14007,34 @@ class AgenticEvidenceLedger:
         total = len(self.claims)
         bad = sum(1 for c in self.claims if c.invalid_qids)
         return total, total - bad, bad
+    def verification_counts(self) -> Dict[str, int]:
+        """Tally claims by verification state, unchecked included.
+
+        `counts()` answers a different question — whether the citations
+        resolve — and was standing in for this one. A claim whose symbols
+        all exist and which no check ever touched is fully valid by that
+        measure and completely unverified by this one, and the answer
+        directive was reading the first while its section promised the
+        second.
+
+        The `""` default of `LedgerClaim.verification` is reported under
+        `unchecked` rather than being folded into any other bucket: it is
+        the absence of evidence, not a kind of evidence.
+        """
+        # ── Step 1: one bucket per state the field can hold ──
+        out = {
+            "confirmed": 0,
+            "refuted": 0,
+            "unsupported": 0,
+            "unverifiable": 0,
+            "unoperationalizable": 0,
+            "unchecked": 0,
+        }
+        # ── Step 2: count, mapping the empty default onto its name ──
+        for claim in self.claims:
+            state = claim.verification or "unchecked"
+            out[state] = out.get(state, 0) + 1
+        return out
 
     def _canonical_qid(self, qid: str, project_id: str) -> str:
         """
@@ -14655,6 +14721,231 @@ class AgenticToolBroker:
         return _out
 
 
+class AgenticEvidenceVerifier:
+    """Settle behavioural claims by reading the code they describe.
+
+    The static verifier asks the call graph four questions and none of
+    them opens a body, so a claim about what a method RETURNS could only
+    ever be answered with a fact about what it CALLS. This class closes
+    that gap the only way it can be closed honestly: it fetches the body
+    of the symbol each claim is about and asks whether the code shown
+    supports the statement.
+
+    Two properties make it affordable. Claims cluster by subject — across
+    the measured run, seventeen claims shared one subject, fifteen shared
+    three, twenty-two shared nine — so a handful of bodies covers a whole
+    plan. And the prefill of a large prompt costs nothing on this stack,
+    which the focus-body preload established independently.
+
+    One property makes it trustworthy: a supported verdict must quote the
+    span of code it rests on, and the quote is checked against the body
+    before the verdict is accepted. A judgement that cannot point at the
+    code is not evidence, however probable it sounds.
+    """
+
+    _CONTRACT = (
+        "You are checking claims against code that is shown to you in "
+        "full. For each claim, decide ONLY from the body printed above "
+        "it — not from the name, not from the signature, not from what "
+        "such a function usually does.\n\n"
+        "Return ONLY a JSON object:\n"
+        '{"verdicts": [{"claim": 1, "verdict": "supported", '
+        '"quote": "<literal text copied from the body>"}]}\n\n'
+        'verdict is "supported" when the body states it, "contradicted" '
+        'when the body states otherwise, "indeterminate" when the body '
+        "shown does not settle it — which is a correct and useful answer, "
+        "not a failure.\n"
+        'For "supported" and "contradicted" the quote is REQUIRED and '
+        "must be copied character for character from the body: it is "
+        "checked. A verdict whose quote is not found in the body is "
+        "discarded and the claim is recorded as unsettled, so an "
+        "approximate quote is worth less than an honest "
+        '"indeterminate".\n'
+    )
+
+    def __init__(self, filt):
+        """Hold the filter; all collaborators are reached through it."""
+        self._f = filt
+
+    @staticmethod
+    def needs_evidence(claim: "LedgerClaim") -> bool:
+        """True when only a body can settle this claim.
+
+        An unknown kind counts as behavioural. The two errors are not
+        symmetric: treating a structural claim as behavioural spends a
+        body fetch that was not needed, while treating a behavioural
+        claim as structural lets a call edge stand in as proof of what
+        the code does, which is the substitution this class exists to
+        prevent.
+        """
+        # ── Step 1: refuted and dynamically proven claims are settled ──
+        if claim.verification in ("refuted", "unoperationalizable"):
+            return False
+        if claim.evidence_type == "dynamic":
+            return False
+        # ── Step 2: structural claims are the graph's business ──
+        return claim.claim_kind != "structural" and bool(claim.subject)
+
+    def group_by_subject(
+        self, claims: List["LedgerClaim"]
+    ) -> Dict[str, List[int]]:
+        """Map each subject to the 1-based indices of its claims."""
+        # ── Step 1: one bucket per subject, insertion-ordered ──
+        groups: Dict[str, List[int]] = {}
+        for n, claim in enumerate(claims, 1):
+            if self.needs_evidence(claim):
+                groups.setdefault(claim.subject, []).append(n)
+        return groups
+
+    def fetch_bodies(
+        self, subjects: List[str], project_id: str
+    ) -> Dict[str, str]:
+        """Fetch each subject's body through the broker, deterministically.
+
+        No model judgement is involved in deciding what to read: the
+        subject came from the claim and the body comes from the index.
+        `resolve` never raises and reports an unresolvable name as a
+        bracketed note, which is dropped here — a subject with no body is
+        a claim that stays unsettled, and saying so is `judge`'s job.
+        """
+        # ── Step 1: resolve each subject once, within a char budget ──
+        broker = AgenticToolBroker(self._f)
+        budget = int(
+            getattr(self._f.valves, "agentic_evidence_max_chars", 48000)
+        )
+        bodies: Dict[str, str] = {}
+        used = 0
+        for subject in subjects:
+            if used >= budget and bodies:
+                break
+            text = broker.resolve("EXPAND", subject, project_id)
+            if not text or text.lstrip().startswith("["):
+                continue
+            bodies[subject] = text
+            used += len(text)
+        return bodies
+
+    def _render_prompt(
+        self,
+        claims: List["LedgerClaim"],
+        groups: Dict[str, List[int]],
+        bodies: Dict[str, str],
+    ) -> str:
+        """Lay out each body followed by the claims made about it."""
+        # ── Step 1: one section per subject whose body we hold ──
+        parts: List[str] = []
+        for subject, idxs in groups.items():
+            if subject not in bodies:
+                continue
+            parts.append(bodies[subject])
+            parts.append(f"\nClaims about {subject}:")
+            for n in idxs:
+                parts.append(f"{n}. {claims[n - 1].text}")
+            parts.append("")
+        # ── Step 2: the contract goes last, after all the evidence ──
+        return "\n".join(parts) + "\n" + self._CONTRACT
+
+    async def judge(
+        self,
+        claims: List["LedgerClaim"],
+        groups: Dict[str, List[int]],
+        bodies: Dict[str, str],
+        aligned_prefix: str,
+    ) -> Dict[int, Tuple[str, str]]:
+        """Ask once for all claims; return {index: (verdict, quote)}.
+
+        Verdicts whose quote is absent from the body are dropped rather
+        than downgraded silently, because a quote that is not in the code
+        means the judgement was not made against the code.
+        """
+        # ── Step 1: one call carrying every body and every claim ──
+        prompt = self._render_prompt(claims, groups, bodies)
+        try:
+            response = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=aligned_prefix,
+                model_override=self._f.valves.cot_model_level2,
+                max_tokens=self._f.valves.agentic_verify_max_tokens,
+                temperature=0.1,
+                label="agentic_evidence",
+                response_format={"type": "json_object"},
+                enable_thinking=False,
+            )
+        except Exception as _e:
+            self._f._log_debug(f"🤖 Evidence: call failed ({_e!r})")
+            return {}
+        if not response:
+            return {}
+
+        # ── Step 2: parse, refusing anything malformed ──
+        cleaned = response.replace("```json", "").replace("```", "").strip()
+        try:
+            raw = json.loads(cleaned).get("verdicts", [])
+            assert isinstance(raw, list)
+        except Exception:
+            self._f._log_debug("🤖 Evidence: unparseable verdicts")
+            return {}
+
+        # ── Step 3: keep only verdicts whose quote is really in the body ──
+        by_index = {n: s for s, idxs in groups.items() for n in idxs}
+        out: Dict[int, Tuple[str, str]] = {}
+        dropped = 0
+        for rv in raw:
+            try:
+                n = int(rv.get("claim", 0))
+                verdict = str(rv.get("verdict", "")).strip().lower()
+                quote = str(rv.get("quote", "")).strip()
+            except Exception:
+                continue
+            if n not in by_index or verdict not in (
+                "supported",
+                "contradicted",
+                "indeterminate",
+            ):
+                continue
+            body = bodies.get(by_index[n], "")
+            if verdict in ("supported", "contradicted"):
+                if not quote or " ".join(quote.split()) not in " ".join(
+                    body.split()
+                ):
+                    dropped += 1
+                    out[n] = ("indeterminate", "quote not found in the body")
+                    continue
+            out[n] = (verdict, quote[:200])
+        if dropped:
+            self._f._log_debug(
+                f"🤖 Evidence: {dropped} verdict(s) discarded — the quote "
+                f"was not in the body they claimed to read"
+            )
+        return out
+
+    def apply(
+        self,
+        claims: List["LedgerClaim"],
+        verdicts: Dict[int, Tuple[str, str]],
+    ) -> int:
+        """Stamp the ledger and report how many claims were settled."""
+        # ── Step 1: map the judge's vocabulary onto the ledger's ──
+        mapping = {
+            "supported": "confirmed",
+            "contradicted": "refuted",
+            "indeterminate": "unsupported",
+        }
+        settled = 0
+        for n, (verdict, quote) in verdicts.items():
+            if not (1 <= n <= len(claims)):
+                continue
+            claim = claims[n - 1]
+            claim.verification = mapping[verdict]
+            claim.evidence_type = "code"
+            claim.verification_detail = (
+                f"body of {claim.subject} read: '{quote}'"
+                if verdict != "indeterminate"
+                else f"body of {claim.subject} read; it does not settle this"
+            )[:300]
+            if verdict != "indeterminate":
+                settled += 1
+        return settled
 class AgenticStaticVerifier:
     """
     Fase 4 static verification: turns ledger claims into typed checks and
@@ -14700,6 +14991,7 @@ class AgenticStaticVerifier:
         project_id: str,
         aligned_prefix: str,
         truncated_steps: Optional[List[AgenticStep]] = None,
+        only_unchecked: bool = False,
     ) -> None:
         """
         Execute a verify step in place: elicit checks, run them, stamp
@@ -14723,7 +15015,15 @@ class AgenticStaticVerifier:
                 not withheld, so the verdict is "degraded", not "done".
         """
         started = time.monotonic()
-        claims = list(ledger.claims)
+        # A closing sweep asks only for what has no verdict yet. Re-eliciting
+        # checks for settled claims would spend the call on work already done
+        # and, worse, let a second reading overturn a verdict the graph
+        # already gave — the point of the sweep is coverage, not revision.
+        claims = [
+            c
+            for c in ledger.claims
+            if not (only_unchecked and c.verification)
+        ]
         if not claims:
             # An empty ledger has two very different causes and they must not
             # read alike. If earlier steps were truncated, their claims were
@@ -14765,6 +15065,39 @@ class AgenticStaticVerifier:
         results = [self._execute(ch, project_id) for ch in checks]
         self._apply_verdicts(claims, checks, results)
         step.output = self._render_report(checks, results, mode)
+
+        # Region: evidence pass — behavioural claims are settled by bodies
+        # The graph answers four questions and none of them opens a body,
+        # so every claim about what the code DOES was previously judged by
+        # a fact about what it CALLS. This runs after the graph pass so a
+        # structural claim keeps its cheap, correct verdict, and only the
+        # claims the graph cannot speak to reach the reader's body.
+        if getattr(self._f.valves, "agentic_evidence_verify", True):
+            _ev = AgenticEvidenceVerifier(self._f)
+            _groups = _ev.group_by_subject(claims)
+            if _groups:
+                _bodies = _ev.fetch_bodies(list(_groups), project_id)
+                if _bodies:
+                    _verdicts = await _ev.judge(
+                        claims, _groups, _bodies, aligned_prefix
+                    )
+                    _settled = _ev.apply(claims, _verdicts)
+                    self._f._log_debug(
+                        f"🤖 Evidence: {len(_groups)} subject(s), "
+                        f"{sum(len(v) for v in _groups.values())} "
+                        f"behavioural claim(s), {len(_bodies)} body/bodies "
+                        f"read, {_settled} settled from code"
+                    )
+                    step.output += (
+                        f"\n\n## Evidence verification "
+                        f"({len(_bodies)} body/bodies read)\n"
+                        + "\n".join(
+                            f"- [C{n}] {claims[n - 1].verification}: "
+                            f"{claims[n - 1].verification_detail}"
+                            for n in sorted(_verdicts)
+                            if 1 <= n <= len(claims)
+                        )
+                    )
 
         # Region: Fase 2 — unoperationalizable is not unverified.
         # A claim citing NO qids generates no checks (the fallback skips
@@ -14849,7 +15182,7 @@ class AgenticStaticVerifier:
         except Exception:
             return None
         checks: List[Dict[str, Any]] = []
-        for rc in raw[:12]:
+        for rc in raw:
             try:
                 cid = int(rc.get("claim", 0))
                 kind = str(rc.get("kind", "")).strip().lower()
@@ -14864,9 +15197,65 @@ class AgenticStaticVerifier:
             ):
                 continue
             checks.append({"claim": cid, "kind": kind, "src": src_n, "dst": dst_n})
-        return checks or None
+        kept = self._select_checks(checks, len(claims))
+        if len(kept) < len(checks):
+            _lost = sorted(
+                {int(c["claim"]) for c in checks}
+                - {int(c["claim"]) for c in kept}
+            )
+            self._f._log_debug(
+                f"🤖 Verify: kept {len(kept)} of {len(checks)} elicited "
+                f"check(s)"
+                + (
+                    f" — claim(s) {_lost} left with none"
+                    if _lost
+                    else " (coverage preserved)"
+                )
+            )
+        return kept or None
 
     @staticmethod
+    @staticmethod
+    def _select_checks(
+        checks: List[Dict[str, Any]], n_claims: int
+    ) -> List[Dict[str, Any]]:
+        """Trim a check list to a budget, coverage before repetition.
+
+        The previous rule was `checks[:12]`. On a plan whose ledger held
+        seventeen claims the model returned twenty-four checks covering
+        every one of them, and the slice kept the first twelve, which
+        covered claims one to eight: nine claims lost their only check
+        because they were cited late in a list, and nothing recorded it.
+
+        A claim with no check is indistinguishable from a claim nobody
+        could check, so the first pass gives every claim one check before
+        any claim gets a second. The budget scales with the claims for
+        the same reason, and the ceiling above it exists only to catch a
+        degenerate response, not to ration work — every surviving check
+        is a graph lookup, and the call that produced them is already
+        paid for.
+        """
+        # ── Step 1: a budget that can cover what it is given ──
+        budget = max(12, n_claims)
+        ceiling = max(budget, 4 * max(n_claims, 1))
+
+        # ── Step 2: first pass, one per claim in claim order ──
+        first: Dict[int, Dict[str, Any]] = {}
+        extra: List[Dict[str, Any]] = []
+        for check in checks:
+            cid = int(check.get("claim", 0))
+            if cid not in first:
+                first[cid] = check
+            else:
+                extra.append(check)
+        out = [first[cid] for cid in sorted(first)][:budget]
+
+        # ── Step 3: spend what is left on the repeats, in order ──
+        for check in extra:
+            if len(out) >= min(budget + len(first), ceiling):
+                break
+            out.append(check)
+        return out
     def _fallback_checks(claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
         """Deterministic pass: pairwise edges for 2+ cited qids, existence
         for single citations. Some signal is better than none."""
@@ -14882,7 +15271,7 @@ class AgenticStaticVerifier:
                 )
             elif qids:
                 checks.append({"claim": n, "kind": "exists", "src": qids[0]})
-        return checks[:12]
+        return AgenticStaticVerifier._select_checks(checks, len(claims))
 
     # ── Deterministic execution ──────────────────────────────────────────
 
@@ -17129,6 +17518,19 @@ class AgenticPlanner:
                 "[No diff: the previous answer carried no fenced code "
                 "block, so there is nothing to compare against the index.]"
             )
+        # Renderer scaffolding is not source. The hub-bodies tier annotates
+        # bodies with `# \u2191 see 'X' in this tier`, and a model that read
+        # one and echoed it while writing code hands back a block that is not
+        # the code it is claiming to be. `_fetch_stored_diffs` already
+        # declines stored rows for this, on the same reasoning: a diff whose
+        # body carries lines the file never had looks applicable and is not.
+        if _TIER_POINTER_RE.search(_emitted):
+            return (
+                "[No diff: the emitted code carries hub-tier pointer "
+                "comments, which are rendering scaffolding rather than "
+                "source. Diffing it would produce hunks the file cannot "
+                "accept. Re-emit the code without those comment lines.]"
+            )
         _names = list(dict.fromkeys(self._EMITTED_SYMBOL_RE.findall(_emitted)))
         if not _names:
             return (
@@ -17144,6 +17546,19 @@ class AgenticPlanner:
         _missing: List[str] = []
         for _name in _names[:4]:
             _qid = _broker._qid_for(_name, project_id)
+            # The resolver answers an ambiguous bare name with one candidate
+            # rather than declining, and `get` alone matches several classes.
+            # Requiring the resolved qid to END in the emitted name is the
+            # cheap half of the guard that was missing: it costs one string
+            # compare and it is exactly what would have caught `get`
+            # resolving to `_load_from_db`.
+            if _qid and _qid.rsplit(".", 1)[-1] != _name.rsplit(".", 1)[-1]:
+                self._f._log_debug(
+                    f"RT-4 emitted-diff: '{_name}' resolved to '{_qid}', "
+                    f"which is a different symbol — not compared"
+                )
+                _missing.append(_name)
+                continue
             _block = None
             if _qid:
                 for _bh in self._f._symbol_index.find_blocks(_qid, project_id):
@@ -17202,7 +17617,8 @@ class AgenticPlanner:
             _out += (
                 "\n\n[Not compared: "
                 + ", ".join(_missing)
-                + " — no live indexed counterpart found.]"
+                + " — no live indexed counterpart could be identified "
+                "without guessing which original it belongs to.]"
             )
         return _out
 
@@ -17283,14 +17699,35 @@ class AgenticPlanner:
             )
             + " (no pipeline)"
         )
+        # Two situations, two instructions. They used to share one,
+        # led by "present it verbatim inside a fenced block", with the
+        # empty case as a trailing clause. On the 28 July 12:42 run the
+        # fetcher returned the 184-character note saying the table held
+        # no diff, and the answer opened a fenced block anyway and filled
+        # it with a diff the model composed from bodies it had read,
+        # complete with an `--- indexed/... +++ emitted/...` header in
+        # our own format and the hub-tier pointer comments copied out of
+        # the rendered body. The honest note went underneath it, which is
+        # how a fabricated artifact came to be published alongside the
+        # statement that no artifact existed.
+        if _art.lstrip().startswith("[No "):
+            return (
+                "## Retrieved for this turn\n\n"
+                "The user asked for an artifact and the pipeline looked "
+                "for it. It does not exist. Say so in one sentence, in "
+                "the words below, and stop.\n\n"
+                "Write NO fenced block and NO diff. Do not reconstruct, "
+                "infer or compose the artifact from code you have read: "
+                "an artifact you assemble yourself is not the one that "
+                "was asked for, and presenting it as such is worse than "
+                "the absence.\n\n" + _art
+            )
         return (
             "## Retrieved for this turn\n\n"
             "The user asked for an artifact and the pipeline fetched it "
             "directly. Present it verbatim inside a fenced block and add "
-            "at most one sentence saying what it is. Do not investigate, "
-            "do not explain what might be wrong with it, and if the text "
-            "below says it could not be produced, say exactly that and "
-            "stop.\n\n" + _art
+            "at most one sentence saying what it is. Do not investigate "
+            "and do not explain what might be wrong with it.\n\n" + _art
         )
 
     async def plan(
@@ -18152,8 +18589,18 @@ class AgenticStepExecutor:
         "\n\nWhen you finish, end with a fenced JSON block exactly like:\n"
         "```json\n"
         '{"claims": [{"claim": "<one factual statement>", '
-        '"qids": ["<exact qualified symbol name>"], "confidence": 0.7}]}\n'
+        '"qids": ["<exact qualified symbol name>"], "confidence": 0.7, '
+        '"kind": "behavioural", "subject": "<the qid it is ABOUT>"}]}\n'
         "```\n"
+        'Set "kind" to "structural" when the claim asserts only that a '
+        "symbol exists or that one calls another — the call graph settles "
+        'those. Set it to "behavioural" when it asserts what the code '
+        "DOES: what it returns, which branch it takes, what it mutates, in "
+        'what order. Set "subject" to the qid whose behaviour the claim '
+        "describes, which is not always the first one you cite: "
+        "\"A calls B with x\" is about A. A behavioural claim is settled "
+        "by reading the subject's body and by nothing else, so naming the "
+        "subject correctly is what makes the claim checkable at all.\n"
         "Only include claims you can tie to symbols present in the context, "
         "using their qualified names exactly as written. Every claim must "
         "NAME ITS MEASUREMENT: the exact qualified symbol(s) whose "
@@ -19023,7 +19470,11 @@ class AgenticSynthesisComposer:
             lines.append(f"Step {s.id} ({s.kind}) verified evidence:")
             if ledger is not None:
                 for c in _step_claims:
-                    badge = "⚗ " if c.evidence_type == "dynamic" else ""
+                    badge = (
+                        "⚗ "
+                        if c.evidence_type == "dynamic"
+                        else ("📖 " if c.evidence_type == "code" else "")
+                    )
                     if c.verification == "refuted":
                         lines.append(
                             f"- {badge}✗ REFUTED: {c.text} "
@@ -19075,6 +19526,20 @@ class AgenticSynthesisComposer:
                             f"{', '.join(c.unread_qids)} — EXPAND it "
                             f"before relying on this, or say what is "
                             f"still unknown)"
+                        )
+                    elif not c.verification:
+                        # No check ever touched this claim. It used to
+                        # render as a bare ✓, identical to one whose
+                        # citations merely resolve, and a later step read
+                        # the tick as settlement. Absence of evidence gets
+                        # its own mark: the citations existing is not the
+                        # claim being true.
+                        cited = f" [{', '.join(c.valid_qids)}]" if c.valid_qids else ""
+                        lines.append(
+                            f"- ? {c.text}{cited} (NOT CHECKED — no "
+                            f"verification ran against this claim; it is "
+                            f"neither confirmed nor refuted. Do not build "
+                            f"on it without saying it is unchecked)"
                         )
                     else:
                         cited = f" [{', '.join(c.valid_qids)}]" if c.valid_qids else ""
@@ -19171,11 +19636,14 @@ class AgenticSynthesisComposer:
             ("```" in (s.output or "")) or ("```" in (s.digest or ""))
             for s in plan.steps
         )
+        _vc = self._ledger.verification_counts()
         lines += self._answer_format_directive(
             ok,
             bad,
             _has_code,
             getattr(self._f, "_serial_unwalked_rungs", None),
+            _vc.get("unchecked", 0),
+            _vc.get("unsupported", 0),
         )
         return "\n".join(lines).rstrip()
 
@@ -19185,6 +19653,8 @@ class AgenticSynthesisComposer:
         n_invalid: int,
         has_code: bool,
         unwalked_rungs: Optional[List[str]] = None,
+        n_unchecked: int = 0,
+        n_unsupported: int = 0,
     ) -> List[str]:
         """
         Instruct the final model on the SHAPE of its answer.
@@ -19229,7 +19699,18 @@ class AgenticSynthesisComposer:
         # confabulable.
         _unw = unwalked_rungs or []
         _scope_gap = len(_unw) >= 4
-        if n_invalid > 0 or n_valid == 0 or _scope_gap:
+        # n_valid and n_invalid measure whether the CITATIONS resolve.
+        # Coverage is a separate question and used to be invisible here:
+        # a claim no check ever touched is fully valid by the citation
+        # measure, so a plan could reach the reader with two thirds of its
+        # claims unverified and this section silent.
+        if (
+            n_invalid > 0
+            or n_valid == 0
+            or _scope_gap
+            or n_unchecked > 0
+            or n_unsupported > 0
+        ):
             out += [
                 "",
                 "**What was not verified** — what this investigation "
@@ -19239,6 +19720,26 @@ class AgenticSynthesisComposer:
                 "acknowledged gap is worth more to the reader than a "
                 "confident sentence papering over it.",
             ]
+            if n_unchecked or n_unsupported:
+                _parts = []
+                if n_unchecked:
+                    _parts.append(
+                        f"{n_unchecked} claim(s) marked NOT CHECKED in the "
+                        f"workspace, against which no verification ran at all"
+                    )
+                if n_unsupported:
+                    _parts.append(
+                        f"{n_unsupported} claim(s) whose check ran and came "
+                        f"back unsupported by the indexed graph"
+                    )
+                out += [
+                    "",
+                    "This investigation carried " + " and ".join(_parts) + ". "
+                    "Name them in that section and do not give them the voice "
+                    "of a verified finding anywhere else in the reply. An "
+                    "unchecked claim may well be true; what is certain is "
+                    "that nothing here establishes it.",
+                ]
             if _scope_gap:
                 out += [
                     "",
@@ -21582,6 +22083,50 @@ class AgenticOrchestrator:
                 return
 
             idx += 1
+
+        # Region: closing verification sweep — coverage, not placement
+        # The auto-inserted verify sits before the terminal analyze so the
+        # synthesis reasons over verified claims, which it does. But every
+        # claim emitted after it — the analyze step's own, and a forge plan's
+        # rivals and experimentum crucis — had no check by construction: on
+        # the 28 July run that was 21 of the 24 unchecked claims across three
+        # turns. Reporting the gap (the NOT CHECKED marker) tells the reader;
+        # closing it is this. One extra call, only when something is missing,
+        # and only over what is missing.
+        _unchecked = [c for c in self._ledger.claims if not c.verification]
+        if _unchecked and getattr(
+            self._f.valves, "agentic_closing_verify", True
+        ):
+            _sweep = AgenticStep(
+                id=max((s.id for s in plan.steps), default=0) + 1,
+                goal=(
+                    "Check the claims emitted after the plan's verify step"
+                ),
+                kind="verify",
+            )
+            plan.steps.append(_sweep)
+            self._f._log_debug(
+                f"🤖 Agentic: closing verification sweep over "
+                f"{len(_unchecked)} claim(s) with no verdict"
+            )
+            await self._f._emit_status(
+                f"🤖 Agentic: checking {len(_unchecked)} remaining claim(s)"
+            )
+            await self._verifier.run_verify_step(
+                _sweep,
+                self._ledger,
+                project_id,
+                aligned_prefix,
+                truncated_steps=[s for s in plan.steps if s.truncated],
+                only_unchecked=True,
+            )
+            if _sweep.status == "done":
+                _sweep.digest = self._digest(_sweep.output)
+            _left = sum(1 for c in self._ledger.claims if not c.verification)
+            self._f._log_debug(
+                f"🤖 Agentic: closing sweep done — {_left} claim(s) still "
+                f"without a verdict"
+            )
 
         # Region: report a truncated plan once, after the loop
         # Region: generative evaluation + re-plan waves (Fase 9, Nivel 2)
@@ -41602,7 +42147,14 @@ class ContextDumper:
             if _r.get("kind") == "call":
                 _L.append(
                     f"in {_p.get('in_tokens')} · out {_p.get('out_tokens')} "
-                    f"· {_p.get('seconds')}s · finish={_p.get('finish_reason')}"
+                    f"· {_p.get('seconds')}s"
+                    + (
+                        f" (wait {_p.get('wait_seconds')}s + gen "
+                        f"{_p.get('gen_seconds')}s)"
+                        if _p.get("wait_seconds") is not None
+                        else ""
+                    )
+                    + f" · finish={_p.get('finish_reason')}"
                     + ("  **TRUNCATED**" if _p.get("truncated") else "")
                 )
                 _L.append(
@@ -45866,6 +46418,40 @@ class Filter:
                 "and executed against the SymbolIndex / call graph. Costs "
                 "one small LLM call (or zero on the deterministic fallback "
                 "and when there are no claims)."
+            ),
+        )
+        agentic_evidence_verify: bool = Field(
+            default=True,
+            description=(
+                "Settle behavioural claims by reading the body of the "
+                "symbol each one is about, instead of accepting a call-graph "
+                "edge as proof of what the code does. Costs one call per "
+                "verification stage; the bodies are fetched deterministically "
+                "and a supported verdict must quote code that is really "
+                "there."
+            ),
+        )
+        agentic_evidence_max_chars: int = Field(
+            default=48000,
+            ge=0,
+            le=200000,
+            description=(
+                "Character budget for the subject bodies gathered for the "
+                "evidence pass. Claims cluster by subject, so this covers "
+                "far more claims than it looks: one body answered seventeen "
+                "claims in the measured run."
+            ),
+        )
+        agentic_closing_verify: bool = Field(
+            default=True,
+            description=(
+                "Run a closing verification sweep over any claim still "
+                "carrying no verdict after the plan's steps finish. The "
+                "plan's own verify step sits before the terminal analyze so "
+                "the synthesis reads verified claims; everything emitted "
+                "after it — the analyze step's own claims, and a forge "
+                "plan's rivals — had no check at all. Costs one call, only "
+                "when claims are missing a verdict, and only over those."
             ),
         )
         agentic_verify_max_tokens: int = Field(
