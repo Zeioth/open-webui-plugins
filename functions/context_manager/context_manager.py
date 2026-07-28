@@ -359,6 +359,103 @@ class CompetitionRecord:
 # without it they never can.
 _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 
+def _note_body_shown(filt, qid: str) -> None:
+    """
+    Record that the model has now seen the body of a qid this turn.
+
+    Called from the three places that render one: the hub-bodies tier,
+    a Block B activation, and a resolved EXPAND. Both the qualified name
+    and its bare tail go in, because a claim may cite either and the
+    question being answered is "was this shown", not "was this spelled
+    the same way twice".
+
+    Deliberately tolerant of a missing attribute and of anything raising:
+    this is bookkeeping about evidence, and bookkeeping must never be the
+    reason evidence fails to reach the model.
+
+    Args:
+        filt: The Filter holding the per-turn set.
+        qid: The symbol whose body was rendered.
+    """
+    try:
+        _seen = getattr(filt, "_bodies_seen_this_turn", None)
+        if _seen is None:
+            return
+        _seen.add(qid)
+        _seen.add(qid.rsplit(".", 1)[-1])
+    except Exception:
+        pass
+
+
+def _resolve_symbol_name(sym: str, find_blocks, qualified_for, all_names):
+    """
+    Resolve a symbol name the model wrote to one the index actually holds.
+
+    Exact match first, then two normalisations that exist because the
+    model does not always write the name it read. Measured over four
+    turns of dumps: 168 cited qids, 45 that no exact lookup could
+    resolve. Ten of those were snake_case symbols rewritten in camelCase
+    — buildBlockA for build_block_a, _updateActiveCode for
+    _update_active_code, _reindexBlockSymbolsWithDocstrings for a method
+    whose real name carries eight underscores. Another was cited as
+    get_resolved_call_graph_MODE for a method spelled entirely lower
+    case. The model normalises identifiers toward conventions this
+    codebase does not use, and an exact-match resolver answers that with
+    "symbol not found".
+
+    That answer costs far more than the typo. A failed EXPAND still
+    spends its tool round, returns nothing, and leaves the step to write
+    about a body it never saw — which is the failure the tool exists to
+    prevent.
+
+    Both fallbacks are exact matches against the index AFTER a
+    transformation, never fuzzy scoring: a name either becomes one the
+    index holds or it does not. Nothing is guessed, so a wrong name still
+    fails and still says so.
+
+    Shared by the tool broker and the static verifier because they had
+    the same five-line resolver copied twice, and a resolver that is
+    taught to handle camelCase in one of them would otherwise still
+    reject it in the other.
+
+    Args:
+        sym: The symbol name as the model wrote it.
+        find_blocks: Callable(name) -> truthy when the index holds it.
+        qualified_for: Callable(name) -> qualified names for a bare name.
+        all_names: Callable() -> every qualified name, for the case-fold
+            pass. May raise or return nothing; that pass is then skipped.
+
+    Returns:
+        A name the index can resolve, or "" when no form matches.
+    """
+    # ── Step 1: the name as written ──
+    if find_blocks(sym):
+        return sym
+    _q = qualified_for(sym)
+    if _q:
+        return sorted(_q)[0]
+    # ── Step 2: camelCase written for a snake_case symbol ──
+    _tail = sym.rsplit(".", 1)[-1]
+    _snake = re.sub(r"(?<!^)(?<!_)([A-Z])", r"_\1", _tail).lower()
+    for _cand in (_snake, _snake.lstrip("_"), "_" + _snake.lstrip("_")):
+        if not _cand or _cand == _tail:
+            continue
+        if find_blocks(_cand):
+            return _cand
+        _q2 = qualified_for(_cand)
+        if _q2:
+            return sorted(_q2)[0]
+    # ── Step 3: the right letters, the wrong case ──
+    try:
+        _fold = _tail.casefold()
+        for _known in all_names() or ():
+            if _known.rsplit(".", 1)[-1].casefold() == _fold:
+                return _known
+    except Exception:
+        pass
+    return ""
+
+
 _MAX_TOOLS_PER_ROUND = 4
 
 _MAX_CLAIMS_PER_STEP = 12
@@ -6155,6 +6252,9 @@ class ContextBuilder:
         candidates.sort(key=lambda x: x[0], reverse=True)
         _, body, block = candidates[0]
         lang = block.symbols[0].language if block.symbols else "python"
+        # Third and last place a body reaches the model: the hub tier,
+        # which unlike the other two arrives unasked, in every prompt.
+        _note_body_shown(self._f, qid)
         return body, lang
 
     def _inject_tier_xrefs(self, body: str, qid: str, kept_set: Set[str]) -> str:
@@ -6979,7 +7079,8 @@ class ContextBuilder:
                             self._f._tokens.truncate_text_to_tokens(body, _cap)
                             + "\n# ... [truncated — use /expand for full body]"
                         )
-                    return f"# `{qid}` (body)\n{body}\n"
+                    _note_body_shown(self._f, qid)
+        return f"# `{qid}` (body)\n{body}\n"
         return ""
 
     # ------------------------------------------------------------------
@@ -13263,6 +13364,11 @@ class LedgerClaim:
         ""  # "" | passed | refuted | inconclusive — set by verify_dynamic
     )
     invalid_relations: List[str] = field(default_factory=list)
+    # Cited symbols that exist but whose BODY the model was never
+    # shown this turn. Not an error on its own — a claim about a call
+    # relation needs no body — but a claim about what a method DOES,
+    # carrying one of these, was written from the signature.
+    unread_qids: List[str] = field(default_factory=list)
 
 
 class AgenticEvidenceLedger:
@@ -13539,12 +13645,30 @@ class AgenticEvidenceLedger:
                 confidence=max(0.0, min(1.0, conf)),
             )
             for qid in claim.qids:
-                if self._qid_exists(qid, project_id):
-                    claim.valid_qids.append(qid)
+                # Stored canonical, not as cited: everything downstream
+                # — the unread-body check, the relation verifier —
+                # compares against names the index uses.
+                _canon = self._canonical_qid(qid, project_id)
+                if _canon:
+                    claim.valid_qids.append(_canon)
                 else:
                     claim.invalid_qids.append(qid)
             # #9: validate asserted call relations, not just symbol existence.
             claim.invalid_relations = self._validate_call_relations(text, project_id)
+            # And the third question, which nothing was asking: was the
+            # BODY of what this claim cites ever put in front of the
+            # model? A citation can name a symbol that exists, assert a
+            # relation the graph confirms, and still describe what the
+            # method DOES having only seen its signature.
+            #
+            # Recorded rather than rejected. A claim about a call
+            # relation legitimately needs no body, and a step can
+            # summarise structure from signatures alone; only a claim
+            # about behaviour is unfounded without one, and telling those
+            # apart is not this function's job. What it can do is count
+            # them, so the gap stops being invisible.
+            _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
+            claim.unread_qids = [q for q in claim.valid_qids if q not in _seen]
             self.claims.append(claim)
         return control
 
@@ -13733,12 +13857,43 @@ class AgenticEvidenceLedger:
         bad = sum(1 for c in self.claims if c.invalid_qids)
         return total, total - bad, bad
 
-    def _qid_exists(self, qid: str, project_id: str) -> bool:
-        """O(1) existence check via the SymbolIndex block maps."""
+    def _canonical_qid(self, qid: str, project_id: str) -> str:
+        """
+        Resolve a cited symbol to the name the index holds, or "".
+
+        Shares the tool broker's resolver rather than checking existence
+        directly, and the reason is an inconsistency that appeared the
+        moment the broker learned to be tolerant. The model cites
+        ContextBuilder.buildBlockA; EXPAND now resolves that to
+        build_block_a and shows the body; and a strict existence check
+        here would still mark the citation invalid — recording the claim
+        as citing a symbol that does not exist WHILE its body sat in the
+        prompt because the same name resolved fine one class away.
+
+        Returning the canonical name rather than a boolean matters for
+        what comes after. valid_qids feeds the unread-body check, which
+        compares against the set of qids whose bodies were rendered — and
+        those are recorded under their real names. A citation kept in the
+        model's spelling would never match one, so every camelCase
+        citation would look unread even after being expanded.
+
+        Args:
+            qid: The symbol as the claim cited it.
+            project_id: Project scope for the lookup.
+
+        Returns:
+            The name the index holds, or "" when nothing matches.
+        """
         try:
-            return bool(self._f._symbol_index.find_blocks(qid, project_id))
+            _si = self._f._symbol_index
+            return _resolve_symbol_name(
+                qid,
+                lambda n: _si.find_blocks(n, project_id),
+                lambda n: _si.get_qualified_names_for(n, project_id),
+                lambda: _si.get_all_qualified_names(project_id),
+            )
         except Exception:
-            return False
+            return ""
 
     # ── Structural-vs-noise classification of unresolved qids (P2/P9) ─────
 
@@ -13895,9 +14050,16 @@ class AgenticEvidenceLedger:
                 if _present is True:
                     invalid.append(f"{_nc}_not_calls_{_ne}")
             for caller, callee in self._CALL_RELATION_RE.findall(_masked):
-                if not self._qid_exists(caller, project_id):
+                # Truthiness is the existence test: the resolver returns
+                # the canonical name or empty. Same question as the
+                # strict check it replaces, and it now answers it for a
+                # camelCase spelling too — which is the point. A relation
+                # asserted in the model's spelling was reported as
+                # involving a symbol that does not exist, while EXPAND
+                # resolved that same name without complaint.
+                if not self._canonical_qid(caller, project_id):
                     continue
-                if not self._qid_exists(callee, project_id):
+                if not self._canonical_qid(callee, project_id):
                     continue
                 # Edge lookup mismatch (root cause of every call relation on a
                 # class method being marked "no edge" live): the regex
@@ -14245,10 +14407,13 @@ class AgenticToolBroker:
 
     def _qid_for(self, sym: str, project_id: str) -> str:
         """Resolve a possibly-bare name to a qualified id ('' when unknown)."""
-        if self._f._symbol_index.find_blocks(sym, project_id):
-            return sym
-        qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
-        return sorted(qids)[0] if qids else ""
+        _si = self._f._symbol_index
+        return _resolve_symbol_name(
+            sym,
+            lambda n: _si.find_blocks(n, project_id),
+            lambda n: _si.get_qualified_names_for(n, project_id),
+            lambda: _si.get_all_qualified_names(project_id),
+        )
 
     def _expand(self, sym: str, project_id: str) -> str:
         """Full body of a symbol from the first live block, char-capped."""
@@ -14267,6 +14432,8 @@ class AgenticToolBroker:
         body = CodeBlockManager.extract_symbol_body(block, qid)
         if not body:
             return f"[EXPAND: body of '{qid}' not extractable]"
+        # The model is about to read this body; record that it did.
+        _note_body_shown(self._f, qid)
         _cap = int(
             getattr(self._f.valves, "agentic_expand_max_chars", self._MAX_BODY_CHARS)
         )
@@ -14608,10 +14775,13 @@ class AgenticStaticVerifier:
 
     def _qid_for(self, sym: str, project_id: str) -> str:
         """Resolve a possibly-bare name to a qualified id ('' when unknown)."""
-        if self._f._symbol_index.find_blocks(sym, project_id):
-            return sym
-        qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
-        return sorted(qids)[0] if qids else ""
+        _si = self._f._symbol_index
+        return _resolve_symbol_name(
+            sym,
+            lambda n: _si.find_blocks(n, project_id),
+            lambda n: _si.get_qualified_names_for(n, project_id),
+            lambda: _si.get_all_qualified_names(project_id),
+        )
 
     def _execute(self, check: Dict[str, Any], project_id: str) -> Tuple[str, str]:
         """
@@ -17131,12 +17301,37 @@ class AgenticPlanner:
         # contract byte-identical.
         qtype_hint = ""
         if question_type and self._f.valves.preplan_question_typing:
+            # Every shape that may skip hypothesize carries the same
+            # closing rule, and it exists because a plan without a forge
+            # still produced a diagnosis. A DESCRIPTIVE turn — "show me
+            # the current source" — came back opening with "Most likely
+            # explanation" and named three syntax errors as the cause. No
+            # rival hypotheses, no graveyard check, no corroboration, no
+            # null bar: none of that machinery runs when no hypothesize
+            # step is scheduled, and the answer never said so.
+            #
+            # The shapes described the PLAN and said nothing about the
+            # ANSWER, so skipping the forge silently removed every
+            # guarantee the forge provides while the wording stayed just
+            # as confident. A conclusion is only as good as what verified
+            # it, and when nothing did, that has to be on the page.
+            _UNVERIFIED_RULE = (
+                "EVIDENCE RULE for this shape: no hypothesize step means "
+                "nothing will be tested against rivals, checked against "
+                "mechanisms already ruled out, or scored for "
+                "corroboration. The analyze step may therefore state only "
+                "what the investigation SHOWS. If a cause suggests itself "
+                "anyway, say it is an unverified conjecture in those "
+                "words and stop there. If establishing the cause is what "
+                "the question actually needs, schedule a hypothesize step "
+                "instead and let it be tested properly.\n\n"
+            )
             _shapes = {
                 "exploratory": (
                     "Question type: EXPLORATORY (no cause proposed). Shape: "
                     "investigate-heavy — map the terrain with investigate "
                     "step(s) BEFORE any hypothesize; do not hypothesize "
-                    "over an unmapped space.\n\n"
+                    "over an unmapped space.\n\n" + _UNVERIFIED_RULE
                 ),
                 "confirmatory": (
                     "Question type: CONFIRMATORY (the user proposes a "
@@ -17149,13 +17344,14 @@ class AgenticPlanner:
                     "Question type: DESCRIPTIVE (factual inventory or "
                     "lookup). Shape: investigate + analyze suffice; do NOT "
                     "schedule hypothesize for factual lookups.\n\n"
+                    + _UNVERIFIED_RULE
                 ),
                 "mechanism": (
                     "Question type: MECHANISM (how does it work). Shape: "
                     "investigate step(s) that trace the call flow "
                     "(callers/callees of the named symbols), then analyze; "
                     "hypothesize only if the trace surfaces a genuine "
-                    "unknown.\n\n"
+                    "unknown.\n\n" + _UNVERIFIED_RULE
                 ),
             }
             qtype_hint = _shapes.get(question_type, "")
@@ -17853,6 +18049,14 @@ class AgenticStepExecutor:
         "no checkable anchor cannot be verified as formulated and will be "
         "marked unoperationalizable — reformulate it as an atomic check "
         "instead (symbol existence, 'A calls B', inheritance). If you have "
+        "A claim about what a symbol DOES — what it returns, which "
+        "branch it takes, what it mutates — requires that its BODY be "
+        "in front of you. A signature tells you a name and its "
+        "arguments; it does not tell you what the code inside does, "
+        "and confidence 1.0 on a body you have not read is a guess "
+        "wearing a number. If the body is not above, EXPAND it first "
+        "or restrict the claim to what you can see. Claims about "
+        "call relations need no body — the graph settles those.\n"
         "Emit AT MOST {max_claims} claims and then close the JSON. That "
         "is a hard limit, not a target: anything past it is discarded "
         "unread, so a longer list costs time and buys nothing. A step "
@@ -18408,6 +18612,15 @@ class AgenticSynthesisComposer:
             total, ok, bad = ledger.counts()
             _claims_total, _claims_bad = total, bad
             header += f"; {total} claims, {ok} with valid citations"
+            # The count that says how much of this was read rather than
+            # inferred. Logged beside the citation counts because they
+            # answer adjacent questions: whether the symbol exists, and
+            # whether anyone looked inside it.
+            _unread = sum(
+                1 for _c in ledger.claims if getattr(_c, "unread_qids", None)
+            )
+            if _unread:
+                header += f", {_unread} citing UNREAD bodies"
             refuted = sum(1 for c in ledger.claims if c.verification == "refuted")
             if refuted:
                 header += f", {refuted} REFUTED"
@@ -18646,6 +18859,27 @@ class AgenticSynthesisComposer:
                             f"- ⚠ {c.text} (asserts call relation(s) with no "
                             f"edge: {', '.join(c.invalid_relations)} — treat "
                             f"as unverified)"
+                        )
+                    elif getattr(c, "unread_qids", None):
+                        # Marked upstream, shown here, because a mark the
+                        # reader never sees changes nothing. A later step
+                        # would otherwise read this claim as settled and
+                        # build a conclusion on top of it.
+                        #
+                        # Below the two branches above deliberately: a
+                        # citation to a symbol that does not exist, and a
+                        # call edge the graph denies, are WRONG. This one
+                        # may well be right — it is merely unbacked, and
+                        # the remedy is one EXPAND rather than a rewrite.
+                        #
+                        # Confirmed claims never reach here, which is
+                        # correct: a call relation the graph has settled
+                        # needs no body to stand.
+                        lines.append(
+                            f"- ⚠ {c.text} (written without reading "
+                            f"{', '.join(c.unread_qids)} — EXPAND it "
+                            f"before relying on this, or say what is "
+                            f"still unknown)"
                         )
                     else:
                         cited = f" [{', '.join(c.valid_qids)}]" if c.valid_qids else ""
@@ -31496,6 +31730,22 @@ class MetacognitiveReasoningEngine:
                 f"🪦 graveyard: buried '{dossier.hypothesis[:60]}' "
                 f"(cause={dossier.cause_of_death})"
             )
+            # Burial is the one thing this method does that the reader has
+            # a stake in, and until now it reached only the log. A ruled-
+            # out mechanism is a RESULT: it is why a later turn will
+            # refuse to propose the same thing, and without seeing it that
+            # refusal arrives with no history behind it. The recall side
+            # was already announced — "Excluding N mechanism(s) already
+            # ruled out" — and this is the side that puts them there.
+            try:
+                await self._f._emit_status(
+                    f"🪦 Ruled out: '{dossier.hypothesis[:70]}' "
+                    f"— {dossier.cause_of_death}; it will not be "
+                    f"proposed again for this code"
+                )
+            except Exception:
+                # Reporting a burial must never undo one.
+                pass
         except Exception as _e:
             self._f._log_debug(f"_bury_hypothesis: skipped ({_e!r})")
 
@@ -46783,6 +47033,21 @@ class Filter:
         # An /agent effort request for the CURRENT turn, or None.
         self._agentic_effort_override: Optional[Tuple[int, int]] = None
 
+        # Qids whose BODY the model has actually been shown this turn.
+        # Three places put one in front of it — the hub-bodies tier, a
+        # Block B activation, and a resolved EXPAND — and until now
+        # nothing recorded which. That gap let a step assert what a
+        # method returns, at confidence 1.0, citing a qid whose body was
+        # never in the prompt: measured in one run, claims of the form
+        # "X returns pstate_raw.get(...)" written from the signature
+        # alone, with the body absent from Block B and no EXPAND
+        # requested for it in the entire turn.
+        #
+        # The verifier could not catch those. It checks call EDGES
+        # against the graph, and what a body RETURNS is not an edge, so
+        # such claims land as unresolved and nobody looks again.
+        self._bodies_seen_this_turn: Set[str] = set()
+
         # -- C6: LTM store completion event --
         self._ltm_store_complete: asyncio.Event = asyncio.Event()
         self._ltm_store_complete.set()  # initially "complete"
@@ -47288,6 +47553,7 @@ class Filter:
             # Same reason: an effort request belongs to the turn that
             # made it, and a later question must not inherit it.
             self._agentic_effort_override = None
+            self._bodies_seen_this_turn = set()
 
             # ------------------------------------------------------------------
             # Region: stop background tasks gracefully before any inlet work
