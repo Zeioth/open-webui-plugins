@@ -359,6 +359,7 @@ class CompetitionRecord:
 # without it they never can.
 _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 
+
 def _note_body_shown(filt, qid: str) -> None:
     """
     Record that the model has now seen the body of a qid this turn.
@@ -17343,8 +17344,7 @@ class AgenticPlanner:
                 "descriptive": (
                     "Question type: DESCRIPTIVE (factual inventory or "
                     "lookup). Shape: investigate + analyze suffice; do NOT "
-                    "schedule hypothesize for factual lookups.\n\n"
-                    + _UNVERIFIED_RULE
+                    "schedule hypothesize for factual lookups.\n\n" + _UNVERIFIED_RULE
                 ),
                 "mechanism": (
                     "Question type: MECHANISM (how does it work). Shape: "
@@ -18616,9 +18616,7 @@ class AgenticSynthesisComposer:
             # inferred. Logged beside the citation counts because they
             # answer adjacent questions: whether the symbol exists, and
             # whether anyone looked inside it.
-            _unread = sum(
-                1 for _c in ledger.claims if getattr(_c, "unread_qids", None)
-            )
+            _unread = sum(1 for _c in ledger.claims if getattr(_c, "unread_qids", None))
             if _unread:
                 header += f", {_unread} citing UNREAD bodies"
             refuted = sum(1 for c in ledger.claims if c.verification == "refuted")
