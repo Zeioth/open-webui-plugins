@@ -12864,11 +12864,20 @@ class LLMOrchestrator:
         # and 31 with a hardcoded 8, from one binary, in one run, with
         # nothing in our own logs to say which was which.
         #
-        # Only the multiplier stays overridable, because it is the one
-        # dimension models.ini cannot express: a global file has no way
-        # to say 'stronger on JSON contracts than on prose'. Everything
-        # else is omitted, and llama.cpp fills an omitted sampler field
-        # from its CLI defaults — which is exactly models.ini.
+        # The multiplier is overridable because it is the one dimension
+        # models.ini cannot express: a global file has no way to say
+        # 'stronger on JSON contracts than on prose'.
+        #
+        # allowed_length travels with it. Omitting it was the mistake
+        # this block used to make, on the reasoning that llama.cpp fills
+        # an omitted sampler field from its CLI defaults "which is
+        # exactly models.ini" — but a field models.ini never mentions is
+        # filled by llama.cpp's own default, and that default is 2. The
+        # startup log read `dry_allowed_length = 2` while the code was
+        # reasoning as if it were 8, which is the difference between
+        # penalizing a repeated sentence and penalizing every identifier
+        # longer than two tokens. Arming a penalty without stating the
+        # length it starts at is arming it without aiming it.
         _extra_body: Optional[Dict[str, Any]] = None
         if response_format is not None:
             _dry = float(getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0)
@@ -12893,7 +12902,12 @@ class LLMOrchestrator:
                 # would never reach; leave their sampling alone.
                 _dry = 0.0
         if _dry > 0:
-            _extra_body = {"dry_multiplier": _dry}
+            _extra_body = {
+                "dry_multiplier": _dry,
+                "dry_allowed_length": int(
+                    getattr(self._f.valves, "llm_dry_allowed_length", 18)
+                ),
+            }
         # Say what was decided. Establishing that DRY had been armed
         # with the server's shape rather than the plugin's took
         # correlating 111 router-log sampler dumps against this
@@ -12902,7 +12916,8 @@ class LLMOrchestrator:
         self._f._log_debug(
             f"sampler ({label}): "
             + (
-                f"dry_multiplier={_dry} sent, shape from server config"
+                f"dry_multiplier={_dry} "
+                f"allowed_length={_extra_body['dry_allowed_length']} sent"
                 if _extra_body
                 else "no dry override sent — server config governs"
             )
@@ -18329,7 +18344,13 @@ class AgenticStepExecutor:
             return str(int(_raw))
         return "2-4"
 
-    def _render_fragment(self, name: str, step: "AgenticStep") -> str:
+    def _render_fragment(
+        self,
+        name: str,
+        step: "AgenticStep",
+        broker: Optional["AgenticToolBroker"] = None,
+        project_id: str = "",
+    ) -> str:
         """
         Resolve one recipe entry to its text.
 
@@ -18348,9 +18369,7 @@ class AgenticStepExecutor:
                 hyp_range=self._hypothesis_range(step),
             )
         if name == "focus_symbols":
-            return "\nFocus symbols suggested by the planner: " + ", ".join(
-                step.symbols
-            )
+            return self._render_focus_symbols(step, broker, project_id)
         if name == "_TOOLS_MENU":
             return self._TOOLS_MENU.replace("{max_tools}", str(_MAX_TOOLS_PER_ROUND))
         if name == "_JSON_CONTRACT":
@@ -18361,8 +18380,83 @@ class AgenticStepExecutor:
         if name == "_PRESENT_INSTRUCTION":
             return self._PRESENT_INSTRUCTION.format(sid=step.id, goal=step.goal)
         return str(getattr(self, name, ""))
+    def _render_focus_symbols(
+        self,
+        step: "AgenticStep",
+        broker: Optional["AgenticToolBroker"] = None,
+        project_id: str = "",
+    ) -> str:
+        """Render the planner's focus symbols, with their bodies attached.
 
-    def build_prompt(self, step: AgenticStep, workspace: str) -> str:
+        The planner already decided what this step is about, so the bodies
+        are fetched here rather than requested from the model. A tool round
+        costs a stop-and-wait against a claims contract that is mandatory
+        and terminal, and the model reliably chooses the contract: measured
+        over two runs and 74 acts, not one `TOOL:` line was ever emitted
+        while steps asserted freely about bodies they had never seen.
+
+        `broker.resolve` never raises — an unresolvable name comes back as a
+        bracketed note, which is itself worth showing, since a focus symbol
+        the index cannot find means the plan named something that does not
+        exist. Bodies arrive char-capped and are recorded as read by the
+        broker, so the unread-citation accounting sees them.
+
+        Falls back to the bare name list when no broker is available, which
+        is how `audit_instruction_recipes` and any other prompt-shape caller
+        keeps working.
+        """
+        # ── Step 1: the names, always ──
+        names = list(step.symbols or [])
+        header = "\nFocus symbols suggested by the planner: " + ", ".join(
+            names
+        )
+        if not broker or not project_id:
+            return header
+
+        # ── Step 2: expand within a declared budget ──
+        budget = int(
+            getattr(self._f.valves, "agentic_preload_focus_max_chars", 32000)
+        )
+        served, skipped, used = [], [], 0
+        for sym in names[:_MAX_TOOLS_PER_ROUND]:
+            body = broker.resolve("EXPAND", sym, project_id)
+            if used + len(body) > budget and served:
+                skipped.append(sym)
+                continue
+            served.append(body)
+            used += len(body)
+        skipped.extend(names[_MAX_TOOLS_PER_ROUND:])
+        if not served:
+            return header
+
+        # ── Step 3: say plainly that these are read, and what is not ──
+        note = (
+            "\n\nTheir bodies are already below — they were fetched for you, "
+            "so do NOT request them again. Anything you assert about these "
+            "symbols must come from the code shown here; if the code does "
+            "not settle a point, say so rather than inferring it from the "
+            "signature.\n\n"
+        )
+        tail = ""
+        if skipped:
+            tail = (
+                "\n[Not preloaded: "
+                + ", ".join(skipped)
+                + " — request with TOOL: EXPAND(<name>) if you need them.]\n"
+            )
+        self._f._log_debug(
+            f"🤖 Agentic: step {step.id} preloaded {len(served)} focus "
+            f"body/bodies ({used} chars), {len(skipped)} left to request"
+        )
+        return header + note + "\n\n".join(served) + tail
+
+    def build_prompt(
+        self,
+        step: AgenticStep,
+        workspace: str,
+        broker: Optional["AgenticToolBroker"] = None,
+        project_id: str = "",
+    ) -> str:
         """
         Render the user-turn prompt for a step, from its instruction recipe.
 
@@ -18420,7 +18514,9 @@ class AgenticStepExecutor:
         for _name, _gate in _recipe:
             if not _gates.get(_gate, False):
                 continue
-            _parts.append(self._render_fragment(_name, step))
+            _parts.append(
+                self._render_fragment(_name, step, broker, project_id)
+            )
         if _sweep:
             self._f._log_debug(
                 f"🤖 Agentic: step {step.id} (investigate) — systematic "
@@ -18432,7 +18528,9 @@ class AgenticStepExecutor:
         return f"## Step instruction\n{instruction}"
 
     _TOOL_RE = re.compile(
-        r"^TOOL:\s*(EXPAND|CALLERS|CALLEES|DOC|GREP|MEMORY)\((.+?)\)\s*$", re.M
+        r"^TOOL:\s*(EXPAND|WRITERS|CALLERS|CALLEES|DOC|GREP|MEMORY)"
+        r"\((.+?)\)\s*$",
+        re.M,
     )
 
     async def run(
@@ -18477,7 +18575,7 @@ class AgenticStepExecutor:
         # connection, never on healthy-but-slow work (Principle 2).
         # ------------------------------------------------------------------
         max_rounds = max(0, self._f.valves.agentic_tool_rounds_max)
-        prompt = self.build_prompt(step, workspace)
+        prompt = self.build_prompt(step, workspace, broker, project_id)
         started = time.monotonic()
         response = ""
         # Region: R19 — tool-round context budget. The step prompt grows
@@ -18564,7 +18662,9 @@ class AgenticStepExecutor:
             # that cost a step 114 seconds alternated two symbols it had
             # been handed in the first round.
             _have.extend(f"{_n}({_a})" for _n, _a in seen)
-            _base = self.build_prompt(step, workspace)
+            _base = self.build_prompt(
+                step, workspace, broker, project_id
+            )
             _tail = (
                 "\n\nYou ALREADY HAVE: "
                 + ", ".join(dict.fromkeys(_have))
@@ -44216,7 +44316,7 @@ class Filter:
             description="Per-call timeout in seconds passed to the HTTP session.",
         )
         llm_json_dry_multiplier: float = Field(
-            default=0.8,
+            default=0.0,
             ge=0.0,
             description=(
                 "Per-request DRY multiplier applied to calls that carry "
@@ -44239,8 +44339,23 @@ class Filter:
                 "before judging this valve."
             ),
         )
+        llm_dry_allowed_length: int = Field(
+            default=18,
+            ge=2,
+            le=64,
+            description=(
+                "Match length at which DRY starts penalizing, sent with the "
+                "multiplier whenever DRY is armed. Never omit it: a field "
+                "models.ini does not mention is filled by llama.cpp's "
+                "default of 2, which penalizes every identifier longer than "
+                "two tokens rather than the repeated sentences DRY is here "
+                "to stop. Measured at 2, 48.2% of emitted symbol ids failed "
+                "to resolve and one symbol came back in eight distinct "
+                "capitalizations across nine emissions."
+            ),
+        )
         llm_long_dry_multiplier: float = Field(
-            default=0.8,
+            default=0.0,
             ge=0.0,
             description=(
                 "Same mechanism as llm_json_dry_multiplier, for the calls "
@@ -46109,6 +46224,20 @@ class Filter:
                 "pre-mortem); the fully-degenerate case (zero valid claims) "
                 "is already covered by the degenerate-workspace warning and "
                 "skips the pre-mortem to avoid duplication."
+            ),
+        )
+        agentic_preload_focus_max_chars: int = Field(
+            default=32000,
+            ge=0,
+            le=64000,
+            description=(
+                "Character budget for the bodies of the planner's focus "
+                "symbols, preloaded into a step's prompt instead of being "
+                "requested through a tool round. Zero disables the preload "
+                "and restores the name-only list. The first symbol is always "
+                "served even if it exceeds the budget, because a step whose "
+                "single focus symbol is too large is better off seeing the "
+                "capped body than seeing nothing."
             ),
         )
         agentic_expand_max_chars: int = Field(
