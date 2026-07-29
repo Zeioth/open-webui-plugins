@@ -6322,7 +6322,11 @@ class ContextBuilder:
                 continue
 
             # ── Step 3: mask string literals and trailing comments ──
-            code, quote, pos = [], "", 0
+            # The accumulator and the joined result are named apart:
+            # one name holding a list and then a string reads as a type
+            # error at the finditer below, which is where a real one
+            # would show.
+            masked, quote, pos = [], "", 0
             while pos < len(line):
                 char = line[pos]
                 if quote:
@@ -6336,9 +6340,9 @@ class ContextBuilder:
                 elif char == "#":
                     break
                 else:
-                    code.append(char)
+                    masked.append(char)
                 pos += 1
-            code = "".join(code)
+            code = "".join(masked)
 
             # ── Step 4: resolve one call site to one tier symbol ──
             target = ""
@@ -13859,11 +13863,25 @@ class AgenticEvidenceLedger:
             for d in json.loads(claims_json):
                 d = dict(d)
                 d["step_id"] = step.id
+                # Per-turn state must not ride in on a cached claim: the
+                # field says which cited bodies were not shown to the model
+                # THIS turn, and the cached value answers that question for
+                # the turn that first wrote it.
+                d.pop("unread_qids", None)
                 key = " ".join(str(d.get("text", "")).casefold().split())
                 if not key or key in existing:
                     continue
                 existing.add(key)
-                self.claims.append(LedgerClaim(**d))
+                _claim = LedgerClaim(**d)
+                # Same computation extract_and_validate runs, at the same
+                # point relative to the claim reaching the ledger.
+                _seen = getattr(
+                    self._f, "_bodies_seen_this_turn", None
+                ) or set()
+                _claim.unread_qids = [
+                    q for q in _claim.valid_qids if q not in _seen
+                ]
+                self.claims.append(_claim)
                 restored += 1
             if restored:
                 self._f._log_debug(
@@ -14064,10 +14082,17 @@ class AgenticEvidenceLedger:
             "hard": 0,
             "read": 0,
             "structural": 0,
+            "blind": 0,
             "unoperationalizable": 0,
             "uncovered": 0,
         }
         # ── Step 2: place each claim by its verdict and its evidence ──
+        # `blind` is split out of `structural` because the two mean opposite
+        # things. A claim about structure, made with the body in front of the
+        # model, is answered correctly by a call-graph edge. The same claim
+        # made about a symbol nobody read is not answered at all: the edge
+        # confirms a relation while the claim describes code that was never
+        # opened. Folding them together hides exactly the case worth finding.
         for claim in self.claims:
             state = claim.verification or ""
             kind = claim.evidence_type or "reasoning"
@@ -14077,6 +14102,8 @@ class AgenticEvidenceLedger:
                 out["uncovered"] += 1
             elif kind in ("code", "dynamic"):
                 out["hard" if state in ("confirmed", "refuted") else "read"] += 1
+            elif getattr(claim, "unread_qids", None):
+                out["blind"] += 1
             else:
                 out["structural"] += 1
         return out
@@ -14828,18 +14855,36 @@ class AgenticEvidenceVerifier:
             return False
         if claim.evidence_type == "dynamic":
             return False
-        # ── Step 2: structural claims are the graph's business ──
-        if claim.claim_kind == "structural" or not claim.subject:
+        # ── Step 2: an unread body is read, whatever the label and
+        # whatever verdict already stands. Both rules below protect a graph
+        # verdict that might be right; neither has anything to protect when
+        # nobody opened the symbol the claim describes.
+        if not claim.subject:
             return False
-        # ── Step 3: only an explicit behavioural claim overturns a verdict ──
-        # Measured in the harness: an unclassified claim the graph confirmed,
-        # given an indeterminate reading of its body, ended as "unsupported".
-        # For a claim the model called behavioural that is correct — the graph
-        # answered a proposition it was not making. For one nobody classified
-        # it discards a verdict that may well have been right, on a guess
-        # about which kind it was. An unclassified claim is still read when it
-        # carries no verdict, which is the case the closing sweep targets.
-        if claim.verification and claim.claim_kind != "behavioural":
+        _unread = bool(getattr(claim, "unread_qids", None))
+
+        # ── Step 3: structural claims are the graph's business, once the
+        # body has been seen. A structural label mostly reports that the
+        # model had nothing else to go on — the symbol whose body was served
+        # produced 23 behavioural claims to one structural, and the symbols
+        # never served produced almost only structural ones. Skipping those
+        # closes a loop: no body, so a structural label; structural label, so
+        # no evidence pass; no evidence pass, so the body is never fetched.
+        # Reading is therefore decided by whether the body was seen, and
+        # superseding by the label, which is the question the label can
+        # actually answer.
+        if claim.claim_kind == "structural" and not _unread:
+            return False
+
+        # ── Step 4: only an explicit behavioural claim overturns a verdict ──
+        # Unchanged except for the unread case: a standing verdict earned
+        # without the body in view is not the kind this rule was written to
+        # defend.
+        if (
+            claim.verification
+            and claim.claim_kind != "behavioural"
+            and not _unread
+        ):
             return False
         return True
 
@@ -15551,13 +15596,15 @@ class AgenticStaticVerifier:
         """Aggregate per-claim: any refuted → refuted; else any confirmed →
         confirmed; else any unsupported → unsupported; else unverifiable."""
         per: Dict[int, List[Tuple[str, str]]] = {}
-        for ch, res in zip(checks, results):
-            per.setdefault(ch["claim"], []).append(res)
+        for ch, outcome in zip(checks, results):
+            per.setdefault(ch["claim"], []).append(outcome)
         for n, claim in enumerate(claims, 1):
-            res = per.get(n)
-            if not res:
+            # Named apart from the loop above: one name holding a tuple and
+            # then a list of tuples reads as a type error at every later use.
+            outcomes = per.get(n)
+            if not outcomes:
                 continue
-            verdicts = [v for v, _ in res]
+            verdicts = [v for v, _ in outcomes]
             if "refuted" in verdicts:
                 claim.verification = "refuted"
             elif "confirmed" in verdicts:
@@ -15566,7 +15613,7 @@ class AgenticStaticVerifier:
                 claim.verification = "unsupported"
             else:
                 claim.verification = "unverifiable"
-            details = [d for v, d in res if v == claim.verification]
+            details = [d for v, d in outcomes if v == claim.verification]
             claim.verification_detail = "; ".join(dict.fromkeys(details))[:300]
 
     @staticmethod
@@ -18631,6 +18678,13 @@ def _find_scaffold_echo(text: str, min_pos: int = 1) -> int:
     return best
 
 
+
+_ALREADY_IN_VIEW_NOTE = (
+    "\n\nTheir bodies are already in the context above. Anything you assert "
+    "about these symbols must come from that code; if it does not settle a "
+    "point, say so rather than inferring it from the signature.\n"
+)
+
 class AgenticStepExecutor:
     """
     Runs a single AgenticStep as a prefix-aligned auxiliary LLM call.
@@ -19106,8 +19160,22 @@ class AgenticStepExecutor:
         budget = int(
             getattr(self._f.valves, "agentic_preload_focus_max_chars", 32000)
         )
-        served, skipped, used = [], [], 0
+        # Block B renders its bodies before any step runs and registers each
+        # one, so a focus symbol already in view needs no second copy. Turn 3
+        # of the 29 July run spent 14551 of 32000 characters re-serving a body
+        # the model was already reading, while two symbols it had asked for by
+        # name went unserved and drew twelve claims from their signatures.
+        #
+        # Matched on the qualified name only: the set also holds bare tails
+        # for the unread-citation counter, which wants to err towards "shown",
+        # and erring that way here would silence a same-named method on a
+        # different class.
+        _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
+        served, skipped, used, already = [], [], 0, []
         for sym in names[:_MAX_TOOLS_PER_ROUND]:
+            if sym in _seen:
+                already.append(sym)
+                continue
             body = broker.resolve("EXPAND", sym, project_id)
             if used + len(body) > budget and served:
                 skipped.append(sym)
@@ -19115,8 +19183,20 @@ class AgenticStepExecutor:
             served.append(body)
             used += len(body)
         skipped.extend(names[_MAX_TOOLS_PER_ROUND:])
-        if not served:
+        if already:
+            self._f._log_debug(
+                f"\U0001f916 Agentic: step {step.id} focus — {len(already)} "
+                f"body/bodies already in context, not re-served "
+                f"({', '.join(already[:3])})"
+            )
+        if not served and not already:
             return header
+        if not served:
+            # Every focus body was already in view. Returning the bare header
+            # would drop the instruction below along with them, and that
+            # instruction is the one telling the step not to reason from a
+            # signature — the exact failure the preload exists to prevent.
+            return header + _ALREADY_IN_VIEW_NOTE
 
         # ── Step 3: say plainly that these are read, and what is not ──
         note = (
@@ -22101,6 +22181,21 @@ class AgenticOrchestrator:
                 and len(plan.steps) < self._f.valves.agentic_max_steps
                 and inserted < 2
             )
+            if control["needs"] and not _needs_capacity:
+                # The gaps a step reports are the symbols it knows it could
+                # not read. Dropping them silently is how a claim ends up
+                # asserted about code nobody opened, with the log showing a
+                # clean turn. Named here so the bound can be sized against
+                # what it costs rather than guessed at.
+                _lost_gaps = [str(g)[:60] for g in control["needs"][:3]]
+                self._f._log_debug(
+                    f"🤖 Agentic: step {step.id} reported "
+                    f"{len(control['needs'])} gap(s) with no capacity to "
+                    f"chase them ({len(plan.steps)}/"
+                    f"{self._f.valves.agentic_max_steps} steps, "
+                    f"{inserted}/2 insertions) — dropped: "
+                    + "; ".join(_lost_gaps)
+                )
             if _needs_capacity:
                 # IR-2: a gap-fill investigation is pointed at the
                 # competition's recorded blind spots alongside the
@@ -22416,7 +22511,6 @@ class AgenticOrchestrator:
                 )
 
 
-        # Region: report a truncated plan once, after the loop
         # Region: generative evaluation + re-plan waves (Fase 9, Nivel 2)
         # The epistemic axis (is it correct?) closed with the verify step;
         # this is the generative axis (is there something better?). Each
@@ -29472,35 +29566,6 @@ class MetacognitiveReasoningEngine:
             ],
         }
 
-    def _compute_coverage_score(
-        self,
-        design: "ExperimentDesign",
-    ) -> float:
-        """
-        DECLARED coverage = labelled_verifiable_claims / total_claims.
-
-        This reads the classifier's LABELS, not reality: a claim counts as
-        covered because design_critical_experiment filed it under critical
-        or supportive, which is a promise that it can be checked — not a
-        demonstration. Use _compute_effective_coverage for anything that
-        weighs how much was actually verified.
-
-        The one place the declared number is the right one is the Active
-        Learning gate, which reasons about the unknown BUCKET itself
-        ("the classifier admits it cannot check most of this, try to
-        reclassify"). There the label is the subject, not the evidence.
-
-        Returns 1.0 when no claims exist (vacuously covered).
-        """
-        total = (
-            len(design.critical_claims)
-            + len(design.supportive_claims)
-            + len(design.unknown_claims)
-        )
-        if total == 0:
-            return 1.0
-        verifiable = len(design.critical_claims) + len(design.supportive_claims)
-        return verifiable / total
 
     def _compute_effective_coverage(
         self,
@@ -34283,21 +34348,6 @@ Code context (recent symbols referenced):
 
         asyncio.create_task(_run())
 
-        self._pending_block_summaries.add(block.hash)
-
-        async def _run() -> None:
-            try:
-                await self.maybe_generate_block_summary(block)
-                if block.block_summary:
-                    # Mark state dirty so the next save_state_if_dirty() persists it.
-                    self._f._conversation_state_manager.mark_dirty(project_id)
-            except Exception as exc:
-                self._f._log_debug(f"Background block summary failed: {exc}")
-            finally:
-                self._pending_block_summaries.discard(block.hash)
-
-        asyncio.create_task(_run())
-
     async def maybe_generate_block_summary(self, block: "CodeBlock") -> None:
         """Generate a summary for an oversized code block when overflow action is 'summarize'.
 
@@ -38135,7 +38185,11 @@ class InletOrchestrator:
                 last_assistant = m
                 asst_rev_idx = i
                 break
-        if last_assistant is None:
+        # Guarded on the index rather than the message: they are set in the
+        # same branch, but only the index is used below, and guarding the
+        # other one leaves a reader — and a type checker — to prove the
+        # coupling for themselves.
+        if last_assistant is None or asst_rev_idx is None:
             return
 
         history_through_assistant = messages[: len(messages) - asst_rev_idx]
@@ -42034,7 +42088,9 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
         _row("read", coverage.get("read", 0),
              "the body was read and does not settle it"),
         _row("structural", coverage.get("structural", 0),
-             "a graph check ran; nothing read the code"),
+             "a graph check settled it, with the body in view"),
+        _row("blind", coverage.get("blind", 0),
+             "asserted about a symbol whose body nobody read"),
         _row("uncovered", coverage.get("uncovered", 0),
              "nothing ran against it"),
     ]
@@ -42445,12 +42501,15 @@ class ContextDumper:
                     project_dir, f"{timestamp_str}_turn_{turn:04d}.agents.md"
                 )
                 with open(_ag_path, "w", encoding="utf-8") as _af:
+                    # Consumed, not merely read: a turn served without the
+                    # pipeline leaves the previous turn's tally in place, and
+                    # taking it here means a value can only ever appear in the
+                    # dump of the turn that produced it.
+                    _cov = getattr(self._f, "_agentic_coverage", None)
+                    self._f._agentic_coverage = None
                     _af.write(
                         self._render_agent_records(
-                            _ag_recs,
-                            turn,
-                            timestamp_str,
-                            getattr(self._f, "_agentic_coverage", None),
+                            _ag_recs, turn, timestamp_str, _cov
                         )
                     )
         except Exception as _e_ag:
@@ -46475,20 +46534,6 @@ class Filter:
                 "default explanation (and the graveyard remembers)."
             ),
         )
-        agentic_funnel_prune: bool = Field(
-            default=True,
-            description=(
-                "EC-8 (the funnel): prune a hypothesis BEFORE paying "
-                "its design LLM call when the free static evidence is "
-                "already fatal — at least 3 graph checks performed, at "
-                "least 2 refuted, and ZERO confirmed. That profile "
-                "(invented symbols/call-graphs with nothing right) "
-                "died after the design call anyway in every observed "
-                "run; the funnel kills it for free. Conservative by "
-                "construction: any confirmed check, or a sparse "
-                "evidence base, exempts the hypothesis from pruning."
-            ),
-        )
         agentic_parsimony_epsilon: float = Field(
             default=0.05,
             ge=0.0,
@@ -46502,24 +46547,6 @@ class Filter:
                 "deterministically from coverage_score x claim count). "
                 "Acts ONLY on ties, so calibrated score semantics are "
                 "untouched. 0.0 disables the tie-break entirely."
-            ),
-        )
-        agentic_corroboration_weight: float = Field(
-            default=0.25,
-            ge=0.0,
-            le=0.6,
-            description=(
-                "EC-4 (corroboration): weight of the corroboration "
-                "term in the hypothesis competition's combined score. "
-                "obj_score is a pure verified/verifiable RATIO, so 1/1 "
-                "and 8/8 both score 1.0 and rivals tie (the R8 "
-                "saturation); corroboration measures the COUNT and "
-                "DIVERSITY of confirmations (saturating exponential "
-                "over confirmed symbol + call-relation checks, +15% "
-                "when both evidence kinds confirm), so more "
-                "independent evidence finally outranks less. The "
-                "obj/llm balance is preserved and scaled by the "
-                "complement. 0.0 restores the pre-EC-4 score exactly."
             ),
         )
         agentic_claims_tail_recovery: bool = Field(
@@ -46643,21 +46670,6 @@ class Filter:
                 "via [REPLICATE-SHADOW]. 'on' = replicate. Cost when it "
                 "fires: one harness-generation LLM call plus one sandbox "
                 "execution."
-            ),
-        )
-        agentic_competition_converge_margin: float = Field(
-            default=0.0,
-            ge=0.0,
-            le=0.5,
-            description=(
-                "Extra convergence condition when early convergence is on: "
-                "the leading hypothesis must beat the runner-up by at least "
-                "this combined-score margin before the competition declares "
-                "victory. 0.0 keeps the original behaviour (absolute "
-                "threshold only). ~0.10–0.15 encodes 'a high score is not "
-                "enough — the winner must DECISIVELY separate from its "
-                "rivals', which is the discrimination the field data "
-                "(all hypotheses are scored each iteration) already supports."
             ),
         )
         hypothesis_target_count: str = Field(
@@ -47107,14 +47119,6 @@ class Filter:
                 "max_iters 2→3. Disable first if latency is critical."
             ),
         )
-        crucis_threshold: float = Field(
-            default=0.12,  # ← 0.12 vs 0.10: catches 10-12% margin ties worth investigating
-            description=(
-                "Score difference below which experimentum crucis is triggered. "
-                "0.12 vs 0.10: triggers ~33% more often, catching borderline ties "
-                "where the information gain is still positive."
-            ),
-        )
         enable_devil_advocate: bool = Field(
             default=True,  # ← ROI=0.160: excellent given 0.25 expected calls
             description=(
@@ -47146,13 +47150,6 @@ class Filter:
         # ROI=0.000 without a second model (degrades to devil_advocate which
         # is already enabled). Activate only when peer_review_model differs
         # from cot_model_level3.
-        peer_review_uncertainty_threshold: float = Field(
-            default=0.5,
-            description=(
-                "Only run peer review when epistemic_uncertainty exceeds this. "
-                "Range [0, 1] — 0.5 = trigger in the genuinely uncertain zone."
-            ),
-        )
 
         # ── 8.9 Scientific method — active learning & coverage (H4 + H2) ────
         # Both free (deterministic, no LLM). Never disable.
@@ -47163,14 +47160,6 @@ class Filter:
                 "exist in the SymbolGraph. Deterministic — no LLM call. "
                 "Directly increases coverage before falsification, preventing "
                 "false negatives where good hypotheses die to the coverage guard."
-            ),
-        )
-        active_learning_max_reclassifications: int = Field(
-            default=3,
-            description=(
-                "Maximum unknown_claims to reclassify per hypothesis per iteration. "
-                "3 covers typical hypotheses (2-4 unknown claims). "
-                "Higher values risk over-expanding verification scope."
             ),
         )
         low_coverage_threshold: float = Field(
@@ -47204,27 +47193,6 @@ class Filter:
         # Harmless with max_iters=2 (cannot fire — needs window+1=3 entries
         # but break fires at iter 3 first). Valve coherence check warns about
         # this at startup. Useful when max_iters is set to 4.
-        enable_stagnation_detection: bool = Field(
-            default=True,  # ← harmless with max_iters=2; useful at max_iters=4
-            description=(
-                "Detect local optima in hypothesis refinement and switch to "
-                "divergent thinking (high temperature, contrarian prompt). "
-                "Harmless with agentic_metacog_max_iters=2 (cannot fire). "
-                "Set agentic_metacog_max_iters=4 to enable effectively."
-            ),
-        )
-        enable_abstention: bool = Field(
-            default=True,
-            description=(
-                "Honest abstention: when no hypothesis survives, distinguish "
-                "'all falsified' (high average coverage — the evidence "
-                "actively refutes them) from 'insufficient evidence' (low "
-                "coverage — the indexed code cannot decide). Below "
-                "abstention_coverage_floor the pipeline abstains explicitly "
-                "instead of reporting a flat failure. Reshapes only the "
-                "no-survivor message; changes no verdict."
-            ),
-        )
         abstention_coverage_floor: float = Field(
             default=0.35,
             ge=0.0,
@@ -47416,25 +47384,9 @@ class Filter:
                 "every turn (most responsive, most calls)."
             ),
         )
-        stagnation_min_delta: float = Field(
-            default=0.02,
-            description=(
-                "Minimum obj_score improvement per window to avoid stagnation. "
-                "0.02 = must improve by at least 2% per window."
-            ),
-        )
 
         # ── 8.11 Scientific method — project‑level metacognition (H5) ───────
         # Free: deterministic analysis post-competition. Compounds over time.
-        enable_metacognitive_debriefing: bool = Field(
-            default=True,  # ← NEVER disable: free, long-term adaptive value
-            description=(
-                "Analyze failure patterns after each competition and adapt "
-                "strategy for future calls in this project. "
-                "Zero additional LLM cost — deterministic SymbolGraph analysis. "
-                "Compounds over the project lifetime."
-            ),
-        )
 
         # ── 8.12 Generation models ───────────────────────────────────────────
         cot_model_level2: str = Field(
@@ -48320,6 +48272,12 @@ class Filter:
 
         # Semaphores
         self._llm_semaphore = asyncio.Semaphore(1)
+        # Per-turn claim-coverage tally, written after the last verdict and
+        # read by the agent dump. Declared here rather than conjured at the
+        # point of first write: an attribute that exists only once something
+        # has written it reads the same as one nothing ever writes, and the
+        # difference only shows as a crash.
+        self._agentic_coverage: Optional[Dict[str, int]] = None
         self._chroma_semaphore = asyncio.Semaphore(2)
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
@@ -48907,6 +48865,10 @@ class Filter:
             # made it, and a later question must not inherit it.
             self._agentic_effort_override = None
             self._bodies_seen_this_turn = set()
+            # Same reason again: the tally is written after the pipeline and
+            # consumed by the dump, and a turn that runs neither would hand
+            # its numbers to whichever turn writes next.
+            self._agentic_coverage = None
 
             # ------------------------------------------------------------------
             # Region: stop background tasks gracefully before any inlet work
