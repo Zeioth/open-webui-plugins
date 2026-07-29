@@ -42020,23 +42020,29 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
     # ── Step 2: the metric first, its parts under it ──
     total = coverage["total"]
     hard = coverage.get("hard", 0)
+
+    def _row(label: str, count: int, note: str) -> str:
+        """One bucket line: absolute, share, and what it means."""
+        return f"- {label:11}{count:4}  {100 * count // total:3}%  {note}"
+
     lines = [
         f"## Claim coverage — {hard}/{total} "
         f"({100 * hard // total}%) settled against real code",
         "",
-        f"- hard       {hard:4}  a body was read and a quote from it verified",
-        f"- read       {coverage.get('read', 0):4}  the body was read and "
-        f"does not settle it",
-        f"- structural {coverage.get('structural', 0):4}  a graph check ran; "
-        f"nothing read the code",
-        f"- uncovered  {coverage.get('uncovered', 0):4}  nothing ran "
-        f"against it",
+        _row("hard", hard,
+             "a body was read and a quote from it verified"),
+        _row("read", coverage.get("read", 0),
+             "the body was read and does not settle it"),
+        _row("structural", coverage.get("structural", 0),
+             "a graph check ran; nothing read the code"),
+        _row("uncovered", coverage.get("uncovered", 0),
+             "nothing ran against it"),
     ]
     _uo = coverage.get("unoperationalizable", 0)
     if _uo:
         lines.append(
-            f"- no anchor  {_uo:4}  nothing to check it against; not a "
-            f"coverage failure"
+            _row("no anchor", _uo,
+                 "nothing to check it against; not a coverage failure")
         )
     lines += ["", ""]
     return "\n".join(lines)
