@@ -12524,6 +12524,25 @@ class LLMOrchestrator:
     # 2. Main LLM caller (with retries, cache, deduplication)
     # ═══════════════════════════════════════════════════════════════════════════
 
+
+    def _note_align(self, outcome: str) -> None:
+        """Tally how each auxiliary call ended up, for one line per turn.
+
+        The prefix alignment is the largest performance feature in the file
+        and every one of its exits returned silently, so a run that spent
+        41% of its wall time re-prefilling looked exactly like a run that
+        did not. Counting the outcomes turns that into a number.
+        """
+        # ── Step 1: a per-turn counter, tolerant of a missing attribute ──
+        try:
+            _t = getattr(self._f, "_align_outcomes_this_turn", None)
+            if _t is None:
+                _t = {}
+                self._f._align_outcomes_this_turn = _t
+            _t[outcome] = _t.get(outcome, 0) + 1
+        except Exception:
+            pass
+
     def _align_system_to_prefix(
         self,
         system_prompt: str,
@@ -12566,9 +12585,11 @@ class LLMOrchestrator:
         effective request.
         """
         if not getattr(self._f.valves, "align_aux_calls_to_prefix", True):
+            self._note_align("valve off")
             return system_prompt
         _prelim = getattr(self._f, "_prelim_system_this_turn", "") or ""
         if not _prelim:
+            self._note_align("no prelim stashed yet")
             return system_prompt
         # ── Guard: idempotence, by HEAD rather than by whole prefix ────────
         # AgenticStepExecutor._aligned_prefix head-caps its copy when prelim
@@ -12586,11 +12607,20 @@ class LLMOrchestrator:
         # prelim a second time.
         _head = _prelim[:512]
         if system_prompt.startswith(_head):
+            self._note_align("already aligned")
             return system_prompt
         # ── Guard: the call must target the model whose slot holds the prefix ──
         _main = getattr(self._f, "_main_model_this_turn", "") or ""
         _aux = effective_model or ""
         if not _main or not _aux or _main.split("/")[-1] != _aux.split("/")[-1]:
+            # Named apart from the warning below, which fires only
+            # when both names exist: an unset name is the case the
+            # warning was written for and the one it cannot report.
+            self._note_align(
+                "model mismatch"
+                if (_main and _aux)
+                else "model name missing"
+            )
             # A name mismatch here (e.g. an OpenWebUI alias in body['model']
             # vs the configured llm_model) silently disables alignment for
             # the whole deployment — the symptom in a run would just be "the
@@ -14793,6 +14823,14 @@ class AgenticToolBroker:
         return _out
 
 
+
+# The one claim shape whose quote must mention something specific: a named
+# call target. Anything vaguer cannot be checked this way without guessing.
+_CALL_TARGET_RE = re.compile(
+    r"\b(?:calls|invokes|delegates to|passes .{0,40}? to)\s+"
+    r"([A-Za-z_][\w.]*)"
+)
+
 class AgenticEvidenceVerifier:
     """Settle behavioural claims by reading the code they describe.
 
@@ -14817,9 +14855,15 @@ class AgenticEvidenceVerifier:
 
     _CONTRACT = (
         "You are checking claims against code that is shown to you in "
-        "full. For each claim, decide ONLY from the body printed above "
-        "it — not from the name, not from the signature, not from what "
-        "such a function usually does.\n\n"
+        "full. Decide from the code printed in this prompt — not from a "
+        "name, not from a signature, not from what a function of that "
+        "name usually does.\n\n"
+        "Each claim is listed under the body of its own subject, and that "
+        "body is where the answer usually is. Some claims describe what "
+        "one symbol obtains from another: 'A reads X from B'. Those are "
+        "settled by B's body, and if B's body is also printed here you "
+        "may quote it. Quote only what is printed; a quote from code not "
+        "shown is discarded.\n\n"
         "Return ONLY a JSON object:\n"
         '{"verdicts": [{"claim": 1, "verdict": "supported", '
         '"quote": "<literal text copied from the body>"}]}\n\n'
@@ -15018,6 +15062,9 @@ class AgenticEvidenceVerifier:
         out: Dict[int, Tuple[str, str]] = {}
         dropped = 0
         unindexed = 0
+        elsewhere = 0
+        offtopic = 0
+        _samples: List[str] = []
         for rv in raw:
             try:
                 n = int(rv.get("claim", 0))
@@ -15040,19 +15087,53 @@ class AgenticEvidenceVerifier:
                 "indeterminate",
             ):
                 continue
-            body = bodies.get(by_index[n], "")
+            # Checked against every body in the prompt, not only the
+            # subject's. A claim of the form "A reads X from B" is settled by
+            # B's body, and scoping the search to A discards a correct
+            # reading as though it were invented. What the check is for is
+            # that the judgement was made against code the judge was shown;
+            # which of the shown bodies carried the line does not bear on it.
             if verdict in ("supported", "contradicted"):
-                if not quote or " ".join(quote.split()) not in " ".join(
-                    body.split()
-                ):
+                _flat = " ".join(quote.split())
+                _found = bool(_flat) and any(
+                    _flat in " ".join(_b.split()) for _b in bodies.values()
+                )
+                if not _found:
                     dropped += 1
-                    out[n] = ("indeterminate", "quote not found in the body")
+                    out[n] = ("indeterminate", "quote not found in any body")
                     continue
+                _own = " ".join(bodies.get(by_index[n], "").split())
+                if _flat not in _own:
+                    elsewhere += 1
+                # A quote can be real code and still be the wrong line. For
+                # the one claim shape where the quote must name something —
+                # "A calls B" and its variants — check that it does. Counted,
+                # not rejected: a call through an alias or a local would fail
+                # this honestly, and two instances in one run is not a number
+                # to build a rule on.
+                _target = _CALL_TARGET_RE.search(claims[n - 1].text)
+                if _target:
+                    _tail = _target.group(1).rsplit(".", 1)[-1]
+                    if _tail and _tail not in _flat:
+                        offtopic += 1
+                        _samples.append(f"{_tail} ∉ quote for claim {n}")
             out[n] = (verdict, quote[:200])
         if dropped:
             self._f._log_debug(
                 f"🤖 Evidence: {dropped} verdict(s) discarded — the quote "
-                f"was not in the body they claimed to read"
+                f"appears in none of the {len(bodies)} body/bodies read"
+            )
+        if elsewhere:
+            self._f._log_debug(
+                f"🤖 Evidence: {elsewhere} verdict(s) settled from a body "
+                f"other than the claim's own subject — cross-symbol "
+                f"readings, kept"
+            )
+        if offtopic:
+            self._f._log_debug(
+                f"🤖 Evidence: {offtopic} verdict(s) quote real code that "
+                f"does not name the call target the claim asserts — kept, "
+                f"but counted: {'; '.join(_samples[:3])}"
             )
         if unindexed:
             self._f._log_debug(
@@ -17750,6 +17831,31 @@ class AgenticPlanner:
             )
         return _out
 
+
+    def _last_answer_emitted_code(self, project_id: str) -> bool:
+        """Whether the previous assistant message carried a fenced block.
+
+        The discriminator between the two readings of "the diff you just
+        applied". Deliberately narrow: a fence is the only thing that could
+        have been applied by the person reading it, and anything softer —
+        a symbol name, a described change — would send genuine stored-diff
+        requests down the computed path.
+
+        Falls back to False on any failure, which restores the previous
+        behaviour rather than replacing one wrong artifact with another.
+        """
+        # ── Step 1: the same source _diff_emitted_against_index reads ──
+        # Reached through the project state manager rather than a stash of
+        # my own: that method already asks this question of the same store,
+        # and two answers to it that could disagree is worse than one.
+        try:
+            _prev = self._f._project_state_manager.get_last_assistant_response(
+                project_id
+            )
+            return "```" in str(_prev or "")
+        except Exception:
+            return False
+
     def _diff_emitted_against_index(self, project_id: str) -> str:
         """
         Unified diff between the code last emitted and the index.
@@ -17935,6 +18041,21 @@ class AgenticPlanner:
 
         # ── Step 2: fetch, deterministically ──
         try:
+            # "the diff you just applied" is ambiguous in one respect the
+            # conversation settles: this assistant applies nothing to a
+            # repository, so if its last message carried a fenced block,
+            # that block is what "applied" refers to and the comparison
+            # belongs against the index. Serving a row from napmem_diffs
+            # there hands over a real diff from some earlier session — 1161
+            # characters of the wrong change on the 29 July run — which
+            # reads as an answer and is not one.
+            if _kind == "diff_stored" and self._last_answer_emitted_code(project_id):
+                self._f._log_debug(
+                    "RT-4 stored-diff: the previous answer carried code, so "
+                    "'just applied' refers to it — computing against the "
+                    "index instead of reading the stored table"
+                )
+                _kind = "diff_compute"
             if _kind == "diff_stored":
                 _art = await self._fetch_stored_diffs(project_id)
             else:
@@ -48278,6 +48399,12 @@ class Filter:
         # has written it reads the same as one nothing ever writes, and the
         # difference only shows as a crash.
         self._agentic_coverage: Optional[Dict[str, int]] = None
+        # Per-turn tally of which exit each auxiliary call took out
+        # of the prefix alignment. Declared rather than conjured at
+        # first write, for the reason ps127 records: an attribute
+        # that exists only once something has written it reads the
+        # same as one nothing ever writes.
+        self._align_outcomes_this_turn: Dict[str, int] = {}
         self._chroma_semaphore = asyncio.Semaphore(2)
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
@@ -48865,6 +48992,20 @@ class Filter:
             # made it, and a later question must not inherit it.
             self._agentic_effort_override = None
             self._bodies_seen_this_turn = set()
+            # Read and cleared together, at the one point every turn
+            # passes through: a run that spends 41% of its wall time
+            # re-prefilling reads exactly like one that does not,
+            # unless something says which exit the auxiliary calls
+            # took.
+            _al = getattr(self, "_align_outcomes_this_turn", None) or {}
+            if _al:
+                self._log_debug(
+                    "\U0001f517 Prefix alignment: "
+                    + ", ".join(
+                        f"{k} x{v}" for k, v in sorted(_al.items())
+                    )
+                )
+            self._align_outcomes_this_turn = {}
             # Same reason again: the tally is written after the pipeline and
             # consumed by the dump, and a turn that runs neither would hand
             # its numbers to whichever turn writes next.
