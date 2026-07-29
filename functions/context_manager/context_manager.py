@@ -3557,6 +3557,10 @@ class ContextPager:
         # project_id -> set of block hashes currently paged out.
         self._paged_hashes: dict = {}
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. State queries
+    # ──────────────────────────────────────────────────────────────────────
+
     def is_paged(self, block_hash: str, project_id: str) -> bool:
         """
         Check if a block hash is currently paged out for a project.
@@ -3584,6 +3588,10 @@ class ContextPager:
     # ------------------------------------------------------------------
     # Region: Eviction & Page-Out
     # ------------------------------------------------------------------
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Eviction — choosing what leaves
+    # ──────────────────────────────────────────────────────────────────────
 
     def get_eviction_candidates(
         self,
@@ -3659,6 +3667,10 @@ class ContextPager:
         selected = [h for h, _, _ in candidates[:n_to_page]]
 
         return selected
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 3. Paging out
+    # ──────────────────────────────────────────────────────────────────────
 
     async def page_out_block(
         self,
@@ -3987,6 +3999,10 @@ class ContextPager:
     # Region: Purge Old Versions
     # ------------------------------------------------------------------
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 4. Purging superseded versions
+    # ──────────────────────────────────────────────────────────────────────
+
     async def purge_old_versions(
         self,
         project_id: str,
@@ -4272,6 +4288,10 @@ class ContextPager:
     # Region: Page-In
     # ------------------------------------------------------------------
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 5. Paging back in
+    # ──────────────────────────────────────────────────────────────────────
+
     async def page_in_block(
         self,
         block_hash: str,
@@ -4427,6 +4447,10 @@ class RaptorCodeIndex:
     # ------------------------------------------------------------------
     # Region: Public API – Rebuild and Retrieve
     # ------------------------------------------------------------------
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Index construction
+    # ──────────────────────────────────────────────────────────────────────
 
     async def rebuild(
         self,
@@ -4704,6 +4728,10 @@ class RaptorCodeIndex:
 
         return created
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Retrieval
+    # ──────────────────────────────────────────────────────────────────────
+
     async def retrieve(
         self,
         query: str,
@@ -4801,6 +4829,10 @@ class RaptorCodeIndex:
     # ------------------------------------------------------------------
     # Region: Graph & Distance Helpers (for clustering)
     # ------------------------------------------------------------------
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 3. Graph features & clustering
+    # ──────────────────────────────────────────────────────────────────────
 
     def _build_adjacency(self, edges_out: dict) -> dict:
         """
@@ -4965,6 +4997,10 @@ class RaptorCodeIndex:
             return result.strip() if result else ""
         except Exception:
             return ""
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 4. Summary persistence & pruning
+    # ──────────────────────────────────────────────────────────────────────
 
     async def _store_summary(
         self,
@@ -13572,6 +13608,10 @@ class AgenticEvidenceLedger:
         self._f = filter_ref
         self.claims: List[LedgerClaim] = []
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Recording claims as steps emit them
+    # ──────────────────────────────────────────────────────────────────────
+
     def _gap_is_non_indexable(self, gap: str) -> bool:
         """Return True when a reported gap asks for data the SymbolIndex
         structurally does not hold, so the NEEDS mechanism should not insert
@@ -13959,6 +13999,10 @@ class AgenticEvidenceLedger:
     # (the repair ladder then salvages only a prefix of the array).
     _RECOVERY_MAX_TOKENS = 2000
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Recovery of a tail a step never produced
+    # ──────────────────────────────────────────────────────────────────────
+
     async def recover_claims_tail(
         self,
         step: AgenticStep,
@@ -14081,6 +14125,10 @@ class AgenticEvidenceLedger:
         )
         return True
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 3. Tallies — what the metric and the dump read
+    # ──────────────────────────────────────────────────────────────────────
+
     def counts(self) -> Tuple[int, int, int]:
         """(total claims, claims fully valid, claims with invalid citations)."""
         total = len(self.claims)
@@ -14164,6 +14212,10 @@ class AgenticEvidenceLedger:
             else:
                 out["structural"] += 1
         return out
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 4. Qid resolution & relation checking
+    # ──────────────────────────────────────────────────────────────────────
 
     def _canonical_qid(self, qid: str, project_id: str) -> str:
         """
@@ -14567,6 +14619,10 @@ class AgenticToolBroker:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Public surface
+    # ──────────────────────────────────────────────────────────────────────
+
     async def resolve_async(self, name: str, arg: str, project_id: str) -> str:
         """
         Async-capable dispatcher: routes MEMORY to its awaitable resolver
@@ -14586,6 +14642,10 @@ class AgenticToolBroker:
             except Exception as e:
                 return f"[MEMORY({arg}) failed: {e}]"
         return self.resolve(name, arg, project_id)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Internals
+    # ──────────────────────────────────────────────────────────────────────
 
     async def _memory(self, query: str, project_id: str) -> str:
         """
@@ -14910,6 +14970,10 @@ class AgenticEvidenceVerifier:
         """Hold the filter; all collaborators are reached through it."""
         self._f = filt
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Public surface
+    # ──────────────────────────────────────────────────────────────────────
+
     @staticmethod
     def needs_evidence(claim: "LedgerClaim") -> bool:
         """True when only a body can settle this claim.
@@ -15029,6 +15093,10 @@ class AgenticEvidenceVerifier:
                 f"unread — raise agentic_evidence_max_chars to cover them"
             )
         return bodies
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Internals
+    # ──────────────────────────────────────────────────────────────────────
 
     def _render_prompt(
         self,
@@ -15325,6 +15393,10 @@ class AgenticStaticVerifier:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Public surface
+    # ──────────────────────────────────────────────────────────────────────
+
     async def run_verify_step(
         self,
         step: AgenticStep,
@@ -15493,6 +15565,10 @@ class AgenticStaticVerifier:
         step.status = "done"
 
     # ── Check elicitation ────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Internals
+    # ──────────────────────────────────────────────────────────────────────
 
     async def _elicit_checks(
         self, claims: List[LedgerClaim], aligned_prefix: str
@@ -16216,6 +16292,10 @@ if __name__ == "__main__":
 
     # ── Step entry point ─────────────────────────────────────────────────
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Entry points — dynamic and regression steps
+    # ──────────────────────────────────────────────────────────────────────
+
     async def run_dynamic_step(
         self,
         step: AgenticStep,
@@ -16355,6 +16435,10 @@ if __name__ == "__main__":
         step.status = "done"
 
     # ── Target selection ─────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Verification core — targets, tests, evidence
+    # ──────────────────────────────────────────────────────────────────────
 
     def _pick_targets(
         self, step: AgenticStep, ledger: "AgenticEvidenceLedger"
@@ -16739,6 +16823,10 @@ if __name__ == "__main__":
             base += f" — {result['detail'][:160]}"
         return base
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 3. Result cache
+    # ──────────────────────────────────────────────────────────────────────
+
     async def _cache_get(self, project_id: str, qid: str) -> Optional[Dict[str, str]]:
         """Row from agentic_harnesses or None (serialized via _db_read)."""
         if self._f._db_conn is None:
@@ -16797,6 +16885,10 @@ if __name__ == "__main__":
             await self._f._state_store._db_enqueue(_write)
         except Exception as e:
             self._f._log_debug(f"🤖 DynamicVerifier: cache write failed — {e}")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 4. TDD hand-off across turns
+    # ──────────────────────────────────────────────────────────────────────
 
     def arm_tdd_verification(self, step: AgenticStep, project_id: str) -> None:
         """
@@ -17183,6 +17275,10 @@ class AgenticPreplanner:
         # Telemetry of the last run, read by the AGENTIC-RUN record.
         self.last_stats: Dict[str, Any] = {}
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Output parsing & brief rendering
+    # ──────────────────────────────────────────────────────────────────────
+
     @staticmethod
     def _extract_tool_lines(response: str) -> List[str]:
         """
@@ -17267,6 +17363,10 @@ class AgenticPreplanner:
             "clearly says otherwise, deviate."
         )
         return "\n".join(lines)[:1400] + "\n\n"
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. The pre-planning pass
+    # ──────────────────────────────────────────────────────────────────────
 
     async def preplan(
         self,
@@ -17706,6 +17806,10 @@ class AgenticPlanner:
     _EMITTED_SYMBOL_RE = re.compile(
         r"^[ \t]*(?:async[ \t]+)?(?:def|class)[ \t]+([A-Za-z_]\w*)", re.M
     )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Direct retrieval — serve without the pipeline
+    # ──────────────────────────────────────────────────────────────────────
 
     @classmethod
     def _retrieval_kind(cls, target: str) -> str:
@@ -18148,6 +18252,10 @@ class AgenticPlanner:
             "and do not explain what might be wrong with it.\n\n" + _art
         )
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Plan construction
+    # ──────────────────────────────────────────────────────────────────────
+
     async def plan(
         self,
         question: str,
@@ -18435,6 +18543,10 @@ class AgenticPlanner:
             fp.rationale = "planner output unparseable"
             return fp
         return AgenticPlan(steps=steps, source="planner_llm", rationale="")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 3. Planner output — parsing, hints and salvage
+    # ──────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _extract_ask(response: str) -> str:
@@ -19149,6 +19261,10 @@ class AgenticStepExecutor:
         ("synthesize_not_paste", "paste_verbatim"),
     )
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Prompt assembly — recipes and fragments
+    # ──────────────────────────────────────────────────────────────────────
+
     @classmethod
     def audit_instruction_recipes(cls) -> str:
         """
@@ -19464,6 +19580,10 @@ class AgenticStepExecutor:
         re.M,
     )
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Execution of one step
+    # ──────────────────────────────────────────────────────────────────────
+
     async def run(
         self,
         step: AgenticStep,
@@ -19699,6 +19819,10 @@ class AgenticSynthesisComposer:
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Workspace rendering
+    # ──────────────────────────────────────────────────────────────────────
 
     def render(
         self,
@@ -20142,6 +20266,10 @@ class AgenticSynthesisComposer:
         )
         return "\n".join(lines).rstrip()
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Answer format directive
+    # ──────────────────────────────────────────────────────────────────────
+
     @staticmethod
     def _answer_format_directive(
         n_valid: int,
@@ -20295,6 +20423,10 @@ class AgenticOrchestrator:
         self._dyn = AgenticDynamicVerifier(filter_ref, self._broker)
 
     # ── Command parsing ──────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Command surface — what /agent accepts and returns
+    # ──────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def parse_command(
@@ -20450,6 +20582,10 @@ class AgenticOrchestrator:
         # The findings block already introduces itself from inside its
         # own fence.
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Plan construction & prompt alignment
+    # ──────────────────────────────────────────────────────────────────────
+
     @staticmethod
     def build_fixed_plan(question: str, full: bool = False) -> AgenticPlan:
         """Fixed two-step plan: investigate the question, then analyze."""
@@ -20509,6 +20645,10 @@ class AgenticOrchestrator:
                 + _PREFIX_ROLE_SEPARATOR
             )
         return prelim_system[: cap * 4] + _PREFIX_ROLE_SEPARATOR
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 3. Difficulty gates & metacognitive reinforcement
+    # ──────────────────────────────────────────────────────────────────────
 
     def _should_reinforce_step(
         self, step: AgenticStep, control: Dict[str, Any], project_id: str
@@ -20643,6 +20783,10 @@ class AgenticOrchestrator:
         except Exception:
             pass
         return False
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 4. Hypothesis competition
+    # ──────────────────────────────────────────────────────────────────────
 
     async def _maybe_compete_hypothesize(
         self,
@@ -21066,6 +21210,10 @@ class AgenticOrchestrator:
             )
         return n_refuted
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 5. Claims recovery & generative evaluation
+    # ──────────────────────────────────────────────────────────────────────
+
     async def _extract_with_recovery(
         self,
         step: AgenticStep,
@@ -21251,6 +21399,10 @@ class AgenticOrchestrator:
                     f"experiment — would keep (angle: {angle[:80]})"
                 )
         return angle, wave
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 6. Workspace rendering for the next step
+    # ──────────────────────────────────────────────────────────────────────
 
     def _digest(self, text: str) -> str:
         """
@@ -21578,6 +21730,10 @@ class AgenticOrchestrator:
                     "answer.",
                 )
             )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 7. The pipeline body
+    # ──────────────────────────────────────────────────────────────────────
 
     async def _run_pipeline_inner(
         self,
@@ -24844,6 +25000,49 @@ class CommandRouter:
     # 7. Explicit commands (/forget, /status, /clean, /expand)
     # ═══════════════════════════════════════════════════════════════════════
 
+
+    def _deliver_command_response(self, messages: list, response: str) -> list:
+        """Put a command's answer where the reader will actually see it.
+
+        An inlet filter cannot return text to the chat; whatever it leaves in
+        `messages` is what the model is asked to continue. The previous idiom
+        replaced the command with an assistant message carrying the answer and
+        then called `ensure_last_message_is_user`, which truncates everything
+        after the last user message and deleted exactly that answer. The
+        model then answered whatever came before, which is why a command
+        produced a reply about something else.
+
+        Replacing the command with an echo instruction keeps the last message
+        a user message, so the truncation has nothing to remove, and routes
+        the answer through the only path that reaches the screen.
+        """
+        # ── Step 1: the command message is the one being answered ──
+        if not messages:
+            return messages
+        for _i in range(len(messages) - 1, -1, -1):
+            if messages[_i].get("role") == "user":
+                messages[_i] = {
+                    "role": "user",
+                    "content": (
+                        "Output the following text exactly as written, with "
+                        "nothing added before or after it — no preamble, no "
+                        "commentary, no closing question:\n\n"
+                        + str(response)
+                    ),
+                }
+                return messages[: _i + 1]
+        # ── Step 2: no user message to replace — append one ──
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Output the following text exactly as written, with "
+                    "nothing added:\n\n" + str(response)
+                ),
+            }
+        )
+        return messages
+
     async def handle_explicit_commands(
         self,
         messages: list,
@@ -24862,6 +25061,13 @@ class CommandRouter:
         # so content is a string on every path that reaches here. str() keeps
         # a caller that bypasses the inlet from raising instead of declining.
         content = str(last_user_msg.get("content", "") or "").strip()
+        # Rewritten to a slash for the comparisons below, so one valve
+        # moves every command without touching eleven dispatch sites.
+        _pfx = str(
+            getattr(self._f.valves, "command_prefix", "//") or "//"
+        )
+        if _pfx != "/" and content.startswith(_pfx):
+            content = "/" + content[len(_pfx):]
 
         if self._f.valves.enable_forget_command and is_explicit_command:
             new_messages, handled = await self._handle_forget_command(
@@ -24893,9 +25099,9 @@ class CommandRouter:
                         file_info = f" ({blk.file_path})" if blk.file_path else ""
                         lines.append(f"- `{h[:8]}...`{file_info}: {snippet}...")
                 response = "\n".join(lines)
-            messages.pop()
-            messages.append({"role": "assistant", "content": response})
-            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
+            return True, self._deliver_command_response(
+                messages, response
+            )
 
         if (
             content.startswith("/clean")
@@ -24903,15 +25109,15 @@ class CommandRouter:
             and self._f.valves.cleanup_suggestions_enabled
         ):
             response = await self._handle_clean_command(content, project_id)
-            messages.pop()
-            messages.append({"role": "assistant", "content": response})
-            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
+            return True, self._deliver_command_response(
+                messages, response
+            )
 
         if content.startswith("/expand"):
             response = await self._handle_expand_command(content, project_id)
-            messages.pop()
-            messages.append({"role": "assistant", "content": response})
-            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
+            return True, self._deliver_command_response(
+                messages, response
+            )
 
         # /freeze [N] and /unfreeze: manual control of the Block A KV freeze.
         # Gated behind enable_freeze_command; when disabled, these fall through
@@ -24922,19 +25128,19 @@ class CommandRouter:
             content.startswith("/unfreeze") or content.startswith("/freeze")
         ):
             response = await self._handle_freeze_command(content, project_id)
-            messages.pop()
-            messages.append({"role": "assistant", "content": response})
-            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
+            return True, self._deliver_command_response(
+                messages, response
+            )
         if self._f.valves.enable_accept_command and content.startswith("/accept"):
             response = await self._handle_accept_command(project_id)
-            messages.pop()
-            messages.append({"role": "assistant", "content": response})
-            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
+            return True, self._deliver_command_response(
+                messages, response
+            )
         if content.startswith("/help"):
             response = self._handle_help_command()
-            messages.pop()
-            messages.append({"role": "assistant", "content": response})
-            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
+            return True, self._deliver_command_response(
+                messages, response
+            )
 
         return False, None
 
@@ -24970,10 +25176,17 @@ class CommandRouter:
         ]
 
         # ── Step 2: render only what is switched on ──
+        # Rendered with the live prefix: a list describing a keystroke
+        # that no longer works is worse than no list.
+        _pfx = str(
+            getattr(_v, "command_prefix", "//") or "//"
+        )
         _lines = ["**CodeAware commands**", ""]
         for _name, _on, _what in _rows:
             if _on:
-                _lines.append(f"- `{_name}` — {_what}")
+                _lines.append(
+                    f"- `{_name.replace(chr(47), _pfx)}` — {_what}"
+                )
         _lines += [
             "",
             "Anything else is treated as a normal question.",
@@ -25071,7 +25284,12 @@ class CommandRouter:
         last_msg = messages[-1]
         if last_msg.get("role") != "user":
             return messages, False
-        content = last_msg.get("content", "").strip()
+        content = str(last_msg.get("content", "") or "").strip()
+        _pfx = str(
+            getattr(self._f.valves, "command_prefix", "//") or "//"
+        )
+        if _pfx != "/" and content.startswith(_pfx):
+            content = "/" + content[len(_pfx):]
         if self._f.valves.enable_forget_command and content.startswith("/forget"):
             parts = content.split(maxsplit=1)
             target = parts[1] if len(parts) > 1 else ""
@@ -38120,6 +38338,19 @@ class InletOrchestrator:
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
+        # Before any classification: what actually arrived. Three hypotheses
+        # about commands not dispatching have been falsified by reading, and
+        # a fourth guess is worth less than one line of fact. Absence of this
+        # line is itself the answer to the question reading cannot settle —
+        # whether the inlet runs at all.
+        try:
+            _raw = (last_user_msg or {}).get("content")
+            self._f._log_debug(
+                f"⌨️ Inlet saw: {len(messages)} message(s), last user content "
+                f"is {type(_raw).__name__}, starts {str(_raw)[:12]!r}"
+            )
+        except Exception:
+            pass
         user_query = last_user_msg.get("content", "") if last_user_msg else ""
 
         has_code_blocks = False
@@ -38152,9 +38383,23 @@ class InletOrchestrator:
 
         # bool(), not the bare `and`: with no last message the expression
         # yields None, and the signature promises bool.
+        # The prefix a person types, which is no longer the frontend's.
+        _pfx = str(
+            getattr(self._f.valves, "command_prefix", "//") or "//"
+        )
+        # Both prefixes are accepted: the configured one, and the slash
+        # that older habits and older guidance still produce. Accepting
+        # only one would make this flag disagree with the dispatcher
+        # below, which matches on a rewritten slash either way — and
+        # that flag is what gates the forget handler.
         is_explicit_command = bool(
             last_user_msg
-            and str(last_user_msg.get("content", "") or "").startswith("/")
+            and str(last_user_msg.get("content", "") or "").startswith(
+                (_pfx, "/")
+            )
+        )
+        self._f._log_debug(
+            f"⌨️ Command flag: {is_explicit_command} (prefix {_pfx!r})"
         )
 
         # Capture every system message now, joined in order, before any
@@ -42138,6 +42383,10 @@ class UserProfileManager:
         """The persisted ConversationState that holds the profile tiers."""
         return self._f._conversation_state_manager.get(project_id)
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Public surface
+    # ──────────────────────────────────────────────────────────────────────
+
     def get_authoritative(self, project_id: str) -> Dict[str, Dict]:
         """The authoritative tier — the only one rendered in Block A."""
         return self._state(project_id).user_profile or {}
@@ -43328,6 +43577,10 @@ class TaskRegistry:
     # plugin load (reproduced on 3.12). PEP 649 defers evaluation on >= 3.14,
     # which is the only reason current production never noticed. Quoted, the
     # annotations behave identically on every interpreter.
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. The task table — definition, validation, lookup
+    # ──────────────────────────────────────────────────────────────────────
+
     def _build_tasks(self) -> List["BackgroundTask"]:
         """
         Build the list of background task definitions.
@@ -43598,6 +43851,10 @@ class TaskRegistry:
     # ------------------------------------------------------------------
     # Region: Background Task Wrappers
     # ------------------------------------------------------------------
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Task bodies
+    # ──────────────────────────────────────────────────────────────────────
 
     async def _bg_raptor(self, project_id: str, stop_event=None) -> None:
         """
@@ -44533,6 +44790,10 @@ class BackgroundTaskManager:
     # Public API
     # ═══════════════════════════════════════════════════════════════════════
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Public surface
+    # ──────────────────────────────────────────────────────────────────────
+
     async def start(
         self,
         name: str,
@@ -44741,6 +45002,10 @@ class BackgroundTaskManager:
     # ═══════════════════════════════════════════════════════════════════════
     # Internal methods
     # ═══════════════════════════════════════════════════════════════════════
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Internals
+    # ──────────────────────────────────────────────────────────────────────
+
     async def _run_task(
         self,
         name: str,
@@ -45597,15 +45862,15 @@ class Filter:
         ────────────────────────────
         """
 
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
         # 1. CONTEXT WINDOW BUDGETS
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
 
-        # ── 1.1 Core budgets ──────────────────────────────────────────────────
         context_window_tokens: int = Field(
             default=131072,
             description="Total token capacity of the LLM server. Must match llama.cpp --ctx-size.",
         )
+
         llama_cpp_keep_tokens: int = Field(
             default=110000,
             ge=0,
@@ -45620,34 +45885,39 @@ class Filter:
                 "your --keep flag exactly."
             ),
         )
+
         response_reserve_tokens: int = Field(
             default=4096,
             ge=256,
             le=16384,
             description="Minimum tokens reserved for the LLM's response.",
         )
+
         global_injection_token_budget: int = Field(
             default=120000,
             description="Hard cap for ALL system injections (Block A + Block B). 0 = disabled.",
         )
+
         active_context_max_tokens: int = Field(
             default=30000,
             description="Maximum tokens for LOD‑activated code context in Block B.",
         )
+
         history_max_tokens: int = Field(
             default=60000,
             description="Maximum tokens for conversation history (non‑system messages). 0 = disabled.",
         )
+
         ltm_retrieval_max_tokens: int = Field(
             default=6000,
             description="Maximum tokens for LTM retrieved per request. 0 = unlimited.",
         )
 
-        # ── 1.2 Code block overflow ───────────────────────────────────────────
         max_code_block_tokens: int = Field(
             default=6000,
             description="Maximum tokens per individual code block. 0 = unlimited.",
         )
+
         max_extractable_block_chars: int = Field(
             default=0,
             ge=0,
@@ -45657,6 +45927,7 @@ class Filter:
                 "with a warning in the logs."
             ),
         )
+
         indent_scan_max_lines: int = Field(
             default=2000,
             description=(
@@ -45668,6 +45939,7 @@ class Filter:
                 "CrossEncoder code-likelihood calls."
             ),
         )
+
         seed_extraction_strip_min_chars: int = Field(
             default=20000,
             description=(
@@ -45682,21 +45954,26 @@ class Filter:
                 "traceback-based activation."
             ),
         )
+
         code_block_overflow_action: str = Field(
             default="summarize",
             description="Action when a block exceeds max_code_block_tokens: 'warn', 'truncate', or 'summarize'.",
         )
+
         code_block_warn_message: str = Field(
             default="[Code block too large - truncated by system]",
         )
+
         summary_code_max_chars: int = Field(
             default=20000,
             description="Max chars sent to LLM when generating a summary for an oversized code block.",
         )
+
         oversized_summary_max_tokens: int = Field(
             default=350,
             description="Max tokens for the generated summary of an oversized code block.",
         )
+
         block_summary_max_source_tokens: int = Field(
             default=20000,
             description=(
@@ -45710,27 +45987,30 @@ class Filter:
             ),
         )
 
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
         # 2. LLM & ORCHESTRATION
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
 
-        # ── 2.1 Inference server ──────────────────────────────────────────────
         LLM_BASE_URL: str = Field(
             default="http://host.docker.internal:8080",
             description="Base URL of the llama.cpp or OpenAI-compatible inference server.",
         )
+
         LLM_API_TOKEN: str = Field(
             default="",
             description="Bearer token for the inference API. Leave empty for unauthenticated local servers.",
         )
+
         llm_model: str = Field(
             default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
             description="Primary LLM model identifier used for all in-context completions.",
         )
+
         llamacpp_endpoint_type: str = Field(
             default="chat",
             description="Endpoint type for llama.cpp: 'chat' uses /v1/chat/completions; 'completion' uses /v1/completions.",
         )
+
         llm_thinking_mode: str = Field(
             default="auto",
             description=(
@@ -45756,11 +46036,12 @@ class Filter:
                 "False→'off')."
             ),
         )
-        # ── 2.2 Timeouts & retries ────────────────────────────────────────────
+
         llm_request_timeout: int = Field(
             default=900,
             description="HTTP timeout in seconds for individual LLM requests before the connection is dropped.",
         )
+
         llm_sock_read_timeout: int = Field(
             default=120,
             ge=0,
@@ -45776,11 +46057,13 @@ class Filter:
                 "llm_request_timeout)."
             ),
         )
+
         llm_per_call_timeout: int = Field(
             default=900,
             ge=1,
             description="Per-call timeout in seconds passed to the HTTP session.",
         )
+
         llm_json_dry_multiplier: float = Field(
             default=0.0,
             ge=0.0,
@@ -45805,6 +46088,7 @@ class Filter:
                 "before judging this valve."
             ),
         )
+
         llm_dry_allowed_length: int = Field(
             default=18,
             ge=2,
@@ -45820,6 +46104,7 @@ class Filter:
                 "capitalizations across nine emissions."
             ),
         )
+
         llm_long_dry_multiplier: float = Field(
             default=0.0,
             ge=0.0,
@@ -45858,6 +46143,7 @@ class Filter:
                 "generate until the context window ends. 0 disables."
             ),
         )
+
         llm_long_dry_min_tokens: int = Field(
             default=1200,
             ge=0,
@@ -45869,6 +46155,7 @@ class Filter:
                 "gets the multiplier."
             ),
         )
+
         llm_uncapped_max_tokens: int = Field(
             default=2048,
             ge=0,
@@ -45893,56 +46180,82 @@ class Filter:
                 "semantics."
             ),
         )
-        # ── 2.3 LLM response cache ────────────────────────────────────────────
+
         LLM_CACHE_TTL: int = Field(
             default=300,
             description="Time-to-live in seconds for entries in the in-memory LLM response cache.",
         )
+
         LLM_CACHE_MAX_SIZE: int = Field(
             default=100,
             description="Maximum number of entries kept in the in-memory LLM response cache.",
         )
 
-        # ── 2.4 Auxiliary models ──────────────────────────────────────────────
         code_block_summary_model: str = Field(
             default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
             description="Model used to generate summaries for oversized code blocks when code_block_overflow_action='summarize'.",
         )
-        # ── 2.5 Multi‑phase response ──────────────────────────────────────────
+
         enable_multi_phase_response: bool = Field(default=True)
+
         force_multi_phase_response: bool = Field(
             default=False,
             description="Force multi‑phase protocol even when budget is not tight.",
         )
+
         multi_phase_effective_max_tokens: int = Field(
             default=8000,
             ge=1000,
             le=200000,
             description="Tokens per part in multi‑phase mode.",
         )
+
         multi_phase_response_threshold: int = Field(
             default=7000,
             ge=0,
             le=200000,
             description="Available tokens below which multi‑phase is activated.",
         )
+
         multi_phase_response_budget_warn: int = Field(
             default=800,
             ge=500,
             le=40000,
             description="Tokens below which a wrap‑up hint is appended to the user message.",
         )
+
         auto_budget_context_for_parts: bool = Field(default=True)
 
-        # ═════════════════════════════════════════════════════════════════════════
-        # 3. SYMBOLGRAPH & ACTIVE CODE
-        # ═════════════════════════════════════════════════════════════════════════
+        peer_review_model: str = Field(
+            default="",
+            description=(
+                "Model for peer review. Must differ from cot_model_level3 for "
+                "genuine epistemic orthogonality. Empty → degrades to devil_advocate."
+            ),
+        )
 
-        # ── 3.1 Extraction & detection ────────────────────────────────────────
+        cot_model_level2: str = Field(
+            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
+            description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
+        )
+
+        cot_model_level3: str = Field(
+            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
+            description="Model used for CoT level 3 (scientific multi‑hypothesis).",
+        )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 3. SYMBOLGRAPH & ACTIVE CODE
+        # ══════════════════════════════════════════════════════════════════════
+
         enable_code_awareness: bool = Field(default=True)
+
         auto_detect_code_blocks: bool = Field(default=True)
+
         code_block_pattern: str = Field(default="```(\\w*)\\n(.*?)```")
+
         track_file_paths: bool = Field(default=True)
+
         assistant_stub_block_max_lines: int = Field(
             default=30,
             ge=0,
@@ -45957,191 +46270,221 @@ class Filter:
                 "(deliberate scaffolding proposals). 0 disables the filter."
             ),
         )
+
         file_path_pattern: str = Field(
             default=r"\b([a-zA-Z0-9_\-\./]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|hpp))\b",
         )
+
         track_line_numbers: bool = Field(default=True)
+
         exclude_filter_internals: bool = Field(default=True)
 
-        # ── 3.2 Call‑graph & data flow ────────────────────────────────────────
         enable_data_flow_analysis: bool = Field(default=True)
 
-        # ── 3.3 Docstrings & CFG generation ──────────────────────────────────
         enable_auto_docstrings: bool = Field(
             default=True,
             description="Automatically generate missing docstrings using the LLM (both lazy and background).",
         )
+
         enable_cfg_skeletons: bool = Field(
             default=True,
             description="Generate control‑flow skeletons (branches preserved, bodies elided) for LOD2 symbols in refactor or high‑debug‑intent queries.",
         )
+
         cfg_skeleton_debug_intent_threshold: float = Field(
             default=0.4,
             ge=0.0,
             le=1.0,
             description="Minimum debug intent weight to trigger CFG skeleton injection.",
         )
+
         cfg_skeleton_max_lines: int = Field(
             default=40,
             ge=5,
             description="Skip CFG generation for functions with > this many lines.",
         )
+
         lazy_docstring_max_per_turn: int = Field(
             default=8,
             ge=0,
             description="Maximum docstrings generated on‑demand (lazy) per turn. 0 = unlimited.",
         )
+
         lazy_docstring_batch_size: int = Field(
             default=8,
             ge=1,
             le=20,
             description="Number of symbols per lazy docstring batch (foreground).",
         )
+
         docstring_bg_batch_size: int = Field(
             default=5,
             ge=1,
             le=20,
             description="Number of symbols per background docstring batch.",
         )
+
         docstring_max_chars: int = Field(
             default=200,
             ge=0,
             description="Maximum docstring chars to suggest to the LLM.",
         )
 
-        # ── 3.4 Block deduplication ───────────────────────────────────────────
         code_similarity_threshold: float = Field(default=0.85)
+
         enable_ast_deduplication: bool = Field(default=True)
+
         auto_remove_duplicate_blocks: bool = Field(default=True)
+
         max_duplicate_age_hours: float = Field(default=6.0)
 
-        # ── 3.5 Active block management ───────────────────────────────────────
         max_active_blocks: int = Field(default=0, ge=0)
+
         max_base_code_blocks: int = Field(default=3)
+
         max_proposed_changes: int = Field(default=5)
+
         max_committed_changes: int = Field(default=10)
+
         prioritize_recent_code: bool = Field(default=True)
+
         enable_obsolete_marking: bool = Field(default=True)
+
         max_obsolete_versions_per_file: int = Field(
             default=3,
             ge=0,
             description="N most recent obsolete versions kept per file. 0 = remove immediately.",
         )
 
-        # ── 3.6 Diffs & commits ───────────────────────────────────────────────
         enable_diff_application: bool = Field(default=True)
+
         diff_pattern: str = Field(
             default="@@\\s*-([0-9]+),([0-9]+)\\s*\\+([0-9]+),([0-9]+)\\s*@@",
         )
+
         commit_pattern: str = Field(default="commit\\s+([a-f0-9]{7,40})")
 
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
         # 4. ARCHITECTURE MAP & HUB‑BODIES TIER
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
 
-        # ── 4.1 Architecture map ──────────────────────────────────────────────
         enable_architecture_map: bool = Field(
             default=True,
             description="Inject a compact class→methods outline into Block A.",
         )
+
         architecture_map_max_tokens: int = Field(
             default=0,
             ge=0,
             description="Token budget for the class outline section. 0 = unlimited.",
         )
+
         enable_hub_callees: bool = Field(
             default=True,
             description="Show outgoing calls ('→ calls:') for hub symbols alongside incoming callers.",
         )
 
-        # ── 4.2 Hub‑bodies tier ───────────────────────────────────────────────
-        # Stable full bodies of top-N hubs, injected between Block A and Block B.
-        # High KV-cache stability: hub bodies change rarely.
         enable_hub_bodies_tier: bool = Field(
             default=True,
             description="Inject full bodies of top‑N hubs as a cacheable tier between Block A and Block B.",
         )
+
         hub_bodies_tier_top_n: int = Field(
             default=16,
             ge=1,
             le=100,
             description="Number of top hubs to include.",
         )
+
         symbol_index_max_in_block_a: int = Field(
             default=30,
             ge=1,
             le=100,
             description="Maximum number of hub symbols (by centrality) to display in Block A's symbol index section.",
         )
+
         hub_bodies_tier_min_centrality: float = Field(
             default=0.0,
             ge=0.0,
             le=1.0,
             description="Minimum centrality score to qualify. 0.0 = no floor.",
         )
+
         hub_bodies_tier_max_tokens: int = Field(
             default=28000,
             ge=500,
             description="Token budget for the entire tier. Auto‑capped to 6000 if multi‑phase is active.",
         )
+
         hub_bodies_tier_max_body_tokens: int = Field(
             default=2500,
             ge=200,
             description="Maximum tokens for an individual hub body. Larger hubs go via LoD.",
         )
+
         hub_bodies_tier_protect_from_paging: bool = Field(
             default=True,
             description="Prevent code blocks that contain hubs in the tier from being paged out.",
         )
+
         hub_bodies_tier_recency_pointers: bool = Field(
             default=True,
             description="Include recency pointers for hub seeds in Block B.",
         )
 
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
         # 5. SEMANTIC SEED INFERENCE
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
+
         seed_inference_mode: str = Field(
             default="auto",
             description="'auto', 'always', or 'off'.",
         )
+
         seed_inference_model: str = Field(
             default="",
             description="Model for seed inference. Empty = use llm_model.",
         )
+
         seed_inference_min_chars: int = Field(
             default=15,
             ge=0,
             description="Minimum query length to trigger inference.",
         )
+
         seed_inference_max_symbols: int = Field(
             default=12,
             ge=1,
             le=40,
             description="Maximum symbols seeded by inference.",
         )
+
         seed_inference_score: float = Field(
             default=0.85,
             ge=0.1,
             le=1.0,
             description="Seed score assigned to LLM‑validated symbols (> lod3_threshold guarantees LOD‑3).",
         )
+
         seed_inference_skeleton_max_tokens: int = Field(
             default=6000,
             ge=500,
             description="Skeleton token cap sent to the planner LLM. 0 = no cap.",
         )
+
         seed_inference_max_tokens: int = Field(
             default=350,
             ge=50,
             description="Token cap for the planner's response.",
         )
+
         seed_inference_fuzzy_threshold: float = Field(
             default=0.85,
             ge=0.6,
             le=1.0,
             description="Minimum token_set_ratio for fuzzy matching of hallucinated ids.",
         )
+
         seed_inference_fuzzy_penalty: float = Field(
             default=0.8,
             ge=0.5,
@@ -46149,25 +46492,29 @@ class Filter:
             description="Score multiplier for symbols found via fuzzy matching.",
         )
 
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
         # 6. ACTIVATION GRAPH (PPR / LOD)
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
 
-        # ── 6.1 Path analysis ─────────────────────────────────────────────────
         enable_path_analysis: bool = Field(default=True)
+
         path_activation_threshold: float = Field(
             default=0.02,
             ge=0.01,
             le=1.0,
             description="Minimum activation score for a node to be considered active.",
         )
+
         path_propagation_steps: int = Field(default=6, ge=1, le=8)
+
         ppr_alpha: float = Field(default=0.90, ge=0.5, le=0.99)
 
-        # ── 6.2 LOD thresholds ────────────────────────────────────────────────
         lod1_threshold: float = Field(default=0.12, ge=0.0, le=1.0)
+
         lod2_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
+
         lod3_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
+
         enable_semantic_lod3_filter: bool = Field(
             default=True,
             description="Use CrossEncoder + LLM cascade to filter blocks for LOD‑3 based on semantic relevance.",
@@ -46183,6 +46530,7 @@ class Filter:
                 "and stabilizes the Block B prefix for KV-cache reuse."
             ),
         )
+
         lod3_sticky_max_symbols: int = Field(
             default=10,
             ge=1,
@@ -46193,20 +46541,22 @@ class Filter:
             ),
         )
 
-        # ── 6.3 LOD by use case ───────────────────────────────────────────────
         enable_lod_by_intent: bool = Field(
             default=True,
             description="Tune LOD policy per use case (Architecture, Planning, Programming, Refactor, Scaffolding).",
         )
+
         lod_intent_explicit_override: bool = Field(
             default=True,
             description="Allow explicit command prefix (/arch, /plan, /code, /refactor, /scaffold) to force the use case.",
         )
+
         lod_intent_refactor_callers_max: int = Field(
             default=12,
             ge=0,
             description="Max direct callers pulled into Block B at LOD‑1 for refactor (case D). 0 = unlimited.",
         )
+
         lod2_exit_ratio: float = Field(
             default=0.60,
             ge=0.3,
@@ -46214,43 +46564,56 @@ class Filter:
             description="Fraction of lod2_threshold used as the exit threshold for LOD‑2 hysteresis.",
         )
 
-        # ── 6.4 Centrality ────────────────────────────────────────────────────
         enable_centrality_prior: bool = Field(default=True)
+
         enable_centrality_lod_bump: bool = Field(default=True)
+
         centrality_lod_bump_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+
         centrality_lod_bump_weight: float = Field(default=0.15, ge=0.0, le=0.5)
 
-        # ── 6.5 Seeds ─────────────────────────────────────────────────────────
         enable_traceback_activation: bool = Field(default=True)
+
         enable_history_seeds: bool = Field(default=True)
+
         history_seeds_lookback: int = Field(default=6, ge=2, le=20)
+
         history_seeds_max_boost: float = Field(default=0.6, ge=0.1, le=0.9)
+
         enable_multi_seed_activation: bool = Field(default=True)
+
         multi_seed_weight_lexical: float = Field(default=0.5, ge=0.0, le=1.0)
+
         multi_seed_weight_structural: float = Field(default=0.3, ge=0.0, le=1.0)
+
         multi_seed_weight_historical: float = Field(default=0.2, ge=0.0, le=1.0)
 
-        # ── 6.6 LOD adaptation ────────────────────────────────────────────────
         enable_lod_adaptive: bool = Field(default=True)
+
         lod_adapt_rate: float = Field(default=0.05, ge=0.01, le=0.2)
+
         lod_adapt_min: float = Field(default=0.25, ge=0.1, le=0.5)
+
         lod_adapt_max: float = Field(default=0.75, ge=0.5, le=0.95)
+
         lod_adapt_underserved_min: int = Field(default=2, ge=1, le=10)
+
         lod_adapt_overserved_min: int = Field(default=3, ge=1, le=10)
 
-        # ── 6.7 Call graph mode resolution ───────────────────────────────────
         full_graph_min_free_token_ratio: float = Field(
             default=0.38,
             ge=0.0,
             le=1.0,
             description="Minimum ratio of free tokens (after Block A/B) to enable full_graph mode.",
         )
+
         expanded_hubs_min_free_token_ratio: float = Field(
             default=0.076,
             ge=0.0,
             le=1.0,
             description="Minimum ratio of free tokens to enable expanded_hubs mode.",
         )
+
         call_graph_context_mode: Literal["hubs_only", "expanded_hubs", "full_graph"] = (
             Field(
                 default="full_graph",
@@ -46264,11 +46627,13 @@ class Filter:
                 ),
             )
         )
+
         full_graph_max_tokens: int = Field(
             default=50000,
             ge=1000,
             description="Token budget for full_graph mode.",
         )
+
         full_graph_amb_callers_cap: int = Field(
             default=8,
             ge=0,
@@ -46281,21 +46646,17 @@ class Filter:
                 "~200 callers on a single line. 0 disables the cap."
             ),
         )
+
         expanded_hubs_max_tokens: int = Field(
             default=50000,
             ge=500,
             description="Token budget for expanded_hubs mode.",
         )
 
-        # ═════════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
         # 7. CLASSIFICATION THRESHOLDS (Heuristic → CE → LLM)
-        # ═════════════════════════════════════════════════════════════════════════
-        # Each classifier follows the same three-stage cascade:
-        #   Heuristic (free) → CrossEncoder (_ce_threshold = confident) →
-        #   LLM fallback (_llm_threshold = uncertain zone boundary)
-        # Middle zone [llm_threshold, ce_threshold) = conservative (no CE decision).
+        # ══════════════════════════════════════════════════════════════════════
 
-        # ── 7.1 General multiplier ────────────────────────────────────────────
         heuristic_reinforcement_weight: float = Field(
             default=1.0,
             ge=0.0,
@@ -46303,13 +46664,13 @@ class Filter:
             description="Multiplier for all heuristic reinforcements (bonuses to CrossEncoder scores).",
         )
 
-        # ── 7.2 Seed & inference gate ─────────────────────────────────────────
         seed_infer_ce_threshold: float = Field(
             default=0.25,
             ge=0.0,
             le=1.0,
             description="Minimum diff to trust CrossEncoder for seed inference decision.",
         )
+
         seed_infer_llm_threshold: float = Field(
             default=0.10,
             ge=0.0,
@@ -46317,25 +46678,27 @@ class Filter:
             description="Maximum diff to trigger LLM fallback for seed inference.",
         )
 
-        # ── 7.3 Intent & use case ─────────────────────────────────────────────
         intent_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
             le=1.0,
             description="Minimum diff to trust CrossEncoder for intent classification.",
         )
+
         intent_llm_threshold: float = Field(
             default=0.15,
             ge=0.0,
             le=1.0,
             description="Maximum diff to trigger LLM fallback for intent classification.",
         )
+
         use_case_ce_threshold: float = Field(
             default=0.25,
             ge=0.0,
             le=1.0,
             description="Minimum diff to trust CrossEncoder for use case classification.",
         )
+
         use_case_llm_threshold: float = Field(
             default=0.12,
             ge=0.0,
@@ -46343,37 +46706,41 @@ class Filter:
             description="Maximum diff to trigger LLM fallback for use case classification.",
         )
 
-        # ── 7.4 Structural decisions (relevance, graph, paging, purge) ───────
         lod3_relevance_ce_threshold: float = Field(
             default=0.35,
             ge=0.0,
             le=1.0,
             description="Minimum diff to trust CrossEncoder for LOD‑3 block relevance.",
         )
+
         lod3_relevance_llm_threshold: float = Field(
             default=0.20,
             ge=0.0,
             le=1.0,
             description="Maximum diff to trigger LLM fallback for LOD‑3 block relevance.",
         )
+
         paging_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
             le=1.0,
             description="Minimum diff to trust CrossEncoder for block paging decision.",
         )
+
         paging_llm_threshold: float = Field(
             default=0.15,
             ge=0.0,
             le=1.0,
             description="Maximum diff to trigger LLM fallback for block paging decision.",
         )
+
         purge_ce_threshold: float = Field(
             default=0.30,
             ge=0.0,
             le=1.0,
             description="Minimum diff to trust CrossEncoder for purge decision.",
         )
+
         purge_llm_threshold: float = Field(
             default=0.15,
             ge=0.0,
@@ -46381,13 +46748,13 @@ class Filter:
             description="Maximum diff to trigger LLM fallback for purge decision.",
         )
 
-        # ── 7.5 Quality & contradiction ───────────────────────────────────────
         duplicate_ce_threshold: float = Field(
             default=0.40,
             ge=0.0,
             le=1.0,
             description="Minimum diff to trust CrossEncoder for duplicate question detection.",
         )
+
         duplicate_llm_threshold: float = Field(
             default=0.25,
             ge=0.0,
@@ -46395,25 +46762,357 @@ class Filter:
             description="Maximum diff to trigger LLM fallback for duplicate question detection.",
         )
 
-        # ═════════════════════════════════════════════════════════════════════
-        # 8. REASONING (Chain‑of‑Thought)
-        # ═════════════════════════════════════════════════════════════════════
+        enable_contradiction_detection: bool = Field(
+            default=True,
+            description="Detect if the last user message contradicts the conversation history.",
+        )
 
-        # ── 8.1 Basic enabling ───────────────────────────────────────────────
+        contradiction_inject_warning: bool = Field(
+            default=True,
+            description="Inject a warning in the system prompt if a contradiction is detected.",
+        )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 8. REASONING — pipeline shape & budget
+        # ══════════════════════════════════════════════════════════════════════
+
         enable_cot_llm_detection: bool = Field(
             default=True,
             description="Use CrossEncoder + LLM cascade for CoT detection; if False, use heuristic only.",
         )
-        enable_status_updates: bool = Field(
+
+        agentic_serial_method: bool = Field(
             default=True,
             description=(
-                "Emit real-time status updates to the UI during reasoning. "
-                "Shows progress of CoT, hypothesis evaluation, peer review, etc. "
-                "Disable if the UI does not support event streaming."
+                "Serial method (S1): forge hypotheses ONE AT A TIME — "
+                "each gets a full investigate/evaluate/analyze cycle "
+                "and seals into a HypothesisDossier (plausible or "
+                "dead) before the next is generated; only plausible "
+                "dossiers reach the final competition. False keeps the "
+                "parallel competition untouched (A/B between runs). "
+                "Default True: the serial method is now the primary "
+                "reasoning path; set False only to A/B against the "
+                "(retired-by-default) parallel competition."
             ),
         )
 
-        # ── 8.16 Agentic pipeline (manual /agent — Fase 1) ──────────────────
+        agentic_max_steps: int = Field(
+            default=7,
+            ge=2,
+            le=8,
+            description=(
+                "Maximum steps the planner may emit. 5 leaves headroom: a "
+                "hypothesize plan (investigate + hypothesize + verify + "
+                "analyze) fills 4 exactly, so at 4 there was no room for a "
+                "NEEDS-inserted follow-up step on precisely the turns that "
+                "investigate the hardest questions. This is the HARD ceiling "
+                "in every mode: agentic_steps_auto only shapes the budget "
+                "SUGGESTED to the planner within it."
+            ),
+        )
+
+        agentic_steps_auto: bool = Field(
+            default=True,
+            description=(
+                "Size the step budget from the pre-planner's difficulty "
+                "verdict instead of always offering the full ceiling. The "
+                "pre-planner — which just explored the framings and possibly "
+                "consulted memory — grades the chosen framing low/medium/"
+                "high as one extra field in its existing JSON (zero extra "
+                "LLM calls), and the planner's contract range becomes 2..3, "
+                "2..5 or 2..agentic_max_steps respectively. The code bounds, "
+                "the model proposes within limits: the verdict never raises "
+                "the ceiling above agentic_max_steps, an unparseable or "
+                "missing verdict keeps the full ceiling (today's behavior "
+                "verbatim, also when the pre-planner is disabled), and the "
+                "parser accepts up to the VALVE ceiling regardless of the "
+                "suggestion. A misjudged 'low' is recoverable mid-run: "
+                "NEEDS-inserted follow-up steps check the valve ceiling, not "
+                "the suggested budget."
+            ),
+        )
+
+        agentic_plan_profile: str = Field(
+            default="auto",
+            description=(
+                "A/B switch between the full scientific method and the "
+                "quick path, from one place. 'auto' (default): the "
+                "selectors decide — question-type hints and the "
+                "difficulty budget produce the quick path (investigate → "
+                "verify → analyze) for descriptive/low turns and the full "
+                "method elsewhere. 'full': every agentic turn schedules "
+                "the complete method (a full-method directive replaces "
+                "the type hint, budget pinned to the agentic_max_steps "
+                "ceiling) — hypothesize always present, so the whole "
+                "competition suite runs. 'fast': every agentic turn "
+                "schedules the minimal shape (quick-path directive, "
+                "budget pinned to 3) — no hypothesize, no competition. "
+                "In full/fast the profile directive REPLACES the "
+                "question-type hint so the plan shape is held constant "
+                "across question types, which is what makes the A/B "
+                "clean. The parser invariants (analyze-last, verify "
+                "auto-insert, order normalization) apply in all three."
+            ),
+        )
+
+        agentic_enforce_step_order: bool = Field(
+            default=True,
+            description=(
+                "Normalize the plan to the scientific method's partial "
+                "order (investigate → hypothesize → design_tests → "
+                "verify_dynamic → verify_regression → verify → analyze) "
+                "with a STABLE sort before execution. The planner contract "
+                "asks for this order but only analyze-last was enforced; a "
+                "plan returned out of order used to run out of order. "
+                "Stable: relative order within each kind is preserved."
+            ),
+        )
+
+        agentic_max_replans: int = Field(
+            default=1,
+            ge=0,
+            le=3,
+            description=(
+                "Hard cap on generative re-plan waves per pipeline run. "
+                "The Nivel-2 loop without a cap is exactly how an agent "
+                "spins forever on a single --parallel 1 slot."
+            ),
+        )
+
+        agentic_exec_mode: str = Field(
+            default="subprocess",
+            description=(
+                "'off' = verify_dynamic steps are inert. 'subprocess' = "
+                "harnesses run in an isolated `python -I` subprocess with a "
+                "tmpdir jail, empty environment, wall timeout and POSIX "
+                "rlimits, behind a denylist tripwire (a handrail, not a "
+                "sandbox: fits the declared threat model — your own code, "
+                "runaway protection — not adversarial input). 'docker' is a "
+                "RESERVED value with no runner implemented yet: selecting it "
+                "makes every execution path refuse loudly instead of "
+                "silently downgrading to the subprocess handrail."
+            ),
+        )
+
+        agentic_step_cache: bool = Field(
+            default=True,
+            description=(
+                "Cache step results in SQLite keyed by (kind, goal) and the "
+                "structure_hash they were produced under; a code edit "
+                "invalidates automatically. Repeated investigations across "
+                "neighbouring turns become free."
+            ),
+        )
+
+        agentic_ledger_persist: bool = Field(
+            default=True,
+            description=(
+                "#11: persist the agentic evidence ledger between turns. At "
+                "the end of a pipeline run the claims are snapshotted into "
+                "pstate (per-project); a turn classified as a CONTINUATION "
+                "restores them so a multi-turn line of reasoning can resume "
+                "instead of starting the ledger empty. A fresh question "
+                "never restores — the snapshot stays put and a 'not a "
+                "continuation' log is emitted instead — so a stale snapshot "
+                "cannot bias an unrelated turn (observed live before the "
+                "gate: three different bugs in a row each inherited the "
+                "prior bug's claims). On by default. A project switch gets a "
+                "clean pstate and never inherits another project's snapshot."
+            ),
+        )
+
+        agentic_ledger_snapshot_max: int = Field(
+            default=40,
+            ge=0,
+            description=(
+                "Maximum ledger claims kept in the #11 snapshot, to bound the "
+                "pstate size. Older claims beyond this are dropped."
+            ),
+        )
+
+        agentic_ctx_size: int = Field(
+            default=131072,
+            ge=8192,
+            le=1048576,
+            description=(
+                "R19: the llama.cpp --ctx-size, used to compute the "
+                "tool-round input budget (ctx minus the aligned prefix "
+                "minus the generation reserve minus the safety margin). "
+                "Must match the server's actual context length or the "
+                "budget guard will be wrong. Only affects budgeting, never "
+                "sent to the model."
+            ),
+        )
+
+        agentic_tool_ctx_margin: int = Field(
+            default=4000,
+            ge=0,
+            le=32000,
+            description=(
+                "R19: safety margin (tokens) held back when computing the "
+                "tool-round input budget, so measurement error in the "
+                "prefix/generation estimate cannot push a step past "
+                "ctx-size into a hard truncation or KV eviction. 4000 is "
+                "comfortable; raise it if truncation reappears."
+            ),
+        )
+
+        agentic_tool_rounds_max: int = Field(
+            default=3,
+            ge=0,
+            le=4,
+            description=(
+                "Maximum tool rounds per step (TOOL: EXPAND/CALLERS/CALLEES/"
+                "DOC/GREP requests resolved locally at zero LLM cost). "
+                "0 disables the tool loop."
+            ),
+        )
+
+        agentic_unlimited_tokens: bool = Field(
+            default=True,
+            description=(
+                "Operator decision: NO token ceiling on any call of the "
+                "agentic/scientific-method pipeline (planner, preplanner, "
+                "steps, verify, harness, digest, competition, crucis, peer "
+                "review, claims recovery...). Per the GOVERNING PRINCIPLES, "
+                "a token cap a healthy run can meet is a quality-budget in "
+                "disguise — a healthy planner hit its cap twice in one "
+                "session and every run silently degraded to the fixed "
+                "fallback plan. Selection is label-based at the call_llm "
+                "choke point, so non-pipeline calls (classifiers, "
+                "summarisers) keep llm_uncapped_max_tokens as their "
+                "anti-runaway cap. When this is off, the per-label "
+                "agentic_*_max_tokens valves below apply as before. The "
+                "remaining protections for uncapped pipeline calls are the "
+                "anti-hang connection backstop and sampler-side loop "
+                "control (DRY), not ceilings that can truncate healthy "
+                "reasoning."
+            ),
+        )
+
+        agentic_runaway_token_cap: int = Field(
+            default=8000,
+            ge=0,
+            description=(
+                "Ceiling passed as max_tokens on pipeline calls when "
+                "agentic_unlimited_tokens is on. 0 sends none at all, "
+                "which is not the same as a large one: the request then "
+                "carries no max_tokens and the model generates until the "
+                "server's context window ends."
+                "\n\n"
+                "MUST stay above every per-label budget, and the reason "
+                "is a mistake this valve has already made. Sized at 4500 "
+                "from a sample of healthy calls that happened to top out "
+                "at 3683, it sat below agentic_step_max_tokens (8000) and "
+                "quietly became the step budget instead of a backstop for "
+                "it. Seven of thirteen steps in one run were cut, three "
+                "of them mid-`TOOL:` line, and each cut cost more than it "
+                "saved: the step lost its claims tail, the recovery call "
+                "fired, and that was cut too. Truncating legitimate work "
+                "does not prevent corruption, it causes it."
+                "\n\n"
+                "16000 is twice the largest per-label budget, so no "
+                "legitimate call can reach it, while still bounding a "
+                "runaway to roughly four minutes against the fifteen a "
+                "context-window-length generation takes. The budgets are "
+                "what shape quality; this is only here to stop "
+                "hallucinated verbosity, and _validate_valve_coherence "
+                "now warns if it is ever lowered back under one."
+                "\n\n"
+                "Raise it if a legitimate call is seen finishing on "
+                "length rather than stop; the agent dump reports "
+                "finish_reason per call, so that is one grep."
+            ),
+        )
+
+        agentic_step_max_tokens: int = Field(
+            default=8000,
+            ge=100,
+            description=(
+                "[Consulted only when agentic_unlimited_tokens is off.] Generation ceiling per agentic step — an ANTI-RUNAWAY "
+                "guard, NOT a quality budget (GOVERNING PRINCIPLES, "
+                "Principle 2 and THE MAXIM). The claims contract sits at "
+                "the very END of a step's output, so a cap a healthy step "
+                "can reach cuts exactly the structured part and blinds the "
+                "verify stage — the same corruption as a mid-generation "
+                "clock kill, by a different cutter. At the old default of "
+                "2500 healthy investigate steps truncated on nearly every "
+                "complex turn (measured: outputs cut at ~2400 tokens, "
+                "claims lost, ~30s recovery attempts per truncation). "
+                "8000 is sized ~3x above the longest healthy step "
+                "observed, so only a pathological generation — the Q4 "
+                "line-cycle repetition loop — can reach it. Recalibrate "
+                "against fresh logs: the correct value is 'never reached "
+                "by a sane step', and if the DRY loop is fixed at the "
+                "sampler level (or the deployment moves to Q8, where the "
+                "loop disappears), truncation at ANY value of this valve "
+                "should become a rare-path event. Do not lower it back "
+                "into the healthy range to save time — that trades claims "
+                "for seconds, the exact swap this pipeline refuses."
+            ),
+        )
+
+        agentic_planner_max_tokens: int = Field(
+            default=2000,
+            ge=100,
+            description=(
+                "[Consulted only when agentic_unlimited_tokens is off.] Generation cap for the planner's JSON plan. 768 leaves "
+                "comfortable room for a multi-step plan with descriptive "
+                "goals and a rationale; a tighter cap truncates the JSON "
+                "mid-object, which fails to parse and falls back to the "
+                "fixed plan — silently dropping richer step kinds like "
+                "design_tests (observed live at 400: a design-tests plan "
+                "generated 402 tokens, hit finish_reason=length, and "
+                "reverted to investigate/verify/analyze with no tests "
+                "armed). Raise further only if plans with many steps are "
+                "still being cut off."
+            ),
+        )
+
+        agentic_preplanner_max_tokens: int = Field(
+            default=900,
+            ge=200,
+            le=2000,
+            description=(
+                "[Consulted only when agentic_unlimited_tokens is off.] Token budget per pre-planner call (framings + choice + "
+                "optional memory conclusions)."
+            ),
+        )
+
+        agentic_verify_max_tokens: int = Field(
+            default=2500,
+            ge=100,
+            description=(
+                "[Consulted only when agentic_unlimited_tokens is off.] Generation ceiling for the verify step's checks JSON. "
+                "Anti-runaway guard, not a quality budget: the output is "
+                "pure structure (up to 12 typed checks), so a cap a "
+                "healthy elicitation can reach breaks the contract "
+                "mid-JSON. Sized well above the largest legitimate check "
+                "set."
+            ),
+        )
+
+        agentic_harness_max_tokens: int = Field(
+            default=2000,
+            ge=200,
+            description=(
+                "[Consulted only when agentic_unlimited_tokens is off.] Generation ceiling for LLM-written test sections. "
+                "Anti-runaway guard, not a quality budget: a harness cut "
+                "mid-function fails to import and the target silently "
+                "loses its dynamic evidence. Sized well above a healthy "
+                "test section."
+            ),
+        )
+
+        agentic_digest_max_tokens: int = Field(
+            default=400,
+            ge=50,
+            description=(
+                "[Consulted only when agentic_unlimited_tokens is off.] Per-step digest budget for the workspace. Head-truncated, "
+                "but a trailing 'NOT FOUND:' section is always preserved."
+            ),
+        )
+
         design_experiment_max_tokens: int = Field(
             default=1500,
             ge=200,
@@ -46432,6 +47131,862 @@ class Filter:
                 "calls that leave max_tokens open."
             ),
         )
+
+        agentic_serial_design_max_tokens: int = Field(
+            default=0,
+            ge=0,
+            description=(
+                "Serial method: output cap for the deep design call "
+                "inside a forge cycle. 0 = UNLIMITED (validation "
+                "default; an incomplete design is worse than a slow "
+                "one). With at most count x cycles designs per run, "
+                "depth is affordable here in a way the parallel mode "
+                "never could."
+            ),
+        )
+
+        agentic_evidence_max_chars: int = Field(
+            default=120000,
+            ge=0,
+            # Capped where the context stops fitting rather than at a round
+            # number: 200000 chars is 50000 tokens, which with the 75500-token
+            # prefix and the 8000 this pass may generate overflows the
+            # server's 131072. 160000 leaves about 7500 tokens of margin.
+            le=160000,
+            description=(
+                "Character budget for the subject bodies gathered for the "
+                "evidence pass. Bodies are fetched most-claims-first, so "
+                "every character added converts into settled claims rather "
+                "than being spent on whichever subject was emitted first. "
+                "Sized against the server's 131072-token context: the "
+                "largest prompt of the 29 July run was 85849 tokens, about "
+                "75500 of it the system prefix, which leaves roughly 46500 "
+                "tokens once the 8000 this pass may generate are reserved. "
+                "Raise it when the log reports subjects left unread; the "
+                "cost is prompt size, which is close to free against a warm "
+                "prefix, and the pass's time tracks the number of claims it "
+                "judges rather than the bodies it reads."
+            ),
+        )
+
+        agentic_preload_focus_max_chars: int = Field(
+            default=32000,
+            ge=0,
+            le=64000,
+            description=(
+                "Character budget for the bodies of the planner's focus "
+                "symbols, preloaded into a step's prompt instead of being "
+                "requested through a tool round. Zero disables the preload "
+                "and restores the name-only list. The first symbol is always "
+                "served even if it exceeds the budget, because a step whose "
+                "single focus symbol is too large is better off seeing the "
+                "capped body than seeing nothing."
+            ),
+        )
+
+        agentic_expand_max_chars: int = Field(
+            default=16000,
+            ge=2000,
+            le=64000,
+            description=(
+                "Character cap for a symbol body returned by the EXPAND tool "
+                "in the agentic pipeline. The previous 6000 truncated large "
+                "hub methods mid-body (observed live: an investigate step "
+                "received a truncated build_block_b, could not see its "
+                "trailing calls, and the pipeline synthesized a hallucinated "
+                "answer). When a body still exceeds the cap the truncation "
+                "notice now tells the model to request the specific line "
+                "range instead of leaving it blind."
+            ),
+        )
+
+        agentic_preplanner_timeout_s: int = Field(
+            default=240,
+            ge=0,
+            description=(
+                "Ceiling for the single pre-planner call. This is an "
+                "anti-hang guard, NOT a budget: it sits at roughly 2.5x the "
+                "measured cost of a healthy call on a --parallel 1 server "
+                "(89.7s in the reference run), so a normal pre-plan never "
+                "comes near it and only a genuinely stuck call is cut. "
+                "Deliberately generous — a pre-planner cut short degrades "
+                "to an empty brief and the planner then decides the HOW "
+                "without knowing the WHAT, which costs far more quality "
+                "than the seconds it saves. On timeout the stage fails open "
+                "(empty brief), never the run. 0 disables the ceiling."
+            ),
+        )
+
+        agentic_planner_timeout_s: int = Field(
+            default=180,
+            ge=0,
+            description=(
+                "Ceiling for the single planner call. Anti-hang guard at "
+                "roughly 3x the measured cost of a healthy call (59.1s in "
+                "the reference run). On timeout the planner degrades to its "
+                "deterministic fixed plan, which is a real plan but a blunt "
+                "one — so the ceiling is set where only a stuck call meets "
+                "it. 0 disables it."
+            ),
+        )
+
+        agentic_exec_timeout_s: int = Field(
+            default=10,
+            ge=1,
+            le=120,
+            description=(
+                "Wall/CPU timeout per harness execution. NOT a budget knob, "
+                "and deliberately the one ceiling in this pipeline where 0 "
+                "is not 'no limit': it becomes RLIMIT_CPU(0, 0) and "
+                "subprocess timeout=0, which kill the sandbox instantly "
+                "rather than freeing it — the opposite of what 0 means "
+                "everywhere else here. It is a containment bound on code "
+                "this process did not write, so its floor stays at 1."
+            ),
+        )
+
+        agentic_slot_wait_timeout_s: float = Field(
+            default=120.0,
+            ge=1.0,
+            le=600.0,
+            description=(
+                "R24: maximum time to wait for the busy slot to drain "
+                "before falling back to the fast path. Bounds the worst "
+                "case so a genuinely stuck background task cannot hang the "
+                "turn indefinitely; on a healthy server the scaffolding "
+                "drains in seconds."
+            ),
+        )
+
+        agentic_tdd_ttl_seconds: float = Field(
+            default=1800.0,
+            ge=0.0,
+            description=(
+                "Fase 6 / P10: an armed inter-turn TDD verdict is discarded if "
+                "not consumed within this many seconds, or if the next turn is "
+                "a different project. Prevents a stale 'you have pending tests' "
+                "injection from leaking into an unrelated later conversation. "
+                "0 disables expiry (legacy behaviour)."
+            ),
+        )
+
+        agentic_wait_for_busy_slot: bool = Field(
+            default=True,
+            description=(
+                "R24: when an otherwise pipeline-eligible code turn finds "
+                "the single --parallel 1 slot busy (e.g. background "
+                "scaffolding still running right after a silent ingestion), "
+                "wait for the in-flight LLM work to drain and then run the "
+                "agentic pipeline, instead of silently degrading to the "
+                "fast path and losing the entire scientific method on the "
+                "first real question of the session. Off restores the old "
+                "skip-on-busy behaviour."
+            ),
+        )
+
+        align_aux_calls_to_prefix: bool = Field(
+            default=True,
+            description=(
+                "Prepend the turn's preliminary system prompt to EVERY "
+                "auxiliary LLM call that targets the turn's main model "
+                "(classify_turn, contradiction_llm, session_summary, "
+                "change_summary, docstrings, and the rest), so each one is a "
+                "prefix extension of the resident context instead of a bare "
+                "prompt. The server logs showed a single bare call sharing 3 "
+                "tokens ('against 3') erasing every valid checkpoint with no "
+                "possible recovery: replacement checkpoints are created where "
+                "prompts end, past the divergence point of every future "
+                "turn, so one killer condemns every subsequent turn to a "
+                "~65s full re-prefill. Calls to a different model, calls "
+                "that already carry the prefix, and calls that would not fit "
+                "the context window are passed through unchanged. Turn OFF "
+                "to restore bare auxiliary prompts (focal but "
+                "pool-destroying)."
+            ),
+        )
+
+        agentic_early_exit: str = Field(
+            default="off",
+            description=(
+                "Whether a high-confidence step may skip the remaining "
+                "non-verify steps. 'off' never evaluates the gate (every "
+                "step always runs). 'shadow' (default) evaluates the gate "
+                "and logs what it WOULD skip via [EARLY-EXIT-SHADOW] while "
+                "still running every step — safe telemetry for A/B testing. "
+                "'on' performs the skip (the original behaviour). Skipping "
+                "cuts cost but measurably corrupts runs when a premature "
+                "step-1 exit drops the steps that would have corrected it, "
+                "so it defaults off the actual-skip path."
+            ),
+        )
+
+        agentic_early_exit_confidence: float = Field(
+            default=0.85,
+            ge=0.5,
+            le=1.0,
+            description=(
+                "Confidence floor for early-exit (only consulted when "
+                "agentic_early_exit is 'shadow' or 'on'). A step declaring "
+                "resolved=true at or above this floor may skip the remaining "
+                "non-verify steps ('verify' steps are never skipped)."
+            ),
+        )
+
+        agentic_clarification_blocks_pipeline: bool = Field(
+            default=False,
+            description=(
+                "R27: when the pre-planner or the planner asks for "
+                "clarification, whether that ask BLOCKS the pipeline. "
+                "False (default): the question is surfaced but the "
+                "pipeline runs anyway — the planner ask substitutes the "
+                "fixed fallback plan — and the answer states the "
+                "assumption it proceeded under and ends with the "
+                "clarifying question, so the user gets a full analysis "
+                "plus the chance to refine. This also routes the reply "
+                "through the normal outlet post-processing (the "
+                "blocking path skipped it, producing raw fences glued "
+                "to prose). True restores the historical ask-and-stop: "
+                "the turn only asks the question and no pipeline runs."
+            ),
+        )
+
+        agentic_enable_ask_user: bool = Field(
+            default=True,
+            description=(
+                "Fase 7: allow a step to end the pipeline early with a "
+                "clarifying question surfaced as the turn's answer "
+                "(stateless — the user's reply is a fresh turn; no plan "
+                "is persisted). Gated by a minimum question length so a "
+                "stray token cannot hijack the turn."
+            ),
+        )
+
+        agentic_ask_user_max_step: int = Field(
+            default=2,
+            ge=1,
+            le=7,
+            description=(
+                "R22: the stateless ask-user clarification short-circuit is "
+                "only honoured from a step at or before this 1-based "
+                "position. A genuine up-front ambiguity surfaces in the "
+                "first step or two; a later verify/analyze 'ask' is almost "
+                "always the model reciting Block A reasoning guidelines as "
+                "prose, which a live run parsed into the ask field and used "
+                "to kill a 7-step plan at step 2. Independent of this, "
+                "plan_profile=full suppresses the short-circuit entirely "
+                "(full demands the complete method run)."
+            ),
+        )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 9. SCIENTIFIC METHOD (hypothesis forge)
+        # ══════════════════════════════════════════════════════════════════════
+
+        agentic_preplanner: bool = Field(
+            default=True,
+            description=(
+                "Pre-planner: an agentic stage BEFORE the planner that "
+                "discovers the correct WHAT while the planner decides the "
+                "HOW. It diverges over 2-3 mechanically distinct framings of "
+                "the request, may consult long-term memory autonomously "
+                "(TOOL: MEMORY), and picks the most defensible framing on "
+                "the available evidence. Its brief orients the planner but "
+                "never overrides an explicit question. Fail-open: any "
+                "failure yields an empty brief and the planner runs exactly "
+                "as without it."
+            ),
+        )
+
+        agentic_preplanner_collapse: bool = Field(
+            default=True,
+            description=(
+                "Pre-planner divergence mode. When True (collapse ON), the "
+                "pre-planner still runs the anti-anchoring exercise on every "
+                "turn but is not forced to fabricate alternatives: an "
+                "unambiguous request yields a SINGLE framing (faster, avoids "
+                "invented distinctions), while a genuinely ambiguous one "
+                "still gets 2-3. When False, it always diverges over 2-3 "
+                "framings — the maximally de-anchoring behavior, at the cost "
+                "of forced framings on clear questions. Turn OFF if you find "
+                "the collapse suppressing divergence on grey-area questions "
+                "that benefited from it: divergence is among the most "
+                "valuable pipe steps, so the always-diverge behavior is one "
+                "toggle away. No effect when agentic_preplanner is False."
+            ),
+        )
+
+        agentic_preplanner_max_tool_rounds: int = Field(
+            default=2,
+            ge=0,
+            le=3,
+            description=(
+                "Maximum MEMORY tool rounds the pre-planner may take before "
+                "committing to a framing (0 disables memory access). Each "
+                "round is zero-LLM retrieval plus one short aligned re-call."
+            ),
+        )
+
+        preplan_question_typing: bool = Field(
+            default=True,
+            description=(
+                "Fase 1: the pre-planner classifies the request's NATURE "
+                "(exploratory = no cause proposed; confirmatory = the user "
+                "proposes a cause to check; descriptive = factual lookup; "
+                "mechanism = how it works) and the planner receives the "
+                "matching plan-shape hint (e.g. descriptive → no "
+                "hypothesize; confirmatory → user's claim as one rival "
+                "among alternatives). A hint, not an order: the parser and "
+                "the order normalization still govern. Off suppresses the "
+                "plan-shape hint (the pre-planner still reports the type "
+                "for telemetry/AGENTIC-RUN), leaving the planner contract "
+                "byte-identical to before."
+            ),
+        )
+
+        preplan_suppress_false_clarify: bool = Field(
+            default=True,
+            description=(
+                "R5: suppress a pre-planner clarification request when the "
+                "question is answerable by its own contract — it names an "
+                "indexed symbol AND states a deliverable ('dame X al "
+                "completo') or a symptom (anomaly markers). Observed live, "
+                "the pre-planner asked for clarification on 'dame "
+                "build_block_a al completo con el fix' after the full "
+                "competition had already run, wasting the turn. When "
+                "suppressed the pipeline fails open (proceeds with no "
+                "brief, as when the pre-planner does not parse). A genuinely "
+                "underspecified request ('fix the bug', no symbol) names "
+                "nothing and still asks. Off restores the old always-ask "
+                "behaviour."
+            ),
+        )
+
+        agentic_serial_hypothesis_count: int = Field(
+            default=3,
+            ge=1,
+            description=(
+                "Serial method: target number of SEALED dossiers to "
+                "forge before the final competition."
+            ),
+        )
+
+        hypothesis_target_count: str = Field(
+            default="4",
+            description=(
+                "How many competing hypotheses the hypothesize step "
+                "requests. Two forms:\n"
+                '  • "auto" — difficulty-derived band, the historical '
+                "behaviour: low → 2-3, medium → 3-5, high → 4-6 (falls "
+                "back to 2-4 when difficulty is unknown).\n"
+                '  • a number, e.g. "4" — a fixed focused competition: '
+                "enough distinct rivals to discriminate a real root cause, "
+                "few enough that each is scored properly and the pool does "
+                "not drift toward hypothesis_hard_cap.\n"
+                "The count is requested in the prompt, not enforced by "
+                "truncation, so a model with one more genuinely distinct "
+                "mechanism can still surface it; hypothesis_hard_cap "
+                "remains the real ceiling."
+            ),
+        )
+
+        agentic_serial_cycles_max: int = Field(
+            default=0,
+            ge=0,
+            description=(
+                "Serial method: max forge cycles per hypothesis. 0 = "
+                "UNLIMITED (the validation default): termination is "
+                "guaranteed by progress gates — a cycle adding no "
+                "newly-resolvable claims seals the dossier — never by "
+                "this counter. Tighten only after the mode is proven "
+                "clean; truncated steps are hallucination generators."
+            ),
+        )
+
+        agentic_hypothesis_retries: int = Field(
+            default=1,
+            ge=0,
+            le=3,
+            description=(
+                "Scientific-method refutation loop: when the verify step "
+                "refutes claim(s) owned by a hypothesize step, insert one "
+                "re-hypothesize (promote the surviving rival or formulate "
+                "a new hypothesis) plus its own verify before the terminal "
+                "analyze, at most this many times per run. 0 restores the "
+                "old feed-forward behavior (refutations are reported to "
+                "analyze but never retried). Each retry costs one "
+                "hypothesize LLM call plus a deterministic verify."
+            ),
+        )
+
+        agentic_retry_router: str = Field(
+            default="on",
+            description=(
+                "Fase 6: route the refutation loop by FAILURE CLASS "
+                "instead of always re-hypothesizing. A refuted claim whose "
+                "cited qid sits in the dynamic verifier's harness-suspect "
+                "pool (Fase 4: infrastructure failure or zero-pass "
+                "suspicion) is evidence about the EXPERIMENT, not the "
+                "hypothesis — burning the bounded retry budget on it "
+                "replaces a possibly-correct hypothesis in response to a "
+                "broken harness. 'off' = every refutation triggers the "
+                "retry (old behavior). 'shadow' (default) = log the "
+                "would-be routing via [RETRY-ROUTER-SHADOW] without "
+                "changing it. 'on' = doubted refutations are excluded "
+                "from the retry trigger (retry proceeds on sound ones "
+                "only; fully doubted → retry withheld, budget preserved, "
+                "status emitted). The other routes already exist: missing "
+                "evidence → NEEDS gap-fill; wrong question → step-level "
+                "ask_user."
+            ),
+        )
+
+        agentic_serial_maturity_confirmed: int = Field(
+            default=4,
+            ge=1,
+            description=(
+                "Serial method: confirmed graph checks required (with "
+                "coverage over low_coverage_threshold) for a dossier "
+                "to seal as MATURE. Deterministic — model confidence "
+                "plays no role in maturity."
+            ),
+        )
+
+        agentic_serial_maturity_min_rungs: int = Field(
+            default=2,
+            ge=1,
+            le=5,
+            description=(
+                "Distinct investigation rungs a hypothesis must have "
+                "walked before it may be sealed 'mature'. Counts "
+                "alongside agentic_serial_maturity_confirmed: enough "
+                "confirmations, over enough of the call tree. A run "
+                "with this at 1 (the old behaviour) sealed four of "
+                "five hypotheses on cycle 1 having read ONE body — "
+                "cheap agreement on the symbols rung bought an early "
+                "exit, while the only hypothesis that walked three "
+                "rungs produced the run's only refutation and won. 2 "
+                "means a verdict requires at least having looked at "
+                "who CALLS the code it blames. Raise for more "
+                "breadth per hypothesis at the cost of cycles; 1 "
+                "restores the count-only gate."
+            ),
+        )
+
+        agentic_serial_crucis_max: int = Field(
+            default=0,
+            ge=0,
+            description=(
+                "Serial method: max experimentum-crucis elimination "
+                "rounds on epsilon ties. 0 = UNLIMITED; a round that "
+                "eliminates nobody ends the loop (progress gate), "
+                "falling through to the deterministic order."
+            ),
+        )
+
+        agentic_serial_null_margin: float = Field(
+            default=0.3,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Serial method: the null-hypothesis bar. The winner is "
+                "accepted only if its corroboration exceeds the null "
+                "baseline's by this margin; otherwise the honest "
+                "terminal state reports that no candidate beat the "
+                "default explanation (and the graveyard remembers)."
+            ),
+        )
+
+        agentic_parsimony_epsilon: float = Field(
+            default=0.05,
+            ge=0.0,
+            le=0.2,
+            description=(
+                "EC-3 (parsimony): when the top survivors' combined "
+                "scores sit within this epsilon of the leader, the tie "
+                "is broken by Occam's razor — the hypothesis with the "
+                "fewest assumptions wins. An assumption is a claim the "
+                "SymbolGraph could not resolve (unverifiable, derived "
+                "deterministically from coverage_score x claim count). "
+                "Acts ONLY on ties, so calibrated score semantics are "
+                "untouched. 0.0 disables the tie-break entirely."
+            ),
+        )
+
+        enable_experiment_design: bool = Field(
+            default=True,  # ← NEVER disable: foundational for all other features
+            description=(
+                "Classify hypothesis claims as CRITICAL (hard kill if false) vs "
+                "SUPPORTIVE (score penalty only) before gathering evidence. "
+                "Enables Popperian asymmetric falsification. "
+                "Required for enable_weighted_scoring and enable_active_learning "
+                "to have any effect. Adds N LLM calls in iter 1 only (cached)."
+            ),
+        )
+
+        enable_generate_predictions: bool = Field(
+            default=True,  # ← marginal ROI=0.027 but structurally complete
+            description=(
+                "Deduce structural consequences of each hypothesis and verify them. "
+                "Closes the hypothetico-deductive cycle. "
+                "Adds N LLM calls in iter 1 only (not repeated in iter 2+). "
+                "Most optional of the enabled features: ROI=0.027, same as "
+                "max_iters 2→3. Disable first if latency is critical."
+            ),
+        )
+
+        enable_scope_delimitation: bool = Field(
+            default=True,  # ← ROI=0.117: good communication quality gain
+            description=(
+                "After selecting the winning hypothesis, add conditions of validity. "
+                "ROI=0.117: 0.60 expected calls, +7% quality. "
+                "Triggers when negative structural evidence OR devil_advocate critique exists."
+            ),
+        )
+
+        enable_devil_advocate: bool = Field(
+            default=True,  # ← ROI=0.160: excellent given 0.25 expected calls
+            description=(
+                "Run a contrarian pass on the winning hypothesis when its "
+                "score exceeds agentic_devil_advocate_threshold. "
+                "Conditional-cost, asymmetric-value insurance (GOVERNING "
+                "PRINCIPLES, Principle 3): it fires rarely, costs one "
+                "small call, and attacks the confident-and-wrong "
+                "hypothesis — the worst output the pipeline can promote."
+            ),
+        )
+
+        enable_peer_review: bool = Field(
+            default=True,  # ← devil's advocate until a 2nd model exists
+            description=(
+                "Enable peer review using a different model architecture. "
+                "ROI=0 when peer_review_model is empty or same as cot_model_level3 "
+                "(degrades to devil_advocate which is already enabled). "
+                "Only activate when a genuinely different model is available."
+            ),
+        )
+
+        low_coverage_threshold: float = Field(
+            default=0.3,
+            description=(
+                "Coverage below this ratio triggers: (1) Active Learning, "
+                "(2) coverage penalty in compute_weighted_score, "
+                "(3) atomic-claims constraint in _build_refinement_constraints. "
+                "0.3 = at least 30% of claims must be verifiable for normal scoring."
+            ),
+        )
+
+        enable_coverage_guard_for_falsification: bool = Field(
+            default=True,  # ← NEVER disable: free, prevents false kills
+            description=(
+                "Downgrade hard kill to score penalty when coverage < "
+                "min_coverage_for_falsification. Prevents Popperian hard kill "
+                "based on sparse evidence — a failed critical claim is only "
+                "trustworthy when we've verified enough of the total claims."
+            ),
+        )
+
+        min_coverage_for_falsification: float = Field(
+            default=0.3,  # ← equal to low_coverage_threshold: consistent policy
+            description=(
+                "Minimum coverage_score required to apply hard kill. "
+                "Keep equal to low_coverage_threshold for consistent policy: "
+                "below 30% coverage, neither penalize heavily nor kill."
+            ),
+        )
+
+        agentic_exploratory_requires_hypothesis: bool = Field(
+            default=True,
+            description=(
+                "An EXPLORATORY question — something is wrong and no cause "
+                "has been proposed — must schedule a hypothesize step rather "
+                "than name a cause and label it an unverified conjecture. "
+                "Turning this off restores the older shape. Measured across "
+                "every turn of the 28 July runs, plans carrying a forge ran "
+                "28 to 31 agent acts and plans without one ran 4 to 18, so "
+                "the saving is real and roughly halves to a third of the "
+                "work — bought by letting a cause reach the reader with no "
+                "rival tested against it."
+            ),
+        )
+
+        investigate_methodology: bool = Field(
+            default=True,
+            description=(
+                "Fase 3: methodology selection for investigate steps. A "
+                "deterministic word-bounded regex (bilingual EN/ES) "
+                "detects ABSENCE or UNIVERSAL goals ('no caller', "
+                "'never', 'ningún', 'todos') and appends the systematic "
+                "sweep discipline: evidence of absence requires EXHAUSTIVE "
+                "enumeration via TOOL: CALLERS/CALLEES/GREP, sampling "
+                "proves existence only, and an unenumerable set must be "
+                "declared instead of silently sampled. Ordinary "
+                "investigate steps keep the historical instruction "
+                "byte-identical. Off disables the selector entirely."
+            ),
+        )
+
+        analyze_methodology_charter: bool = Field(
+            default=True,
+            description=(
+                "Fase 5: conclusion-quality methodology for the terminal "
+                "analyze. The analysis must END with three labeled lines: "
+                "LOAD-BEARING EVIDENCE (the single piece whose failure "
+                "flips the conclusion — sensitivity analysis), RESIDUAL "
+                "RISK (false positive: passed checks but could be wrong, "
+                "vs false negative: evidence never seen — truncation, "
+                "incomplete enumeration), and ERROR CHARACTER when "
+                "evidence disagreed (SYSTEMATIC: stale index / wrong "
+                "framing, re-running will not help, vs RANDOM: sampling "
+                "noise, re-running helps). Labeled so the phase metric is "
+                "a grep and synthesis inherits them verbatim. Off leaves "
+                "the analyze instruction byte-identical."
+            ),
+        )
+
+        claims_operationalization: str = Field(
+            default="on",
+            description=(
+                "Fase 2: distinguish 'cannot be verified AS FORMULATED' "
+                "from 'not yet verified'. A claim citing no qids generates "
+                "no checks and silently dodges verification; downstream it "
+                "reads as pending when the real diagnosis is a badly "
+                "formulated claim. 'off' = old behavior. 'shadow' "
+                "(default) = log would-be cases via "
+                "[OPERATIONALIZE-SHADOW] without stamping. 'on' = stamp "
+                "verification='unoperationalizable' (deterministic — no "
+                "anchor means no check, no LLM judgement involved) and "
+                "list the affected claims in the verify report so "
+                "synthesis asks for a better claim instead of more "
+                "evidence. The claims contract always states the "
+                "requirement (name the measurement); this valve governs "
+                "only the verdict."
+            ),
+        )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 10. VERIFICATION & EVIDENCE
+        # ══════════════════════════════════════════════════════════════════════
+
+        agentic_auto_verify: bool = Field(
+            default=True,
+            description=(
+                "Auto-insert a static verify step right before the final "
+                "analyze: workspace claims are converted into typed checks "
+                "and executed against the SymbolIndex / call graph. Costs "
+                "one small LLM call (or zero on the deterministic fallback "
+                "and when there are no claims)."
+            ),
+        )
+
+        agentic_evidence_verify: bool = Field(
+            default=True,
+            description=(
+                "Settle behavioural claims by reading the body of the "
+                "symbol each one is about, instead of accepting a call-graph "
+                "edge as proof of what the code does. Costs one call per "
+                "verification stage; the bodies are fetched deterministically "
+                "and a supported verdict must quote code that is really "
+                "there."
+            ),
+        )
+
+        agentic_closing_verify: bool = Field(
+            default=True,
+            description=(
+                "Run a closing verification sweep over any claim still "
+                "carrying no verdict after the plan's steps finish. The "
+                "plan's own verify step sits before the terminal analyze so "
+                "the synthesis reads verified claims; everything emitted "
+                "after it — the analyze step's own claims, and a forge "
+                "plan's rivals — had no check at all. Costs one call, only "
+                "when claims are missing a verdict, and only over those."
+            ),
+        )
+
+        agentic_verify_dynamic_gated: str = Field(
+            default="shadow",
+            description=(
+                "#10: gate the (expensive, sandbox-executing) verify_dynamic "
+                "step on need. A planned verify_dynamic runs only when the "
+                "turn intent is debugging or the user asked "
+                "explicitly with '!test' in the message; otherwise it is "
+                "skipped in favour of static verify. 'off' = always run "
+                "planned verify_dynamic (prior behaviour). 'shadow' (default) "
+                "= log '[DYNGROUND-SHADOW] would skip' WITHOUT skipping, to "
+                "see how often it would fire. 'on' = actually skip when the "
+                "need condition is not met."
+            ),
+        )
+
+        agentic_gate_verify_dynamic: str = Field(
+            default="shadow",
+            description=(
+                "NUEVO-2/P3: let the difficulty gate trigger an ad-hoc "
+                "verify_dynamic for an escalated step whose claims are "
+                "behavioral (execution/logic), even when the plan scheduled "
+                "no verify_dynamic. Static falsification against the "
+                "SymbolIndex can pass a claim the running code contradicts; "
+                "this closes that gap for the claims that most need it. "
+                "Requires agentic_exec_mode='subprocess'. 'off' = never. "
+                "'shadow' (default) = log '[DYNGATE-SHADOW] would run dynamic "
+                "verification' WITHOUT running it. 'on' = run it (bounded by "
+                "the remaining budget); it adds auxiliary LLM calls between "
+                "the aligned prefill and the main inference."
+            ),
+        )
+
+        verify_dynamic_verdict_integrity: str = Field(
+            default="on",
+            description=(
+                "Fase 4: the experiment's control. Two failure shapes were "
+                "stamped as the system's strongest refutation when they "
+                "are evidence about the HARNESS, not the code: (1) status "
+                "error/timeout/rejected — the harness never ran, yet every "
+                "claim citing the qid got 'refuted'; (2) zero-pass "
+                "suspicion — 'fail' with 0/N asserts passed (N>=3): a "
+                "surgical refutation fails the asserts touching the "
+                "claim, EVERYTHING failing is the signature of a broken "
+                "composition (a result that would also 'refute' a "
+                "known-good implementation refutes only the harness). "
+                "'off' = old behavior. 'shadow' (default) = log would-be "
+                "downgrades via [VERDICT-INTEGRITY-SHADOW] without "
+                "changing verdicts. 'on' = downgrade both shapes to "
+                "'inconclusive' (inert for every existing consumer) and "
+                "stamp the ⚗ claim 'unverifiable' instead of 'refuted'. "
+                "Either mode parks the qid in _harness_suspects for the "
+                "Fase 6 retry router ('harness doubt' route). Blinding — "
+                "the harness generator receiving the operationalized "
+                "check, not the hypothesis narrative — was audited and is "
+                "already structurally satisfied: _elicit_tests receives "
+                "body + testability verdict only."
+            ),
+        )
+
+        verify_replicate_suspect: str = Field(
+            default="on",
+            description=(
+                "Fase 8: selective replication. When a FRESH harness run "
+                "comes back with a suspect shape (shared predicate with "
+                "verify_dynamic_verdict_integrity: infrastructure status "
+                "or zero-pass), regenerate the tests ONCE with a hint "
+                "describing the failure, re-compose and re-execute, and "
+                "let the second result be authoritative — recovered "
+                "evidence instead of discarded evidence. Structurally "
+                "bounded to one replication per target; cached results "
+                "are never replicated (only fresh executions pay the "
+                "extra harness). A replica that reproduces a suspect "
+                "shape CONFIRMS the doubt with two independent data "
+                "points and flows into the Fase 4/6 handling as usual. "
+                "'off' = never. 'shadow' (default) = log would-replicate "
+                "via [REPLICATE-SHADOW]. 'on' = replicate. Cost when it "
+                "fires: one harness-generation LLM call plus one sandbox "
+                "execution."
+            ),
+        )
+
+        agentic_dynamic_max_targets: int = Field(
+            default=2,
+            ge=1,
+            le=5,
+            description="Maximum symbols a verify_dynamic step will test.",
+        )
+
+        agentic_regression_max_callers: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description=(
+                "Fase 7: maximum direct callers a verify_regression step "
+                "re-checks. Cached-harness callers re-execute at zero LLM "
+                "cost; uncached ones are elicited up to the budget."
+            ),
+        )
+
+        agentic_tdd_inter_turn: bool = Field(
+            default=True,
+            description=(
+                "Fase 6: after a design_tests step, verify the NEXT main "
+                "response's generated code against the acceptance tests in a "
+                "background task (no LLM call, slot-free), and surface the "
+                "verdict at the top of the following turn. Requires "
+                "agentic_exec_mode in ('subprocess', 'docker')."
+            ),
+        )
+
+        agentic_claims_tail_recovery: bool = Field(
+            default=True,
+            description=(
+                "When a step's generation is truncated at "
+                "agentic_step_max_tokens before emitting its end-positioned "
+                "claims JSON block, re-ask for the block with one short "
+                "grounded follow-up call (the paid-for prose is handed "
+                "back; only the JSON is regenerated). Recovered claims pass "
+                "the same citation validation as native ones. Observed "
+                "live: three truncated steps in one run lost every claim, "
+                "leaving verify and the difficulty gate evidence-blind."
+            ),
+        )
+
+        agentic_coherence_check: str = Field(
+            default="shadow",
+            description=(
+                "P4: cross-step coherence check before the generative "
+                "evaluation (Fase 9). A light, no-LLM scan for two steps that "
+                "reached CONTRADICTORY verdicts on the same symbol with high "
+                "confidence (one confirmed, one refuted). 'off' = never. "
+                "'shadow' (default) = detect and log '[COHERENCE] would abort' "
+                "WITHOUT acting, to calibrate before enabling. 'on' = abort "
+                "the generative wave on a detected contradiction and force a "
+                "full re-plan instead of asking 'is there something better?' "
+                "over an internally inconsistent workspace."
+            ),
+        )
+
+        agentic_coherence_min_confidence: float = Field(
+            default=0.7,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Minimum confidence BOTH contradicting claims must carry for "
+                "the P4 coherence check to treat them as a real contradiction "
+                "rather than low-confidence noise."
+            ),
+        )
+
+        agentic_generative_eval: str = Field(
+            default="shadow",
+            description=(
+                "Generative evaluation between execution and synthesis "
+                "(Fase 9, Nivel-2 iteration). One aligned call asks the "
+                "IMPROVEMENT question — correctness is the verify step's "
+                "job — and may propose up to 2 follow-up steps. 'off' = "
+                "never. 'shadow' (default) = run the evaluation and log "
+                "'would replan' WITHOUT executing the wave (grep "
+                "[REPLAN-SHADOW]). 'on' = append and execute the wave "
+                "(executor-only: investigate/analyze, no control signals — "
+                "a wave must not recursively replan), capped by "
+                "agentic_max_replans and the budget floor."
+            ),
+        )
+
+        agentic_generative_rigor: str = Field(
+            default="on",
+            description=(
+                "P1: subject a proposed generative improvement to a structural "
+                "test before accepting it. Today the evaluator's "
+                "'improvement_found' is a bare model judgement — a false "
+                "positive spins a re-plan wave on a stylistic preference. When "
+                "on, the proposed angle and the current approach are treated "
+                "as two hypotheses and find_experimentum_crucis looks for an "
+                "experiment that distinguishes them; if none exists the "
+                "'improvement' is deemed stylistic and the wave is dropped. "
+                "'off' = accept improvements as before. 'shadow' (default) = "
+                "log '[RIGOR-SHADOW] improvement has/ lacks a distinguishing "
+                "experiment' WITHOUT changing the decision, to calibrate. "
+                "'on' = drop improvements with no distinguishing experiment."
+            ),
+        )
+
         enable_degeneracy_retry: bool = Field(
             default=True,
             description=(
@@ -46467,300 +48022,37 @@ class Filter:
                 "model no longer needs the scaffolding."
             ),
         )
-        agentic_runaway_token_cap: int = Field(
-            default=8000,
-            ge=0,
-            description=(
-                "Ceiling passed as max_tokens on pipeline calls when "
-                "agentic_unlimited_tokens is on. 0 sends none at all, "
-                "which is not the same as a large one: the request then "
-                "carries no max_tokens and the model generates until the "
-                "server's context window ends."
-                "\n\n"
-                "MUST stay above every per-label budget, and the reason "
-                "is a mistake this valve has already made. Sized at 4500 "
-                "from a sample of healthy calls that happened to top out "
-                "at 3683, it sat below agentic_step_max_tokens (8000) and "
-                "quietly became the step budget instead of a backstop for "
-                "it. Seven of thirteen steps in one run were cut, three "
-                "of them mid-`TOOL:` line, and each cut cost more than it "
-                "saved: the step lost its claims tail, the recovery call "
-                "fired, and that was cut too. Truncating legitimate work "
-                "does not prevent corruption, it causes it."
-                "\n\n"
-                "16000 is twice the largest per-label budget, so no "
-                "legitimate call can reach it, while still bounding a "
-                "runaway to roughly four minutes against the fifteen a "
-                "context-window-length generation takes. The budgets are "
-                "what shape quality; this is only here to stop "
-                "hallucinated verbosity, and _validate_valve_coherence "
-                "now warns if it is ever lowered back under one."
-                "\n\n"
-                "Raise it if a legitimate call is seen finishing on "
-                "length rather than stop; the agent dump reports "
-                "finish_reason per call, so that is one grep."
-            ),
-        )
-        agentic_unlimited_tokens: bool = Field(
+
+        agentic_premortem: bool = Field(
             default=True,
             description=(
-                "Operator decision: NO token ceiling on any call of the "
-                "agentic/scientific-method pipeline (planner, preplanner, "
-                "steps, verify, harness, digest, competition, crucis, peer "
-                "review, claims recovery...). Per the GOVERNING PRINCIPLES, "
-                "a token cap a healthy run can meet is a quality-budget in "
-                "disguise — a healthy planner hit its cap twice in one "
-                "session and every run silently degraded to the fixed "
-                "fallback plan. Selection is label-based at the call_llm "
-                "choke point, so non-pipeline calls (classifiers, "
-                "summarisers) keep llm_uncapped_max_tokens as their "
-                "anti-runaway cap. When this is off, the per-label "
-                "agentic_*_max_tokens valves below apply as before. The "
-                "remaining protections for uncapped pipeline calls are the "
-                "anti-hang connection backstop and sampler-side loop "
-                "control (DRY), not ceilings that can truncate healthy "
-                "reasoning."
+                "Pre-mortem: instruct the synthesis (main) call to red-team "
+                "its OWN answer before giving it — name the single most "
+                "fragile point and the validity clause that must hold; if "
+                "that clause is not backed by the workspace evidence, say so "
+                "in the answer instead of sounding falsely confident. "
+                "Intensity is gated by the fraction of invalid citations in "
+                "the ledger (objective graph signal, not self-reported "
+                "confidence): light when evidence is solid, emphatic when "
+                "the solution leans on unverified identifiers. No extra LLM "
+                "call — it rides the synthesis prompt already sent."
             ),
         )
-        agentic_step_max_tokens: int = Field(
-            default=8000,
-            ge=100,
-            description=(
-                "[Consulted only when agentic_unlimited_tokens is off.] Generation ceiling per agentic step — an ANTI-RUNAWAY "
-                "guard, NOT a quality budget (GOVERNING PRINCIPLES, "
-                "Principle 2 and THE MAXIM). The claims contract sits at "
-                "the very END of a step's output, so a cap a healthy step "
-                "can reach cuts exactly the structured part and blinds the "
-                "verify stage — the same corruption as a mid-generation "
-                "clock kill, by a different cutter. At the old default of "
-                "2500 healthy investigate steps truncated on nearly every "
-                "complex turn (measured: outputs cut at ~2400 tokens, "
-                "claims lost, ~30s recovery attempts per truncation). "
-                "8000 is sized ~3x above the longest healthy step "
-                "observed, so only a pathological generation — the Q4 "
-                "line-cycle repetition loop — can reach it. Recalibrate "
-                "against fresh logs: the correct value is 'never reached "
-                "by a sane step', and if the DRY loop is fixed at the "
-                "sampler level (or the deployment moves to Q8, where the "
-                "loop disappears), truncation at ANY value of this valve "
-                "should become a rare-path event. Do not lower it back "
-                "into the healthy range to save time — that trades claims "
-                "for seconds, the exact swap this pipeline refuses."
-            ),
-        )
-        agentic_digest_max_tokens: int = Field(
-            default=400,
-            ge=50,
-            description=(
-                "[Consulted only when agentic_unlimited_tokens is off.] Per-step digest budget for the workspace. Head-truncated, "
-                "but a trailing 'NOT FOUND:' section is always preserved."
-            ),
-        )
-        agentic_preplanner_timeout_s: int = Field(
-            default=240,
-            ge=0,
-            description=(
-                "Ceiling for the single pre-planner call. This is an "
-                "anti-hang guard, NOT a budget: it sits at roughly 2.5x the "
-                "measured cost of a healthy call on a --parallel 1 server "
-                "(89.7s in the reference run), so a normal pre-plan never "
-                "comes near it and only a genuinely stuck call is cut. "
-                "Deliberately generous — a pre-planner cut short degrades "
-                "to an empty brief and the planner then decides the HOW "
-                "without knowing the WHAT, which costs far more quality "
-                "than the seconds it saves. On timeout the stage fails open "
-                "(empty brief), never the run. 0 disables the ceiling."
-            ),
-        )
-        agentic_planner_timeout_s: int = Field(
-            default=180,
-            ge=0,
-            description=(
-                "Ceiling for the single planner call. Anti-hang guard at "
-                "roughly 3x the measured cost of a healthy call (59.1s in "
-                "the reference run). On timeout the planner degrades to its "
-                "deterministic fixed plan, which is a real plan but a blunt "
-                "one — so the ceiling is set where only a stuck call meets "
-                "it. 0 disables it."
-            ),
-        )
-        agentic_max_steps: int = Field(
-            default=7,
-            ge=2,
-            le=8,
-            description=(
-                "Maximum steps the planner may emit. 5 leaves headroom: a "
-                "hypothesize plan (investigate + hypothesize + verify + "
-                "analyze) fills 4 exactly, so at 4 there was no room for a "
-                "NEEDS-inserted follow-up step on precisely the turns that "
-                "investigate the hardest questions. This is the HARD ceiling "
-                "in every mode: agentic_steps_auto only shapes the budget "
-                "SUGGESTED to the planner within it."
-            ),
-        )
-        agentic_steps_auto: bool = Field(
-            default=True,
-            description=(
-                "Size the step budget from the pre-planner's difficulty "
-                "verdict instead of always offering the full ceiling. The "
-                "pre-planner — which just explored the framings and possibly "
-                "consulted memory — grades the chosen framing low/medium/"
-                "high as one extra field in its existing JSON (zero extra "
-                "LLM calls), and the planner's contract range becomes 2..3, "
-                "2..5 or 2..agentic_max_steps respectively. The code bounds, "
-                "the model proposes within limits: the verdict never raises "
-                "the ceiling above agentic_max_steps, an unparseable or "
-                "missing verdict keeps the full ceiling (today's behavior "
-                "verbatim, also when the pre-planner is disabled), and the "
-                "parser accepts up to the VALVE ceiling regardless of the "
-                "suggestion. A misjudged 'low' is recoverable mid-run: "
-                "NEEDS-inserted follow-up steps check the valve ceiling, not "
-                "the suggested budget."
-            ),
-        )
-        agentic_planner_max_tokens: int = Field(
-            default=2000,
-            ge=100,
-            description=(
-                "[Consulted only when agentic_unlimited_tokens is off.] Generation cap for the planner's JSON plan. 768 leaves "
-                "comfortable room for a multi-step plan with descriptive "
-                "goals and a rationale; a tighter cap truncates the JSON "
-                "mid-object, which fails to parse and falls back to the "
-                "fixed plan — silently dropping richer step kinds like "
-                "design_tests (observed live at 400: a design-tests plan "
-                "generated 402 tokens, hit finish_reason=length, and "
-                "reverted to investigate/verify/analyze with no tests "
-                "armed). Raise further only if plans with many steps are "
-                "still being cut off."
-            ),
-        )
-        agentic_step_cache: bool = Field(
-            default=True,
-            description=(
-                "Cache step results in SQLite keyed by (kind, goal) and the "
-                "structure_hash they were produced under; a code edit "
-                "invalidates automatically. Repeated investigations across "
-                "neighbouring turns become free."
-            ),
-        )
-        agentic_clarification_blocks_pipeline: bool = Field(
-            default=False,
-            description=(
-                "R27: when the pre-planner or the planner asks for "
-                "clarification, whether that ask BLOCKS the pipeline. "
-                "False (default): the question is surfaced but the "
-                "pipeline runs anyway — the planner ask substitutes the "
-                "fixed fallback plan — and the answer states the "
-                "assumption it proceeded under and ends with the "
-                "clarifying question, so the user gets a full analysis "
-                "plus the chance to refine. This also routes the reply "
-                "through the normal outlet post-processing (the "
-                "blocking path skipped it, producing raw fences glued "
-                "to prose). True restores the historical ask-and-stop: "
-                "the turn only asks the question and no pipeline runs."
-            ),
-        )
-        agentic_wait_for_busy_slot: bool = Field(
-            default=True,
-            description=(
-                "R24: when an otherwise pipeline-eligible code turn finds "
-                "the single --parallel 1 slot busy (e.g. background "
-                "scaffolding still running right after a silent ingestion), "
-                "wait for the in-flight LLM work to drain and then run the "
-                "agentic pipeline, instead of silently degrading to the "
-                "fast path and losing the entire scientific method on the "
-                "first real question of the session. Off restores the old "
-                "skip-on-busy behaviour."
-            ),
-        )
-        agentic_slot_wait_timeout_s: float = Field(
-            default=120.0,
-            ge=1.0,
-            le=600.0,
-            description=(
-                "R24: maximum time to wait for the busy slot to drain "
-                "before falling back to the fast path. Bounds the worst "
-                "case so a genuinely stuck background task cannot hang the "
-                "turn indefinitely; on a healthy server the scaffolding "
-                "drains in seconds."
-            ),
-        )
-        agentic_ask_user_max_step: int = Field(
-            default=2,
-            ge=1,
-            le=7,
-            description=(
-                "R22: the stateless ask-user clarification short-circuit is "
-                "only honoured from a step at or before this 1-based "
-                "position. A genuine up-front ambiguity surfaces in the "
-                "first step or two; a later verify/analyze 'ask' is almost "
-                "always the model reciting Block A reasoning guidelines as "
-                "prose, which a live run parsed into the ask field and used "
-                "to kill a 7-step plan at step 2. Independent of this, "
-                "plan_profile=full suppresses the short-circuit entirely "
-                "(full demands the complete method run)."
-            ),
-        )
-        agentic_ctx_size: int = Field(
-            default=131072,
-            ge=8192,
-            le=1048576,
-            description=(
-                "R19: the llama.cpp --ctx-size, used to compute the "
-                "tool-round input budget (ctx minus the aligned prefix "
-                "minus the generation reserve minus the safety margin). "
-                "Must match the server's actual context length or the "
-                "budget guard will be wrong. Only affects budgeting, never "
-                "sent to the model."
-            ),
-        )
-        agentic_tool_ctx_margin: int = Field(
-            default=4000,
-            ge=0,
-            le=32000,
-            description=(
-                "R19: safety margin (tokens) held back when computing the "
-                "tool-round input budget, so measurement error in the "
-                "prefix/generation estimate cannot push a step past "
-                "ctx-size into a hard truncation or KV eviction. 4000 is "
-                "comfortable; raise it if truncation reappears."
-            ),
-        )
-        agentic_tool_rounds_max: int = Field(
-            default=3,
-            ge=0,
-            le=4,
-            description=(
-                "Maximum tool rounds per step (TOOL: EXPAND/CALLERS/CALLEES/"
-                "DOC/GREP requests resolved locally at zero LLM cost). "
-                "0 disables the tool loop."
-            ),
-        )
-        agentic_early_exit_confidence: float = Field(
-            default=0.85,
-            ge=0.5,
+
+        premortem_suspect_ratio: float = Field(
+            default=0.34,
+            ge=0.0,
             le=1.0,
             description=(
-                "Confidence floor for early-exit (only consulted when "
-                "agentic_early_exit is 'shadow' or 'on'). A step declaring "
-                "resolved=true at or above this floor may skip the remaining "
-                "non-verify steps ('verify' steps are never skipped)."
+                "Fraction of ledger claims with invalid citations at or above "
+                "which the pre-mortem switches from light to emphatic. Below "
+                "it the solution is treated as evidence-solid (light "
+                "pre-mortem); the fully-degenerate case (zero valid claims) "
+                "is already covered by the degenerate-workspace warning and "
+                "skips the pre-mortem to avoid duplication."
             ),
         )
-        agentic_early_exit: str = Field(
-            default="off",
-            description=(
-                "Whether a high-confidence step may skip the remaining "
-                "non-verify steps. 'off' never evaluates the gate (every "
-                "step always runs). 'shadow' (default) evaluates the gate "
-                "and logs what it WOULD skip via [EARLY-EXIT-SHADOW] while "
-                "still running every step — safe telemetry for A/B testing. "
-                "'on' performs the skip (the original behaviour). Skipping "
-                "cuts cost but measurably corrupts runs when a premature "
-                "step-1 exit drops the steps that would have corrected it, "
-                "so it defaults off the actual-skip path."
-            ),
-        )
+
         agentic_metacog_reinforce: str = Field(
             default="shadow",
             description=(
@@ -46782,60 +48074,7 @@ class Filter:
                 "aligned prefill and the main inference."
             ),
         )
-        agentic_verify_dynamic_gated: str = Field(
-            default="shadow",
-            description=(
-                "#10: gate the (expensive, sandbox-executing) verify_dynamic "
-                "step on need. A planned verify_dynamic runs only when the "
-                "turn intent is debugging or the user asked "
-                "explicitly with '!test' in the message; otherwise it is "
-                "skipped in favour of static verify. 'off' = always run "
-                "planned verify_dynamic (prior behaviour). 'shadow' (default) "
-                "= log '[DYNGROUND-SHADOW] would skip' WITHOUT skipping, to "
-                "see how often it would fire. 'on' = actually skip when the "
-                "need condition is not met."
-            ),
-        )
-        agentic_ledger_persist: bool = Field(
-            default=True,
-            description=(
-                "#11: persist the agentic evidence ledger between turns. At "
-                "the end of a pipeline run the claims are snapshotted into "
-                "pstate (per-project); a turn classified as a CONTINUATION "
-                "restores them so a multi-turn line of reasoning can resume "
-                "instead of starting the ledger empty. A fresh question "
-                "never restores — the snapshot stays put and a 'not a "
-                "continuation' log is emitted instead — so a stale snapshot "
-                "cannot bias an unrelated turn (observed live before the "
-                "gate: three different bugs in a row each inherited the "
-                "prior bug's claims). On by default. A project switch gets a "
-                "clean pstate and never inherits another project's snapshot."
-            ),
-        )
-        agentic_ledger_snapshot_max: int = Field(
-            default=40,
-            ge=0,
-            description=(
-                "Maximum ledger claims kept in the #11 snapshot, to bound the "
-                "pstate size. Older claims beyond this are dropped."
-            ),
-        )
-        agentic_gate_verify_dynamic: str = Field(
-            default="shadow",
-            description=(
-                "NUEVO-2/P3: let the difficulty gate trigger an ad-hoc "
-                "verify_dynamic for an escalated step whose claims are "
-                "behavioral (execution/logic), even when the plan scheduled "
-                "no verify_dynamic. Static falsification against the "
-                "SymbolIndex can pass a claim the running code contradicts; "
-                "this closes that gap for the claims that most need it. "
-                "Requires agentic_exec_mode='subprocess'. 'off' = never. "
-                "'shadow' (default) = log '[DYNGATE-SHADOW] would run dynamic "
-                "verification' WITHOUT running it. 'on' = run it (bounded by "
-                "the remaining budget); it adds auxiliary LLM calls between "
-                "the aligned prefill and the main inference."
-            ),
-        )
+
         agentic_metacog_confidence_floor: float = Field(
             default=0.55,
             ge=0.0,
@@ -46846,850 +48085,773 @@ class Filter:
                 "signal, fabricated identifiers, escalates regardless)."
             ),
         )
-        align_aux_calls_to_prefix: bool = Field(
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 11. ANSWER CONDUCT & USER PROFILE
+        # ══════════════════════════════════════════════════════════════════════
+
+        enable_confidence_scoring: bool = Field(
+            default=True,
+            description="Request a confidence score at the end of each response.",
+        )
+
+        confidence_prompt: str = Field(
+            default="\n\nAfter your response, on a new line, output '[Confidence: XX%]'...",
+            description="Suffix appended to system prompt to request confidence score.",
+        )
+
+        enable_user_profile: bool = Field(
             default=True,
             description=(
-                "Prepend the turn's preliminary system prompt to EVERY "
-                "auxiliary LLM call that targets the turn's main model "
-                "(classify_turn, contradiction_llm, session_summary, "
-                "change_summary, docstrings, and the rest), so each one is a "
-                "prefix extension of the resident context instead of a bare "
-                "prompt. The server logs showed a single bare call sharing 3 "
-                "tokens ('against 3') erasing every valid checkpoint with no "
-                "possible recovery: replacement checkpoints are created where "
-                "prompts end, past the divergence point of every future "
-                "turn, so one killer condemns every subsequent turn to a "
-                "~65s full re-prefill. Calls to a different model, calls "
-                "that already carry the prefix, and calls that would not fit "
-                "the context window are passed through unchanged. Turn OFF "
-                "to restore bare auxiliary prompts (focal but "
-                "pool-destroying)."
+                "User profile: a small, stable block of learned user "
+                "preferences injected at the TOP of Block A so every agentic "
+                "call — pre-planner, planner, each step, synthesis — shares it "
+                "(Block A is the only prefix all N+1 pipeline calls see). V1 "
+                "learns LANGUAGE only, fixing it drifting to English "
+                "mid-pipeline. Two tiers: inferred values land in a provisional "
+                "tier and reach the authoritative tier (the one rendered in "
+                "Block A) only after being corroborated "
+                "user_profile_promotion_count times or declared by the user, "
+                "so a one-off confident guess never enters the prompt."
             ),
         )
-        agentic_serial_method: bool = Field(
-            default=True,
+
+        user_profile_min_confidence: float = Field(
+            default=0.85,
+            ge=0.0,
+            le=1.0,
             description=(
-                "Serial method (S1): forge hypotheses ONE AT A TIME — "
-                "each gets a full investigate/evaluate/analyze cycle "
-                "and seals into a HypothesisDossier (plausible or "
-                "dead) before the next is generated; only plausible "
-                "dossiers reach the final competition. False keeps the "
-                "parallel competition untouched (A/B between runs). "
-                "Default True: the serial method is now the primary "
-                "reasoning path; set False only to A/B against the "
-                "(retired-by-default) parallel competition."
+                "Minimum self-reported confidence for an inferred value to be "
+                "recorded in the provisional tier at all. Values below this "
+                "are ignored. High by design; promotion to authoritative then "
+                "additionally requires corroboration."
             ),
         )
-        agentic_serial_hypothesis_count: int = Field(
+
+        user_profile_promotion_count: int = Field(
+            default=2,
+            ge=1,
+            le=10,
+            description=(
+                "How many times the SAME value must be independently inferred "
+                "before it is promoted from the provisional tier to the "
+                "authoritative tier (which Block A renders). This is what "
+                "prevents a transient mode from fossilizing in Block A: only a "
+                "value that recurs promotes; a one-off guess does not. A user "
+                "declaration bypasses this (human outranks inference)."
+            ),
+        )
+
+        user_profile_decay_turns: int = Field(
+            default=40,
+            ge=0,
+            le=1000,
+            description=(
+                "Turns without re-corroboration after which an authoritative "
+                "field is demoted/removed, keeping the profile reflecting "
+                "RECENT behavior. 0 disables decay. For language this is nearly "
+                "inert (it rarely changes) but the mechanism guards all fields."
+            ),
+        )
+
+        user_profile_lookback: int = Field(
+            default=6,
+            ge=2,
+            le=20,
+            description=(
+                "How many recent user messages the profile inference reads as "
+                "evidence. The profile reflects RECENT modus operandi, so the "
+                "window is short and rolling rather than the whole history."
+            ),
+        )
+
+        user_profile_infer_interval: int = Field(
             default=3,
-            ge=1,
-            description=(
-                "Serial method: target number of SEALED dossiers to "
-                "forge before the final competition."
-            ),
-        )
-        agentic_serial_cycles_max: int = Field(
-            default=0,
-            ge=0,
-            description=(
-                "Serial method: max forge cycles per hypothesis. 0 = "
-                "UNLIMITED (the validation default): termination is "
-                "guaranteed by progress gates — a cycle adding no "
-                "newly-resolvable claims seals the dossier — never by "
-                "this counter. Tighten only after the mode is proven "
-                "clean; truncated steps are hallucination generators."
-            ),
-        )
-        agentic_serial_maturity_confirmed: int = Field(
-            default=4,
-            ge=1,
-            description=(
-                "Serial method: confirmed graph checks required (with "
-                "coverage over low_coverage_threshold) for a dossier "
-                "to seal as MATURE. Deterministic — model confidence "
-                "plays no role in maturity."
-            ),
-        )
-        agentic_serial_maturity_min_rungs: int = Field(
-            default=2,
-            ge=1,
-            le=5,
-            description=(
-                "Distinct investigation rungs a hypothesis must have "
-                "walked before it may be sealed 'mature'. Counts "
-                "alongside agentic_serial_maturity_confirmed: enough "
-                "confirmations, over enough of the call tree. A run "
-                "with this at 1 (the old behaviour) sealed four of "
-                "five hypotheses on cycle 1 having read ONE body — "
-                "cheap agreement on the symbols rung bought an early "
-                "exit, while the only hypothesis that walked three "
-                "rungs produced the run's only refutation and won. 2 "
-                "means a verdict requires at least having looked at "
-                "who CALLS the code it blames. Raise for more "
-                "breadth per hypothesis at the cost of cycles; 1 "
-                "restores the count-only gate."
-            ),
-        )
-        agentic_serial_design_max_tokens: int = Field(
-            default=0,
-            ge=0,
-            description=(
-                "Serial method: output cap for the deep design call "
-                "inside a forge cycle. 0 = UNLIMITED (validation "
-                "default; an incomplete design is worse than a slow "
-                "one). With at most count x cycles designs per run, "
-                "depth is affordable here in a way the parallel mode "
-                "never could."
-            ),
-        )
-        agentic_serial_crucis_max: int = Field(
-            default=0,
-            ge=0,
-            description=(
-                "Serial method: max experimentum-crucis elimination "
-                "rounds on epsilon ties. 0 = UNLIMITED; a round that "
-                "eliminates nobody ends the loop (progress gate), "
-                "falling through to the deterministic order."
-            ),
-        )
-        agentic_serial_null_margin: float = Field(
-            default=0.3,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Serial method: the null-hypothesis bar. The winner is "
-                "accepted only if its corroboration exceeds the null "
-                "baseline's by this margin; otherwise the honest "
-                "terminal state reports that no candidate beat the "
-                "default explanation (and the graveyard remembers)."
-            ),
-        )
-        agentic_parsimony_epsilon: float = Field(
-            default=0.05,
-            ge=0.0,
-            le=0.2,
-            description=(
-                "EC-3 (parsimony): when the top survivors' combined "
-                "scores sit within this epsilon of the leader, the tie "
-                "is broken by Occam's razor — the hypothesis with the "
-                "fewest assumptions wins. An assumption is a claim the "
-                "SymbolGraph could not resolve (unverifiable, derived "
-                "deterministically from coverage_score x claim count). "
-                "Acts ONLY on ties, so calibrated score semantics are "
-                "untouched. 0.0 disables the tie-break entirely."
-            ),
-        )
-        agentic_claims_tail_recovery: bool = Field(
-            default=True,
-            description=(
-                "When a step's generation is truncated at "
-                "agentic_step_max_tokens before emitting its end-positioned "
-                "claims JSON block, re-ask for the block with one short "
-                "grounded follow-up call (the paid-for prose is handed "
-                "back; only the JSON is regenerated). Recovered claims pass "
-                "the same citation validation as native ones. Observed "
-                "live: three truncated steps in one run lost every claim, "
-                "leaving verify and the difficulty gate evidence-blind."
-            ),
-        )
-        agentic_coherence_check: str = Field(
-            default="shadow",
-            description=(
-                "P4: cross-step coherence check before the generative "
-                "evaluation (Fase 9). A light, no-LLM scan for two steps that "
-                "reached CONTRADICTORY verdicts on the same symbol with high "
-                "confidence (one confirmed, one refuted). 'off' = never. "
-                "'shadow' (default) = detect and log '[COHERENCE] would abort' "
-                "WITHOUT acting, to calibrate before enabling. 'on' = abort "
-                "the generative wave on a detected contradiction and force a "
-                "full re-plan instead of asking 'is there something better?' "
-                "over an internally inconsistent workspace."
-            ),
-        )
-        agentic_coherence_min_confidence: float = Field(
-            default=0.7,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Minimum confidence BOTH contradicting claims must carry for "
-                "the P4 coherence check to treat them as a real contradiction "
-                "rather than low-confidence noise."
-            ),
-        )
-        agentic_generative_rigor: str = Field(
-            default="on",
-            description=(
-                "P1: subject a proposed generative improvement to a structural "
-                "test before accepting it. Today the evaluator's "
-                "'improvement_found' is a bare model judgement — a false "
-                "positive spins a re-plan wave on a stylistic preference. When "
-                "on, the proposed angle and the current approach are treated "
-                "as two hypotheses and find_experimentum_crucis looks for an "
-                "experiment that distinguishes them; if none exists the "
-                "'improvement' is deemed stylistic and the wave is dropped. "
-                "'off' = accept improvements as before. 'shadow' (default) = "
-                "log '[RIGOR-SHADOW] improvement has/ lacks a distinguishing "
-                "experiment' WITHOUT changing the decision, to calibrate. "
-                "'on' = drop improvements with no distinguishing experiment."
-            ),
-        )
-        agentic_enforce_step_order: bool = Field(
-            default=True,
-            description=(
-                "Normalize the plan to the scientific method's partial "
-                "order (investigate → hypothesize → design_tests → "
-                "verify_dynamic → verify_regression → verify → analyze) "
-                "with a STABLE sort before execution. The planner contract "
-                "asks for this order but only analyze-last was enforced; a "
-                "plan returned out of order used to run out of order. "
-                "Stable: relative order within each kind is preserved."
-            ),
-        )
-        agentic_hypothesis_retries: int = Field(
-            default=1,
-            ge=0,
-            le=3,
-            description=(
-                "Scientific-method refutation loop: when the verify step "
-                "refutes claim(s) owned by a hypothesize step, insert one "
-                "re-hypothesize (promote the surviving rival or formulate "
-                "a new hypothesis) plus its own verify before the terminal "
-                "analyze, at most this many times per run. 0 restores the "
-                "old feed-forward behavior (refutations are reported to "
-                "analyze but never retried). Each retry costs one "
-                "hypothesize LLM call plus a deterministic verify."
-            ),
-        )
-        agentic_retry_router: str = Field(
-            default="on",
-            description=(
-                "Fase 6: route the refutation loop by FAILURE CLASS "
-                "instead of always re-hypothesizing. A refuted claim whose "
-                "cited qid sits in the dynamic verifier's harness-suspect "
-                "pool (Fase 4: infrastructure failure or zero-pass "
-                "suspicion) is evidence about the EXPERIMENT, not the "
-                "hypothesis — burning the bounded retry budget on it "
-                "replaces a possibly-correct hypothesis in response to a "
-                "broken harness. 'off' = every refutation triggers the "
-                "retry (old behavior). 'shadow' (default) = log the "
-                "would-be routing via [RETRY-ROUTER-SHADOW] without "
-                "changing it. 'on' = doubted refutations are excluded "
-                "from the retry trigger (retry proceeds on sound ones "
-                "only; fully doubted → retry withheld, budget preserved, "
-                "status emitted). The other routes already exist: missing "
-                "evidence → NEEDS gap-fill; wrong question → step-level "
-                "ask_user."
-            ),
-        )
-        verify_replicate_suspect: str = Field(
-            default="on",
-            description=(
-                "Fase 8: selective replication. When a FRESH harness run "
-                "comes back with a suspect shape (shared predicate with "
-                "verify_dynamic_verdict_integrity: infrastructure status "
-                "or zero-pass), regenerate the tests ONCE with a hint "
-                "describing the failure, re-compose and re-execute, and "
-                "let the second result be authoritative — recovered "
-                "evidence instead of discarded evidence. Structurally "
-                "bounded to one replication per target; cached results "
-                "are never replicated (only fresh executions pay the "
-                "extra harness). A replica that reproduces a suspect "
-                "shape CONFIRMS the doubt with two independent data "
-                "points and flows into the Fase 4/6 handling as usual. "
-                "'off' = never. 'shadow' (default) = log would-replicate "
-                "via [REPLICATE-SHADOW]. 'on' = replicate. Cost when it "
-                "fires: one harness-generation LLM call plus one sandbox "
-                "execution."
-            ),
-        )
-        hypothesis_target_count: str = Field(
-            default="4",
-            description=(
-                "How many competing hypotheses the hypothesize step "
-                "requests. Two forms:\n"
-                '  • "auto" — difficulty-derived band, the historical '
-                "behaviour: low → 2-3, medium → 3-5, high → 4-6 (falls "
-                "back to 2-4 when difficulty is unknown).\n"
-                '  • a number, e.g. "4" — a fixed focused competition: '
-                "enough distinct rivals to discriminate a real root cause, "
-                "few enough that each is scored properly and the pool does "
-                "not drift toward hypothesis_hard_cap.\n"
-                "The count is requested in the prompt, not enforced by "
-                "truncation, so a model with one more genuinely distinct "
-                "mechanism can still surface it; hypothesis_hard_cap "
-                "remains the real ceiling."
-            ),
-        )
-        agentic_plan_profile: str = Field(
-            default="auto",
-            description=(
-                "A/B switch between the full scientific method and the "
-                "quick path, from one place. 'auto' (default): the "
-                "selectors decide — question-type hints and the "
-                "difficulty budget produce the quick path (investigate → "
-                "verify → analyze) for descriptive/low turns and the full "
-                "method elsewhere. 'full': every agentic turn schedules "
-                "the complete method (a full-method directive replaces "
-                "the type hint, budget pinned to the agentic_max_steps "
-                "ceiling) — hypothesize always present, so the whole "
-                "competition suite runs. 'fast': every agentic turn "
-                "schedules the minimal shape (quick-path directive, "
-                "budget pinned to 3) — no hypothesize, no competition. "
-                "In full/fast the profile directive REPLACES the "
-                "question-type hint so the plan shape is held constant "
-                "across question types, which is what makes the A/B "
-                "clean. The parser invariants (analyze-last, verify "
-                "auto-insert, order normalization) apply in all three."
-            ),
-        )
-        preplan_suppress_false_clarify: bool = Field(
-            default=True,
-            description=(
-                "R5: suppress a pre-planner clarification request when the "
-                "question is answerable by its own contract — it names an "
-                "indexed symbol AND states a deliverable ('dame X al "
-                "completo') or a symptom (anomaly markers). Observed live, "
-                "the pre-planner asked for clarification on 'dame "
-                "build_block_a al completo con el fix' after the full "
-                "competition had already run, wasting the turn. When "
-                "suppressed the pipeline fails open (proceeds with no "
-                "brief, as when the pre-planner does not parse). A genuinely "
-                "underspecified request ('fix the bug', no symbol) names "
-                "nothing and still asks. Off restores the old always-ask "
-                "behaviour."
-            ),
-        )
-        preplan_question_typing: bool = Field(
-            default=True,
-            description=(
-                "Fase 1: the pre-planner classifies the request's NATURE "
-                "(exploratory = no cause proposed; confirmatory = the user "
-                "proposes a cause to check; descriptive = factual lookup; "
-                "mechanism = how it works) and the planner receives the "
-                "matching plan-shape hint (e.g. descriptive → no "
-                "hypothesize; confirmatory → user's claim as one rival "
-                "among alternatives). A hint, not an order: the parser and "
-                "the order normalization still govern. Off suppresses the "
-                "plan-shape hint (the pre-planner still reports the type "
-                "for telemetry/AGENTIC-RUN), leaving the planner contract "
-                "byte-identical to before."
-            ),
-        )
-        claims_operationalization: str = Field(
-            default="on",
-            description=(
-                "Fase 2: distinguish 'cannot be verified AS FORMULATED' "
-                "from 'not yet verified'. A claim citing no qids generates "
-                "no checks and silently dodges verification; downstream it "
-                "reads as pending when the real diagnosis is a badly "
-                "formulated claim. 'off' = old behavior. 'shadow' "
-                "(default) = log would-be cases via "
-                "[OPERATIONALIZE-SHADOW] without stamping. 'on' = stamp "
-                "verification='unoperationalizable' (deterministic — no "
-                "anchor means no check, no LLM judgement involved) and "
-                "list the affected claims in the verify report so "
-                "synthesis asks for a better claim instead of more "
-                "evidence. The claims contract always states the "
-                "requirement (name the measurement); this valve governs "
-                "only the verdict."
-            ),
-        )
-        investigate_methodology: bool = Field(
-            default=True,
-            description=(
-                "Fase 3: methodology selection for investigate steps. A "
-                "deterministic word-bounded regex (bilingual EN/ES) "
-                "detects ABSENCE or UNIVERSAL goals ('no caller', "
-                "'never', 'ningún', 'todos') and appends the systematic "
-                "sweep discipline: evidence of absence requires EXHAUSTIVE "
-                "enumeration via TOOL: CALLERS/CALLEES/GREP, sampling "
-                "proves existence only, and an unenumerable set must be "
-                "declared instead of silently sampled. Ordinary "
-                "investigate steps keep the historical instruction "
-                "byte-identical. Off disables the selector entirely."
-            ),
-        )
-        analyze_methodology_charter: bool = Field(
-            default=True,
-            description=(
-                "Fase 5: conclusion-quality methodology for the terminal "
-                "analyze. The analysis must END with three labeled lines: "
-                "LOAD-BEARING EVIDENCE (the single piece whose failure "
-                "flips the conclusion — sensitivity analysis), RESIDUAL "
-                "RISK (false positive: passed checks but could be wrong, "
-                "vs false negative: evidence never seen — truncation, "
-                "incomplete enumeration), and ERROR CHARACTER when "
-                "evidence disagreed (SYSTEMATIC: stale index / wrong "
-                "framing, re-running will not help, vs RANDOM: sampling "
-                "noise, re-running helps). Labeled so the phase metric is "
-                "a grep and synthesis inherits them verbatim. Off leaves "
-                "the analyze instruction byte-identical."
-            ),
-        )
-        verify_dynamic_verdict_integrity: str = Field(
-            default="on",
-            description=(
-                "Fase 4: the experiment's control. Two failure shapes were "
-                "stamped as the system's strongest refutation when they "
-                "are evidence about the HARNESS, not the code: (1) status "
-                "error/timeout/rejected — the harness never ran, yet every "
-                "claim citing the qid got 'refuted'; (2) zero-pass "
-                "suspicion — 'fail' with 0/N asserts passed (N>=3): a "
-                "surgical refutation fails the asserts touching the "
-                "claim, EVERYTHING failing is the signature of a broken "
-                "composition (a result that would also 'refute' a "
-                "known-good implementation refutes only the harness). "
-                "'off' = old behavior. 'shadow' (default) = log would-be "
-                "downgrades via [VERDICT-INTEGRITY-SHADOW] without "
-                "changing verdicts. 'on' = downgrade both shapes to "
-                "'inconclusive' (inert for every existing consumer) and "
-                "stamp the ⚗ claim 'unverifiable' instead of 'refuted'. "
-                "Either mode parks the qid in _harness_suspects for the "
-                "Fase 6 retry router ('harness doubt' route). Blinding — "
-                "the harness generator receiving the operationalized "
-                "check, not the hypothesis narrative — was audited and is "
-                "already structurally satisfied: _elicit_tests receives "
-                "body + testability verdict only."
-            ),
-        )
-        agentic_generative_eval: str = Field(
-            default="shadow",
-            description=(
-                "Generative evaluation between execution and synthesis "
-                "(Fase 9, Nivel-2 iteration). One aligned call asks the "
-                "IMPROVEMENT question — correctness is the verify step's "
-                "job — and may propose up to 2 follow-up steps. 'off' = "
-                "never. 'shadow' (default) = run the evaluation and log "
-                "'would replan' WITHOUT executing the wave (grep "
-                "[REPLAN-SHADOW]). 'on' = append and execute the wave "
-                "(executor-only: investigate/analyze, no control signals — "
-                "a wave must not recursively replan), capped by "
-                "agentic_max_replans and the budget floor."
-            ),
-        )
-        agentic_max_replans: int = Field(
-            default=1,
-            ge=0,
-            le=3,
-            description=(
-                "Hard cap on generative re-plan waves per pipeline run. "
-                "The Nivel-2 loop without a cap is exactly how an agent "
-                "spins forever on a single --parallel 1 slot."
-            ),
-        )
-        agentic_auto_verify: bool = Field(
-            default=True,
-            description=(
-                "Auto-insert a static verify step right before the final "
-                "analyze: workspace claims are converted into typed checks "
-                "and executed against the SymbolIndex / call graph. Costs "
-                "one small LLM call (or zero on the deterministic fallback "
-                "and when there are no claims)."
-            ),
-        )
-        agentic_exploratory_requires_hypothesis: bool = Field(
-            default=True,
-            description=(
-                "An EXPLORATORY question — something is wrong and no cause "
-                "has been proposed — must schedule a hypothesize step rather "
-                "than name a cause and label it an unverified conjecture. "
-                "Turning this off restores the older shape. Measured across "
-                "every turn of the 28 July runs, plans carrying a forge ran "
-                "28 to 31 agent acts and plans without one ran 4 to 18, so "
-                "the saving is real and roughly halves to a third of the "
-                "work — bought by letting a cause reach the reader with no "
-                "rival tested against it."
-            ),
-        )
-        agentic_evidence_verify: bool = Field(
-            default=True,
-            description=(
-                "Settle behavioural claims by reading the body of the "
-                "symbol each one is about, instead of accepting a call-graph "
-                "edge as proof of what the code does. Costs one call per "
-                "verification stage; the bodies are fetched deterministically "
-                "and a supported verdict must quote code that is really "
-                "there."
-            ),
-        )
-        agentic_evidence_max_chars: int = Field(
-            default=120000,
-            ge=0,
-            # Capped where the context stops fitting rather than at a round
-            # number: 200000 chars is 50000 tokens, which with the 75500-token
-            # prefix and the 8000 this pass may generate overflows the
-            # server's 131072. 160000 leaves about 7500 tokens of margin.
-            le=160000,
-            description=(
-                "Character budget for the subject bodies gathered for the "
-                "evidence pass. Bodies are fetched most-claims-first, so "
-                "every character added converts into settled claims rather "
-                "than being spent on whichever subject was emitted first. "
-                "Sized against the server's 131072-token context: the "
-                "largest prompt of the 29 July run was 85849 tokens, about "
-                "75500 of it the system prefix, which leaves roughly 46500 "
-                "tokens once the 8000 this pass may generate are reserved. "
-                "Raise it when the log reports subjects left unread; the "
-                "cost is prompt size, which is close to free against a warm "
-                "prefix, and the pass's time tracks the number of claims it "
-                "judges rather than the bodies it reads."
-            ),
-        )
-        agentic_closing_verify: bool = Field(
-            default=True,
-            description=(
-                "Run a closing verification sweep over any claim still "
-                "carrying no verdict after the plan's steps finish. The "
-                "plan's own verify step sits before the terminal analyze so "
-                "the synthesis reads verified claims; everything emitted "
-                "after it — the analyze step's own claims, and a forge "
-                "plan's rivals — had no check at all. Costs one call, only "
-                "when claims are missing a verdict, and only over those."
-            ),
-        )
-        agentic_verify_max_tokens: int = Field(
-            default=2500,
-            ge=100,
-            description=(
-                "[Consulted only when agentic_unlimited_tokens is off.] Generation ceiling for the verify step's checks JSON. "
-                "Anti-runaway guard, not a quality budget: the output is "
-                "pure structure (up to 12 typed checks), so a cap a "
-                "healthy elicitation can reach breaks the contract "
-                "mid-JSON. Sized well above the largest legitimate check "
-                "set."
-            ),
-        )
-        agentic_exec_mode: str = Field(
-            default="subprocess",
-            description=(
-                "'off' = verify_dynamic steps are inert. 'subprocess' = "
-                "harnesses run in an isolated `python -I` subprocess with a "
-                "tmpdir jail, empty environment, wall timeout and POSIX "
-                "rlimits, behind a denylist tripwire (a handrail, not a "
-                "sandbox: fits the declared threat model — your own code, "
-                "runaway protection — not adversarial input). 'docker' is a "
-                "RESERVED value with no runner implemented yet: selecting it "
-                "makes every execution path refuse loudly instead of "
-                "silently downgrading to the subprocess handrail."
-            ),
-        )
-        agentic_exec_timeout_s: int = Field(
-            default=10,
-            ge=1,
-            le=120,
-            description=(
-                "Wall/CPU timeout per harness execution. NOT a budget knob, "
-                "and deliberately the one ceiling in this pipeline where 0 "
-                "is not 'no limit': it becomes RLIMIT_CPU(0, 0) and "
-                "subprocess timeout=0, which kill the sandbox instantly "
-                "rather than freeing it — the opposite of what 0 means "
-                "everywhere else here. It is a containment bound on code "
-                "this process did not write, so its floor stays at 1."
-            ),
-        )
-        agentic_dynamic_max_targets: int = Field(
-            default=2,
-            ge=1,
-            le=5,
-            description="Maximum symbols a verify_dynamic step will test.",
-        )
-        agentic_harness_max_tokens: int = Field(
-            default=2000,
-            ge=200,
-            description=(
-                "[Consulted only when agentic_unlimited_tokens is off.] Generation ceiling for LLM-written test sections. "
-                "Anti-runaway guard, not a quality budget: a harness cut "
-                "mid-function fails to import and the target silently "
-                "loses its dynamic evidence. Sized well above a healthy "
-                "test section."
-            ),
-        )
-        agentic_tdd_ttl_seconds: float = Field(
-            default=1800.0,
-            ge=0.0,
-            description=(
-                "Fase 6 / P10: an armed inter-turn TDD verdict is discarded if "
-                "not consumed within this many seconds, or if the next turn is "
-                "a different project. Prevents a stale 'you have pending tests' "
-                "injection from leaking into an unrelated later conversation. "
-                "0 disables expiry (legacy behaviour)."
-            ),
-        )
-        agentic_tdd_inter_turn: bool = Field(
-            default=True,
-            description=(
-                "Fase 6: after a design_tests step, verify the NEXT main "
-                "response's generated code against the acceptance tests in a "
-                "background task (no LLM call, slot-free), and surface the "
-                "verdict at the top of the following turn. Requires "
-                "agentic_exec_mode in ('subprocess', 'docker')."
-            ),
-        )
-        agentic_regression_max_callers: int = Field(
-            default=5,
             ge=1,
             le=20,
             description=(
-                "Fase 7: maximum direct callers a verify_regression step "
-                "re-checks. Cached-harness callers re-execute at zero LLM "
-                "cost; uncached ones are elicited up to the budget."
+                "Run the profile inference once every N user messages (once "
+                "there are >= 2). With user_profile_promotion_count this sets "
+                "how fast a preference settles: e.g. interval 3 + promotion 2 "
+                "fixes language around turn 6. Lower settles faster on less "
+                "evidence; higher waits for more before committing. 1 runs it "
+                "every turn (most responsive, most calls)."
             ),
         )
-        agentic_enable_ask_user: bool = Field(
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 12. LONG-TERM MEMORY (LTM)
+        # ══════════════════════════════════════════════════════════════════════
+
+        long_term_memory_dir: str = Field(default="/app/backend/data/long_term_memory")
+
+        long_term_memory_expiration_days: int = Field(default=30)
+
+        ltm_store_only_code_sessions: bool = Field(default=True)
+
+        long_term_memory_top_k: int = Field(default=10)
+
+        long_term_memory_similarity_threshold: float = Field(default=0.65)
+
+        ltm_time_decay_hours: float = Field(default=12.0)
+
+        ltm_index_symbols_enabled: bool = Field(default=True)
+
+        ltm_symbol_index_max_per_message: int = Field(default=20)
+
+        ltm_symbol_boost_enabled: bool = Field(default=True)
+
+        ltm_symbol_boost_factor: float = Field(default=1.5)
+
+        ltm_symbol_boost_min_similarity: float = Field(default=0.5)
+
+        ltm_symbol_force_mode_enabled: bool = Field(default=False)
+
+        ltm_symbol_force_fallback_to_semantic: bool = Field(default=True)
+
+        enable_multi_query_retrieval: bool = Field(default=False)
+
+        multi_query_variants: int = Field(default=2, ge=1, le=4)
+
+        enable_contextual_retrieval: bool = Field(default=True)
+
+        contextual_retrieval_mode: str = Field(default="metadata")
+
+        enable_reranking: bool = Field(default=True)
+
+        reranker_model: str = Field(
+            default="Qwen/Qwen3-Reranker-0.6B",
+            description="CrossEncoder model for reranking LTM results. Supports 32K context.",
+        )
+
+        reranker_top_k: int = Field(default=5)
+
+        enable_raptor: bool = Field(
+            default=True,
+            description="Enable RAPTOR hierarchical clustering of code symbols for faster LTM retrieval.",
+        )
+
+        raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
+
+        raptor_summary_model: str = Field(
+            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
+        )
+
+        raptor_summary_max_tokens: int = Field(default=150)
+
+        raptor_min_similarity: float = Field(
+            default=0.0,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Cosine-similarity floor for RAPTOR cluster summaries injected "
+                "into Block B. Hits below the floor are dropped, so off-topic "
+                "queries stop receiving top-k summaries unconditionally. 0.0 "
+                "disables the floor (previous behavior). Calibrate from the "
+                "per-hit 'RAPTOR retrieve: sim=' debug lines."
+            ),
+        )
+
+        raptor_use_call_graph_proximity: bool = Field(
+            default=True,
+            description="Weight call‑graph distance alongside semantic similarity when clustering.",
+        )
+
+        raptor_graph_weight: float = Field(
+            default=0.5,
+            ge=0.0,
+            le=1.0,
+            description="0.0 = semantic only, 1.0 = graph only.",
+        )
+
+        napmem_max_stored_diffs: int = Field(
+            default=500,
+            ge=50,
+            description=(
+                "Global retention cap for rows in the napmem_diffs table. "
+                "Oldest rows beyond the cap are deleted on insert."
+            ),
+        )
+
+        napmem_diff_source_max_chars: int = Field(
+            default=400_000,
+            ge=0,
+            description=(
+                "Cap on len(prev)+len(new) above which the unified diff is "
+                "not computed (quadratic difflib cost on whole-file pastes); "
+                "a synthetic one-line stub is stored instead. 0 disables the "
+                "cap (not recommended)."
+            ),
+        )
+
+        napmem_top_k: int = Field(
+            default=3,
+            ge=1,
+            le=5,
+            description=(
+                "Maximum memories returned per MEMORY tool search "
+                "(summaries with their associated diffs)."
+            ),
+        )
+
+        napmem_min_score: float = Field(
+            default=0.3,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Relevance floor for MEMORY results (normalized [0,1]). Hits "
+                "below it are dropped; if none survive, the tool returns the "
+                "explicit no-results fallback instead of noise."
+            ),
+        )
+
+        napmem_tool_enable: bool = Field(
             default=True,
             description=(
-                "Fase 7: allow a step to end the pipeline early with a "
-                "clarifying question surfaced as the turn's answer "
-                "(stateless — the user's reply is a fresh turn; no plan "
-                "is persisted). Gated by a minimum question length so a "
-                "stray token cannot hijack the turn."
+                "Expose the MEMORY tool (NapMem long-term memory search) to "
+                "agentic steps. Off removes the tool from the step contract "
+                "and the broker rejects MEMORY requests."
             ),
         )
-        agentic_preplanner: bool = Field(
+
+        napmem_diff_truncate_chars: int = Field(
+            default=0,
+            ge=0,
+            description=(
+                "Per-diff truncation when rendering MEMORY results. 0 = no "
+                "per-diff truncation (default). The aggregate tool result is "
+                "always capped by the broker regardless of this value."
+            ),
+        )
+
+        napmem_static_ltm: str = Field(
+            default="on",
+            description=(
+                "'on' (default) = inject retrieved LTM memories into the "
+                "system prompt every turn. It ships as the default because "
+                "'auto' rests on an inference the measurements refuse: "
+                "across every run examined the MEMORY tool was reachable "
+                "on each agentic turn and called ZERO times, so the skip "
+                "made the hardest-working turns the memory-blind ones. "
+                "'auto' = skip the "
+                "static injection only on turns where the agentic pipeline "
+                "fires and the MEMORY tool is therefore reachable; turns the "
+                "pipeline skips (continuations, busy slot, architecture "
+                "queries) keep the injection so no turn is memory-blind. "
+                "'off' = never inject; memory is on-demand only. LTM storage "
+                "is unaffected in every mode."
+            ),
+        )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 13. CONTEXT COMPRESSION
+        # ══════════════════════════════════════════════════════════════════════
+
+        paste_diet_max_chars: int = Field(
+            default=100_000,
+            ge=0,
+            description=(
+                "When the current user message's fenced-code payload exceeds "
+                "this many characters, spans whose blocks are already indexed "
+                "are replaced with one-line SymbolGraph references (prose is "
+                "kept). Bounds the outgoing turn so the server can run at a "
+                "native-window --ctx-size without YaRN. 0 disables the diet."
+            ),
+        )
+
+        enable_history_llmlingua: bool = Field(
             default=True,
+            description="Apply LLMLingua‑2 compression to conversation history.",
+        )
+
+        history_compress_recent_rate: float = Field(
+            default=0.75,
+            ge=0.3,
+            le=1.0,
+            description="Compression rate for the last `history_compress_recent_lookback` turns.",
+        )
+
+        history_compress_old_rate: float = Field(
+            default=0.40,
+            ge=0.1,
+            le=1.0,
+            description="Compression rate for turns older than recent_lookback.",
+        )
+
+        history_compress_indexed_rate: float = Field(
+            default=0.20,
+            ge=0.05,
+            le=0.5,
+            description="Compression rate for old turns whose code is fully indexed.",
+        )
+
+        history_compress_recent_lookback: int = Field(
+            default=4,
+            ge=1,
+            le=20,
+            description="Number of recent turns exempt from aggressive compression.",
+        )
+
+        enable_secondary_compaction: bool = Field(
+            default=False,
             description=(
-                "Pre-planner: an agentic stage BEFORE the planner that "
-                "discovers the correct WHAT while the planner decides the "
-                "HOW. It diverges over 2-3 mechanically distinct framings of "
-                "the request, may consult long-term memory autonomously "
-                "(TOOL: MEMORY), and picks the most defensible framing on "
-                "the available evidence. Its brief orients the planner but "
-                "never overrides an explicit question. Fail-open: any "
-                "failure yields an empty brief and the planner runs exactly "
-                "as without it."
+                "Run LLMLingua (secondary compactor) after the primary "
+                "compactor. Off by default: it is a natural-language token "
+                "classifier and over a technical transcript it drops hedges, "
+                "negations and identifier delimiters, rewriting the record "
+                "for a fraction of a percent of the prompt. Messages citing "
+                "code are skipped even when this is on."
             ),
         )
-        agentic_preplanner_collapse: bool = Field(
+
+        enable_code_compression: bool = Field(
+            default=False,
+            description="Apply LLMLingua‑2 compression to individual code blocks in Block B (LOD‑3).",
+        )
+
+        code_compression_rate: float = Field(
+            default=0.5,
+            ge=0.3,
+            le=0.8,
+            description="Fraction of tokens to KEEP when compressing a code block.",
+        )
+
+        code_compression_min_tokens: int = Field(
+            default=150,
+            description="Minimum tokens a code block must have before compression is attempted.",
+        )
+
+        enable_question_aware_compression: bool = Field(
             default=True,
-            description=(
-                "Pre-planner divergence mode. When True (collapse ON), the "
-                "pre-planner still runs the anti-anchoring exercise on every "
-                "turn but is not forced to fabricate alternatives: an "
-                "unambiguous request yields a SINGLE framing (faster, avoids "
-                "invented distinctions), while a genuinely ambiguous one "
-                "still gets 2-3. When False, it always diverges over 2-3 "
-                "framings — the maximally de-anchoring behavior, at the cost "
-                "of forced framings on clear questions. Turn OFF if you find "
-                "the collapse suppressing divergence on grey-area questions "
-                "that benefited from it: divergence is among the most "
-                "valuable pipe steps, so the always-diverge behavior is one "
-                "toggle away. No effect when agentic_preplanner is False."
-            ),
+            description="Preserve tokens relevant to the user's question during code compression.",
         )
-        agentic_preplanner_max_tokens: int = Field(
-            default=900,
-            ge=200,
-            le=2000,
-            description=(
-                "[Consulted only when agentic_unlimited_tokens is off.] Token budget per pre-planner call (framings + choice + "
-                "optional memory conclusions)."
-            ),
+
+        enable_code_history_compression: bool = Field(
+            default=True,
+            description="Replace old multi‑phase code parts with compact commit summaries.",
         )
-        agentic_preplanner_max_tool_rounds: int = Field(
+
+        code_history_force_compress_after_turns: int = Field(
+            default=8,
+            ge=0,
+            description="Force‑compress code‑bearing history blocked by symbol‑index ratio for > N turns. 0 = never.",
+        )
+
+        code_history_keep_last_n_parts: int = Field(
+            default=3,
+            ge=1,
+            le=5,
+            description="Number of recent multi‑phase parts to keep in full.",
+        )
+
+        code_history_symbol_index_threshold: float = Field(
+            default=0.75,
+            ge=0.5,
+            le=1.0,
+            description="Minimum symbol‑index ratio to allow compression.",
+        )
+
+        enable_lean_user_code: bool = Field(
+            default=True,
+            description="Replace large user code blocks in history with a compact stub.",
+        )
+
+        lean_user_code_min_tokens: int = Field(
+            default=12000,
+            description="Token threshold above which a user code block is stubbed.",
+        )
+
+        max_conversation_summaries: int = Field(
+            default=3,
+            ge=0,
+            description="Maximum summary blocks kept and re‑injected per request. 0 = keep all.",
+        )
+
+        summarization_model: str = Field(
+            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
+            description="Model used for all general-purpose summarization tasks.",
+        )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 14. SESSION & STATE
+        # ══════════════════════════════════════════════════════════════════════
+
+        project_id: str = Field(
+            default="default",
+            description="Logical project identifier that scopes all per-project state.",
+        )
+
+        max_cached_projects: int = Field(
+            default=10,
+            description="Maximum project states kept in the in-memory LRU cache.",
+        )
+
+        state_db_path: str = Field(
+            default="/app/backend/data/conversation_state.db",
+            description="Filesystem path for the SQLite database that persists conversation state.",
+        )
+
+        preserve_tool_calls: bool = Field(
+            default=True,
+            description="Strip orphaned tool-call messages from history before window management.",
+        )
+
+        enable_session_summary: bool = Field(default=True)
+
+        session_summary_interval_messages: int = Field(default=8)
+
+        session_summary_max_tokens: int = Field(default=0)
+
+        summarize_batch_turns: int = Field(
+            default=5,
+            ge=1,
+            le=30,
+            description="Minimum unsummarized turns before generating one summary.",
+        )
+
+        enable_hierarchical_summaries: bool = Field(
+            default=True,
+            description="Fold oldest L1 turn summaries into a single L2 summary.",
+        )
+
+        hierarchical_summary_group_size: int = Field(
+            default=4,
+            ge=2,
+            le=12,
+            description="Number of oldest L1 summaries folded into one L2 summary.",
+        )
+
+        max_hierarchical_summaries: int = Field(
             default=2,
             ge=0,
-            le=3,
+            description="Maximum L2 summaries kept. 0 = keep all.",
+        )
+
+        hierarchical_summary_max_tokens: int = Field(
+            default=250,
+            ge=80,
+            le=800,
+            description="Token budget for an L2 consolidated summary.",
+        )
+
+        enable_feedback_tracking: bool = Field(default=True)
+
+        feedback_history_limit: int = Field(default=10)
+
+        inject_feedback_context: bool = Field(default=True)
+
+        preserve_error_context: bool = Field(default=True)
+
+        enable_response_cache: bool = Field(default=True)
+
+        response_cache_similarity_threshold: float = Field(default=0.92)
+
+        response_cache_ttl_hours: float = Field(default=24.0)
+
+        response_cache_max_entries: int = Field(default=100)
+
+        response_cache_include_context_hash: bool = Field(default=True)
+
+        duplicate_question_threshold: float = Field(default=0.92)
+
+        duplicate_question_lookback: int = Field(default=20)
+
+        duplicate_question_lookback_hours: float = Field(default=24.0)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 15. PERFORMANCE & PERSISTENCE
+        # ══════════════════════════════════════════════════════════════════════
+
+        block_a_freeze_turns: int = Field(
+            default=10,
+            ge=0,
             description=(
-                "Maximum MEMORY tool rounds the pre-planner may take before "
-                "committing to a framing (0 disables memory access). Each "
-                "round is zero-LLM retrieval plus one short aligned re-call."
+                "Freeze Block A (and its structure hash) for up to N counted changes, "
+                "so structural edits do not each trigger a full KV prefill. "
+                "During the window Block A "
+                "serves its cached text with a staleness header. The window "
+                "breaks and re-captures on the Nth counted change (paying one "
+                "prefill then). What counts as a change is governed by "
+                "block_a_freeze_count_all_changes. 0 = feature disabled (every "
+                "structural change invalidates Block A immediately, as before)."
             ),
         )
 
-        # ── 8.7 Scientific method — epistemic toolkit ────────────────────────
-        # ROI ranking of this block (from marginal analysis):
-        #   enable_weighted_scoring:   ∞  (free — uses experiment_design output)
-        #   enable_active_learning:    ∞  (free — deterministic SymbolGraph)
-        #   enable_experimentum_crucis: 0.455  (best non-free ROI in the system)
-        #   enable_scope_delimitation:  0.117
-        #   enable_devil_advocate:      0.160
-        #   enable_experiment_design:   0.083  (foundational — required for above)
-        #   enable_generate_predictions: 0.027 (most optional, same ROI as iter 3)
-        enable_experiment_design: bool = Field(
-            default=True,  # ← NEVER disable: foundational for all other features
+        block_a_freeze_count_all_changes: bool = Field(
+            default=False,
             description=(
-                "Classify hypothesis claims as CRITICAL (hard kill if false) vs "
-                "SUPPORTIVE (score penalty only) before gathering evidence. "
-                "Enables Popperian asymmetric falsification. "
-                "Required for enable_weighted_scoring and enable_active_learning "
-                "to have any effect. Adds N LLM calls in iter 1 only (cached)."
+                "When True, every turn that would rebuild Block A counts toward "
+                "block_a_freeze_turns. When False (default), only structural "
+                "edits count — turns where the symbol signature snapshot changed "
+                "(dirty_qids non-empty). False keeps the freeze effectively "
+                "infinite during pure Q&A (nothing changed, prefix was stable "
+                "anyway) and only spends the budget on real edits, minimizing "
+                "how stale the frozen map can get per counted step."
             ),
         )
-        enable_peer_review: bool = Field(
-            default=True,  # ← devil's advocate until a 2nd model exists
-            description=(
-                "Enable peer review using a different model architecture. "
-                "ROI=0 when peer_review_model is empty or same as cot_model_level3 "
-                "(degrades to devil_advocate which is already enabled). "
-                "Only activate when a genuinely different model is available."
-            ),
-        )
-        peer_review_model: str = Field(
-            default="",
-            description=(
-                "Model for peer review. Must differ from cot_model_level3 for "
-                "genuine epistemic orthogonality. Empty → degrades to devil_advocate."
-            ),
-        )
-        enable_scope_delimitation: bool = Field(
-            default=True,  # ← ROI=0.117: good communication quality gain
-            description=(
-                "After selecting the winning hypothesis, add conditions of validity. "
-                "ROI=0.117: 0.60 expected calls, +7% quality. "
-                "Triggers when negative structural evidence OR devil_advocate critique exists."
-            ),
-        )
-        enable_generate_predictions: bool = Field(
-            default=True,  # ← marginal ROI=0.027 but structurally complete
-            description=(
-                "Deduce structural consequences of each hypothesis and verify them. "
-                "Closes the hypothetico-deductive cycle. "
-                "Adds N LLM calls in iter 1 only (not repeated in iter 2+). "
-                "Most optional of the enabled features: ROI=0.027, same as "
-                "max_iters 2→3. Disable first if latency is critical."
-            ),
-        )
-        enable_devil_advocate: bool = Field(
-            default=True,  # ← ROI=0.160: excellent given 0.25 expected calls
-            description=(
-                "Run a contrarian pass on the winning hypothesis when its "
-                "score exceeds agentic_devil_advocate_threshold. "
-                "Conditional-cost, asymmetric-value insurance (GOVERNING "
-                "PRINCIPLES, Principle 3): it fires rarely, costs one "
-                "small call, and attacks the confident-and-wrong "
-                "hypothesis — the worst output the pipeline can promote."
-            ),
-        )
-        agentic_devil_advocate_threshold: float = Field(
-            default=0.75,
+
+        block_a_freeze_max_drift: float = Field(
+            default=0.0,
             ge=0.0,
             le=1.0,
             description=(
-                "Winning score above which the devil's advocate fires. "
-                "Was a hardcoded 0.8; lowered to 0.75 so the insurance "
-                "triggers on a wider band of high-confidence winners. "
-                "Measured at 0.8 the pass fired in ~10% of competitions "
-                "at ~9s per firing (~1s expected cost) — cheap enough "
-                "that widening the band buys quality at negligible cost. "
-                "Raise it back toward 0.8+ only if the extra contrarian "
-                "passes prove noisy for your model."
+                "When > 0, the freeze also breaks early if the fraction of "
+                "dirty symbols (dirty_qids / total) exceeds this ratio on a "
+                "counted change, even before block_a_freeze_turns is reached — "
+                "a safety valve so a single large refactor mid-window does not "
+                "keep serving a badly-stale map. 0 = disabled (only the turn "
+                "count governs breakage)."
             ),
         )
 
-        # ── 8.8 Scientific method — peer review ─────────────────────────────
-        # ROI=0.000 without a second model (degrades to devil_advocate which
-        # is already enabled). Activate only when peer_review_model differs
-        # from cot_model_level3.
-
-        # ── 8.9 Scientific method — active learning & coverage (H4 + H2) ────
-        # Both free (deterministic, no LLM). Never disable.
-        enable_active_learning: bool = Field(
-            default=True,  # ← NEVER disable: free, ∞ ROI
+        block_a_freeze_break_on_ingestion: bool = Field(
+            default=False,
             description=(
-                "Reclassify UNKNOWN claims as SUPPORTIVE when their symbols "
-                "exist in the SymbolGraph. Deterministic — no LLM call. "
-                "Directly increases coverage before falsification, preventing "
-                "false negatives where good hypotheses die to the coverage guard."
-            ),
-        )
-        low_coverage_threshold: float = Field(
-            default=0.3,
-            description=(
-                "Coverage below this ratio triggers: (1) Active Learning, "
-                "(2) coverage penalty in compute_weighted_score, "
-                "(3) atomic-claims constraint in _build_refinement_constraints. "
-                "0.3 = at least 30% of claims must be verifiable for normal scoring."
-            ),
-        )
-        enable_coverage_guard_for_falsification: bool = Field(
-            default=True,  # ← NEVER disable: free, prevents false kills
-            description=(
-                "Downgrade hard kill to score penalty when coverage < "
-                "min_coverage_for_falsification. Prevents Popperian hard kill "
-                "based on sparse evidence — a failed critical claim is only "
-                "trustworthy when we've verified enough of the total claims."
-            ),
-        )
-        min_coverage_for_falsification: float = Field(
-            default=0.3,  # ← equal to low_coverage_threshold: consistent policy
-            description=(
-                "Minimum coverage_score required to apply hard kill. "
-                "Keep equal to low_coverage_threshold for consistent policy: "
-                "below 30% coverage, neither penalize heavily nor kill."
+                "When True, silent ingestion of a code paste breaks the freeze "
+                "and re-captures, since a large paste changes the structure "
+                "wholesale and freezing a map of just-replaced code would be "
+                "maximally misleading. When False (default), ingestion leaves "
+                "the current freeze window untouched. "
+                "In short: determines whether code pasted mid-session triggers "
+                "a prefill. It does not affect the first turn after a paste, "
+                "which prefills either way; from there on, the server's own "
+                "context checkpoints absorb the cost for as long as the prefix "
+                "holds and the server keeps running (they live in its memory "
+                "and do not survive a restart)."
             ),
         )
 
-        # ── 8.10 Scientific method — stagnation detection (H5) ──────────────
-        # Harmless with max_iters=2 (cannot fire — needs window+1=3 entries
-        # but break fires at iter 3 first). Valve coherence check warns about
-        # this at startup. Useful when max_iters is set to 4.
-        abstention_coverage_floor: float = Field(
-            default=0.35,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Average coverage_score below which a no-survivor competition "
-                "is reported as abstention (insufficient evidence) rather than "
-                "refutation."
-            ),
+        enable_skeleton_tier: bool = Field(
+            default=True,
+            description="Inject the project skeleton (signatures) as a stable cache tier inside Block A.",
         )
-        agentic_premortem: bool = Field(
+
+        skeleton_tier_max_tokens: int = Field(
+            default=0,
+            ge=0,
+            description="Max tokens for the skeleton tier. 0 = unlimited. Over budget → tier skipped.",
+        )
+
+        skeleton_tier_suppresses_block_b_signatures: bool = Field(
+            default=True,
+            description="When skeleton tier is active, Block B omits bare signatures already in the stable tier.",
+        )
+
+        skeleton_include_docstrings: bool = Field(
+            default=True,
+            description="Include one‑line docstrings in the skeleton tier.",
+        )
+
+        docstring_flush_on_complete: bool = Field(
             default=True,
             description=(
-                "Pre-mortem: instruct the synthesis (main) call to red-team "
-                "its OWN answer before giving it — name the single most "
-                "fragile point and the validity clause that must hold; if "
-                "that clause is not backed by the workspace evidence, say so "
-                "in the answer instead of sounding falsely confident. "
-                "Intensity is gated by the fraction of invalid citations in "
-                "the ledger (objective graph signal, not self-reported "
-                "confidence): light when evidence is solid, emphatic when "
-                "the solution leans on unverified identifiers. No extra LLM "
-                "call — it rides the synthesis prompt already sent."
+                "Re-render the skeleton tier ONCE when background docstring "
+                "generation reaches full coverage (or the queue stalls), so "
+                "LLM-generated docstrings become visible in Block A. Costs a "
+                "single partial prefill from the skeleton's position; when "
+                "off, generated docstrings only surface after the next "
+                "structural edit."
             ),
         )
-        premortem_suspect_ratio: float = Field(
-            default=0.34,
-            ge=0.0,
-            le=1.0,
+
+        emergency_max_turns: int = Field(
+            default=4,
+            ge=1,
+            le=20,
+            description="Turns to keep when an individual turn exceeds budget × 0.8 (emergency cap).",
+        )
+
+        compaction_defer_during_autocontinue: bool = Field(
+            default=True,
+            description="Skip turn‑based summarize/evict while an AutoContinue multi‑part session is active.",
+        )
+
+        enable_edge_persistence: bool = Field(default=True)
+
+        enable_speculative_prefetch: bool = Field(default=True)
+
+        speculative_prefetch_max: int = Field(default=5, ge=1, le=20)
+
+        enable_silent_ingestion: bool = Field(default=True)
+
+        enable_block_paging: bool = Field(
+            default=True,
+            description="Soft‑evict low‑activation blocks to ChromaDB instead of dropping them.",
+        )
+
+        block_paging_threshold: int = Field(
+            default=15,
+            ge=5,
+            le=100,
+            description="active_blocks count above which paging starts.",
+        )
+
+        block_paging_min_activation: float = Field(
+            default=0.15,
+            ge=0.01,
+            le=0.5,
+            description="PPR activation score below which a block is eligible for paging.",
+        )
+
+        purge_old_code_versions_enabled: bool = Field(
+            default=True,
+            description="Move code versions beyond the N most recent per file to cold storage.",
+        )
+
+        purge_old_code_versions_max_per_file: int = Field(
+            default=3,
+            ge=1,
+            le=20,
+            description="Number of recent code versions per file to keep in active context.",
+        )
+
+        purge_allow_hard_delete: bool = Field(
+            default=False,
             description=(
-                "Fraction of ledger claims with invalid citations at or above "
-                "which the pre-mortem switches from light to emphatic. Below "
-                "it the solution is treated as evidence-solid (light "
-                "pre-mortem); the fully-degenerate case (zero valid claims) "
-                "is already covered by the degenerate-workspace warning and "
-                "skips the pre-mortem to avoid duplication."
+                "Allow purge_old_versions to permanently delete old code versions from "
+                "active_blocks when block paging is unavailable (ChromaDB down or "
+                "enable_block_paging=False). "
+                "When False (default), the block is kept to prevent silent data loss. "
+                "When True, the block is deleted and its content is unrecoverable."
             ),
         )
-        agentic_preload_focus_max_chars: int = Field(
-            default=32000,
+
+        purge_orphaned_data_interval: int = Field(
+            default=10,
             ge=0,
-            le=64000,
+            description="Turns between automatic purges of orphaned DB rows. 0 = disabled.",
+        )
+
+        max_autocontinue_turns: int = Field(
+            default=8,
+            ge=2,
+            le=30,
+            description="Maximum consecutive AutoContinue turns before the watchdog forces a reset.",
+        )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 16. INTERACTION & COMMANDS
+        # ══════════════════════════════════════════════════════════════════════
+
+        enable_status_updates: bool = Field(
+            default=True,
             description=(
-                "Character budget for the bodies of the planner's focus "
-                "symbols, preloaded into a step's prompt instead of being "
-                "requested through a tool round. Zero disables the preload "
-                "and restores the name-only list. The first symbol is always "
-                "served even if it exceeds the budget, because a step whose "
-                "single focus symbol is too large is better off seeing the "
-                "capped body than seeing nothing."
+                "Emit real-time status updates to the UI during reasoning. "
+                "Shows progress of CoT, hypothesis evaluation, peer review, etc. "
+                "Disable if the UI does not support event streaming."
             ),
         )
-        agentic_expand_max_chars: int = Field(
-            default=16000,
-            ge=2000,
-            le=64000,
+
+        command_prefix: str = Field(
+            default="//",
             description=(
-                "Character cap for a symbol body returned by the EXPAND tool "
-                "in the agentic pipeline. The previous 6000 truncated large "
-                "hub methods mid-body (observed live: an investigate step "
-                "received a truncated build_block_b, could not see its "
-                "trailing calls, and the pipeline synthesized a hallucinated "
-                "answer). When a body still exceeds the cap the truncation "
-                "notice now tells the model to request the specific line "
-                "range instead of leaving it blind."
+                "What a command starts with. Defaults to a double slash: "
+                "OpenWebUI 0.11 claimed the single slash for its own menu of "
+                "skills and prompts, and every command here stopped being "
+                "dispatched. A backslash would avoid that menu outright but "
+                "is the escape character in every file that has to carry it, "
+                "so the doubled slash is the maintainable choice — note it "
+                "still BEGINS with a slash, so it does not by itself stop a "
+                "frontend that reacts to the first keystroke. Set to '/' on "
+                "an older build. Applies to what a PERSON types; a slash the "
+                "model writes in its own answer is still honoured, since "
+                "that is what older guidance taught it."
             ),
         )
+
+        normalize_glued_fences: bool = Field(
+            default=True,
+            description=(
+                "Repair code fences glued to preceding prose (e.g. "
+                "'asi:```python') in the previous assistant response during "
+                "the inlet prologue, before hashing, indexing, LTM storage "
+                "and history re-injection. Fixes fence-anchored extraction "
+                "and stops the malformed pattern from re-entering the "
+                "model's visible history where it can be imitated."
+            ),
+        )
+
+        outlet_expand_intercept_enabled: bool = Field(default=True)
+
+        outlet_expand_intercept_max_symbols: int = Field(default=0, ge=0)
+
+        outlet_expand_intercept_depth: int = Field(default=5, ge=0)
+
+        expand_default_depth: int = Field(default=2)
+
+        enable_skeleton_intent: bool = Field(
+            default=True,
+            description="Serve a copy‑pasteable signature‑only skeleton for scaffolding queries.",
+        )
+
+        enable_accept_command: bool = Field(
+            default=True,
+            description=(
+                "Enable the /accept chat command: marks the most "
+                "recent hypothesis-competition record of this "
+                "project as validated in the real world "
+                "(external_validation=True). Closes the R33 "
+                "learning loop — without it the strategy history "
+                "learns only from falsifications, never from "
+                "confirmed wins."
+            ),
+        )
+
+        enable_freeze_command: bool = Field(
+            default=True,
+            description=(
+                "Enable the /freeze and /unfreeze chat commands for manual "
+                "control of the Block A KV-cache freeze.\n"
+                "  /freeze       → freeze the architecture map using "
+                "block_a_freeze_turns as the edit budget.\n"
+                "  /freeze N     → freeze for N structural edits.\n"
+                "  /freeze 0     → freeze indefinitely, until /unfreeze.\n"
+                "  /unfreeze     → release immediately; the next turn rebuilds "
+                "Block A fresh (likely one prefill) and hands control back to "
+                "the automatic freeze policy.\n"
+                "A manual freeze overrides both the automatic policy and a "
+                "disabled block_a_freeze_turns valve, since it is an explicit "
+                "user instruction. When this valve is False, both commands are "
+                "ignored and fall through as ordinary messages."
+            ),
+        )
+
+        enable_natural_language_intents: bool = Field(default=False)
+
+        enable_forget_command: bool = Field(default=True)
+
+        enable_natural_language_forget: bool = Field(default=True)
+
+        enable_natural_language_remember: bool = Field(default=True)
+
+        enable_natural_language_obsolete: bool = Field(default=True)
+
+        enable_command_suggestions: bool = Field(default=True)
+
+        command_suggestion_cooldown_minutes: int = Field(default=10)
+
+        proactive_summary_threshold: float = Field(default=0.95)
+
+        cleanup_suggestions_enabled: bool = Field(default=True)
+
+        cleanup_inactive_threshold_messages: int = Field(default=30)
+
+        cleanup_excluded_content_types: list = Field(
+            default_factory=lambda: ["BASE_CODE"],
+        )
+
+        cleanup_status_command_enabled: bool = Field(default=True)
+
+        cleanup_proactive_suggestions: bool = Field(default=True)
+
+        cleanup_suggestion_cooldown_messages: int = Field(default=20)
+
+        cleanup_command_enabled: bool = Field(default=True)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 17. UTILITIES, TUNING & USER-FACING TEXT
+        # ══════════════════════════════════════════════════════════════════════
+
         default_response_language: str = Field(
             default="Spanish",
             description=(
@@ -47704,6 +48866,7 @@ class Filter:
                 "the user-profile block; requires enable_user_profile."
             ),
         )
+
         code_comment_language: str = Field(
             default="English",
             description=(
@@ -47717,6 +48880,7 @@ class Filter:
                 "enable_user_profile."
             ),
         )
+
         code_style_contract: str = Field(
             default=(
                 "Every function and class must have a concise, descriptive "
@@ -47741,724 +48905,54 @@ class Filter:
                 "enable_user_profile."
             ),
         )
-        enable_user_profile: bool = Field(
-            default=True,
-            description=(
-                "User profile: a small, stable block of learned user "
-                "preferences injected at the TOP of Block A so every agentic "
-                "call — pre-planner, planner, each step, synthesis — shares it "
-                "(Block A is the only prefix all N+1 pipeline calls see). V1 "
-                "learns LANGUAGE only, fixing it drifting to English "
-                "mid-pipeline. Two tiers: inferred values land in a provisional "
-                "tier and reach the authoritative tier (the one rendered in "
-                "Block A) only after being corroborated "
-                "user_profile_promotion_count times or declared by the user, "
-                "so a one-off confident guess never enters the prompt."
-            ),
-        )
-        user_profile_min_confidence: float = Field(
-            default=0.85,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Minimum self-reported confidence for an inferred value to be "
-                "recorded in the provisional tier at all. Values below this "
-                "are ignored. High by design; promotion to authoritative then "
-                "additionally requires corroboration."
-            ),
-        )
-        user_profile_promotion_count: int = Field(
-            default=2,
-            ge=1,
-            le=10,
-            description=(
-                "How many times the SAME value must be independently inferred "
-                "before it is promoted from the provisional tier to the "
-                "authoritative tier (which Block A renders). This is what "
-                "prevents a transient mode from fossilizing in Block A: only a "
-                "value that recurs promotes; a one-off guess does not. A user "
-                "declaration bypasses this (human outranks inference)."
-            ),
-        )
-        user_profile_decay_turns: int = Field(
-            default=40,
-            ge=0,
-            le=1000,
-            description=(
-                "Turns without re-corroboration after which an authoritative "
-                "field is demoted/removed, keeping the profile reflecting "
-                "RECENT behavior. 0 disables decay. For language this is nearly "
-                "inert (it rarely changes) but the mechanism guards all fields."
-            ),
-        )
-        user_profile_lookback: int = Field(
-            default=6,
-            ge=2,
-            le=20,
-            description=(
-                "How many recent user messages the profile inference reads as "
-                "evidence. The profile reflects RECENT modus operandi, so the "
-                "window is short and rolling rather than the whole history."
-            ),
-        )
-        user_profile_infer_interval: int = Field(
-            default=3,
-            ge=1,
-            le=20,
-            description=(
-                "Run the profile inference once every N user messages (once "
-                "there are >= 2). With user_profile_promotion_count this sets "
-                "how fast a preference settles: e.g. interval 3 + promotion 2 "
-                "fixes language around turn 6. Lower settles faster on less "
-                "evidence; higher waits for more before committing. 1 runs it "
-                "every turn (most responsive, most calls)."
-            ),
-        )
 
-        # ── 8.11 Scientific method — project‑level metacognition (H5) ───────
-        # Free: deterministic analysis post-competition. Compounds over time.
-
-        # ── 8.12 Generation models ───────────────────────────────────────────
-        cot_model_level2: str = Field(
-            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
-            description="Model used for CoT level 2 (step‑by‑step reasoning chain).",
-        )
-        cot_model_level3: str = Field(
-            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
-            description="Model used for CoT level 3 (scientific multi‑hypothesis).",
-        )
-
-        # ── 8.14 Complementary features ─────────────────────────────────────
-        enable_contradiction_detection: bool = Field(
-            default=True,
-            description="Detect if the last user message contradicts the conversation history.",
-        )
-        contradiction_inject_warning: bool = Field(
-            default=True,
-            description="Inject a warning in the system prompt if a contradiction is detected.",
-        )
-        enable_confidence_scoring: bool = Field(
-            default=True,
-            description="Request a confidence score at the end of each response.",
-        )
-        confidence_prompt: str = Field(
-            default="\n\nAfter your response, on a new line, output '[Confidence: XX%]'...",
-            description="Suffix appended to system prompt to request confidence score.",
-        )
-        normalize_glued_fences: bool = Field(
-            default=True,
-            description=(
-                "Repair code fences glued to preceding prose (e.g. "
-                "'asi:```python') in the previous assistant response during "
-                "the inlet prologue, before hashing, indexing, LTM storage "
-                "and history re-injection. Fixes fence-anchored extraction "
-                "and stops the malformed pattern from re-entering the "
-                "model's visible history where it can be imitated."
-            ),
-        )
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 9. LONG‑TERM MEMORY (LTM)
-        # ═════════════════════════════════════════════════════════════════════════
-
-        # ── 9.1 Storage & retrieval ───────────────────────────────────────────
-        long_term_memory_dir: str = Field(default="/app/backend/data/long_term_memory")
-        long_term_memory_expiration_days: int = Field(default=30)
-        ltm_store_only_code_sessions: bool = Field(default=True)
-        long_term_memory_top_k: int = Field(default=10)
-        long_term_memory_similarity_threshold: float = Field(default=0.65)
-        ltm_time_decay_hours: float = Field(default=12.0)
-
-        # ── 9.2 Symbol boosting ───────────────────────────────────────────────
-        ltm_index_symbols_enabled: bool = Field(default=True)
-        ltm_symbol_index_max_per_message: int = Field(default=20)
-        ltm_symbol_boost_enabled: bool = Field(default=True)
-        ltm_symbol_boost_factor: float = Field(default=1.5)
-        ltm_symbol_boost_min_similarity: float = Field(default=0.5)
-        ltm_symbol_force_mode_enabled: bool = Field(default=False)
-        ltm_symbol_force_fallback_to_semantic: bool = Field(default=True)
-
-        # ── 9.3 Augmented retrieval ───────────────────────────────────────────
-        enable_multi_query_retrieval: bool = Field(default=False)
-        multi_query_variants: int = Field(default=2, ge=1, le=4)
-        enable_contextual_retrieval: bool = Field(default=True)
-        contextual_retrieval_mode: str = Field(default="metadata")
-
-        # ── 9.4 Reranking ─────────────────────────────────────────────────────
-        enable_reranking: bool = Field(default=True)
-        reranker_model: str = Field(
-            default="Qwen/Qwen3-Reranker-0.6B",
-            description="CrossEncoder model for reranking LTM results. Supports 32K context.",
-        )
-        reranker_top_k: int = Field(default=5)
-
-        # ── 9.5 RAPTOR ────────────────────────────────────────────────────────
-        enable_raptor: bool = Field(
-            default=True,
-            description="Enable RAPTOR hierarchical clustering of code symbols for faster LTM retrieval.",
-        )
-        raptor_clusters_per_level: int = Field(default=5, ge=2, le=20)
-        raptor_summary_model: str = Field(
-            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
-        )
-        raptor_summary_max_tokens: int = Field(default=150)
-        raptor_min_similarity: float = Field(
-            default=0.0,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Cosine-similarity floor for RAPTOR cluster summaries injected "
-                "into Block B. Hits below the floor are dropped, so off-topic "
-                "queries stop receiving top-k summaries unconditionally. 0.0 "
-                "disables the floor (previous behavior). Calibrate from the "
-                "per-hit 'RAPTOR retrieve: sim=' debug lines."
-            ),
-        )
-        raptor_use_call_graph_proximity: bool = Field(
-            default=True,
-            description="Weight call‑graph distance alongside semantic similarity when clustering.",
-        )
-        raptor_graph_weight: float = Field(
-            default=0.5,
-            ge=0.0,
-            le=1.0,
-            description="0.0 = semantic only, 1.0 = graph only.",
-        )
-
-        # ── 9.x NapMem (agentic long-term memory tool) ───────────────────────
-        napmem_max_stored_diffs: int = Field(
-            default=500,
-            ge=50,
-            description=(
-                "Global retention cap for rows in the napmem_diffs table. "
-                "Oldest rows beyond the cap are deleted on insert."
-            ),
-        )
-        napmem_diff_source_max_chars: int = Field(
-            default=400_000,
-            ge=0,
-            description=(
-                "Cap on len(prev)+len(new) above which the unified diff is "
-                "not computed (quadratic difflib cost on whole-file pastes); "
-                "a synthetic one-line stub is stored instead. 0 disables the "
-                "cap (not recommended)."
-            ),
-        )
-        napmem_top_k: int = Field(
-            default=3,
-            ge=1,
-            le=5,
-            description=(
-                "Maximum memories returned per MEMORY tool search "
-                "(summaries with their associated diffs)."
-            ),
-        )
-        napmem_min_score: float = Field(
-            default=0.3,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "Relevance floor for MEMORY results (normalized [0,1]). Hits "
-                "below it are dropped; if none survive, the tool returns the "
-                "explicit no-results fallback instead of noise."
-            ),
-        )
-        napmem_tool_enable: bool = Field(
-            default=True,
-            description=(
-                "Expose the MEMORY tool (NapMem long-term memory search) to "
-                "agentic steps. Off removes the tool from the step contract "
-                "and the broker rejects MEMORY requests."
-            ),
-        )
-        napmem_diff_truncate_chars: int = Field(
-            default=0,
-            ge=0,
-            description=(
-                "Per-diff truncation when rendering MEMORY results. 0 = no "
-                "per-diff truncation (default). The aggregate tool result is "
-                "always capped by the broker regardless of this value."
-            ),
-        )
-        napmem_static_ltm: str = Field(
-            default="on",
-            description=(
-                "'on' (default) = inject retrieved LTM memories into the "
-                "system prompt every turn. It ships as the default because "
-                "'auto' rests on an inference the measurements refuse: "
-                "across every run examined the MEMORY tool was reachable "
-                "on each agentic turn and called ZERO times, so the skip "
-                "made the hardest-working turns the memory-blind ones. "
-                "'auto' = skip the "
-                "static injection only on turns where the agentic pipeline "
-                "fires and the MEMORY tool is therefore reachable; turns the "
-                "pipeline skips (continuations, busy slot, architecture "
-                "queries) keep the injection so no turn is memory-blind. "
-                "'off' = never inject; memory is on-demand only. LTM storage "
-                "is unaffected in every mode."
-            ),
-        )
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 10. CONTEXT COMPRESSION
-        # ═════════════════════════════════════════════════════════════════════════
-
-        # ── 10.0 Current-turn paste diet ─────────────────────────────────────
-        paste_diet_max_chars: int = Field(
-            default=100_000,
-            ge=0,
-            description=(
-                "When the current user message's fenced-code payload exceeds "
-                "this many characters, spans whose blocks are already indexed "
-                "are replaced with one-line SymbolGraph references (prose is "
-                "kept). Bounds the outgoing turn so the server can run at a "
-                "native-window --ctx-size without YaRN. 0 disables the diet."
-            ),
-        )
-
-        # ── 10.1 History compression (LLMLingua) ─────────────────────────────
-        enable_history_llmlingua: bool = Field(
-            default=True,
-            description="Apply LLMLingua‑2 compression to conversation history.",
-        )
-        history_compress_recent_rate: float = Field(
-            default=0.75,
-            ge=0.3,
-            le=1.0,
-            description="Compression rate for the last `history_compress_recent_lookback` turns.",
-        )
-        history_compress_old_rate: float = Field(
-            default=0.40,
-            ge=0.1,
-            le=1.0,
-            description="Compression rate for turns older than recent_lookback.",
-        )
-        history_compress_indexed_rate: float = Field(
-            default=0.20,
-            ge=0.05,
-            le=0.5,
-            description="Compression rate for old turns whose code is fully indexed.",
-        )
-        history_compress_recent_lookback: int = Field(
-            default=4,
-            ge=1,
-            le=20,
-            description="Number of recent turns exempt from aggressive compression.",
-        )
-        enable_secondary_compaction: bool = Field(
-            default=False,
-            description=(
-                "Run LLMLingua (secondary compactor) after the primary "
-                "compactor. Off by default: it is a natural-language token "
-                "classifier and over a technical transcript it drops hedges, "
-                "negations and identifier delimiters, rewriting the record "
-                "for a fraction of a percent of the prompt. Messages citing "
-                "code are skipped even when this is on."
-            ),
-        )
-
-        # ── 10.2 Code compression (LLMLingua) ────────────────────────────────
-        enable_code_compression: bool = Field(
-            default=False,
-            description="Apply LLMLingua‑2 compression to individual code blocks in Block B (LOD‑3).",
-        )
-        code_compression_rate: float = Field(
-            default=0.5,
-            ge=0.3,
-            le=0.8,
-            description="Fraction of tokens to KEEP when compressing a code block.",
-        )
-        code_compression_min_tokens: int = Field(
-            default=150,
-            description="Minimum tokens a code block must have before compression is attempted.",
-        )
-        enable_question_aware_compression: bool = Field(
-            default=True,
-            description="Preserve tokens relevant to the user's question during code compression.",
-        )
-
-        # ── 10.3 Code history management ─────────────────────────────────────
-        enable_code_history_compression: bool = Field(
-            default=True,
-            description="Replace old multi‑phase code parts with compact commit summaries.",
-        )
-        code_history_force_compress_after_turns: int = Field(
-            default=8,
-            ge=0,
-            description="Force‑compress code‑bearing history blocked by symbol‑index ratio for > N turns. 0 = never.",
-        )
-        code_history_keep_last_n_parts: int = Field(
-            default=3,
-            ge=1,
-            le=5,
-            description="Number of recent multi‑phase parts to keep in full.",
-        )
-        code_history_symbol_index_threshold: float = Field(
-            default=0.75,
-            ge=0.5,
-            le=1.0,
-            description="Minimum symbol‑index ratio to allow compression.",
-        )
-        enable_lean_user_code: bool = Field(
-            default=True,
-            description="Replace large user code blocks in history with a compact stub.",
-        )
-        lean_user_code_min_tokens: int = Field(
-            default=12000,
-            description="Token threshold above which a user code block is stubbed.",
-        )
-
-        # ── 10.4 Conversation summaries ───────────────────────────────────────
-        max_conversation_summaries: int = Field(
-            default=3,
-            ge=0,
-            description="Maximum summary blocks kept and re‑injected per request. 0 = keep all.",
-        )
-        summarization_model: str = Field(
-            default="llamacpp/Kwaipilot_KAT-Coder-V2.5-Dev-APEX-MTP-I-Compact-v2D-lite",
-            description="Model used for all general-purpose summarization tasks.",
-        )
-        # ═════════════════════════════════════════════════════════════════════════
-        # 11. SESSION & STATE
-        # ═════════════════════════════════════════════════════════════════════════
-
-        # ── 11.1 Project & storage ────────────────────────────────────────────
-        project_id: str = Field(
-            default="default",
-            description="Logical project identifier that scopes all per-project state.",
-        )
-        max_cached_projects: int = Field(
-            default=10,
-            description="Maximum project states kept in the in-memory LRU cache.",
-        )
-        state_db_path: str = Field(
-            default="/app/backend/data/conversation_state.db",
-            description="Filesystem path for the SQLite database that persists conversation state.",
-        )
-        preserve_tool_calls: bool = Field(
-            default=True,
-            description="Strip orphaned tool-call messages from history before window management.",
-        )
-
-        # ── 11.2 Conversation summaries ───────────────────────────────────────
-        enable_session_summary: bool = Field(default=True)
-        session_summary_interval_messages: int = Field(default=8)
-        session_summary_max_tokens: int = Field(default=0)
-        summarize_batch_turns: int = Field(
-            default=5,
-            ge=1,
-            le=30,
-            description="Minimum unsummarized turns before generating one summary.",
-        )
-        enable_hierarchical_summaries: bool = Field(
-            default=True,
-            description="Fold oldest L1 turn summaries into a single L2 summary.",
-        )
-        hierarchical_summary_group_size: int = Field(
-            default=4,
-            ge=2,
-            le=12,
-            description="Number of oldest L1 summaries folded into one L2 summary.",
-        )
-        max_hierarchical_summaries: int = Field(
-            default=2,
-            ge=0,
-            description="Maximum L2 summaries kept. 0 = keep all.",
-        )
-        hierarchical_summary_max_tokens: int = Field(
-            default=250,
-            ge=80,
-            le=800,
-            description="Token budget for an L2 consolidated summary.",
-        )
-
-        # ── 11.3 Feedback tracking ────────────────────────────────────────────
-        enable_feedback_tracking: bool = Field(default=True)
-        feedback_history_limit: int = Field(default=10)
-        inject_feedback_context: bool = Field(default=True)
-        preserve_error_context: bool = Field(default=True)
-
-        # ── 11.4 Response & duplicate cache ──────────────────────────────────
-        enable_response_cache: bool = Field(default=True)
-        response_cache_similarity_threshold: float = Field(default=0.92)
-        response_cache_ttl_hours: float = Field(default=24.0)
-        response_cache_max_entries: int = Field(default=100)
-        response_cache_include_context_hash: bool = Field(default=True)
-        duplicate_question_threshold: float = Field(default=0.92)
-        duplicate_question_lookback: int = Field(default=20)
-        duplicate_question_lookback_hours: float = Field(default=24.0)
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 12. PERFORMANCE & PERSISTENCE
-        # ═════════════════════════════════════════════════════════════════════════
-
-        # ── 12.1 Block A freeze (KV prefix stability across edits) ───────────
-        block_a_freeze_turns: int = Field(
-            default=10,
-            ge=0,
-            description=(
-                "Freeze Block A (and its structure hash) for up to N counted changes, "
-                "so structural edits do not each trigger a full KV prefill. "
-                "During the window Block A "
-                "serves its cached text with a staleness header. The window "
-                "breaks and re-captures on the Nth counted change (paying one "
-                "prefill then). What counts as a change is governed by "
-                "block_a_freeze_count_all_changes. 0 = feature disabled (every "
-                "structural change invalidates Block A immediately, as before)."
-            ),
-        )
-        block_a_freeze_count_all_changes: bool = Field(
-            default=False,
-            description=(
-                "When True, every turn that would rebuild Block A counts toward "
-                "block_a_freeze_turns. When False (default), only structural "
-                "edits count — turns where the symbol signature snapshot changed "
-                "(dirty_qids non-empty). False keeps the freeze effectively "
-                "infinite during pure Q&A (nothing changed, prefix was stable "
-                "anyway) and only spends the budget on real edits, minimizing "
-                "how stale the frozen map can get per counted step."
-            ),
-        )
-        block_a_freeze_max_drift: float = Field(
-            default=0.0,
-            ge=0.0,
-            le=1.0,
-            description=(
-                "When > 0, the freeze also breaks early if the fraction of "
-                "dirty symbols (dirty_qids / total) exceeds this ratio on a "
-                "counted change, even before block_a_freeze_turns is reached — "
-                "a safety valve so a single large refactor mid-window does not "
-                "keep serving a badly-stale map. 0 = disabled (only the turn "
-                "count governs breakage)."
-            ),
-        )
-        block_a_freeze_break_on_ingestion: bool = Field(
-            default=False,
-            description=(
-                "When True, silent ingestion of a code paste breaks the freeze "
-                "and re-captures, since a large paste changes the structure "
-                "wholesale and freezing a map of just-replaced code would be "
-                "maximally misleading. When False (default), ingestion leaves "
-                "the current freeze window untouched. "
-                "In short: determines whether code pasted mid-session triggers "
-                "a prefill. It does not affect the first turn after a paste, "
-                "which prefills either way; from there on, the server's own "
-                "context checkpoints absorb the cost for as long as the prefix "
-                "holds and the server keeps running (they live in its memory "
-                "and do not survive a restart)."
-            ),
-        )
-
-        # ── 12.2 Volatility‑tiered context ───────────────────────────────────
-        enable_skeleton_tier: bool = Field(
-            default=True,
-            description="Inject the project skeleton (signatures) as a stable cache tier inside Block A.",
-        )
-        skeleton_tier_max_tokens: int = Field(
-            default=0,
-            ge=0,
-            description="Max tokens for the skeleton tier. 0 = unlimited. Over budget → tier skipped.",
-        )
-        skeleton_tier_suppresses_block_b_signatures: bool = Field(
-            default=True,
-            description="When skeleton tier is active, Block B omits bare signatures already in the stable tier.",
-        )
-        skeleton_include_docstrings: bool = Field(
-            default=True,
-            description="Include one‑line docstrings in the skeleton tier.",
-        )
-        docstring_flush_on_complete: bool = Field(
-            default=True,
-            description=(
-                "Re-render the skeleton tier ONCE when background docstring "
-                "generation reaches full coverage (or the queue stalls), so "
-                "LLM-generated docstrings become visible in Block A. Costs a "
-                "single partial prefill from the skeleton's position; when "
-                "off, generated docstrings only surface after the next "
-                "structural edit."
-            ),
-        )
-        emergency_max_turns: int = Field(
-            default=4,
-            ge=1,
-            le=20,
-            description="Turns to keep when an individual turn exceeds budget × 0.8 (emergency cap).",
-        )
-        compaction_defer_during_autocontinue: bool = Field(
-            default=True,
-            description="Skip turn‑based summarize/evict while an AutoContinue multi‑part session is active.",
-        )
-
-        # ── 12.3 Graph & ingestion ────────────────────────────────────────────
-        enable_edge_persistence: bool = Field(default=True)
-        enable_speculative_prefetch: bool = Field(default=True)
-        speculative_prefetch_max: int = Field(default=5, ge=1, le=20)
-        enable_silent_ingestion: bool = Field(default=True)
-
-        # ── 12.4 Block lifecycle ──────────────────────────────────────────────
-        enable_block_paging: bool = Field(
-            default=True,
-            description="Soft‑evict low‑activation blocks to ChromaDB instead of dropping them.",
-        )
-        block_paging_threshold: int = Field(
-            default=15,
-            ge=5,
-            le=100,
-            description="active_blocks count above which paging starts.",
-        )
-        block_paging_min_activation: float = Field(
-            default=0.15,
-            ge=0.01,
-            le=0.5,
-            description="PPR activation score below which a block is eligible for paging.",
-        )
-        purge_old_code_versions_enabled: bool = Field(
-            default=True,
-            description="Move code versions beyond the N most recent per file to cold storage.",
-        )
-        purge_old_code_versions_max_per_file: int = Field(
-            default=3,
-            ge=1,
-            le=20,
-            description="Number of recent code versions per file to keep in active context.",
-        )
-        purge_allow_hard_delete: bool = Field(
-            default=False,
-            description=(
-                "Allow purge_old_versions to permanently delete old code versions from "
-                "active_blocks when block paging is unavailable (ChromaDB down or "
-                "enable_block_paging=False). "
-                "When False (default), the block is kept to prevent silent data loss. "
-                "When True, the block is deleted and its content is unrecoverable."
-            ),
-        )
-
-        # ── 12.5 Maintenance ──────────────────────────────────────────────────
-        purge_orphaned_data_interval: int = Field(
-            default=10,
-            ge=0,
-            description="Turns between automatic purges of orphaned DB rows. 0 = disabled.",
-        )
-        max_autocontinue_turns: int = Field(
-            default=8,
-            ge=2,
-            le=30,
-            description="Maximum consecutive AutoContinue turns before the watchdog forces a reset.",
-        )
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 13. INTERACTION & COMMANDS
-        # ═════════════════════════════════════════════════════════════════════════
-
-        # ── 13.1 Commands & expansion ─────────────────────────────────────────
-        outlet_expand_intercept_enabled: bool = Field(default=True)
-        outlet_expand_intercept_max_symbols: int = Field(default=0, ge=0)
-        outlet_expand_intercept_depth: int = Field(default=5, ge=0)
-        expand_default_depth: int = Field(default=2)
-        enable_skeleton_intent: bool = Field(
-            default=True,
-            description="Serve a copy‑pasteable signature‑only skeleton for scaffolding queries.",
-        )
-        enable_accept_command: bool = Field(
-            default=True,
-            description=(
-                "Enable the /accept chat command: marks the most "
-                "recent hypothesis-competition record of this "
-                "project as validated in the real world "
-                "(external_validation=True). Closes the R33 "
-                "learning loop — without it the strategy history "
-                "learns only from falsifications, never from "
-                "confirmed wins."
-            ),
-        )
-        enable_freeze_command: bool = Field(
-            default=True,
-            description=(
-                "Enable the /freeze and /unfreeze chat commands for manual "
-                "control of the Block A KV-cache freeze.\n"
-                "  /freeze       → freeze the architecture map using "
-                "block_a_freeze_turns as the edit budget.\n"
-                "  /freeze N     → freeze for N structural edits.\n"
-                "  /freeze 0     → freeze indefinitely, until /unfreeze.\n"
-                "  /unfreeze     → release immediately; the next turn rebuilds "
-                "Block A fresh (likely one prefill) and hands control back to "
-                "the automatic freeze policy.\n"
-                "A manual freeze overrides both the automatic policy and a "
-                "disabled block_a_freeze_turns valve, since it is an explicit "
-                "user instruction. When this valve is False, both commands are "
-                "ignored and fall through as ordinary messages."
-            ),
-        )
-
-        # ── 13.1.2 Natural language commands ──────────────────────────────────
-        # Only these commands are implemented through natural language.
-        enable_natural_language_intents: bool = Field(default=False)
-        enable_forget_command: bool = Field(default=True)
-        enable_natural_language_forget: bool = Field(default=True)
-        enable_natural_language_remember: bool = Field(default=True)
-        enable_natural_language_obsolete: bool = Field(default=True)
-
-        # ── 13.2 Proactive suggestions ────────────────────────────────────────
-        enable_command_suggestions: bool = Field(default=True)
-        command_suggestion_cooldown_minutes: int = Field(default=10)
-        proactive_summary_threshold: float = Field(default=0.95)
-
-        # ── 13.3 Context cleanup ──────────────────────────────────────────────
-        cleanup_suggestions_enabled: bool = Field(default=True)
-        cleanup_inactive_threshold_messages: int = Field(default=30)
-        cleanup_excluded_content_types: list = Field(
-            default_factory=lambda: ["BASE_CODE"],
-        )
-        cleanup_status_command_enabled: bool = Field(default=True)
-        cleanup_proactive_suggestions: bool = Field(default=True)
-        cleanup_suggestion_cooldown_messages: int = Field(default=20)
-        cleanup_command_enabled: bool = Field(default=True)
-
-        # ═════════════════════════════════════════════════════════════════════════
-        # 14. UTILITIES & TUNING
-        # ═════════════════════════════════════════════════════════════════════════
-
-        # ── 14.1 Core ─────────────────────────────────────────────────────────
         debug: bool = Field(
             default=True,
             description="Enable verbose timestamped debug logging to stdout for all CodeAware subsystems.",
         )
+
         priority: int = Field(
             default=0,
             description="OpenWebUI pipeline priority. Lower numbers run earlier in the filter chain.",
         )
+
         use_tiktoken: bool = Field(
             default=True,
             description="Use tiktoken (cl100k_base) for accurate token counting.",
         )
 
-        # ── 14.2 Context dump (evolution tracking) ────────────────────────────
         enable_context_dump: bool = Field(
             default=True,
             description="Dump per‑turn context (Block A, Block B, message window) to disk for evolution tracking.",
         )
+
         context_dump_dir: str = Field(
             default="/app/backend/data/context_dumps",
             description="Directory for per‑turn context snapshots.",
         )
+
         context_dump_max_files_per_project: int = Field(
             default=200,
             ge=0,
             description="Max Markdown snapshots kept per project. 0 = keep all.",
         )
+
         context_dump_include_messages: bool = Field(
             default=True,
             description="Include the non‑system message window in each snapshot.",
         )
+
         context_dump_message_max_chars: int = Field(
             default=8000,
             ge=0,
             description="Truncate each captured message body to this many chars. 0 = no truncation.",
         )
+
         context_dump_write_jsonl: bool = Field(
             default=True,
             description="Append a compact metrics line per turn to evolution.jsonl.",
         )
+
         enable_agent_dump: bool = Field(
             default=True,
             description=(
@@ -48491,89 +48985,105 @@ class Filter:
             ),
         )
 
-        # ── 14.3 Weighting & decay ────────────────────────────────────────────
         raw_file_priority_boost: float = Field(default=2.0)
-        block_expiration_hours: float = Field(default=24.0)
-        proposed_change_retention_turns: int = Field(default=20)
-        error_retention_turns: int = Field(default=15)
-        track_active_code_age: bool = Field(default=True)
-        active_code_timeout_minutes: int = Field(default=45)
-        recent_activity_window_minutes: int = Field(default=15)
-        max_change_summaries: int = Field(default=1000)
-        # ═════════════════════════════════════════════════════════════════════════
-        # 15. LAZY + BACKGROUND TASKS
-        # ═════════════════════════════════════════════════════════════════════════
 
-        # ── 15.1 Master switch ────────────────────────────────────────────────
+        block_expiration_hours: float = Field(default=24.0)
+
+        proposed_change_retention_turns: int = Field(default=20)
+
+        error_retention_turns: int = Field(default=15)
+
+        track_active_code_age: bool = Field(default=True)
+
+        active_code_timeout_minutes: int = Field(default=45)
+
+        recent_activity_window_minutes: int = Field(default=15)
+
+        max_change_summaries: int = Field(default=1000)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 18. LAZY + BACKGROUND TASKS
+        # ══════════════════════════════════════════════════════════════════════
+
         enable_background_tasks: bool = Field(
             default=True,
             description="Master switch for ALL background tasks. If False, no background work is started.",
         )
 
-        # ── 15.2 Lazy tasks (inlet) ───────────────────────────────────────────
         enable_lazy_session_summary: bool = Field(
             default=False,
             description="Enable lazy session summary generation in inlet.",
         )
+
         enable_lazy_prefetch: bool = Field(
             default=True,
             description="Enable lazy prefetch of CodePathViews in inlet.",
         )
+
         enable_lazy_docstrings: bool = Field(
             default=False,
             description="Enable lazy generation of docstrings in inlet.",
         )
+
         enable_lazy_raptor: bool = Field(
             default=False,
             description="Enable lazy RAPTOR rebuild in inlet.",
         )
+
         enable_lazy_purge: bool = Field(
             default=False,
             description="Enable lazy purge of old versions in inlet (experimental).",
         )
+
         enable_lazy_path_index: bool = Field(
             default=True,
             description="Enable lazy path-index rebuild in inlet as a fallback when "
             "the background pass has not finished. Rebuilds CodePathViews for all "
             "entry points; invalidated by code-state changes (e.g. an ingestion).",
         )
+
         enable_lazy_lod: bool = Field(
             default=True,
             description="Enable lazy LOD adaptive adjustment in inlet (uses last response).",
         )
-        # ── 15.3 Background tasks (outlet) ────────────────────────────────────
+
         enable_bg_docstrings: bool = Field(
             default=True,
             description="Enable background docstring generation between turns.",
         )
+
         enable_bg_prefetch: bool = Field(
             default=True,
             description="Enable background speculative prefetch between turns.",
         )
+
         enable_bg_session_summary: bool = Field(
             default=True,
             description="Enable background session summary generation between turns.",
         )
+
         enable_bg_raptor: bool = Field(
             default=True,
             description="Enable background RAPTOR rebuild between turns.",
         )
+
         enable_bg_purge: bool = Field(
             default=False,
             description="Enable background purge of old versions between turns (experimental).",
         )
+
         enable_bg_path_index: bool = Field(
             default=True,
             description="Enable background path-index rebuild between turns. Moves the "
             "per-entry-point CodePathView build off the critical inlet path (the "
             "dominant cost on a large first ingestion); invalidated by code-state changes.",
         )
+
         enable_bg_lod: bool = Field(
             default=True,
             description="Enable background LOD adaptive adjustment between turns.",
         )
 
-        # ── 15.4 Priority & performance ───────────────────────────────────────
         task_priority: Dict[str, int] = Field(
             default_factory=lambda: {
                 "session_summary": 1,  # Controls window size — direct impact every turn
@@ -48589,6 +49099,7 @@ class Filter:
                 "It affects both background and lazy tasks execution order."
             ),
         )
+
         bg_task_max_concurrent: int = Field(
             default=5,
             ge=1,
@@ -48598,23 +49109,28 @@ class Filter:
                 "The specified amount of bg tasks will spawn at the same time, by priority order."
             ),
         )
+
         bg_task_stop_timeout: float = Field(
             default=2.0,
             ge=1.0,
             le=30.0,
             description="Maximum seconds to wait for background tasks to finish gracefully at inlet.",
         )
+
         bg_task_cancel_timeout: float = Field(
             default=5.0
         )  # Bound on awaiting the cancel
+
         bg_task_log_detailed: bool = Field(
             default=False,
             description="If True, log start/stop/duration for every background task.",
         )
+
         bg_task_measure_performance: bool = Field(
             default=True,
             description="If True, record and log execution time for each background task run.",
         )
+
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Initialization
