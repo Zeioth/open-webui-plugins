@@ -13863,6 +13863,28 @@ class AgenticEvidenceLedger:
             # them, so the gap stops being invisible.
             _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
             claim.unread_qids = [q for q in claim.valid_qids if q not in _seen]
+            # A structural claim asserts one thing the graph can settle: that
+            # this subject calls these symbols. Two of them with the same
+            # subject and the same cited qids are the same assertion however
+            # they are worded, which is how one turn recorded seven facts as
+            # fourteen claims — each stated once in English by an investigate
+            # step and once in Spanish by the analyze step after it. Text
+            # normalisation cannot see that; this can.
+            if claim.claim_kind == "structural" and claim.subject:
+                _sig = (claim.subject, tuple(sorted(claim.valid_qids)))
+                _dupe = any(
+                    _c.claim_kind == "structural"
+                    and _c.subject == claim.subject
+                    and tuple(sorted(_c.valid_qids)) == _sig[1]
+                    for _c in self.claims
+                )
+                if _dupe:
+                    self._f._log_debug(
+                        f"🤖 Ledger: structural claim about "
+                        f"{claim.subject} restates one already recorded "
+                        f"for the same symbols — not counted twice"
+                    )
+                    continue
             self.claims.append(claim)
         return control
 
@@ -19030,6 +19052,13 @@ class AgenticStepExecutor:
         "\"A calls B with x\" is about A. A behavioural claim is settled "
         "by reading the subject's body and by nothing else, so naming the "
         "subject correctly is what makes the claim checkable at all.\n"
+        "Write the \"claim\" text in English, whatever language the rest "
+        "of your answer uses. Claim text is machinery, not prose: it is "
+        "matched against qualified symbol names, settled by quoting source "
+        "that is in English, and compared against the other claims of this "
+        "turn to catch the same fact stated twice. Your analysis above the "
+        "JSON still answers in the reader's language — that is what "
+        "reaches them.\n"
         "Only include claims you can tie to symbols present in the context, "
         "using their qualified names exactly as written. Every claim must "
         "NAME ITS MEASUREMENT: the exact qualified symbol(s) whose "
@@ -21232,6 +21261,14 @@ class AgenticOrchestrator:
         worth as much to the synthesis as the findings, and plain head
         truncation would drop it.
         """
+        # The ceiling valve names the digest among what it lifts, and this
+        # method never asked. What head-truncation removes is the JSON claim
+        # block at the end of a step's output, which is precisely what the
+        # next step needs in order not to re-derive it: one turn's step 9
+        # produced 1070 tokens against this 400-token budget, and the step
+        # after it restated seven of the claims it never saw.
+        if getattr(self._f.valves, "agentic_unlimited_tokens", False):
+            return _close_dangling_fence(text)
         budget = max(50, self._f.valves.agentic_digest_max_tokens)
         m = re.search(r"(?im)^\s*NOT FOUND:.*(?:\n.*)*\Z", text)
         if m:
@@ -22309,21 +22346,74 @@ class AgenticOrchestrator:
             # inserts one follow-up investigate. Bounded by
             # agentic_max_steps and two insertions per run; it runs to
             # completion like every other step (GOVERNING PRINCIPLES).
+            # -- Gaps that name a symbol are answered by serving it --------
+            # A gap of the form "read the body of X" does not need the
+            # investigate step the cap rations; it needs X in front of the
+            # next step, which `_render_focus_symbols` does for free. The
+            # cap stays for gaps that are genuine sub-questions.
+            _served_names: List[str] = []
+            _open_gaps: List[str] = []
+            if control["needs"]:
+                _next_step = None
+                for _s in plan.steps[idx + 1:]:
+                    if _s.status in ("", "pending"):
+                        _next_step = _s
+                        break
+                if _next_step is not None:
+                    # Partitioned, not counted: a gap naming a symbol is
+                    # satisfied by serving it, and one asking a sub-question
+                    # is not. Suppressing the gap-fill on the strength of the
+                    # first kind discards the second without a word.
+                    _want: List[str] = []
+                    for _gap in control["needs"]:
+                        _hit = self._symbols_named_in(str(_gap), project_id)
+                        if not _hit:
+                            _open_gaps.append(_gap)
+                            continue
+                        for _nm in _hit:
+                            if _nm not in _want:
+                                _want.append(_nm)
+                    _already = set(_next_step.symbols or [])
+                    _served_names = [n for n in _want if n not in _already][:8]
+                    if _served_names:
+                        # Front, not back. The renderer serves the first
+                        # _MAX_TOOLS_PER_ROUND names, so appending put every
+                        # requested body out of reach on any step whose
+                        # planner had already named that many — and the log
+                        # still called them attached. A planner's focus list
+                        # is a prediction from the goal text; a gap is what
+                        # the step found missing once it ran. The observation
+                        # goes first.
+                        _next_step.symbols = _served_names + [
+                            s for s in (_next_step.symbols or [])
+                            if s not in _served_names
+                        ]
+                        self._f._log_debug(
+                            f"🤖 Agentic: step {step.id} asked for "
+                            f"{len(_served_names)} body/bodies — attached to "
+                            f"step {_next_step.id}'s focus rather than "
+                            f"spending a gap-fill slot: "
+                            + ", ".join(_served_names[:4])
+                        )
+            # What the attachment did not satisfy is what the gap-fill is
+            # for. When nothing was attached this is every gap, which is the
+            # behaviour before ps151.
+            _remaining = _open_gaps if _served_names else list(control["needs"])
             _needs_capacity = (
-                control["needs"]
+                _remaining
                 and len(plan.steps) < self._f.valves.agentic_max_steps
                 and inserted < 2
             )
-            if control["needs"] and not _needs_capacity:
+            if _remaining and not _needs_capacity:
                 # The gaps a step reports are the symbols it knows it could
                 # not read. Dropping them silently is how a claim ends up
                 # asserted about code nobody opened, with the log showing a
                 # clean turn. Named here so the bound can be sized against
                 # what it costs rather than guessed at.
-                _lost_gaps = [str(g)[:60] for g in control["needs"][:3]]
+                _lost_gaps = [str(g)[:60] for g in _remaining[:3]]
                 self._f._log_debug(
                     f"🤖 Agentic: step {step.id} reported "
-                    f"{len(control['needs'])} gap(s) with no capacity to "
+                    f"{len(_remaining)} unserved gap(s) with no capacity to "
                     f"chase them ({len(plan.steps)}/"
                     f"{self._f.valves.agentic_max_steps} steps, "
                     f"{inserted}/2 insertions) — dropped: "
@@ -22351,7 +22441,7 @@ class AgenticOrchestrator:
                     self._f._serial_blind_spots = []
                 new_step = AgenticStep(
                     id=max(s.id for s in plan.steps) + 1,
-                    goal=("Investigate: " + "; ".join(control["needs"][:2]) + _bs_goal),
+                    goal=("Investigate: " + "; ".join(_remaining[:2]) + _bs_goal),
                     kind="investigate",
                 )
                 plan.steps.insert(idx + 1, new_step)
@@ -24837,8 +24927,55 @@ class CommandRouter:
             messages.pop()
             messages.append({"role": "assistant", "content": response})
             return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
+        if content.startswith("/help"):
+            response = self._handle_help_command()
+            messages.pop()
+            messages.append({"role": "assistant", "content": response})
+            return True, self._f._inlet_orch.ensure_last_message_is_user(messages)
 
         return False, None
+
+    def _handle_help_command(self) -> str:
+        """List the commands this router actually dispatches.
+
+        The tip offered to a quiet conversation named `/remember`, `/status`
+        and `/help`, none of which had a handler, and omitted `/accept`,
+        which is the only signal the strategy history ever receives that a
+        hypothesis held up in the real world. A hand-maintained list is what
+        drifted; each line here sits beside the valve that gates it, so a
+        command that stops being dispatched stops being advertised.
+        """
+        # ── Step 1: one line per command, with its gate ──
+        _v = self._f.valves
+        _rows = [
+            ("/agent <question>", True,
+             "run the agentic pipeline on this question explicitly"),
+            ("/accept", getattr(_v, "enable_accept_command", True),
+             "record that the last diagnosis held up — the ONLY signal the "
+             "strategy history gets that something worked"),
+            ("/expand <symbol>", True, "pull a symbol's full body into context"),
+            ("/forget <topic>", True, "drop what the filter remembers about it"),
+            ("/freeze · /unfreeze", True,
+             "pin the static prefix so the KV cache survives edits"),
+            ("/clean", getattr(_v, "cleanup_command_enabled", True),
+             "drop inactive code blocks from the working set"),
+            ("/status",
+             getattr(_v, "cleanup_status_command_enabled", True)
+             and getattr(_v, "cleanup_suggestions_enabled", True),
+             "list the code blocks that have gone quiet"),
+            ("/help", True, "this list"),
+        ]
+
+        # ── Step 2: render only what is switched on ──
+        _lines = ["**CodeAware commands**", ""]
+        for _name, _on, _what in _rows:
+            if _on:
+                _lines.append(f"- `{_name}` — {_what}")
+        _lines += [
+            "",
+            "Anything else is treated as a normal question.",
+        ]
+        return "\n".join(_lines)
 
     async def _handle_accept_command(self, project_id: str) -> str:
         """
@@ -24848,7 +24985,27 @@ class CommandRouter:
         falsifications; the EXPLICIT /accept (never inferred from
         conversation flow — that detection is mushy by design
         rejection) records that the winning hypothesis survived
-        contact with the real world. Rewrites the newest row's JSON
+        contact with the real world.
+
+        There is deliberately no automatic version of this, and the
+        reason is not that models are not good enough yet. Whether a
+        diagnosis held up is a property of the operator's system after
+        they acted on it, which no model observes however capable. An
+        automatic accept could only fire on the pipeline's own
+        measurements, and deriving the label from the number it is
+        meant to validate makes the check circular: a turn reporting
+        high coverage would confirm itself, and the history would
+        learn that classes producing coverage are good rather than
+        classes producing correct answers. A turn can reach complete
+        coverage while answering the wrong question.
+
+        This is the same asymmetry the forge runs on. One contrary
+        fact from the index kills a hypothesis and the machine sees it
+        alone; no quantity of agreement establishes a cause, which is
+        why the most corroborated dossier returns 'plausible' and
+        never 'true'. The machine owns what can be eliminated, the
+        operator owns what cannot, and the second half does not become
+        automatable by making the model larger. Rewrites the newest row's JSON
         with external_validation=True through the same DB queue the
         writers use.
         """
@@ -25194,8 +25351,10 @@ class CommandRouter:
         if state.message_count > 15 and not state.has_any_calls:
             state.last_suggestion_timestamp = now
             return (
-                "[CodeAware] Tip: You can manage context with commands like "
-                "`/forget`, `/remember`, `/status`, `/clean`. Use `/help` for more info."
+                "[CodeAware] Tip: `/expand` pulls a symbol's body in, "
+                "`/forget` drops a topic, and `/accept` tells the filter a "
+                "diagnosis held up — the only way it learns what works. "
+                "`/help` lists them all."
             )
         return None
 
@@ -32172,7 +32331,22 @@ class MetacognitiveReasoningEngine:
         except Exception:
             _sh = ""
         _grave = self._load_graveyard(project_id, _sh)
-        _exclusions: List[str] = [f"{h} (cause: {c})" for h, c, _u in _grave]
+        # Only causes that are evidence AGAINST the hypothesis exclude it from
+        # future generation. `unfounded` means the cycles ended with no facts
+        # either way, and `null_bar` that support never cleared the baseline;
+        # neither refutes anything, and burying them forever puts a mechanism
+        # out of reach of the one request that could revive it — "give me
+        # another account" — while reporting it as ruled out.
+        _refuting = ("falsified", "fabricated")
+        _exclusions: List[str] = [
+            f"{h} (cause: {c})" for h, c, _u in _grave if c in _refuting
+        ]
+        _unrefuted = [h for h, c, _u in _grave if c not in _refuting]
+        if _unrefuted:
+            self._f._log_debug(
+                f"_forge_all: {len(_unrefuted)} graveyard entry/entries kept "
+                f"available — died for want of evidence, not against it"
+            )
         # S7: the fecundity compass — the unsettled ground every dead
         # dossier left behind, aggregated for informed generation.
         # Empty when no graveyard entry carries it (pre-S7 rows or a
@@ -32197,7 +32371,7 @@ class MetacognitiveReasoningEngine:
             # visible to the user watching the chat.
             await self._f._emit_status(
                 f"🪦 [recalled] Excluding {len(_exclusions)} "
-                f"mechanism(s) already ruled out"
+                f"mechanism(s) the evidence ruled out"
             )
         _queue: List[str] = [t for t, _c in seed_pool if t and len(t.strip()) >= 20]
         # S3: class-prior ordering. When R33's history shows call-
@@ -32227,6 +32401,31 @@ class MetacognitiveReasoningEngine:
                     "_forge_all: queue reordered by class prior "
                     "(relation-heavy candidates last)"
                 )
+                # A prior biases; it does not empty. Sorting alone would
+                # push the whole class past the slot budget, and a class
+                # that is never generated can never produce the evidence
+                # that would clear its name — the rate stays high because
+                # nothing new is measured, and the prior confirms itself.
+                # One slot is reserved for it, which is the least that
+                # keeps it alive.
+                _n_slots = int(self._f.valves.agentic_serial_hypothesis_count)
+                _rel = [
+                    t for t in _queue if self._CALL_RELATION_RE.search(t)
+                ]
+                if _rel and _n_slots > 0 and len(_queue) > _n_slots:
+                    if not any(
+                        self._CALL_RELATION_RE.search(t)
+                        for t in _queue[:_n_slots]
+                    ):
+                        _keep = _rel[0]
+                        _queue.remove(_keep)
+                        _queue.insert(max(_n_slots - 1, 0), _keep)
+                        self._f._log_debug(
+                            "_forge_all: class prior floored — one "
+                            "relation-leaning candidate kept in the "
+                            "budget so the class can still earn its way "
+                            "back"
+                        )
         except Exception:
             pass
         # An /agent effort request overrides the valve for this turn
@@ -33350,6 +33549,32 @@ class MetacognitiveReasoningEngine:
                 f"_get_adaptive_strategy: call_fail_rate={call_fail_rate:.2f} > 0.6 "
                 f"→ call-relation constraint will be injected"
             )
+
+        # One line per competition, flags or no flags. A silent engine and an
+        # engine that never ran read identically otherwise, and the validated
+        # count is the state of the positive half — a zero here says the loop
+        # is open, which is worth seeing rather than deducing.
+        _raised = [
+            _k
+            for _k in (
+                "prefer_symbol_verification",
+                "suggest_divergent_start",
+                "tighten_screen_relations",
+                "tighten_screen_symbols",
+            )
+            if strategy.get(_k)
+        ]
+        _validated = sum(
+            1 for _r in recent if getattr(_r, "external_validation", False)
+        )
+        self._f._log_debug(
+            f"\U0001f393 Reinforcement: {n} record(s) over "
+            f"{len(history)} kept, {_validated} externally validated · "
+            f"call_fail {call_fail_rate:.2f} · symbol_fail "
+            f"{symbol_fail_rate:.2f} · stagnation {stagnation_rate:.2f} · "
+            f"avg_coverage {avg_coverage:.2f} · "
+            + ("flags: " + ", ".join(_raised) if _raised else "no flags raised")
+        )
 
         return strategy
 
@@ -42254,7 +42479,7 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
     if _uo:
         lines.append(
             _row("no anchor", _uo,
-                 "nothing to check it against; not a coverage failure")
+                 "unverifiable as written; no code could settle it")
         )
     lines += ["", ""]
     return "\n".join(lines)
@@ -47708,10 +47933,15 @@ class Filter:
             ),
         )
         napmem_static_ltm: str = Field(
-            default="auto",
+            default="on",
             description=(
-                "'on' = inject retrieved LTM memories into the system prompt "
-                "every turn (legacy behavior). 'auto' (default) = skip the "
+                "'on' (default) = inject retrieved LTM memories into the "
+                "system prompt every turn. It ships as the default because "
+                "'auto' rests on an inference the measurements refuse: "
+                "across every run examined the MEMORY tool was reachable "
+                "on each agentic turn and called ZERO times, so the skip "
+                "made the hardest-working turns the memory-blind ones. "
+                "'auto' = skip the "
                 "static injection only on turns where the agentic pipeline "
                 "fires and the MEMORY tool is therefore reachable; turns the "
                 "pipeline skips (continuations, busy slot, architecture "
@@ -49048,6 +49278,10 @@ class Filter:
                     )
                 )
             self._align_outcomes_this_turn = {}
+            # Written by the forge only when a rival survives, read on every
+            # turn by the answer's confidence line. Without this, a turn whose
+            # competition left no survivor is divided by the previous turn's.
+            self._serial_rival_relations = []
             # Same reason again: the tally is written after the pipeline and
             # consumed by the dump, and a turn that runs neither would hand
             # its numbers to whichever turn writes next.
@@ -49875,6 +50109,8 @@ class Filter:
             )
         except Exception as _e_conf:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
+
+
 
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """
