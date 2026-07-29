@@ -7165,6 +7165,10 @@ class ContextBuilder:
         # ── Step 2: resolve the body from an active block ──
         state = self._f._conversation_state_manager.get(project_id)
         block_hashes = self._f._symbol_index.find_blocks(qid, project_id)
+        # Bound before the loop, which may not run: the index can still know
+        # a qid whose blocks have been evicted or marked obsolete, and the
+        # return below is outside the loop.
+        body = ""
         for bh in block_hashes:
             block = state.active_blocks.get(bh)
             if block and not block.obsolete:
@@ -7178,8 +7182,13 @@ class ContextBuilder:
                             + "\n# ... [truncated — use /expand for full body]"
                         )
                     _note_body_shown(self._f, qid)
+        # A header with nothing under it is worse than no section at all:
+        # the reader is told a body was rendered and shown an empty fence.
+        # The `return ""` that used to sit below this line could never run,
+        # being placed after an unconditional return.
+        if not body:
+            return ""
         return f"# `{qid}` (body)\n{body}\n"
-        return ""
 
     # ------------------------------------------------------------------
     # Region: Block B — Dynamic, per‑query LOD‑activated context
@@ -14784,7 +14793,19 @@ class AgenticEvidenceVerifier:
         if claim.evidence_type == "dynamic":
             return False
         # ── Step 2: structural claims are the graph's business ──
-        return claim.claim_kind != "structural" and bool(claim.subject)
+        if claim.claim_kind == "structural" or not claim.subject:
+            return False
+        # ── Step 3: only an explicit behavioural claim overturns a verdict ──
+        # Measured in the harness: an unclassified claim the graph confirmed,
+        # given an indeterminate reading of its body, ended as "unsupported".
+        # For a claim the model called behavioural that is correct — the graph
+        # answered a proposition it was not making. For one nobody classified
+        # it discards a verdict that may well have been right, on a guess
+        # about which kind it was. An unclassified claim is still read when it
+        # carries no verdict, which is the case the closing sweep targets.
+        if claim.verification and claim.claim_kind != "behavioural":
+            return False
+        return True
 
     def group_by_subject(
         self, claims: List["LedgerClaim"]
@@ -14916,6 +14937,89 @@ class AgenticEvidenceVerifier:
             self._f._log_debug(
                 f"🤖 Evidence: {dropped} verdict(s) discarded — the quote "
                 f"was not in the body they claimed to read"
+            )
+        return out
+    async def judge_texts(
+        self,
+        texts: List[str],
+        bodies_text: str,
+        aligned_prefix: str,
+    ) -> List[Optional[bool]]:
+        """Rule on free-text consequences against bodies already read.
+
+        The forge's experiment phase settles each derived consequence with
+        the graph and then the contract check; what survives both is
+        undecidable to static instruments and used to reach the verdict
+        untouched. This judges exactly those, against the bodies the cycle
+        already expanded — no new fetch, no model-chosen reading list.
+
+        Same discipline as `judge`: a supported or contradicted ruling
+        must quote a span that is literally present in the bodies, and a
+        ruling whose quote is not found is recorded as None rather than
+        trusted. Returns one entry per input text: True (supported),
+        False (contradicted) or None (still undecidable — a legitimate
+        outcome, stated rather than papered over).
+        """
+        # ── Step 1: nothing to judge, or nothing to judge against ──
+        if not texts or not bodies_text.strip():
+            return [None] * len(texts)
+
+        # ── Step 2: one call, bodies first, contract last ──
+        numbered = "\n".join(f"{n}. {t}" for n, t in enumerate(texts, 1))
+        prompt = (
+            bodies_text
+            + "\n\nClaims to check against the code above:\n"
+            + numbered
+            + "\n\n"
+            + self._CONTRACT
+        )
+        try:
+            response = await self._f._llm_orchestrator.call_llm(
+                prompt=prompt,
+                system_prompt=aligned_prefix,
+                model_override=self._f.valves.cot_model_level2,
+                max_tokens=self._f.valves.agentic_verify_max_tokens,
+                temperature=0.1,
+                label="forge_evidence",
+                response_format={"type": "json_object"},
+                enable_thinking=False,
+            )
+        except Exception as _e:
+            self._f._log_debug(f"🤖 Forge evidence: call failed ({_e!r})")
+            return [None] * len(texts)
+        if not response:
+            return [None] * len(texts)
+
+        # ── Step 3: parse and enforce the quote rule ──
+        cleaned = response.replace("```json", "").replace("```", "").strip()
+        try:
+            raw = json.loads(cleaned).get("verdicts", [])
+            assert isinstance(raw, list)
+        except Exception:
+            return [None] * len(texts)
+        flat = " ".join(bodies_text.split())
+        out: List[Optional[bool]] = [None] * len(texts)
+        dropped = 0
+        for rv in raw:
+            try:
+                n = int(rv.get("claim", 0))
+                verdict = str(rv.get("verdict", "")).strip().lower()
+                quote = " ".join(str(rv.get("quote", "")).split())
+            except Exception:
+                continue
+            if not (1 <= n <= len(texts)):
+                continue
+            if verdict == "indeterminate":
+                continue
+            if verdict in ("supported", "contradicted"):
+                if not quote or quote not in flat:
+                    dropped += 1
+                    continue
+                out[n - 1] = verdict == "supported"
+        if dropped:
+            self._f._log_debug(
+                f"🤖 Forge evidence: {dropped} ruling(s) discarded — quote "
+                f"not found in the bodies read this cycle"
             )
         return out
 
@@ -15182,6 +15286,7 @@ class AgenticStaticVerifier:
         except Exception:
             return None
         checks: List[Dict[str, Any]] = []
+        _foreign: List[Tuple[int, str]] = []
         for rc in raw:
             try:
                 cid = int(rc.get("claim", 0))
@@ -15196,7 +15301,31 @@ class AgenticStaticVerifier:
                 or not (1 <= cid <= len(claims))
             ):
                 continue
+            # The check must anchor in the claim it is attached to. `src` is
+            # the subject the verdict will be stamped onto, so a check whose
+            # src the claim never cites tests a different proposition and its
+            # verdict is not about this claim — most visibly for a claim that
+            # cites nothing at all, which a foreign check can carry all the
+            # way to "confirmed". Only src is constrained: a claim reading
+            # "A calls X, Y and Z" cites A alone, and each check's dst is
+            # legitimately a symbol the text names without citing.
+            _qids = set(claims[cid - 1].qids or [])
+            _bare = {q.rsplit(".", 1)[-1] for q in _qids}
+            # A claim citing nothing accepts no check: there is no anchor for
+            # a verdict to be about. Skipping the guard for that case left the
+            # worst one unguarded — the harness showed such a claim reaching
+            # "confirmed" on a check about unrelated symbols, when with no
+            # check at all it is correctly marked unoperationalizable.
+            if not (src_n in _qids or src_n.rsplit(".", 1)[-1] in _bare):
+                _foreign.append((cid, src_n))
+                continue
             checks.append({"claim": cid, "kind": kind, "src": src_n, "dst": dst_n})
+        if _foreign:
+            self._f._log_debug(
+                f"🤖 Verify: dropped {len(_foreign)} check(s) whose src is "
+                f"not cited by the claim they target: "
+                + "; ".join(f"C{n}←{s}" for n, s in _foreign[:4])
+            )
         kept = self._select_checks(checks, len(claims))
         if len(kept) < len(checks):
             _lost = sorted(
@@ -15214,7 +15343,6 @@ class AgenticStaticVerifier:
             )
         return kept or None
 
-    @staticmethod
     @staticmethod
     def _select_checks(
         checks: List[Dict[str, Any]], n_claims: int
@@ -15256,6 +15384,7 @@ class AgenticStaticVerifier:
                 break
             out.append(check)
         return out
+    @staticmethod
     def _fallback_checks(claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
         """Deterministic pass: pairwise edges for 2+ cited qids, existence
         for single citations. Some signal is better than none."""
@@ -17865,6 +17994,18 @@ class AgenticPlanner:
             # guarantee the forge provides while the wording stayed just
             # as confident. A conclusion is only as good as what verified
             # it, and when nothing did, that has to be on the page.
+            # Whether EXPLORATORY may settle for the hedge below or must
+            # schedule a hypothesize step. Off restores the older shape,
+            # which ran 4 to 18 agent acts against the 28 to 31 a forge
+            # costs, and bought that saving by letting a cause reach the
+            # reader with nothing having competed against it.
+            _require_hyp = bool(
+                getattr(
+                    self._f.valves,
+                    "agentic_exploratory_requires_hypothesis",
+                    True,
+                )
+            )
             _UNVERIFIED_RULE = (
                 "EVIDENCE RULE for this shape: no hypothesize step means "
                 "nothing will be tested against rivals, checked against "
@@ -17881,7 +18022,21 @@ class AgenticPlanner:
                     "Question type: EXPLORATORY (no cause proposed). Shape: "
                     "investigate-heavy — map the terrain with investigate "
                     "step(s) BEFORE any hypothesize; do not hypothesize "
-                    "over an unmapped space.\n\n" + _UNVERIFIED_RULE
+                    "over an unmapped space.\n\n"
+                    + (
+                        "This shape REQUIRES a hypothesize step after the "
+                        "investigation. An exploratory question is one where "
+                        "something is wrong and nobody has proposed why, "
+                        "which is precisely the case a cause must be earned "
+                        "rather than asserted: a cause that no rival was "
+                        "tested against, that was never checked against "
+                        "mechanisms already ruled out and never scored for "
+                        "corroboration, is not a finding. Plan "
+                        "investigate step(s) first, then hypothesize, and "
+                        "let the analysis rank what survived.\n\n"
+                        if _require_hyp
+                        else _UNVERIFIED_RULE
+                    )
                 ),
                 "confirmatory": (
                     "Question type: CONFIRMATORY (the user proposes a "
@@ -19252,6 +19407,13 @@ class AgenticSynthesisComposer:
         )
         _all_citations_invalid = False
         _claims_total, _claims_bad = 0, 0
+        # Bound here, not only inside the branch below. They are read
+        # unconditionally further down, so a turn whose steps emitted no
+        # claims used to raise out of the composer and cost the whole
+        # synthesis — workspace, format directive and all. Zero is also the
+        # honest value: no claims is no valid citations, which is exactly
+        # the state the format directive's `n_valid == 0` gate exists for.
+        total, ok, bad = 0, 0, 0
         if ledger is not None and ledger.claims:
             total, ok, bad = ledger.counts()
             _claims_total, _claims_bad = total, bad
@@ -19636,7 +19798,11 @@ class AgenticSynthesisComposer:
             ("```" in (s.output or "")) or ("```" in (s.digest or ""))
             for s in plan.steps
         )
-        _vc = self._ledger.verification_counts()
+        _vc = (
+            ledger.verification_counts()
+            if ledger is not None
+            else {}
+        )
         lines += self._answer_format_directive(
             ok,
             bad,
@@ -22094,38 +22260,76 @@ class AgenticOrchestrator:
         # closing it is this. One extra call, only when something is missing,
         # and only over what is missing.
         _unchecked = [c for c in self._ledger.claims if not c.verification]
-        if _unchecked and getattr(
-            self._f.valves, "agentic_closing_verify", True
+        # The forge verifies inside its cycles — graph, contract check and
+        # the in-cycle evidence ruling — and its competition has already
+        # selected by the time control reaches here, so a sweep after it
+        # can no longer inform anything: it earns its place only when the
+        # scientific method did not run. And it is guarded in full,
+        # because on its first live run an unguarded failure here took
+        # down everything behind it — the generative evaluation and the
+        # synthesis format directive — which is a worse outcome than any
+        # number of unchecked claims.
+        _forge_ran = bool(
+            getattr(self._f.valves, "agentic_serial_method", False)
+        ) and any(s.kind == "hypothesize" for s in plan.steps)
+        if (
+            _unchecked
+            and not _forge_ran
+            and getattr(self._f.valves, "agentic_closing_verify", True)
         ):
-            _sweep = AgenticStep(
-                id=max((s.id for s in plan.steps), default=0) + 1,
-                goal=(
-                    "Check the claims emitted after the plan's verify step"
-                ),
-                kind="verify",
-            )
-            plan.steps.append(_sweep)
+            try:
+                _sweep = AgenticStep(
+                    id=max((s.id for s in plan.steps), default=0) + 1,
+                    goal=(
+                        "Check the claims emitted after the plan's "
+                        "verify step"
+                    ),
+                    kind="verify",
+                )
+                # Inserted BEFORE the terminal analyze, never appended:
+                # two consumers key on steps[-1].kind == "analyze", and
+                # appending broke both on the first live run.
+                _pos = (
+                    len(plan.steps) - 1
+                    if plan.steps and plan.steps[-1].kind == "analyze"
+                    else len(plan.steps)
+                )
+                plan.steps.insert(_pos, _sweep)
+                self._f._log_debug(
+                    f"🤖 Agentic: closing verification sweep over "
+                    f"{len(_unchecked)} claim(s) with no verdict"
+                )
+                await self._f._emit_status(
+                    f"🤖 Agentic: checking {len(_unchecked)} remaining "
+                    f"claim(s)"
+                )
+                await self._verifier.run_verify_step(
+                    _sweep,
+                    self._ledger,
+                    project_id,
+                    aligned_prefix,
+                    truncated_steps=[s for s in plan.steps if s.truncated],
+                    only_unchecked=True,
+                )
+                if _sweep.status == "done":
+                    _sweep.digest = self._digest(_sweep.output)
+                _left = sum(
+                    1 for c in self._ledger.claims if not c.verification
+                )
+                self._f._log_debug(
+                    f"🤖 Agentic: closing sweep done — {_left} claim(s) "
+                    f"still without a verdict"
+                )
+            except Exception as _e_sw:
+                self._f._log_debug(
+                    f"🤖 Agentic: closing sweep failed ({_e_sw!r}) — the "
+                    f"pipeline tail continues"
+                )
+        elif _unchecked and _forge_ran:
             self._f._log_debug(
-                f"🤖 Agentic: closing verification sweep over "
-                f"{len(_unchecked)} claim(s) with no verdict"
-            )
-            await self._f._emit_status(
-                f"🤖 Agentic: checking {len(_unchecked)} remaining claim(s)"
-            )
-            await self._verifier.run_verify_step(
-                _sweep,
-                self._ledger,
-                project_id,
-                aligned_prefix,
-                truncated_steps=[s for s in plan.steps if s.truncated],
-                only_unchecked=True,
-            )
-            if _sweep.status == "done":
-                _sweep.digest = self._digest(_sweep.output)
-            _left = sum(1 for c in self._ledger.claims if not c.verification)
-            self._f._log_debug(
-                f"🤖 Agentic: closing sweep done — {_left} claim(s) still "
-                f"without a verdict"
+                f"🤖 Agentic: closing sweep skipped — the forge verified "
+                f"in-cycle; {len(_unchecked)} claim(s) carry no separate "
+                f"verdict and the workspace marks them"
             )
 
         # Region: report a truncated plan once, after the loop
@@ -22172,78 +22376,91 @@ class AgenticOrchestrator:
                 "🤖 Agentic: generative evaluation skipped (early-exit fired)"
             )
             _ge_mode = "off"
-        while (
-            _ge_mode in ("shadow", "on")
-            and _replans_used < self._f.valves.agentic_max_replans
-        ):
-            _angle, _wave = await self._generative_evaluation(
-                plan, question, aligned_prefix, project_id
-            )
-            if not _wave:
-                break
-            if _ge_mode == "shadow":
+        # The probe for a better angle, and the waves it may propose,
+        # are optional; the steps already run and the claims already in
+        # the ledger are not. Unguarded, a failure here reached the
+        # caller, which degrades the turn to a single pass and discards
+        # all of it — which is how four turns of the 28 July 14:xx run
+        # lost their agentic work to one exception in the tail.
+        try:
+            while (
+                _ge_mode in ("shadow", "on")
+                and _replans_used < self._f.valves.agentic_max_replans
+            ):
+                _angle, _wave = await self._generative_evaluation(
+                    plan, question, aligned_prefix, project_id
+                )
+                if not _wave:
+                    break
+                if _ge_mode == "shadow":
+                    self._f._log_debug(
+                        f"🤖 [REPLAN-SHADOW] would replan (angle: {_angle[:80]}) "
+                        f"with {len(_wave)} step(s): "
+                        + "; ".join(s.goal[:60] for s in _wave)
+                    )
+                    break
+                _replans_used += 1
                 self._f._log_debug(
-                    f"🤖 [REPLAN-SHADOW] would replan (angle: {_angle[:80]}) "
-                    f"with {len(_wave)} step(s): "
-                    + "; ".join(s.goal[:60] for s in _wave)
+                    f"🤖 Agentic: re-plan wave {_replans_used}/"
+                    f"{self._f.valves.agentic_max_replans} (angle: {_angle[:80]})"
                 )
-                break
-            _replans_used += 1
-            self._f._log_debug(
-                f"🤖 Agentic: re-plan wave {_replans_used}/"
-                f"{self._f.valves.agentic_max_replans} (angle: {_angle[:80]})"
-            )
-            for wstep in _wave:
-                plan.steps.append(wstep)
-                # Appended at the tail, so its display position is the
-                # current length; earlier steps keep their numbers.
-                wstep.display_no = len(plan.steps)
-                await self._f._emit_status(
-                    f"🤖 Agentic wave step {wstep.display_no} ({wstep.kind}): "
-                    f"{wstep.goal[:60]}"
-                )
-                workspace = self._render_workspace(plan.steps)
-                await self._executor.run(
-                    wstep,
-                    aligned_prefix,
-                    workspace,
-                    project_id=project_id,
-                    broker=self._broker,
-                )
-                if wstep.status == "done":
-                    _wctl = await self._extract_with_recovery(wstep, project_id)
-                    # Same reinforcement gate as main-loop steps: shadow
-                    # counting must include waves or the calibration lies.
-                    if _mc_gate_mode in ("shadow", "on"):
-                        _wesc, _wwhy = self._should_reinforce_step(
-                            wstep, _wctl, project_id
-                        )
-                        if _wesc and _mc_gate_mode == "shadow":
-                            self._f._log_debug(
-                                f"🤖 [METACOG-SHADOW] wave step {wstep.id} "
-                                f"would escalate ({_wwhy})"
+                for wstep in _wave:
+                    plan.steps.append(wstep)
+                    # Appended at the tail, so its display position is the
+                    # current length; earlier steps keep their numbers.
+                    wstep.display_no = len(plan.steps)
+                    await self._f._emit_status(
+                        f"🤖 Agentic wave step {wstep.display_no} ({wstep.kind}): "
+                        f"{wstep.goal[:60]}"
+                    )
+                    workspace = self._render_workspace(plan.steps)
+                    await self._executor.run(
+                        wstep,
+                        aligned_prefix,
+                        workspace,
+                        project_id=project_id,
+                        broker=self._broker,
+                    )
+                    if wstep.status == "done":
+                        _wctl = await self._extract_with_recovery(wstep, project_id)
+                        # Same reinforcement gate as main-loop steps: shadow
+                        # counting must include waves or the calibration lies.
+                        if _mc_gate_mode in ("shadow", "on"):
+                            _wesc, _wwhy = self._should_reinforce_step(
+                                wstep, _wctl, project_id
                             )
-                        elif _wesc:
-                            await self._reinforce_step(
-                                wstep,
+                            if _wesc and _mc_gate_mode == "shadow":
+                                self._f._log_debug(
+                                    f"🤖 [METACOG-SHADOW] wave step {wstep.id} "
+                                    f"would escalate ({_wwhy})"
+                                )
+                            elif _wesc:
+                                await self._reinforce_step(
+                                    wstep,
+                                    project_id,
+                                    status_prefix=(
+                                        f"🤖 Agentic wave step "
+                                        f"{wstep.id} ({wstep.kind})"
+                                    ),
+                                )
+                        wstep.digest = self._digest(wstep.output)
+                        if use_cache and structure_hash:
+                            await self._cache.put(
                                 project_id,
-                                status_prefix=(
-                                    f"🤖 Agentic wave step "
-                                    f"{wstep.id} ({wstep.kind})"
-                                ),
+                                structure_hash,
+                                wstep,
+                                self._ledger.serialize_for(wstep.id),
                             )
-                    wstep.digest = self._digest(wstep.output)
-                    if use_cache and structure_hash:
-                        await self._cache.put(
-                            project_id,
-                            structure_hash,
-                            wstep,
-                            self._ledger.serialize_for(wstep.id),
-                        )
-                self._f._log_debug(
-                    f"🤖 Agentic wave step {wstep.id} ({wstep.kind}): "
-                    f"{wstep.status} in {wstep.seconds:.1f}s"
-                )
+                    self._f._log_debug(
+                        f"🤖 Agentic wave step {wstep.id} ({wstep.kind}): "
+                        f"{wstep.status} in {wstep.seconds:.1f}s"
+                    )
+        except Exception as _e_tail:
+            self._f._log_debug(
+                f"\U0001f916 Agentic: generative evaluation / re-plan "
+                f"failed ({_e_tail!r}) — keeping the {len(plan.steps)} "
+                f"step(s) already run and continuing to the synthesis"
+            )
 
         # Region: inject synthesis workspace for the main call
         _workspace = self._composer.render(plan, question, self._ledger, project_id)
@@ -31276,6 +31493,8 @@ class MetacognitiveReasoningEngine:
             # identical on every later verdict. The experiment must
             # report its own instruments.
             _by_graph, _by_contract = 0, 0
+            _undecided_txt: List[str] = []
+            _undecided_idx: List[int] = []
             for _c in _claims:
                 _v = self._claim_verified(_c, evidence, project_id)
                 if _v is not None:
@@ -31292,6 +31511,17 @@ class MetacognitiveReasoningEngine:
                         # checker ran on every abstention, but it only
                         # CONTRIBUTED when it settled one.
                         self._tag_strategy(_dossier, "contract-check")
+                # Evidence pass, in-cycle: what the graph and the
+                # contract check both abstained on is a behavioural
+                # consequence, and the bodies that decide it were read
+                # THIS cycle. Deferring it to a post-competition
+                # sweep produced verdicts that could no longer
+                # inform selection; here the ruling lands before the
+                # cycle's verdict, hence before sealing, hence
+                # before the competition. Judged in one batch below.
+                if _v is None:
+                    _undecided_idx.append(len(_undecided_txt))
+                    _undecided_txt.append(_c)
                 if _v is True:
                     _conf_n += 1
                     if len(_dossier.confirmed_claims) < 8:
@@ -31305,6 +31535,58 @@ class MetacognitiveReasoningEngine:
                     # dossier's legacy — ground touched but never
                     # settled, the map informed generation follows.
                     _dossier.unresolved_claims.append(_c)
+            # ── Evidence ruling on this cycle's undecidables ──
+            # Gated on undecidables existing AND bodies having been read
+            # this hypothesis; guarded so a failure here can only leave
+            # the counts as they were, never take the cycle down.
+            if (
+                _undecided_txt
+                and _expanded_parts
+                and getattr(self._f.valves, "agentic_evidence_verify", True)
+            ):
+                try:
+                    # The forge's calls carry their own short system
+                    # prompts rather than the aligned prefix, which is
+                    # not in scope here; the judge follows the same
+                    # convention.
+                    _rulings = await AgenticEvidenceVerifier(
+                        self._f
+                    ).judge_texts(
+                        _undecided_txt,
+                        "\n\n".join(_expanded_parts),
+                        "You check claims against code shown in full. "
+                        "Answer ONLY with the JSON object requested.",
+                    )
+                except Exception as _e_ev:
+                    self._f._log_debug(
+                        f"🤖 Forge evidence: pass failed ({_e_ev!r}) — "
+                        f"undecidables stay undecided"
+                    )
+                    _rulings = [None] * len(_undecided_txt)
+                _ev_conf = _ev_ref = 0
+                for _txt, _r in zip(_undecided_txt, _rulings):
+                    if _r is True:
+                        _conf_n += 1
+                        _ev_conf += 1
+                        if len(_dossier.confirmed_claims) < 8:
+                            _dossier.confirmed_claims.append(_txt)
+                        if _txt in _dossier.unresolved_claims:
+                            _dossier.unresolved_claims.remove(_txt)
+                    elif _r is False:
+                        _ref_n += 1
+                        _ev_ref += 1
+                        if len(_dossier.refuted_claims) < 8:
+                            _dossier.refuted_claims.append(_txt)
+                        if _txt in _dossier.unresolved_claims:
+                            _dossier.unresolved_claims.remove(_txt)
+                if _ev_conf or _ev_ref:
+                    self._tag_strategy(_dossier, "evidence-check")
+                    self._f._log_debug(
+                        f"🤖 Forge evidence (cycle {_cycle}): "
+                        f"{len(_undecided_txt)} undecidable(s) judged "
+                        f"against {len(_expanded_parts)} body/bodies — "
+                        f"{_ev_conf} supported, {_ev_ref} contradicted"
+                    )
             _dossier.confirmed_checks = _n_conf_e
             _dossier.refuted_checks = _n_ref_e
             _dossier.refuted_symbol_checks = sum(
@@ -46420,6 +46702,20 @@ class Filter:
                 "and when there are no claims)."
             ),
         )
+        agentic_exploratory_requires_hypothesis: bool = Field(
+            default=True,
+            description=(
+                "An EXPLORATORY question — something is wrong and no cause "
+                "has been proposed — must schedule a hypothesize step rather "
+                "than name a cause and label it an unverified conjecture. "
+                "Turning this off restores the older shape. Measured across "
+                "every turn of the 28 July runs, plans carrying a forge ran "
+                "28 to 31 agent acts and plans without one ran 4 to 18, so "
+                "the saving is real and roughly halves to a third of the "
+                "work — bought by letting a cause reach the reader with no "
+                "rival tested against it."
+            ),
+        )
         agentic_evidence_verify: bool = Field(
             default=True,
             description=(
@@ -47643,10 +47939,13 @@ class Filter:
                 "agent invents what, which is the input to designing its "
                 "instruction recipe. "
                 "\n\n"
-                "Off by default: the records carry your project's code and "
-                "a runaway generation can make one turn weigh hundreds of "
-                "kilobytes (capped per record, with the truncation marked "
-                "— a record that hits the cap is itself diagnostic)."
+                "ON by default, and worth knowing what that writes: the "
+                "records carry your project's code verbatim, and a runaway "
+                "generation can make one turn weigh hundreds of kilobytes "
+                "(capped per record, with the truncation marked — a record "
+                "that hits the cap is itself diagnostic). Turn it off if "
+                "those files must not exist on disk; the pipeline is "
+                "unaffected either way, and only the forensics are lost."
             ),
         )
 
