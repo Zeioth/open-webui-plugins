@@ -14044,6 +14044,42 @@ class AgenticEvidenceLedger:
             state = claim.verification or "unchecked"
             out[state] = out.get(state, 0) + 1
         return out
+    def coverage(self) -> Dict[str, int]:
+        """Tally claims by the strength of the evidence behind them.
+
+        This is the project's success metric, so the buckets are drawn
+        where the difference matters rather than where it is convenient.
+        A claim whose body was read and did not settle it is honest and
+        unproven, and belongs nowhere near one carrying a verified quote.
+        A claim confirmed by a call-graph edge was answered on a different
+        question than it asked, and belongs nowhere near either.
+
+        `unoperationalizable` is counted apart. A claim with no checkable
+        anchor is not a coverage failure — folding it into `uncovered`
+        would push the metric down for correctly declining to invent one.
+        """
+        # ── Step 1: one bucket per strength, plus the totals ──
+        out = {
+            "total": len(self.claims),
+            "hard": 0,
+            "read": 0,
+            "structural": 0,
+            "unoperationalizable": 0,
+            "uncovered": 0,
+        }
+        # ── Step 2: place each claim by its verdict and its evidence ──
+        for claim in self.claims:
+            state = claim.verification or ""
+            kind = claim.evidence_type or "reasoning"
+            if state == "unoperationalizable":
+                out["unoperationalizable"] += 1
+            elif not state:
+                out["uncovered"] += 1
+            elif kind in ("code", "dynamic"):
+                out["hard" if state in ("confirmed", "refuted") else "read"] += 1
+            else:
+                out["structural"] += 1
+        return out
 
     def _canonical_qid(self, qid: str, project_id: str) -> str:
         """
@@ -14819,7 +14855,10 @@ class AgenticEvidenceVerifier:
         return groups
 
     def fetch_bodies(
-        self, subjects: List[str], project_id: str
+        self,
+        subjects: List[str],
+        project_id: str,
+        weights: Optional[Dict[str, int]] = None,
     ) -> Dict[str, str]:
         """Fetch each subject's body through the broker, deterministically.
 
@@ -14829,21 +14868,43 @@ class AgenticEvidenceVerifier:
         bracketed note, which is dropped here — a subject with no body is
         a claim that stays unsettled, and saying so is `judge`'s job.
         """
-        # ── Step 1: resolve each subject once, within a char budget ──
+        # ── Step 1: spend the budget on the subjects that settle most ──
+        # Emission order says nothing about a body's worth. Turn 3 of the
+        # 29 July run held fourteen subjects, eleven with a single claim,
+        # and ran out of budget before two that carried six each — whose
+        # claims then came back indeterminate. The tie-break is
+        # alphabetical so two runs over the same ledger send the same
+        # prompt, which a cache prefix depends on.
         broker = AgenticToolBroker(self._f)
         budget = int(
             getattr(self._f.valves, "agentic_evidence_max_chars", 48000)
         )
+        _w = weights or {}
+        ordered = sorted(subjects, key=lambda s: (-_w.get(s, 1), s))
+
+        # ── Step 2: resolve each in turn, recording what did not fit ──
         bodies: Dict[str, str] = {}
+        dropped: List[str] = []
         used = 0
-        for subject in subjects:
+        for subject in ordered:
             if used >= budget and bodies:
-                break
+                dropped.append(subject)
+                continue
             text = broker.resolve("EXPAND", subject, project_id)
             if not text or text.lstrip().startswith("["):
                 continue
             bodies[subject] = text
             used += len(text)
+
+        # ── Step 3: say what the budget cost, in claims ──
+        if dropped:
+            _lost = sum(_w.get(s, 1) for s in dropped)
+            self._f._log_debug(
+                f"🤖 Evidence: budget of {budget} chars spent on "
+                f"{len(bodies)} body/bodies ({used} chars); "
+                f"{len(dropped)} subject(s) carrying {_lost} claim(s) left "
+                f"unread — raise agentic_evidence_max_chars to cover them"
+            )
         return bodies
 
     def _render_prompt(
@@ -14911,12 +14972,22 @@ class AgenticEvidenceVerifier:
         by_index = {n: s for s, idxs in groups.items() for n in idxs}
         out: Dict[int, Tuple[str, str]] = {}
         dropped = 0
+        unindexed = 0
         for rv in raw:
             try:
                 n = int(rv.get("claim", 0))
                 verdict = str(rv.get("verdict", "")).strip().lower()
                 quote = str(rv.get("quote", "")).strip()
             except Exception:
+                continue
+            # A ruling that names no claim cannot be placed. Position is not
+            # a safe fallback — one call asked about six claims and returned
+            # five verdicts, so attaching them in order would give a
+            # body-backed verdict to a claim nobody read. It is counted and
+            # reported instead, because a reading thrown away in silence is
+            # indistinguishable from a reading never made.
+            if "claim" not in rv:
+                unindexed += 1
                 continue
             if n not in by_index or verdict not in (
                 "supported",
@@ -14937,6 +15008,12 @@ class AgenticEvidenceVerifier:
             self._f._log_debug(
                 f"🤖 Evidence: {dropped} verdict(s) discarded — the quote "
                 f"was not in the body they claimed to read"
+            )
+        if unindexed:
+            self._f._log_debug(
+                f"🤖 Evidence: {unindexed} verdict(s) named no claim and "
+                f"could not be placed — {len(out)} of {len(raw)} ruling(s) "
+                f"reached the ledger"
             )
         return out
     async def judge_texts(
@@ -15180,7 +15257,11 @@ class AgenticStaticVerifier:
             _ev = AgenticEvidenceVerifier(self._f)
             _groups = _ev.group_by_subject(claims)
             if _groups:
-                _bodies = _ev.fetch_bodies(list(_groups), project_id)
+                _bodies = _ev.fetch_bodies(
+                    list(_groups),
+                    project_id,
+                    {s: len(v) for s, v in _groups.items()},
+                )
                 if _bodies:
                     _verdicts = await _ev.judge(
                         claims, _groups, _bodies, aligned_prefix
@@ -17789,7 +17870,13 @@ class AgenticPlanner:
             _ok = (
                 _cls.get("direct_retrieval") is True
                 and bool(_target)
-                and str(_cls.get("intent", "")) != "debug"
+                # The intent label used to gate this and no longer does. It
+                # is not stable — the same request came back "debug" three
+                # times and "modify" once across four runs — and the two
+                # conditions below already reject the case it was guarding:
+                # a compound ask, and one the classifier judged
+                # reasoning-heavy. A deterministic lookup should not depend
+                # on a label that moves.
                 and _cls.get("multiclause") is not True
                 and int(_cls.get("cot_level", 1) or 1) == 1
                 and _kind in ("diff_stored", "diff_compute")
@@ -22269,13 +22356,15 @@ class AgenticOrchestrator:
         # down everything behind it — the generative evaluation and the
         # synthesis format directive — which is a worse outcome than any
         # number of unchecked claims.
-        _forge_ran = bool(
-            getattr(self._f.valves, "agentic_serial_method", False)
-        ) and any(s.kind == "hypothesize" for s in plan.steps)
-        if (
-            _unchecked
-            and not _forge_ran
-            and getattr(self._f.valves, "agentic_closing_verify", True)
+        # The forge rules on its own consequences inside each cycle, before
+        # the verdict that seals a dossier, so the sweep cannot and need not
+        # inform selection. What is left for it afterwards is the terminal
+        # analyze step's claims, emitted after the last evidence pass — the
+        # synthesis a reader acts on. Standing down for forge plans left
+        # exactly those uncovered: three claims in each forge turn of the
+        # 29 July run, against none in the turn that had no forge.
+        if _unchecked and getattr(
+            self._f.valves, "agentic_closing_verify", True
         ):
             try:
                 _sweep = AgenticStep(
@@ -22325,12 +22414,7 @@ class AgenticOrchestrator:
                     f"🤖 Agentic: closing sweep failed ({_e_sw!r}) — the "
                     f"pipeline tail continues"
                 )
-        elif _unchecked and _forge_ran:
-            self._f._log_debug(
-                f"🤖 Agentic: closing sweep skipped — the forge verified "
-                f"in-cycle; {len(_unchecked)} claim(s) carry no separate "
-                f"verdict and the workspace marks them"
-            )
+
 
         # Region: report a truncated plan once, after the loop
         # Region: generative evaluation + re-plan waves (Fase 9, Nivel 2)
@@ -22463,6 +22547,13 @@ class AgenticOrchestrator:
             )
 
         # Region: inject synthesis workspace for the main call
+        # Stamped here, after every verdict is in and before the synthesis
+        # reads the ledger, so the dump carries the same numbers the answer
+        # was built from rather than a later reconstruction of them.
+        try:
+            self._f._agentic_coverage = self._ledger.coverage()
+        except Exception as _e_cov:
+            self._f._log_debug(f"coverage tally skipped ({_e_cov!r})")
         _workspace = self._composer.render(plan, question, self._ledger, project_id)
         if self._f.valves.agentic_premortem and self._ledger.claims:
             _t, _o, _b = self._ledger.counts()
@@ -41913,6 +42004,43 @@ class UserProfileManager:
         return out
 
 
+
+def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
+    """Render the claim-coverage tally, or nothing when there is none.
+
+    Written into the dump so the metric does not have to be reconstructed
+    by parsing it afterwards — a reconstruction that cannot see which
+    verification pass renumbered its claims, and reports covered ones as
+    uncovered when it guesses wrong.
+    """
+    # ── Step 1: nothing to say when no claims were made ──
+    if not coverage or not coverage.get("total"):
+        return ""
+
+    # ── Step 2: the metric first, its parts under it ──
+    total = coverage["total"]
+    hard = coverage.get("hard", 0)
+    lines = [
+        f"## Claim coverage — {hard}/{total} "
+        f"({100 * hard // total}%) settled against real code",
+        "",
+        f"- hard       {hard:4}  a body was read and a quote from it verified",
+        f"- read       {coverage.get('read', 0):4}  the body was read and "
+        f"does not settle it",
+        f"- structural {coverage.get('structural', 0):4}  a graph check ran; "
+        f"nothing read the code",
+        f"- uncovered  {coverage.get('uncovered', 0):4}  nothing ran "
+        f"against it",
+    ]
+    _uo = coverage.get("unoperationalizable", 0)
+    if _uo:
+        lines.append(
+            f"- no anchor  {_uo:4}  nothing to check it against; not a "
+            f"coverage failure"
+        )
+    lines += ["", ""]
+    return "\n".join(lines)
+
 class ContextDumper:
     """
     Captures per‑turn context snapshots and writes them to disk for
@@ -42311,7 +42439,14 @@ class ContextDumper:
                     project_dir, f"{timestamp_str}_turn_{turn:04d}.agents.md"
                 )
                 with open(_ag_path, "w", encoding="utf-8") as _af:
-                    _af.write(self._render_agent_records(_ag_recs, turn, timestamp_str))
+                    _af.write(
+                        self._render_agent_records(
+                            _ag_recs,
+                            turn,
+                            timestamp_str,
+                            getattr(self._f, "_agentic_coverage", None),
+                        )
+                    )
         except Exception as _e_ag:
             self._f._log_debug(f"agent dump skipped ({_e_ag!r})")
 
@@ -42401,6 +42536,7 @@ class ContextDumper:
         records: List[Dict[str, Any]],
         turn: int,
         timestamp_str: str,
+        coverage: Optional[Dict[str, int]] = None,
     ) -> str:
         """
         Render this turn's agent acts as readable Markdown.
@@ -42418,7 +42554,8 @@ class ContextDumper:
         _L: List[str] = [
             f"# Agent acts — turn {turn:04d} ({timestamp_str})",
             "",
-            f"{len(records)} act(s), in execution order. Pair this file "
+            _COVERAGE_BLOCK(coverage)
+            + f"{len(records)} act(s), in execution order. Pair this file "
             f"with {timestamp_str}_turn_{turn:04d}.md, which holds the "
             "context these agents were given.",
             "",
@@ -46728,14 +46865,26 @@ class Filter:
             ),
         )
         agentic_evidence_max_chars: int = Field(
-            default=48000,
+            default=120000,
             ge=0,
-            le=200000,
+            # Capped where the context stops fitting rather than at a round
+            # number: 200000 chars is 50000 tokens, which with the 75500-token
+            # prefix and the 8000 this pass may generate overflows the
+            # server's 131072. 160000 leaves about 7500 tokens of margin.
+            le=160000,
             description=(
                 "Character budget for the subject bodies gathered for the "
-                "evidence pass. Claims cluster by subject, so this covers "
-                "far more claims than it looks: one body answered seventeen "
-                "claims in the measured run."
+                "evidence pass. Bodies are fetched most-claims-first, so "
+                "every character added converts into settled claims rather "
+                "than being spent on whichever subject was emitted first. "
+                "Sized against the server's 131072-token context: the "
+                "largest prompt of the 29 July run was 85849 tokens, about "
+                "75500 of it the system prefix, which leaves roughly 46500 "
+                "tokens once the 8000 this pass may generate are reserved. "
+                "Raise it when the log reports subjects left unread; the "
+                "cost is prompt size, which is close to free against a warm "
+                "prefix, and the pass's time tracks the number of claims it "
+                "judges rather than the bodies it reads."
             ),
         )
         agentic_closing_verify: bool = Field(
