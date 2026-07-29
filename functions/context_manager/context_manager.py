@@ -24858,7 +24858,10 @@ class CommandRouter:
         if not last_user_msg:
             return False, None
 
-        content = last_user_msg.get("content", "").strip()
+        # Defensive: the inlet flattens all-text part lists before this runs,
+        # so content is a string on every path that reaches here. str() keeps
+        # a caller that bypasses the inlet from raising instead of declining.
+        content = str(last_user_msg.get("content", "") or "").strip()
 
         if self._f.valves.enable_forget_command and is_explicit_command:
             new_messages, handled = await self._handle_forget_command(
@@ -38072,6 +38075,48 @@ class InletOrchestrator:
         messages: list,
     ) -> Tuple[Optional[dict], str, str, bool, bool]:
         """Extract last user message, query, and detect explicit commands."""
+        # Region: one shape for content, before anything reads it
+        # A newer OpenWebUI sends content as a list of parts. Fifty-six
+        # reads in this file assume a string; live, that raises TypeError
+        # here and AttributeError in the forget handler, both swallowed by
+        # the inlet's guard — so every slash command reached the model as
+        # an ordinary question and was answered as prose.
+        #
+        # Only an ALL-TEXT list is flattened. One carrying an image is left
+        # untouched: flattening it would fix the same commands and silently
+        # drop the image, which is the worse trade.
+        _coerced = 0
+        _dropped: List[str] = []
+        for _m in messages or []:
+            if not isinstance(_m, dict):
+                continue
+            _c = _m.get("content")
+            if not isinstance(_c, list) or not _c:
+                continue
+            _drop = [
+                str(_p.get("type") or "?")
+                for _p in _c
+                if not (isinstance(_p, dict) and _p.get("type") == "text")
+            ]
+            _m["content"] = "".join(
+                str(_p.get("text") or "")
+                for _p in _c
+                if isinstance(_p, dict) and _p.get("type") == "text"
+            )
+            _coerced += 1
+            if _drop:
+                _dropped.extend(_drop)
+        if _coerced:
+            self._f._log_debug(
+                f"⌨️ Content shape: {_coerced} message(s) arrived as part "
+                f"lists and were flattened before any read"
+                + (
+                    f" — non-text part(s) discarded: {', '.join(_dropped[:4])}"
+                    if _dropped
+                    else ""
+                )
+            )
+
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
@@ -38105,9 +38150,12 @@ class InletOrchestrator:
                     cleaned if (cleaned and len(cleaned) >= 10) else user_query
                 )
 
-        is_explicit_command = last_user_msg and last_user_msg.get(
-            "content", ""
-        ).startswith("/")
+        # bool(), not the bare `and`: with no last message the expression
+        # yields None, and the signature promises bool.
+        is_explicit_command = bool(
+            last_user_msg
+            and str(last_user_msg.get("content", "") or "").startswith("/")
+        )
 
         # Capture every system message now, joined in order, before any
         # downstream compression/trim step can touch them.
