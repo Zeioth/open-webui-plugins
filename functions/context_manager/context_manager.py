@@ -14132,7 +14132,12 @@ class AgenticEvidenceLedger:
                 out["uncovered"] += 1
             elif kind in ("code", "dynamic"):
                 out["hard" if state in ("confirmed", "refuted") else "read"] += 1
-            elif getattr(claim, "unread_qids", None):
+            elif claim.subject and claim.subject in (
+                getattr(claim, "unread_qids", None) or []
+            ):
+                # Blind is about the symbol the claim describes, not
+                # about every symbol it mentions. 'A calls B' cites B
+                # and is settled by the graph without opening it.
                 out["blind"] += 1
             else:
                 out["structural"] += 1
@@ -14905,7 +14910,14 @@ class AgenticEvidenceVerifier:
         # nobody opened the symbol the claim describes.
         if not claim.subject:
             return False
-        _unread = bool(getattr(claim, "unread_qids", None))
+        # The subject's own body, not the citation list: the loop this
+        # breaks is 'nobody read X, so the claim about X is labelled
+        # structural, so nobody ever reads X'. A claim that merely
+        # cites an unopened symbol in a call relation is not in it.
+        _unread = bool(
+            claim.subject
+            and claim.subject in (getattr(claim, "unread_qids", None) or [])
+        )
 
         # ── Step 3: structural claims are the graph's business, once the
         # body has been seen. A structural label mostly reports that the
@@ -22766,7 +22778,19 @@ class AgenticOrchestrator:
         # reads the ledger, so the dump carries the same numbers the answer
         # was built from rather than a later reconstruction of them.
         try:
-            self._f._agentic_coverage = self._ledger.coverage()
+            _cov = self._ledger.coverage()
+            # Survivors the evidence did not separate from the winner. Only
+            # 'independent' ones bear on whether the presented account is the
+            # right one; 'competing' was settled by the ranking and
+            # 'complementary' makes the answer partial, not wrong.
+            _rel = getattr(self._f, "_serial_rival_relations", None) or []
+            _cov["rivals_independent"] = sum(
+                1 for _r in _rel if _r == "independent"
+            )
+            _cov["rivals_complementary"] = sum(
+                1 for _r in _rel if _r == "complementary"
+            )
+            self._f._agentic_coverage = _cov
         except Exception as _e_cov:
             self._f._log_debug(f"coverage tally skipped ({_e_cov!r})")
         _workspace = self._composer.render(plan, question, self._ledger, project_id)
@@ -32658,6 +32682,12 @@ class MetacognitiveReasoningEngine:
             _rel_labels = [
                 d.relation_to_winner for d in _rivals[:3] if d.relation_to_winner
             ]
+            # Published beside the other per-turn serial stashes, for the
+            # answer's confidence line: a survivor the evidence could not
+            # separate from the winner is the one thing that bears on
+            # whether the presented account is the right one, and it was
+            # visible only here.
+            self._f._serial_rival_relations = list(_rel_labels)
             if _rel_labels:
                 _note += f"; relation to winner: {', '.join(_rel_labels)}"
             if any(_l == "complementary" for _l in _rel_labels):
@@ -42200,9 +42230,14 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
         """One bucket line: absolute, share, and what it means."""
         return f"- {label:11}{count:4}  {100 * count // total:3}%  {note}"
 
+    # hard + structural: both are checked against code the AST produced,
+    # and a claim nobody opened a body for is counted apart as `blind`.
+    # Matches the footer the outlet writes, so the answer and its dump
+    # cannot disagree about the same word.
+    settled = hard + coverage.get("structural", 0)
     lines = [
-        f"## Claim coverage — {hard}/{total} "
-        f"({100 * hard // total}%) settled against real code",
+        f"## Claim coverage — {settled}/{total} "
+        f"({100 * settled // total}%) settled against real code",
         "",
         _row("hard", hard,
              "a body was read and a quote from it verified"),
@@ -42622,12 +42657,13 @@ class ContextDumper:
                     project_dir, f"{timestamp_str}_turn_{turn:04d}.agents.md"
                 )
                 with open(_ag_path, "w", encoding="utf-8") as _af:
-                    # Consumed, not merely read: a turn served without the
-                    # pipeline leaves the previous turn's tally in place, and
-                    # taking it here means a value can only ever appear in the
-                    # dump of the turn that produced it.
+                    # Read, not consumed. The dump is scheduled from the
+                    # inlet and the outlet needs the same number for the
+                    # answer's footer; clearing it here left that footer
+                    # with nothing. The per-turn reset at the inlet is the
+                    # guarantee that a turn cannot inherit another's tally,
+                    # and it covers every path a turn can take.
                     _cov = getattr(self._f, "_agentic_coverage", None)
-                    self._f._agentic_coverage = None
                     _af.write(
                         self._render_agent_records(
                             _ag_recs, turn, timestamp_str, _cov
@@ -48405,6 +48441,12 @@ class Filter:
         # that exists only once something has written it reads the
         # same as one nothing ever writes.
         self._align_outcomes_this_turn: Dict[str, int] = {}
+        # Relation of each surviving rival to the winner, published by
+        # the forge and read by the answer's confidence line. Declared
+        # here for the reason ps127 records: an attribute that exists
+        # only once something has written it reads the same as one
+        # nothing ever writes.
+        self._serial_rival_relations: List[str] = []
         self._chroma_semaphore = asyncio.Semaphore(2)
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
@@ -49744,6 +49786,96 @@ class Filter:
     #   🔥 STATE MANAGEMENT    – Update code state, persist LTM, response cache
     #   🚀 RESOURCE OPTIMISATION – Purge expired memories, DB checkpoints, free VRAM
     # ==========================================================================
+
+    def _replace_asserted_confidence(self, body: dict) -> None:
+        """Swap the model's stated confidence for the turn's measured one.
+
+        `[Confidence: NN%]` is asked for by an instruction in Block A and
+        answered without reference to anything. Measured over the 29 July
+        runs it predicts nothing: every claim the code refuted came from
+        the 1.0 bucket, and 88 of 88 values sat at or above 0.9.
+
+        The ledger's tally does mean something, so it takes the line's
+        place when a pipeline ran. A turn that made no claims keeps the
+        model's own line, because there is nothing measured to put there.
+
+        Never raises: a footer is presentation, and presentation must not
+        be the reason an answer fails to reach the reader.
+        """
+        # ── Step 1: only when this turn actually measured something ──
+        try:
+            _cov = getattr(self, "_agentic_coverage", None) or {}
+            _total = int(_cov.get("total", 0) or 0)
+            if _total <= 0:
+                return
+            _hard = int(_cov.get("hard", 0) or 0)
+            _struct = int(_cov.get("structural", 0) or 0)
+            _settled = _hard + _struct
+
+            # ── Step 2: name what did NOT reach code, in the reader's terms ──
+            _open = []
+            for _key, _word in (
+                ("read", "read but unresolved"),
+                ("blind", "asserted unread"),
+                ("uncovered", "unchecked"),
+            ):
+                _n = int(_cov.get(_key, 0) or 0)
+                if _n:
+                    _open.append(f"{_n} {_word}")
+            # ── Step 2b: the selection the evidence did not settle ──
+            # A uniform prior over the accounts that were NOT discriminated:
+            # with one independent survivor the presented account is one of
+            # two the evidence could not separate. This is the single
+            # judgement in the number, and it is here rather than inside a
+            # weight so it can be argued with.
+            _indep = int(_cov.get("rivals_independent", 0) or 0)
+            _compl = int(_cov.get("rivals_complementary", 0) or 0)
+            _conf = (_settled / _total) / (1 + _indep)
+            if _indep:
+                _open.append(
+                    f"{_indep} rival account"
+                    + ("s" if _indep > 1 else "")
+                    + " the evidence did not rule out"
+                )
+            if _compl:
+                _open.append(
+                    f"{_compl} possible co-cause"
+                    + ("s" if _compl > 1 else "")
+                    + " left out"
+                )
+            _line = (
+                f"[Confidence: {int(round(100 * _conf))}% — "
+                f"{_settled}/{_total} claims settled against code"
+                + ("; " + ", ".join(_open) if _open else "")
+                + "]"
+            )
+
+            # ── Step 3: replace the asserted line, or append if absent ──
+            _msgs = body.get("messages") or []
+            _last = next(
+                (
+                    m
+                    for m in reversed(_msgs)
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None or not isinstance(_last.get("content"), str):
+                return
+            _text = _last["content"]
+            _new, _n_sub = re.subn(
+                r"\[Confidence:\s*\d+\s*%\]", _line, _text
+            )
+            _last["content"] = (
+                _new if _n_sub else _text.rstrip() + "\n\n" + _line
+            )
+            self._log_debug(
+                f"outlet: confidence footer {'replaced' if _n_sub else 'added'}"
+                f" with the measured tally ({_settled}/{_total})"
+            )
+        except Exception as _e_conf:
+            self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
+
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """
         Post-process the request after the LLM has generated its response.
@@ -49903,6 +50035,7 @@ class Filter:
                     self._log_debug(
                         f"outlet: investigation record appended " f"({len(_rec)} chars)"
                     )
+            self._replace_asserted_confidence(body)
         except Exception as _e:
             self._log_debug(f"outlet: record append skipped ({_e!r})")
 
