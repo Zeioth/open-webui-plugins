@@ -13370,6 +13370,19 @@ class LLMOrchestrator:
                     future.add_done_callback(
                         lambda f: not f.cancelled() and f.exception()
                     )
+                # Counted here, at the one exit that tells a caller its call
+                # died. Each failure is already logged where it is handled;
+                # what was missing is the total, and a run that lost most of
+                # its calls looked exactly like one that lost none.
+                try:
+                    _f_tally = getattr(self._f, "_llm_failures_this_turn", None)
+                    if not isinstance(_f_tally, dict):
+                        _f_tally = {}
+                        self._f._llm_failures_this_turn = _f_tally
+                    _f_tally["count"] = int(_f_tally.get("count", 0)) + 1
+                    _f_tally["last"] = str(label or "unlabelled")
+                except Exception:
+                    pass
                 raise
             finally:
                 async with self._f._pending_llm_lock:
@@ -14174,6 +14187,41 @@ class AgenticEvidenceLedger:
             state = claim.verification or "unchecked"
             out[state] = out.get(state, 0) + 1
         return out
+
+    @staticmethod
+    def bucket_of(claim: "LedgerClaim") -> str:
+        """Which bucket a claim falls into, as one rule with one home.
+
+        Both the tally and the dump's per-claim list need this, and each had
+        its own copy until they were compared across sixty combinations of
+        state, evidence type and unread qids. They agreed — and two copies of
+        one formula is what produced a header reading 86% and a footer
+        reading 93% of the same turn.
+
+        Returns one of: unoperationalizable, uncovered, hard, read, blind,
+        structural.
+        """
+        # ── Step 1: the two states that decide before evidence matters ──
+        _state = claim.verification or ""
+        _kind = claim.evidence_type or "reasoning"
+        if _state == "unoperationalizable":
+            return "unoperationalizable"
+        if not _state:
+            return "uncovered"
+
+        # ── Step 2: a body was read — did a quote from it settle the claim ──
+        if _kind in ("code", "dynamic"):
+            return "hard" if _state in ("confirmed", "refuted") else "read"
+
+        # ── Step 3: settled without a body. Blind is about the SUBJECT ──
+        # "A calls B" cites B and is settled by the graph without opening it,
+        # so citing an unread symbol is not the same as asserting about one.
+        if claim.subject and claim.subject in (
+            getattr(claim, "unread_qids", None) or []
+        ):
+            return "blind"
+        return "structural"
+
     def coverage(self) -> Dict[str, Any]:
         """Tally claims by the strength of the evidence behind them.
 
@@ -14206,23 +14254,7 @@ class AgenticEvidenceLedger:
         # confirms a relation while the claim describes code that was never
         # opened. Folding them together hides exactly the case worth finding.
         for claim in self.claims:
-            state = claim.verification or ""
-            kind = claim.evidence_type or "reasoning"
-            if state == "unoperationalizable":
-                out["unoperationalizable"] += 1
-            elif not state:
-                out["uncovered"] += 1
-            elif kind in ("code", "dynamic"):
-                out["hard" if state in ("confirmed", "refuted") else "read"] += 1
-            elif claim.subject and claim.subject in (
-                getattr(claim, "unread_qids", None) or []
-            ):
-                # Blind is about the symbol the claim describes, not
-                # about every symbol it mentions. 'A calls B' cites B
-                # and is settled by the graph without opening it.
-                out["blind"] += 1
-            else:
-                out["structural"] += 1
+            out[self.bucket_of(claim)] += 1
         return out
 
     # ──────────────────────────────────────────────────────────────────────
@@ -15234,8 +15266,12 @@ class AgenticEvidenceVerifier:
                     dropped += 1
                     out[n] = ("indeterminate", "quote not found in any body")
                     continue
+                # Per element, not the joined string. ps171 made the quote
+                # check per element and left this reading the join, so two
+                # quotes from the same body — "a ⏎ b" — matched nothing and
+                # every multi-quote verdict counted as cross-symbol.
                 _own = " ".join(bodies.get(by_index[n], "").split())
-                if _flat not in _own:
+                if any(_q not in _own for _q in _flats):
                     elsewhere += 1
                 # A quote can be real code and still be the wrong line. For
                 # the one claim shape where the quote must name something —
@@ -21334,7 +21370,17 @@ class AgenticOrchestrator:
             "🤖 Agentic · generative evaluation: probing for a better angle"
         )
         # Region: compact workspace digest for the evaluator
-        workspace = self._render_workspace(plan.steps)
+        workspace = self._render_workspace(
+                plan.steps,
+                budget=self._workspace_budget(),
+                estimate=getattr(
+                    self._f._tokens, "estimate_code_tokens", None
+                ),
+                shorten=getattr(
+                    self._f._tokens, "truncate_text_to_tokens", None
+                ),
+                note=self._f._log_debug,
+            )
         workspace = self._f._tokens.truncate_text_to_tokens(workspace, 1200)
 
         prompt = (
@@ -21472,8 +21518,53 @@ class AgenticOrchestrator:
             self._f._tokens.truncate_text_to_tokens(text, budget)
         )
 
+
+    def _workspace_budget(self) -> int:
+        """Tokens the workspace may occupy before the oldest are shortened.
+
+        The window minus what already fills it: the aligned prefix is Block
+        A plus Block B and is the bulk of the system prompt, and the
+        generation reserve and the safety margin are the same two the
+        tool-round budget uses.
+
+        Separate from the renderer because that renderer is a staticmethod
+        and has no filter to ask. A first version of this patch reached for
+        `self._f` inside it anyway; the NameError was swallowed by its own
+        try/except and the budget silently stayed zero, which is the exact
+        failure shape this file keeps being patched for.
+
+        The helpers are passed with getattr rather than attribute access,
+        so a token utility without one of them yields an unbounded
+        workspace — today's behaviour — rather than an exception at a call
+        site outside any guard.
+        """
+        # ── Step 1: the window, less the prefix and the reserves ──
+        try:
+            _prefix = self._f._tokens.estimate_code_tokens(
+                getattr(self._f, "_prelim_system_this_turn", "") or ""
+            )
+            return max(
+                0,
+                int(self._f.valves.agentic_ctx_size)
+                - _prefix
+                - int(self._f.valves.agentic_runaway_token_cap)
+                - int(self._f.valves.agentic_tool_ctx_margin),
+            )
+        except Exception as _e_budget:
+            self._f._log_debug(
+                f"workspace budget unavailable ({_e_budget!r}) — no bound "
+                f"applied this turn"
+            )
+            return 0
+
     @staticmethod
-    def _render_workspace(steps: List[AgenticStep]) -> str:
+    def _render_workspace(
+        steps: List[AgenticStep],
+        budget: int = 0,
+        estimate: Optional[Callable[[str], int]] = None,
+        shorten: Optional[Callable[[str, int], str]] = None,
+        note: Optional[Callable[[str], None]] = None,
+    ) -> str:
         """
         Render the previous steps for the NEXT step's user turn.
 
@@ -21500,6 +21591,41 @@ class AgenticOrchestrator:
         attempted = [s for s in steps if s.status != "pending"]
         if not attempted:
             return ""
+
+        # Region: total budget — ps160 lifted the per-digest cap because
+        # head-truncation removed the claim block the next step needs, and
+        # that left the workspace bounded only by max_steps × the runaway
+        # ceiling: 7 × 8000 = 56000 against a window with about 38000 to
+        # spare. Bounding the total instead keeps full digests while they
+        # fit and shortens the OLDEST first — the newest step is the one
+        # about to be built on, and the earliest are already summarised by
+        # everything after them.
+        _shortened = 0
+        if budget and estimate is not None and shorten is not None:
+            _sizes = [(_s, estimate(_s.digest or "")) for _s in attempted]
+            _total = sum(_n for _, _n in _sizes)
+            if _total > budget:
+                _over = _total - budget
+                for _s, _n in _sizes:  # oldest first
+                    if _over <= 0:
+                        break
+                    _keep = max(200, _n - _over)
+                    if _keep >= _n:
+                        continue
+                    _s.digest = (
+                        shorten(_s.digest or "", _keep)
+                        + "\n_(digest shortened to fit the window — claims "
+                        "below this point were made and are not shown)_"
+                    )
+                    _over -= _n - _keep
+                    _shortened += 1
+                if note is not None:
+                    note(
+                        f"🤖 Workspace: {_total} tokens over a {budget} "
+                        f"budget — {_shortened} oldest digest(s) shortened, "
+                        f"newest kept whole"
+                    )
+
         lines = ["## Agentic workspace (previous steps)"]
         for s in attempted:
             if s.status == "done":
@@ -21765,6 +21891,54 @@ class AgenticOrchestrator:
     # 7. The pipeline body
     # ──────────────────────────────────────────────────────────────────────
 
+
+    def _question_type_or_intent(self, project_id: str) -> str:
+        """The pre-planner's question type, or the turn's intent standing in.
+
+        A pre-planner whose call fails returns ("", "") and leaves no type,
+        and the planner without a type gets no shape hint — so nothing
+        requires a hypothesize step and the forge, which returns False on
+        anything else, cannot run. One failed auxiliary call therefore took
+        the scientific method out of the turn silently, and a whole run went
+        by with four such failures and no hypothesis.
+
+        The type is a classification the turn already has another source
+        for. `classify_turn`'s intent maps onto shape where it is
+        unambiguous: "debug" is a symptom with no cause named, which is the
+        exploratory case that REQUIRES a hypothesize step. Anything less
+        clear yields "", which is the planner's own judgement and the
+        previous behaviour exactly.
+        """
+        # ── Step 1: the pre-planner's own answer wins whenever it has one ──
+        _pp = str(
+            getattr(self._preplanner, "last_stats", {}).get("question_type", "")
+            or ""
+        ).strip()
+        if _pp:
+            return _pp
+
+        # ── Step 2: the intent the turn was already classified with ──
+        try:
+            _pstate = self._f._project_state_manager.get_pstate(project_id)
+            _intent = str(
+                (_pstate.get("turn_classification") or {}).get("intent", "")
+                or ""
+            ).strip().lower()
+        except Exception:
+            return ""
+        _shape = {
+            "debug": "exploratory",
+            "modify": "descriptive",
+            "explain": "mechanism",
+        }.get(_intent, "")
+        if _shape:
+            self._f._log_debug(
+                f"🧭 Question type: pre-planner left none — intent "
+                f"'{_intent}' stands in as '{_shape}', so the planner still "
+                f"gets a shape and the forge stays reachable"
+            )
+        return _shape
+
     async def _run_pipeline_inner(
         self,
         question: str,
@@ -21896,10 +22070,7 @@ class AgenticOrchestrator:
             difficulty=str(
                 getattr(self._preplanner, "last_stats", {}).get("difficulty", "") or ""
             ),
-            question_type=str(
-                getattr(self._preplanner, "last_stats", {}).get("question_type", "")
-                or ""
-            ),
+            question_type=self._question_type_or_intent(project_id),
         )
         self._f._log_debug(
             f"🤖 Agentic: plan ready ({len(plan.steps)} steps, "
@@ -22421,7 +22592,17 @@ class AgenticOrchestrator:
                 f"🤖 Agentic step {step.display_no}/{len(plan.steps)} "
                 f"({step.kind}): {step.goal[:60]}"
             )
-            workspace = self._render_workspace(plan.steps)
+            workspace = self._render_workspace(
+                plan.steps,
+                budget=self._workspace_budget(),
+                estimate=getattr(
+                    self._f._tokens, "estimate_code_tokens", None
+                ),
+                shorten=getattr(
+                    self._f._tokens, "truncate_text_to_tokens", None
+                ),
+                note=self._f._log_debug,
+            )
             await self._executor.run(
                 step,
                 aligned_prefix,
@@ -22574,12 +22755,33 @@ class AgenticOrchestrator:
                             s for s in (_next_step.symbols or [])
                             if s not in _served_names
                         ]
+                        # Attached is not served: the renderer takes the
+                        # first _MAX_TOOLS_PER_ROUND names, and three steps
+                        # pointing at one successor leave it holding more
+                        # than that. Saying so is the difference between a
+                        # budget finding and a coverage number nobody can
+                        # explain.
+                        _reach = _MAX_TOOLS_PER_ROUND
+                        _beyond = max(
+                            0, len(_next_step.symbols or []) - _reach
+                        )
                         self._f._log_debug(
                             f"🤖 Agentic: step {step.id} asked for "
                             f"{len(_served_names)} body/bodies — attached to "
                             f"step {_next_step.id}'s focus rather than "
                             f"spending a gap-fill slot: "
                             + ", ".join(_served_names[:4])
+                            + (
+                                f" — but {_beyond} of that step's "
+                                f"{len(_next_step.symbols or [])} focus "
+                                f"symbol(s) now fall beyond the {_reach} the "
+                                f"round serves: "
+                                + ", ".join(
+                                    (_next_step.symbols or [])[_reach:][:4]
+                                )
+                                if _beyond
+                                else ""
+                            )
                         )
             # What the attachment did not satisfy is what the gap-fill is
             # for. When nothing was attached this is every gap, which is the
@@ -23000,7 +23202,17 @@ class AgenticOrchestrator:
                         f"🤖 Agentic wave step {wstep.display_no} ({wstep.kind}): "
                         f"{wstep.goal[:60]}"
                     )
-                    workspace = self._render_workspace(plan.steps)
+                    workspace = self._render_workspace(
+                plan.steps,
+                budget=self._workspace_budget(),
+                estimate=getattr(
+                    self._f._tokens, "estimate_code_tokens", None
+                ),
+                shorten=getattr(
+                    self._f._tokens, "truncate_text_to_tokens", None
+                ),
+                note=self._f._log_debug,
+            )
                     await self._executor.run(
                         wstep,
                         aligned_prefix,
@@ -23071,22 +23283,10 @@ class AgenticOrchestrator:
             # two act types. Capped above any turn recorded so far.
             _per: List[str] = []
             for _c in self._ledger.claims[:40]:
-                _st = _c.verification or ""
-                _kd = _c.evidence_type or "reasoning"
-                if _st == "unoperationalizable":
+                # The ledger's own rule, not a second copy of it.
+                _bucket = self._ledger.bucket_of(_c)
+                if _bucket == "unoperationalizable":
                     _bucket = "no-anchor"
-                elif not _st:
-                    _bucket = "uncovered"
-                elif _kd in ("code", "dynamic"):
-                    _bucket = (
-                        "hard" if _st in ("confirmed", "refuted") else "read"
-                    )
-                elif _c.subject and _c.subject in (
-                    getattr(_c, "unread_qids", None) or []
-                ):
-                    _bucket = "blind"
-                else:
-                    _bucket = "structural"
                 _per.append(
                     f"{_bucket:10} {(_c.subject or '—')[:44]:44} "
                     f"{' '.join(_c.text.split())[:70]}"
@@ -23108,6 +23308,11 @@ class AgenticOrchestrator:
             _cov["had_hypothesize"] = any(
                 getattr(_s, "kind", "") == "hypothesize" for _s in plan.steps
             )
+            # Carried with the tally it should be read against, so a dump
+            # cannot report a percentage without reporting that the turn lost
+            # calls while measuring it.
+            _lf_t = getattr(self._f, "_llm_failures_this_turn", None) or {}
+            _cov["llm_failures"] = int(_lf_t.get("count", 0) or 0)
             self._f._agentic_coverage = _cov
         except Exception as _e_cov:
             self._f._log_debug(f"coverage tally skipped ({_e_cov!r})")
@@ -25115,6 +25320,33 @@ class CommandRouter:
         )
         return messages
 
+
+    def command_prefix(self) -> str:
+        """The prefix a person types, with its default in one place.
+
+        ps163 wrote this fallback four times. A default repeated is a
+        default that will be changed three times.
+        """
+        # ── Step 1: the valve, or the shipped default ──
+        return str(
+            getattr(self._f.valves, "command_prefix", "//") or "//"
+        )
+
+    def normalise_command(self, content: str) -> str:
+        """Rewrite a typed command onto the slash the dispatch expects.
+
+        The eleven comparisons below are written against "/", so one
+        rewrite here moves every command without touching any of them.
+        Written twice by ps163 — here and in the forget handler — and the
+        second copy is what this removes.
+        """
+        # ── Step 1: only when the configured prefix is in use ──
+        _pfx = self.command_prefix()
+        _text = str(content or "")
+        if _pfx != "/" and _text.startswith(_pfx):
+            return "/" + _text[len(_pfx):]
+        return _text
+
     async def handle_explicit_commands(
         self,
         messages: list,
@@ -25132,14 +25364,9 @@ class CommandRouter:
         # Defensive: the inlet flattens all-text part lists before this runs,
         # so content is a string on every path that reaches here. str() keeps
         # a caller that bypasses the inlet from raising instead of declining.
-        content = str(last_user_msg.get("content", "") or "").strip()
-        # Rewritten to a slash for the comparisons below, so one valve
-        # moves every command without touching eleven dispatch sites.
-        _pfx = str(
-            getattr(self._f.valves, "command_prefix", "//") or "//"
+        content = self.normalise_command(
+            str(last_user_msg.get("content", "") or "").strip()
         )
-        if _pfx != "/" and content.startswith(_pfx):
-            content = "/" + content[len(_pfx):]
 
         if self._f.valves.enable_forget_command and is_explicit_command:
             new_messages, handled = await self._handle_forget_command(
@@ -25250,9 +25477,7 @@ class CommandRouter:
         # ── Step 2: render only what is switched on ──
         # Rendered with the live prefix: a list describing a keystroke
         # that no longer works is worse than no list.
-        _pfx = str(
-            getattr(_v, "command_prefix", "//") or "//"
-        )
+        _pfx = self.command_prefix()
         _lines = ["**CodeAware commands**", ""]
         for _name, _on, _what in _rows:
             if _on:
@@ -25356,12 +25581,9 @@ class CommandRouter:
         last_msg = messages[-1]
         if last_msg.get("role") != "user":
             return messages, False
-        content = str(last_msg.get("content", "") or "").strip()
-        _pfx = str(
-            getattr(self._f.valves, "command_prefix", "//") or "//"
+        content = self.normalise_command(
+            str(last_msg.get("content", "") or "").strip()
         )
-        if _pfx != "/" and content.startswith(_pfx):
-            content = "/" + content[len(_pfx):]
         if self._f.valves.enable_forget_command and content.startswith("/forget"):
             parts = content.split(maxsplit=1)
             target = parts[1] if len(parts) > 1 else ""
@@ -38360,6 +38582,37 @@ class InletOrchestrator:
     # 3. User info extraction (last message, query, commands)
     # ═══════════════════════════════════════════════════════════════════════════
 
+
+    @staticmethod
+    def flatten_part_lists(messages: list) -> int:
+        """Give every message's content one shape. Returns how many changed.
+
+        A newer OpenWebUI sends content as a list of parts, and fifty-six
+        reads in this file assume a string — `.rstrip()`, `re.sub`,
+        `.startswith`. Each raises, the inlet's guard swallows it, and the
+        turn degrades with no line saying why.
+
+        Only text parts survive: a list carrying an image is flattened too,
+        and the caller reports what was dropped. A first version left mixed
+        lists intact to preserve the image, and preserved nothing — the
+        reads two lines later raised on the list just the same.
+        """
+        # ── Step 1: every message, in place, idempotent on strings ──
+        _n = 0
+        for _m in messages or []:
+            if not isinstance(_m, dict):
+                continue
+            _c = _m.get("content")
+            if not isinstance(_c, list) or not _c:
+                continue
+            _m["content"] = "".join(
+                str(_p.get("text") or "")
+                for _p in _c
+                if isinstance(_p, dict) and _p.get("type") == "text"
+            )
+            _n += 1
+        return _n
+
     async def inlet_extract_user_info(
         self,
         messages: list,
@@ -38455,10 +38708,9 @@ class InletOrchestrator:
 
         # bool(), not the bare `and`: with no last message the expression
         # yields None, and the signature promises bool.
-        # The prefix a person types, which is no longer the frontend's.
-        _pfx = str(
-            getattr(self._f.valves, "command_prefix", "//") or "//"
-        )
+        # The prefix a person types, read through the router that owns
+        # it rather than a fourth copy of its default.
+        _pfx = self._f._commands.command_prefix()
         # Both prefixes are accepted: the configured one, and the slash
         # that older habits and older guidance still produce. Accepting
         # only one would make this flag disagree with the dispatcher
@@ -42822,7 +43074,7 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
 
     def _row(label: str, count: int, note: str) -> str:
         """One bucket line: absolute, share, and what it means."""
-        return f"- {label:11}{count:4}  {100 * count // total:3}%  {note}"
+        return f"- {label:11}{count:4}  {int(round(100 * count / total)):3}%  {note}"
 
     # hard + structural: both are checked against code the AST produced,
     # and a claim nobody opened a body for is counted apart as `blind`.
@@ -42830,8 +43082,14 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
     # cannot disagree about the same word.
     settled = hard + coverage.get("structural", 0)
     lines = [
+        # round(), not floor: the footer rounds, and a sweep of every
+        # hard/total pair up to twenty found 69 of 190 pairs where the two
+        # differed by a point — 2/3 as 66 here and 67 there. ps143 unified
+        # the numerator and left this.
         f"## Claim coverage — {settled}/{total} "
-        f"({100 * settled // total}%) settled against real code",
+        f"({int(round(100 * settled / total))}%) settled against real "
+        f"code (hard + structural; the rows below are each bucket's own "
+        f"share and round independently, so they need not sum to this)",
         "",
         _row("hard", hard,
              "a body was read and a quote from it verified"),
@@ -42853,6 +43111,13 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
     # The turn's shape, then every claim under the counts that
     # summarise it. Reading what a bucket has in common is the step
     # this file exists to make possible.
+    _lf_n = int(coverage.get("llm_failures", 0) or 0)
+    if _lf_n:
+        lines.append("")
+        lines.append(
+            f"**{_lf_n} LLM call(s) failed during this turn — the numbers "
+            f"above were measured over what survived.**"
+        )
     _qt = str(coverage.get("question_type") or "")
     _hh = coverage.get("had_hypothesize")
     if _qt or _hh is not None:
@@ -42861,7 +43126,8 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
             f"question type: {_qt or chr(63)} · hypothesize step: "
             + ("yes" if _hh else "no")
         )
-    _pc = coverage.get("per_claim") or []
+    _raw_pc = coverage.get("per_claim")
+    _pc: List[Any] = list(_raw_pc) if isinstance(_raw_pc, list) else []
     if _pc:
         lines.append("")
         lines.append("<details><summary>every claim by bucket</summary>")
@@ -49332,6 +49598,20 @@ class Filter:
         # that exists only once something has written it reads the
         # same as one nothing ever writes.
         self._align_outcomes_this_turn: Dict[str, int] = {}
+        # How many LLM calls died this turn, and the label of the last one.
+        # A coverage number measured over a turn that lost most of its calls
+        # is not comparable with one that lost none.
+        self._llm_failures_this_turn: Dict[str, Any] = {}
+        # Written by the forge and read on every turn. Undeclared and
+        # uncleared until the per-turn sweep found them, so a turn whose
+        # forge did not run rendered the last forging turn's blind spots,
+        # rungs and collisions — and the forge runs only on exploratory
+        # questions, which is a minority of turns.
+        self._serial_blind_spots: List[Any] = []
+        self._serial_unwalked_rungs: List[Any] = []
+        # A count, not a list: the forge assigns _collision_count to it.
+        # Declared as what it is rather than as what its two neighbours are.
+        self._serial_collisions: int = 0
         # Relation of each surviving rival to the winner, published by
         # the forge and read by the answer's confidence line. Declared
         # here for the reason ps127 records: an attribute that exists
@@ -49943,6 +50223,17 @@ class Filter:
             # turn by the answer's confidence line. Without this, a turn whose
             # competition left no survivor is divided by the previous turn's.
             self._serial_rival_relations = []
+            _lf = getattr(self, "_llm_failures_this_turn", None) or {}
+            if _lf.get("count"):
+                self._log_debug(
+                    f"⚠️ Transport: {_lf['count']} LLM call(s) failed last "
+                    f"turn (last: {_lf.get('last', '?')}) — any metric from "
+                    f"that turn is not comparable with a clean one"
+                )
+            self._llm_failures_this_turn = {}
+            self._serial_blind_spots = []
+            self._serial_unwalked_rungs = []
+            self._serial_collisions = 0
             # Same reason again: the tally is written after the pipeline and
             # consumed by the dump, and a turn that runs neither would hand
             # its numbers to whichever turn writes next.
@@ -49975,6 +50266,21 @@ class Filter:
             # client resends the full history each turn, so the count is a
             # stable global turn number. Diffs persisted this inlet are tagged
             # with it; turn summaries later attach diffs by covers_turns range.
+            # Region: one shape for content, before ANYTHING reads it
+            # ps162 put this at the top of inlet_extract_user_info, which
+            # runs after process_prev_assistant_turn and merge_pasted_files
+            # — and the second does `(target.get("content", "") or
+            # "").rstrip()`, which raises on a list. The guard swallowed it
+            # and the turn degraded before the normalisation was reached.
+            _flat_n = self._inlet_orch.flatten_part_lists(
+                body.get("messages") or []
+            )
+            if _flat_n:
+                self._log_debug(
+                    f"⌨️ Content shape: {_flat_n} message(s) arrived as part "
+                    f"lists and were flattened before any read"
+                )
+
             pstate["napmem_turn_number"] = sum(
                 1
                 for m in (body.get("messages") or [])
@@ -50699,9 +51005,45 @@ class Filter:
         """
         # ── Step 1: only when this turn actually measured something ──
         try:
-            _cov = getattr(self, "_agentic_coverage", None) or {}
+            _cov = getattr(self, "_agentic_coverage", None)
+            if _cov is None:
+                # No pipeline this turn — a direct retrieval or a non-code
+                # question. The model's line is all there is and claiming
+                # otherwise would be worse than saying nothing.
+                return
             _total = int(_cov.get("total", 0) or 0)
             if _total <= 0:
+                # A pipeline ran and produced nothing checkable. Left as it
+                # was, this is indistinguishable from a measured number, and
+                # the model's estimate predicts nothing: across the 29 July
+                # runs every claim the code refuted came from its 1.0 bucket.
+                # So the estimate stays — it is the only thing there is — and
+                # is labelled as its own.
+                _msgs0 = body.get("messages") or []
+                _last0 = next(
+                    (
+                        m
+                        for m in reversed(_msgs0)
+                        if isinstance(m, dict) and m.get("role") == "assistant"
+                    ),
+                    None,
+                )
+                if _last0 is None or not isinstance(_last0.get("content"), str):
+                    return
+                _t0, _n0 = re.subn(
+                    r"\[Confidence:\s*(\d+)\s*%\]",
+                    lambda m: (
+                        f"[Confidence: {m.group(1)}% — the model's own "
+                        f"estimate; this turn verified nothing against code]"
+                    ),
+                    _last0["content"],
+                )
+                if _n0:
+                    _last0["content"] = _t0
+                self._log_debug(
+                    f"outlet: a pipeline ran and settled no claims — "
+                    f"{'labelled' if _n0 else 'no footer to label'}"
+                )
                 return
             _hard = int(_cov.get("hard", 0) or 0)
             _struct = int(_cov.get("structural", 0) or 0)
