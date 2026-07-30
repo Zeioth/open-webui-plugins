@@ -5463,6 +5463,22 @@ class ContextBuilder:
         if is_code_session and self._f.valves.enable_confidence_scoring:
             parts.append(self._f.valves.confidence_prompt.strip())
 
+        # The turn mark, told to the model that actually writes answers.
+        # ps185 put this in the agentic step contract, whose readers never
+        # produce a user-facing answer. The second sentence is the reason
+        # this is worth saying at all: every previous answer in the history
+        # opens with [Tn], and a model shown a pattern reproduces it.
+        parts.append(
+            "Each answer is prefixed with its turn number — [T12] and so "
+            "on — after you write it. The person may refer back to a turn "
+            "by that mark, and a turn that has since been compressed keeps "
+            "it while a summarised range renders as 'turns 12-18', so the "
+            "reference resolves either way. Do NOT write the mark "
+            "yourself: it is added for you, and one you write is either "
+            "overwritten or, if it names the wrong turn, a reference that "
+            "resolves to nothing."
+        )
+
         if is_code_session and self._f.valves.enable_code_awareness:
             checklist = (
                 "## Code review checklist (apply when reviewing or fixing code):\n"
@@ -21983,6 +21999,14 @@ class AgenticOrchestrator:
         # is_continuation is classified in the inlet before the pipeline
         # runs, so pstate already holds this turn's verdict here.
         self._ledger.claims = []
+        # Stamped on entry, overwritten by the real tally when the ledger
+        # is counted. Without it, a pipeline that entered and then lost
+        # its calls left the field at the inlet's None, and the footer
+        # could not tell "nothing ran" from "ran and settled nothing" —
+        # so a run that lost twenty-five calls to the transport showed an
+        # unlabelled estimate and read as the computed footer being
+        # broken.
+        self._f._agentic_coverage = {"total": 0}
         if self._f.valves.agentic_ledger_persist:
             try:
                 _snap = self._f._project_state_manager.get_pstate(project_id).get(
@@ -23317,6 +23341,79 @@ class AgenticOrchestrator:
         except Exception as _e_cov:
             self._f._log_debug(f"coverage tally skipped ({_e_cov!r})")
         _workspace = self._composer.render(plan, question, self._ledger, project_id)
+        # The measured confidence, told to the model BEFORE it writes.
+        # The outlet's replacement is computed correctly and discarded —
+        # every edit made there is, which the missing investigation
+        # record proves — so the number reaches nobody by that path. The
+        # trailing injection does reach the model, and a number the model
+        # writes reaches the reader and the history both.
+        try:
+            # The turn number the inlet already recorded for this turn,
+            # which is the same count the dump names its file with. Read
+            # rather than recomputed: `messages` is not in scope here,
+            # and a second count is how two numbers drift apart.
+            _turn_no = int(
+                self._f._project_state_manager.get_pstate(project_id).get(
+                    "napmem_turn_number", 0
+                )
+                or 0
+            )
+            _t_all = int(_cov.get("total", 0) or 0)
+            if _t_all > 0:
+                _t_ok = int(_cov.get("hard", 0) or 0) + int(
+                    _cov.get("structural", 0) or 0
+                )
+                _t_ind = int(_cov.get("rivals_independent", 0) or 0)
+                _t_pct = int(
+                    round(100 * (_t_ok / _t_all) / (1 + _t_ind))
+                )
+                _t_open = []
+                for _k, _w in (
+                    ("read", "read but unresolved"),
+                    ("blind", "asserted unread"),
+                    ("uncovered", "unchecked"),
+                ):
+                    _n_k = int(_cov.get(_k, 0) or 0)
+                    if _n_k:
+                        _t_open.append(f"{_n_k} {_w}")
+                if _t_ind:
+                    _t_open.append(
+                        f"{_t_ind} rival account"
+                        + ("s" if _t_ind > 1 else "")
+                        + " the evidence did not rule out"
+                    )
+                _t_line = (
+                    f"[Confidence: {_t_pct}% — {_t_ok}/{_t_all} claims "
+                    f"settled against code"
+                    + ("; " + ", ".join(_t_open) if _t_open else "")
+                    + "]"
+                )
+                if _turn_no > 0:
+                    _workspace += (
+                        f"\n\n## Your turn mark\n"
+                        f"Open your answer with exactly `[T{_turn_no}]` "
+                        f"on its own line, then a blank line, then the "
+                        f"answer. The person refers back to turns by "
+                        f"that mark."
+                    )
+                _workspace += (
+                    "\n\n## Your confidence line\n"
+                    "This turn's evidence was counted. End your answer "
+                    "with exactly this line, copied character for "
+                    "character, and do NOT write a confidence line of "
+                    "your own — your own estimate is not measured and "
+                    "predicts nothing:\n\n"
+                    + _t_line
+                )
+                self._f._log_debug(
+                    f"🤖 Agentic: measured confidence handed to the final "
+                    f"model — {_t_line[:60]}"
+                )
+        except Exception as _e_conf_inj:
+            self._f._log_debug(
+                f"measured confidence injection skipped "
+                f"({_e_conf_inj!r})"
+            )
         if self._f.valves.agentic_premortem and self._ledger.claims:
             _t, _o, _b = self._ledger.counts()
             if not (_t > 0 and _o == 0):
@@ -38613,6 +38710,50 @@ class InletOrchestrator:
             _n += 1
         return _n
 
+
+    def mark_previous_answer(self, messages: list) -> None:
+        """Add the turn mark to the previous answer if the model omitted it.
+
+        The mark is asked for in the trailing injection, which reaches the
+        model before it writes, and a mark the model writes reaches the
+        reader. A model that ignores the instruction would leave the turn
+        unreferenceable, so the mark is added here when the answer is read
+        back on the following turn — inlet edits persist, which is why the
+        commands work and why the outlet's version of this does not.
+
+        The number is that answer's own turn, which is one less than the
+        turn now being handled.
+        """
+        # ── Step 1: the previous answer, and the turn it belonged to ──
+        try:
+            _msgs = messages or []
+            _users = sum(
+                1
+                for _m in _msgs
+                if isinstance(_m, dict) and _m.get("role") == "user"
+            )
+            _prev_turn = _users - 1
+            if _prev_turn < 1:
+                return
+            for _m in reversed(_msgs):
+                if not isinstance(_m, dict):
+                    continue
+                if _m.get("role") != "assistant":
+                    continue
+                _c = _m.get("content")
+                if not isinstance(_c, str) or not _c.strip():
+                    return
+                if _c.lstrip().startswith("[T"):
+                    return
+                _m["content"] = f"[T{_prev_turn}]\n\n{_c.lstrip()}"
+                self._f._log_debug(
+                    f"inlet: previous answer had no turn mark — added "
+                    f"[T{_prev_turn}]"
+                )
+                return
+        except Exception:
+            return
+
     async def inlet_extract_user_info(
         self,
         messages: list,
@@ -50275,6 +50416,11 @@ class Filter:
             _flat_n = self._inlet_orch.flatten_part_lists(
                 body.get("messages") or []
             )
+            # A backstop for the turn mark: asked of the model in
+            # the trailing injection, added here when it did not.
+            self._inlet_orch.mark_previous_answer(
+                body.get("messages") or []
+            )
             if _flat_n:
                 self._log_debug(
                     f"⌨️ Content shape: {_flat_n} message(s) arrived as part "
@@ -51115,6 +51261,64 @@ class Filter:
 
 
 
+
+    def _mark_answer_turn(self, body: dict) -> None:
+        """Open the answer with the turn number it belongs to.
+
+        A person referring to "T12" needs the mark to be in the text, because
+        that is the only thing that survives into the history the model
+        reads. It is the turn number rather than a new identifier because
+        every path that collapses history already carries turn numbers: a
+        commit summary opens with [T{n}], and an L1 or L2 summary renders
+        its covers_turns range into the prompt. A separate identifier space
+        would have needed its own carrier in all three.
+
+        Never raises: a mark is presentation, and presentation must not be
+        the reason an answer fails to arrive.
+        """
+        # ── Step 1: the turn, from the same count everything else uses ──
+        try:
+            _msgs = body.get("messages") or []
+            _turn = sum(
+                1
+                for _m in _msgs
+                if isinstance(_m, dict) and _m.get("role") == "user"
+            )
+            if _turn < 1:
+                return
+            _last = next(
+                (
+                    _m
+                    for _m in reversed(_msgs)
+                    if isinstance(_m, dict) and _m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None or not isinstance(_last.get("content"), str):
+                return
+
+            # ── Step 2: one mark, replaced rather than stacked ──
+            # The count moves — a regeneration, an edit, a branch, or a
+            # client resending a different slice all change it — and outlet
+            # edits persist into the history, so a second mark would stack
+            # on the first and stay there. Only a mark at the very start is
+            # replaced: one inside the body is the model quoting a
+            # reference back, which is the feature working.
+            _text = _last["content"]
+            _mark = f"[T{_turn}]"
+            _stripped = re.sub(r"^\s*\[T\d+\]\s*", "", _text)
+            if _stripped != _text.lstrip():
+                self._log_debug(
+                    f"outlet: replacing an earlier turn mark with {_mark} "
+                    f"— the user-message count moved"
+                )
+            elif _text.lstrip().startswith(_mark):
+                return
+            _last["content"] = f"{_mark}\n\n{_stripped.lstrip()}"
+            self._log_debug(f"outlet: answer marked {_mark}")
+        except Exception as _e_mark:
+            self._log_debug(f"outlet: turn mark skipped ({_e_mark!r})")
+
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         """
         Post-process the request after the LLM has generated its response.
@@ -51274,6 +51478,7 @@ class Filter:
                     self._log_debug(
                         f"outlet: investigation record appended " f"({len(_rec)} chars)"
                     )
+            self._mark_answer_turn(body)
             self._replace_asserted_confidence(body)
         except Exception as _e:
             self._log_debug(f"outlet: record append skipped ({_e!r})")
