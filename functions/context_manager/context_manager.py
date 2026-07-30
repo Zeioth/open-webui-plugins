@@ -458,6 +458,9 @@ def _resolve_symbol_name(sym: str, find_blocks, qualified_for, all_names):
 
 
 _MAX_TOOLS_PER_ROUND = 4
+# A body cut below this is worse than an honest omission: too little to carry a
+# method's shape, and enough to look like the whole of it.
+_FOCUS_MIN_PARTIAL_CHARS = 4000
 
 _MAX_CLAIMS_PER_STEP = 12
 
@@ -12639,6 +12642,26 @@ class LLMOrchestrator:
         if not getattr(self._f.valves, "align_aux_calls_to_prefix", True):
             self._note_align("valve off")
             return system_prompt
+
+        # A call that does not reason about the codebase gains nothing from
+        # the prefix and pays all of it. Measured: a 133-token prompt
+        # producing 12 tokens took 94 seconds aligned and 0.8 unaligned,
+        # the same call earlier in the same turn before _prelim existed.
+        _floor = 0
+        try:
+            _floor = int(
+                getattr(self._f.valves, "align_aux_min_prompt_tokens", 0) or 0
+            )
+        except Exception:
+            _floor = 0
+        if _floor > 0:
+            try:
+                _own = len(system_prompt or "") + len(prompt or "")
+                if _own // 4 < _floor:
+                    self._note_align("below size floor")
+                    return system_prompt
+            except Exception:
+                pass
         _prelim = getattr(self._f, "_prelim_system_this_turn", "") or ""
         if not _prelim:
             self._note_align("no prelim stashed yet")
@@ -14223,19 +14246,34 @@ class AgenticEvidenceLedger:
         if _state == "unoperationalizable":
             return "unoperationalizable"
         if not _state:
+            # Nothing ran — but WHY matters. A claim whose own subject was
+            # never read is blind: retrieval failed, and that is a fixable
+            # thing with a name. Anything else is uncovered, which says only
+            # that no check happened. `unread_qids` is populated at
+            # extraction, before judging, so the distinction is available
+            # exactly when the verdict is still empty.
+            if claim.subject and claim.subject in (
+                getattr(claim, "unread_qids", None) or []
+            ):
+                return "blind"
             return "uncovered"
 
-        # ── Step 2: a body was read — did a quote from it settle the claim ──
-        if _kind in ("code", "dynamic"):
-            return "hard" if _state in ("confirmed", "refuted") else "read"
-
-        # ── Step 3: settled without a body. Blind is about the SUBJECT ──
-        # "A calls B" cites B and is settled by the graph without opening it,
-        # so citing an unread symbol is not the same as asserting about one.
+        # ── Step 2: blindness first — it outranks whatever settled it ──
+        # ps145: a quote lifted from another body can confirm a sentence
+        # without anyone having opened the symbol the sentence is about.
+        # Asking the evidence type first labelled that `hard`, which is the
+        # strongest word in the metric for a claim nobody checked against
+        # its own body. Blind is about the SUBJECT: "A calls B" cites B and
+        # is settled by the graph without opening it, so citing an unread
+        # symbol is not the same as asserting about one.
         if claim.subject and claim.subject in (
             getattr(claim, "unread_qids", None) or []
         ):
             return "blind"
+
+        # ── Step 3: a body was read — did a quote from it settle the claim ──
+        if _kind in ("code", "dynamic"):
+            return "hard" if _state in ("confirmed", "refuted") else "read"
         return "structural"
 
     def coverage(self) -> Dict[str, Any]:
@@ -14434,6 +14472,48 @@ class AgenticEvidenceLedger:
         re.IGNORECASE,
     )
 
+
+    def _known_names(self, project_id: str) -> set:
+        """Every name the index knows, qualified and bare.
+
+        Membership here is the existence test a call relation needs. The
+        resolver cannot serve it: it echoes an unmatched name back, so
+        truthiness answers "did you give me a string" rather than "is this
+        a symbol".
+        """
+        # ── Step 1: the index's own names, plus their bare forms ──
+        try:
+            _all = set(
+                self._f._symbol_index.get_all_qualified_names(project_id)
+            )
+        except Exception:
+            return set()
+        return _all | {q.rsplit(".", 1)[-1] for q in _all}
+
+    def _relation_side_is_symbol(
+        self, name: str, known: set, project_id: str
+    ) -> bool:
+        """Is this side of an asserted relation a symbol that exists?
+
+        Accepts a qualified name, a bare name the index knows, and a
+        spelling the resolver can canonicalise INTO one of those — the
+        camelCase case ps had to fix once already. Rejects a word that
+        only resolves to itself, which is what an unmatched name does.
+        """
+        # ── Step 1: known outright ──
+        _n = (name or "").strip("`. ")
+        if not _n:
+            return False
+        if _n in known:
+            return True
+
+        # ── Step 2: canonicalisable into something known ──
+        try:
+            _c = self._canonical_qid(_n, project_id)
+        except Exception:
+            return False
+        return bool(_c) and _c != _n and _c in known
+
     def _validate_call_relations(self, text: str, project_id: str) -> List[str]:
         """
         Verify 'A calls B' relations asserted in a claim against the
@@ -14477,9 +14557,19 @@ class AgenticEvidenceLedger:
                 # asserted in the model's spelling was reported as
                 # involving a symbol that does not exist, while EXPAND
                 # resolved that same name without complaint.
-                if not self._canonical_qid(caller, project_id):
+                # Membership, not truthiness. The resolver echoes an
+                # unmatched name back — `return set(qids) if qids else
+                # {bare_name}` — so `_canonical_qid("which")` is "which" and
+                # the old test passed a word that exists nowhere. Seven of
+                # twelve relations in one run were English grammar reaching
+                # this line: "the calls graph", "also calls ContextDumper".
+                # _relation_in_graph asks it this way already.
+                _known = self._known_names(project_id)
+                if not self._relation_side_is_symbol(caller, _known,
+                                                     project_id):
                     continue
-                if not self._canonical_qid(callee, project_id):
+                if not self._relation_side_is_symbol(callee, _known,
+                                                     project_id):
                     continue
                 # Edge lookup mismatch (root cause of every call relation on a
                 # class method being marked "no edge" live): the regex
@@ -19532,12 +19622,36 @@ class AgenticStepExecutor:
         # different class.
         _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
         served, skipped, used, already = [], [], 0, []
+        partial: List[str] = []
         for sym in names[:_MAX_TOOLS_PER_ROUND]:
             if sym in _seen:
                 already.append(sym)
                 continue
             body = broker.resolve("EXPAND", sym, project_id)
             if used + len(body) > budget and served:
+                # Cut, not dropped. A run lost `Filter.inlet` here — 44428
+                # characters against a 32000 budget — and the answer that
+                # needed it inferred the wrong lifecycle from the signature.
+                # The line it needed sat at 7% of that body. The remainder
+                # is only worth serving if there is enough of it to carry a
+                # method's shape, and the cut must be named: a body that
+                # stops early is not evidence that what is missing is
+                # absent.
+                _left = budget - used
+                if _left >= _FOCUS_MIN_PARTIAL_CHARS:
+                    _cut = body[:_left]
+                    _pct = 100 * len(_cut) // max(1, len(body))
+                    served.append(
+                        _cut
+                        + f"\n\n# ── CUT: this is the first {_pct}% of "
+                        f"{sym}; the rest did not fit this step's budget. "
+                        f"Something absent below this point may still exist "
+                        f"in the body — say so rather than concluding it is "
+                        f"missing. ──"
+                    )
+                    used += len(_cut)
+                    partial.append(sym)
+                    continue
                 skipped.append(sym)
                 continue
             served.append(body)
@@ -19576,6 +19690,12 @@ class AgenticStepExecutor:
         self._f._log_debug(
             f"🤖 Agentic: step {step.id} preloaded {len(served)} focus "
             f"body/bodies ({used} chars), {len(skipped)} left to request"
+            + (
+                f" — {len(partial)} served CUT to fit: "
+                + ", ".join(partial)
+                if partial
+                else ""
+            )
         )
         return header + note + "\n\n".join(served) + tail
 
@@ -20388,6 +20508,15 @@ class AgenticSynthesisComposer:
             "causal chain between them), in a short paragraph. If the "
             "evidence supports no single mechanism, say that instead "
             "of promoting the least bad candidate.",
+            "",
+            "This paragraph may not assert what you are about to list "
+            "below as unverified or NOT CHECKED. If the mechanism rests "
+            "on a body you did not read, name it AND say what it rests "
+            "on, in this paragraph — \"the reset appears to happen in "
+            "X, though X's body was not read\" — not four paragraphs "
+            "later. A reader who stops here, which is what putting it "
+            "first invites, must not be left with a guess wearing the "
+            "voice of a finding.",
             "",
             "**What the evidence shows** — the facts that carry the "
             "explanation: the symbols, call relations and code paths "
@@ -26761,11 +26890,23 @@ class CodeBlockManager:
                 config = ProcessConfig()
                 config.language = "markdown"
                 result = process(content, config)
+                # A mapping, not an object: ProcessResult carries keys, so
+                # `hasattr(result, "blocks")` was false every time and the
+                # branch below had never run. Both spellings accepted.
+                _rblocks = None
                 if hasattr(result, "blocks"):
+                    _rblocks = result.blocks
+                elif hasattr(result, "get"):
+                    try:
+                        _rblocks = result.get("blocks")
+                    except Exception:
+                        _rblocks = None
+                if _rblocks is not None:
                     self._f._log_debug(
-                        f"extract_code_blocks: process() found {len(result.blocks)} block(s)"
+                        f"extract_code_blocks: process() found "
+                        f"{len(_rblocks)} block(s)"
                     )
-                    for b in result.blocks:
+                    for b in _rblocks:
                         lang = getattr(b, "language", None) or "text"
                         code = content[b.start_byte : b.end_byte].strip()
                         blocks.append(
@@ -26779,8 +26920,13 @@ class CodeBlockManager:
                         return self._postprocess_blocks(blocks, spans, content)
                 else:
                     self._f._log_debug(
-                        "extract_code_blocks: process() result has no .blocks — "
-                        "falling through to regex"
+                        "extract_code_blocks: no blocks in the process() "
+                        "result — falling through to regex. It carries: "
+                        + (
+                            ", ".join(sorted(result.keys())[:12])
+                            if hasattr(result, "keys")
+                            else type(result).__name__
+                        )
                     )
             except Exception as e:
                 self._f._log_debug(
@@ -47784,6 +47930,19 @@ class Filter:
             ),
         )
 
+        align_aux_min_prompt_tokens: int = Field(
+            default=400,
+            description=(
+                "Auxiliary calls whose OWN prompt is below this many "
+                "tokens skip prefix alignment. Aligning them re-prefills "
+                "the whole static prefix for a call that needs none of "
+                "it: measured over a run, seed_disambiguate sent 133 "
+                "tokens, produced 12, and took 94 seconds, of which about "
+                "93 were prefix. 628s of that run — 47% of all call time "
+                "— went to calls under 2000 tokens. Set to 0 to align "
+                "everything, which is the behaviour before this valve."
+            ),
+        )
         align_aux_calls_to_prefix: bool = Field(
             default=True,
             description=(
