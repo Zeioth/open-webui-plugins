@@ -12685,6 +12685,11 @@ class LLMOrchestrator:
                     f"cot_model_level2 (and the other *_model valves) at the "
                     f"model actually selected in the UI."
                 )
+            self._note_align(
+                "model mismatch"
+                if (_main and _aux)
+                else "model name missing"
+            )
             return system_prompt
         # ── Guard: the aligned call must still fit the context window ──────
         # Measured over prefix + role + THE PROMPT ITSELF: summarize and
@@ -12699,8 +12704,15 @@ class LLMOrchestrator:
                 )
                 _total = _prelim + system_prompt + (prompt or "")
                 if len(self._f.tokenizer.encode(_total)) > budget:
+                    # The aligned form does not fit the window.
+                    # Counted rather than returned in silence: a run
+                    # where this fires on every call looks exactly
+                    # like one where alignment works, and the
+                    # difference is the whole context re-prefilled.
+                    self._note_align("over budget")
                     return system_prompt
             except Exception:
+                self._note_align("budget check failed")
                 return system_prompt
         # ── Countermand the inherited confidence footer for JSON calls ─────
         # Block A carries the confidence_prompt suffix ("After your response
@@ -14162,7 +14174,7 @@ class AgenticEvidenceLedger:
             state = claim.verification or "unchecked"
             out[state] = out.get(state, 0) + 1
         return out
-    def coverage(self) -> Dict[str, int]:
+    def coverage(self) -> Dict[str, Any]:
         """Tally claims by the strength of the evidence behind them.
 
         This is the project's success metric, so the buckets are drawn
@@ -14960,7 +14972,10 @@ class AgenticEvidenceVerifier:
         "not a failure.\n"
         'For "supported" and "contradicted" the quote is REQUIRED and '
         "must be copied character for character from the body: it is "
-        "checked. A verdict whose quote is not found in the body is "
+        "checked. A claim about SEVERAL places takes several quotes: "
+        "pass a LIST, one per place, and every one is checked, so a "
+        "claim that four exits do something is settled by four quotes "
+        "or not at all. A verdict whose quote is not found in the body is "
         "discarded and the claim is recorded as unsettled, so an "
         "approximate quote is worth less than an honest "
         '"indeterminate".\n'
@@ -15171,7 +15186,17 @@ class AgenticEvidenceVerifier:
             try:
                 n = int(rv.get("claim", 0))
                 verdict = str(rv.get("verdict", "")).strip().lower()
-                quote = str(rv.get("quote", "")).strip()
+                # A list settles a claim about several places; a string is
+                # the single-site case and behaves exactly as before. The
+                # check is per element, so one unfound quote still discards
+                # the verdict — the standard does not drop, the protocol
+                # widens.
+                _raw_q = rv.get("quote", "")
+                if isinstance(_raw_q, list):
+                    _quotes = [str(q).strip() for q in _raw_q if str(q).strip()]
+                else:
+                    _quotes = [str(_raw_q).strip()] if str(_raw_q).strip() else []
+                quote = " ⏎ ".join(_quotes)
             except Exception:
                 continue
             # A ruling that names no claim cannot be placed. Position is not
@@ -15197,8 +15222,13 @@ class AgenticEvidenceVerifier:
             # which of the shown bodies carried the line does not bear on it.
             if verdict in ("supported", "contradicted"):
                 _flat = " ".join(quote.split())
-                _found = bool(_flat) and any(
-                    _flat in " ".join(_b.split()) for _b in bodies.values()
+                _flats = [" ".join(q.split()) for q in _quotes]
+                # Every element, not the joined string: a claim about
+                # four exits is settled by four quotes, and one that
+                # is not found still discards the whole verdict.
+                _found = bool(_flats) and all(
+                    any(_q in " ".join(_b.split()) for _b in bodies.values())
+                    for _q in _flats
                 )
                 if not _found:
                     dropped += 1
@@ -23035,6 +23065,48 @@ class AgenticOrchestrator:
             )
             _cov["rivals_complementary"] = sum(
                 1 for _r in _rel if _r == "complementary"
+            )
+            # One line per claim, so reading the losing bucket is reading a
+            # list rather than pairing claims with verdicts by index across
+            # two act types. Capped above any turn recorded so far.
+            _per: List[str] = []
+            for _c in self._ledger.claims[:40]:
+                _st = _c.verification or ""
+                _kd = _c.evidence_type or "reasoning"
+                if _st == "unoperationalizable":
+                    _bucket = "no-anchor"
+                elif not _st:
+                    _bucket = "uncovered"
+                elif _kd in ("code", "dynamic"):
+                    _bucket = (
+                        "hard" if _st in ("confirmed", "refuted") else "read"
+                    )
+                elif _c.subject and _c.subject in (
+                    getattr(_c, "unread_qids", None) or []
+                ):
+                    _bucket = "blind"
+                else:
+                    _bucket = "structural"
+                _per.append(
+                    f"{_bucket:10} {(_c.subject or '—')[:44]:44} "
+                    f"{' '.join(_c.text.split())[:70]}"
+                )
+            _cov["per_claim"] = _per
+            # The shape of the turn, both of which had to be grepped out of
+            # the server log to interpret a low number: a turn that never
+            # formed a hypothesis reads like one whose hypothesis failed.
+            # The same source the planner was handed 1200 lines above, not
+            # a field of my own: `_preplanner.last_stats`. Inventing an
+            # attribute here is how five earlier patches in this series
+            # shipped a name nothing writes.
+            _cov["question_type"] = str(
+                getattr(self._preplanner, "last_stats", {}).get(
+                    "question_type", ""
+                )
+                or "unknown"
+            )
+            _cov["had_hypothesize"] = any(
+                getattr(_s, "kind", "") == "hypothesize" for _s in plan.steps
             )
             self._f._agentic_coverage = _cov
         except Exception as _e_cov:
@@ -42778,6 +42850,27 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
             _row("no anchor", _uo,
                  "unverifiable as written; no code could settle it")
         )
+    # The turn's shape, then every claim under the counts that
+    # summarise it. Reading what a bucket has in common is the step
+    # this file exists to make possible.
+    _qt = str(coverage.get("question_type") or "")
+    _hh = coverage.get("had_hypothesize")
+    if _qt or _hh is not None:
+        lines.append("")
+        lines.append(
+            f"question type: {_qt or chr(63)} · hypothesize step: "
+            + ("yes" if _hh else "no")
+        )
+    _pc = coverage.get("per_claim") or []
+    if _pc:
+        lines.append("")
+        lines.append("<details><summary>every claim by bucket</summary>")
+        lines.append("")
+        lines.append("```")
+        lines.extend(str(_p) for _p in _pc)
+        lines.append("```")
+        lines.append("")
+        lines.append("</details>")
     lines += ["", ""]
     return "\n".join(lines)
 
@@ -49228,7 +49321,11 @@ class Filter:
         # point of first write: an attribute that exists only once something
         # has written it reads the same as one nothing ever writes, and the
         # difference only shows as a crash.
-        self._agentic_coverage: Optional[Dict[str, int]] = None
+        # Widened from Dict[str, int]: the tally now carries the
+        # claims themselves and the turn's shape beside the counts,
+        # so the annotation says mixed rather than being quietly
+        # wrong about what it holds.
+        self._agentic_coverage: Optional[Dict[str, Any]] = None
         # Per-turn tally of which exit each auxiliary call took out
         # of the prefix alignment. Declared rather than conjured at
         # first write, for the reason ps127 records: an attribute
