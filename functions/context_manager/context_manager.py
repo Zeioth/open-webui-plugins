@@ -6364,12 +6364,12 @@ class ContextBuilder:
                     if idx < 0:
                         rest = ""
                         break
-                    rest, open_quote = rest[idx + 3:], ""
+                    rest, open_quote = rest[idx + 3 :], ""
                 else:
                     match = re.search(r'"""|\'\'\'', rest)
                     if not match:
                         break
-                    open_quote, rest = match.group(0), rest[match.end():]
+                    open_quote, rest = match.group(0), rest[match.end() :]
                     in_doc = True
             if in_doc:
                 continue
@@ -6390,7 +6390,7 @@ class ContextBuilder:
                         continue
                     if char == quote:
                         quote = ""
-                elif char in "\"\'":
+                elif char in "\"'":
                     quote = char
                 elif char == "#":
                     break
@@ -6401,10 +6401,7 @@ class ContextBuilder:
 
             # ── Step 4: resolve one call site to one tier symbol ──
             target = ""
-            pattern = (
-                r"(?:(?P<recv>[A-Za-z_][\w.]*)\.)?"
-                r"(?P<name>[A-Za-z_]\w*)\s*\("
-            )
+            pattern = r"(?:(?P<recv>[A-Za-z_][\w.]*)\.)?" r"(?P<name>[A-Za-z_]\w*)\s*\("
             for match in re.finditer(pattern, code):
                 candidate = by_bare.get(match.group("name"), "")
                 if not candidate or candidate in emitted:
@@ -12579,7 +12576,6 @@ class LLMOrchestrator:
     # 2. Main LLM caller (with retries, cache, deduplication)
     # ═══════════════════════════════════════════════════════════════════════════
 
-
     def _note_align(self, outcome: str) -> None:
         """Tally how each auxiliary call ended up, for one line per turn.
 
@@ -12649,9 +12645,7 @@ class LLMOrchestrator:
         # the same call earlier in the same turn before _prelim existed.
         _floor = 0
         try:
-            _floor = int(
-                getattr(self._f.valves, "align_aux_min_prompt_tokens", 0) or 0
-            )
+            _floor = int(getattr(self._f.valves, "align_aux_min_prompt_tokens", 0) or 0)
         except Exception:
             _floor = 0
         if _floor > 0:
@@ -12692,9 +12686,7 @@ class LLMOrchestrator:
             # when both names exist: an unset name is the case the
             # warning was written for and the one it cannot report.
             self._note_align(
-                "model mismatch"
-                if (_main and _aux)
-                else "model name missing"
+                "model mismatch" if (_main and _aux) else "model name missing"
             )
             # A name mismatch here (e.g. an OpenWebUI alias in body['model']
             # vs the configured llm_model) silently disables alignment for
@@ -12725,9 +12717,7 @@ class LLMOrchestrator:
                     f"model actually selected in the UI."
                 )
             self._note_align(
-                "model mismatch"
-                if (_main and _aux)
-                else "model name missing"
+                "model mismatch" if (_main and _aux) else "model name missing"
             )
             return system_prompt
         # ── Guard: the aligned call must still fit the context window ──────
@@ -13332,7 +13322,7 @@ class LLMOrchestrator:
                             f"[LLM] {model}{label_str} – "
                             f"in:{in_tokens} out:{out_tokens} "
                             f"took {time.monotonic() - t_start:.3f}s "
-                        f"(waited {t_acquired - t_start:.3f}s)"
+                            f"(waited {t_acquired - t_start:.3f}s)"
                             f"{' [TRUNCATED]' if result.truncated else ''}"
                         )
                         # Agent forensics. One hook covers every agent
@@ -13350,12 +13340,8 @@ class LLMOrchestrator:
                                 "in_tokens": in_tokens,
                                 "out_tokens": out_tokens,
                                 "seconds": round(time.monotonic() - t_start, 2),
-                                "wait_seconds": round(
-                                    t_acquired - t_start, 2
-                                ),
-                                "gen_seconds": round(
-                                    time.monotonic() - t_acquired, 2
-                                ),
+                                "wait_seconds": round(t_acquired - t_start, 2),
+                                "gen_seconds": round(time.monotonic() - t_acquired, 2),
                                 "finish_reason": getattr(result, "finish_reason", ""),
                                 "truncated": bool(result.truncated),
                                 "max_tokens": (
@@ -13942,12 +13928,23 @@ class AgenticEvidenceLedger:
                 # the claim.
                 subject=_subject or (qids[0] if qids else ""),
             )
+            _known_here = self._known_names(project_id)
+            _known_bare = {_q.rsplit(".", 1)[-1] for _q in _known_here}
             for qid in claim.qids:
                 # Stored canonical, not as cited: everything downstream
                 # — the unread-body check, the relation verifier —
                 # compares against names the index uses.
+                # Membership, not truthiness. The resolver echoes an
+                # unmatched name back, so `_canonical_qid("NoSuchClass.
+                # noSuchMethod")` is that string and used to land in
+                # valid_qids — which is why "N claims with invalid
+                # citations" has read zero for this project's whole
+                # history. ps192 fixed the same mistake on the relation
+                # side and left this one.
                 _canon = self._canonical_qid(qid, project_id)
-                if _canon:
+                if _canon and (
+                    _canon in _known_here or _canon.rsplit(".", 1)[-1] in _known_bare
+                ):
                     claim.valid_qids.append(_canon)
                 else:
                     claim.invalid_qids.append(qid)
@@ -14031,12 +14028,8 @@ class AgenticEvidenceLedger:
                 _claim = LedgerClaim(**d)
                 # Same computation extract_and_validate runs, at the same
                 # point relative to the claim reaching the ledger.
-                _seen = getattr(
-                    self._f, "_bodies_seen_this_turn", None
-                ) or set()
-                _claim.unread_qids = [
-                    q for q in _claim.valid_qids if q not in _seen
-                ]
+                _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
+                _claim.unread_qids = [q for q in _claim.valid_qids if q not in _seen]
                 self.claims.append(_claim)
                 restored += 1
             if restored:
@@ -14198,6 +14191,7 @@ class AgenticEvidenceLedger:
         total = len(self.claims)
         bad = sum(1 for c in self.claims if c.invalid_qids)
         return total, total - bad, bad
+
     def verification_counts(self) -> Dict[str, int]:
         """Tally claims by verification state, unchecked included.
 
@@ -14472,7 +14466,6 @@ class AgenticEvidenceLedger:
         re.IGNORECASE,
     )
 
-
     def _known_names(self, project_id: str) -> set:
         """Every name the index knows, qualified and bare.
 
@@ -14483,16 +14476,12 @@ class AgenticEvidenceLedger:
         """
         # ── Step 1: the index's own names, plus their bare forms ──
         try:
-            _all = set(
-                self._f._symbol_index.get_all_qualified_names(project_id)
-            )
+            _all = set(self._f._symbol_index.get_all_qualified_names(project_id))
         except Exception:
             return set()
         return _all | {q.rsplit(".", 1)[-1] for q in _all}
 
-    def _relation_side_is_symbol(
-        self, name: str, known: set, project_id: str
-    ) -> bool:
+    def _relation_side_is_symbol(self, name: str, known: set, project_id: str) -> bool:
         """Is this side of an asserted relation a symbol that exists?
 
         Accepts a qualified name, a bare name the index knows, and a
@@ -14565,11 +14554,9 @@ class AgenticEvidenceLedger:
                 # this line: "the calls graph", "also calls ContextDumper".
                 # _relation_in_graph asks it this way already.
                 _known = self._known_names(project_id)
-                if not self._relation_side_is_symbol(caller, _known,
-                                                     project_id):
+                if not self._relation_side_is_symbol(caller, _known, project_id):
                     continue
-                if not self._relation_side_is_symbol(callee, _known,
-                                                     project_id):
+                if not self._relation_side_is_symbol(callee, _known, project_id):
                     continue
                 # Edge lookup mismatch (root cause of every call relation on a
                 # class method being marked "no edge" live): the regex
@@ -15060,13 +15047,12 @@ class AgenticToolBroker:
         return _out
 
 
-
 # The one claim shape whose quote must mention something specific: a named
 # call target. Anything vaguer cannot be checked this way without guessing.
 _CALL_TARGET_RE = re.compile(
-    r"\b(?:calls|invokes|delegates to|passes .{0,40}? to)\s+"
-    r"([A-Za-z_][\w.]*)"
+    r"\b(?:calls|invokes|delegates to|passes .{0,40}? to)\s+" r"([A-Za-z_][\w.]*)"
 )
+
 
 class AgenticEvidenceVerifier:
     """Settle behavioural claims by reading the code they describe.
@@ -15175,17 +15161,11 @@ class AgenticEvidenceVerifier:
         # Unchanged except for the unread case: a standing verdict earned
         # without the body in view is not the kind this rule was written to
         # defend.
-        if (
-            claim.verification
-            and claim.claim_kind != "behavioural"
-            and not _unread
-        ):
+        if claim.verification and claim.claim_kind != "behavioural" and not _unread:
             return False
         return True
 
-    def group_by_subject(
-        self, claims: List["LedgerClaim"]
-    ) -> Dict[str, List[int]]:
+    def group_by_subject(self, claims: List["LedgerClaim"]) -> Dict[str, List[int]]:
         """Map each subject to the 1-based indices of its claims."""
         # ── Step 1: one bucket per subject, insertion-ordered ──
         groups: Dict[str, List[int]] = {}
@@ -15216,9 +15196,7 @@ class AgenticEvidenceVerifier:
         # alphabetical so two runs over the same ledger send the same
         # prompt, which a cache prefix depends on.
         broker = AgenticToolBroker(self._f)
-        budget = int(
-            getattr(self._f.valves, "agentic_evidence_max_chars", 48000)
-        )
+        budget = int(getattr(self._f.valves, "agentic_evidence_max_chars", 48000))
         _w = weights or {}
         ordered = sorted(subjects, key=lambda s: (-_w.get(s, 1), s))
 
@@ -15416,6 +15394,7 @@ class AgenticEvidenceVerifier:
                 f"reached the ledger"
             )
         return out
+
     async def judge_texts(
         self,
         texts: List[str],
@@ -15441,7 +15420,41 @@ class AgenticEvidenceVerifier:
         if not texts or not bodies_text.strip():
             return [None] * len(texts)
 
-        # ── Step 2: one call, bodies first, contract last ──
+        # ── Step 2: nothing in hand that COULD settle any of them ──
+        # A quote settles a claim only if the body it comes from mentions
+        # what the claim is about. Two calls in one run spent 110s and 8s
+        # to return an empty verdict list because the consequences named
+        # `calculateConfidenceScore` and the bodies were
+        # `AgenticEvidenceLedger`. One overlap anywhere is enough to make
+        # the call — ps137 settles a claim about A from B's body on
+        # purpose, and this test cannot tell which body carries the quote.
+        try:
+            _named: set = set()
+            for _t in texts:
+                _named |= set(
+                    re.findall(
+                        r"[A-Za-z_]\w*(?:\.\w+)+|[A-Za-z_]\w*(?=\(\))",
+                        str(_t),
+                    )
+                )
+            if _named:
+                _bodies_flat = bodies_text
+                _hit = any(
+                    _n in _bodies_flat or _n.rsplit(".", 1)[-1] in _bodies_flat
+                    for _n in _named
+                )
+                if not _hit:
+                    self._f._log_debug(
+                        f"🔬 Forge evidence: skipped — none of the "
+                        f"{len(_named)} symbol(s) the {len(texts)} "
+                        f"consequence(s) name appear in the bodies at hand, "
+                        f"so no quote could settle any of them"
+                    )
+                    return [None] * len(texts)
+        except Exception:
+            pass
+
+        # ── Step 3: one call, bodies first, contract last ──
         numbered = "\n".join(f"{n}. {t}" for n, t in enumerate(texts, 1))
         prompt = (
             bodies_text
@@ -15527,6 +15540,8 @@ class AgenticEvidenceVerifier:
             if verdict != "indeterminate":
                 settled += 1
         return settled
+
+
 class AgenticStaticVerifier:
     """
     Fase 4 static verification: turns ledger claims into typed checks and
@@ -15604,11 +15619,7 @@ class AgenticStaticVerifier:
         # checks for settled claims would spend the call on work already done
         # and, worse, let a second reading overturn a verdict the graph
         # already gave — the point of the sweep is coverage, not revision.
-        claims = [
-            c
-            for c in ledger.claims
-            if not (only_unchecked and c.verification)
-        ]
+        claims = [c for c in ledger.claims if not (only_unchecked and c.verification)]
         if not claims:
             # An empty ledger has two very different causes and they must not
             # read alike. If earlier steps were truncated, their claims were
@@ -15818,8 +15829,7 @@ class AgenticStaticVerifier:
         kept = self._select_checks(checks, len(claims))
         if len(kept) < len(checks):
             _lost = sorted(
-                {int(c["claim"]) for c in checks}
-                - {int(c["claim"]) for c in kept}
+                {int(c["claim"]) for c in checks} - {int(c["claim"]) for c in kept}
             )
             self._f._log_debug(
                 f"🤖 Verify: kept {len(kept)} of {len(checks)} elicited "
@@ -15873,6 +15883,7 @@ class AgenticStaticVerifier:
                 break
             out.append(check)
         return out
+
     @staticmethod
     def _fallback_checks(claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
         """Deterministic pass: pairwise edges for 2+ cited qids, existence
@@ -18141,7 +18152,6 @@ class AgenticPlanner:
             )
         return _out
 
-
     def _last_answer_emitted_code(self, project_id: str) -> bool:
         """Whether the previous assistant message carried a fenced block.
 
@@ -19117,12 +19127,12 @@ def _find_scaffold_echo(text: str, min_pos: int = 1) -> int:
     return best
 
 
-
 _ALREADY_IN_VIEW_NOTE = (
     "\n\nTheir bodies are already in the context above. Anything you assert "
     "about these symbols must come from that code; if it does not settle a "
     "point, say so rather than inferring it from the signature.\n"
 )
+
 
 class AgenticStepExecutor:
     """
@@ -19333,10 +19343,10 @@ class AgenticStepExecutor:
         "DOES: what it returns, which branch it takes, what it mutates, in "
         'what order. Set "subject" to the qid whose behaviour the claim '
         "describes, which is not always the first one you cite: "
-        "\"A calls B with x\" is about A. A behavioural claim is settled "
+        '"A calls B with x" is about A. A behavioural claim is settled '
         "by reading the subject's body and by nothing else, so naming the "
         "subject correctly is what makes the claim checkable at all.\n"
-        "Write the \"claim\" text in English, whatever language the rest "
+        'Write the "claim" text in English, whatever language the rest '
         "of your answer uses. Claim text is machinery, not prose: it is "
         "matched against qualified symbol names, settled by quoting source "
         "that is in English, and compared against the other claims of this "
@@ -19573,6 +19583,7 @@ class AgenticStepExecutor:
         if name == "_PRESENT_INSTRUCTION":
             return self._PRESENT_INSTRUCTION.format(sid=step.id, goal=step.goal)
         return str(getattr(self, name, ""))
+
     def _render_focus_symbols(
         self,
         step: "AgenticStep",
@@ -19600,16 +19611,12 @@ class AgenticStepExecutor:
         """
         # ── Step 1: the names, always ──
         names = list(step.symbols or [])
-        header = "\nFocus symbols suggested by the planner: " + ", ".join(
-            names
-        )
+        header = "\nFocus symbols suggested by the planner: " + ", ".join(names)
         if not broker or not project_id:
             return header
 
         # ── Step 2: expand within a declared budget ──
-        budget = int(
-            getattr(self._f.valves, "agentic_preload_focus_max_chars", 32000)
-        )
+        budget = int(getattr(self._f.valves, "agentic_preload_focus_max_chars", 32000))
         # Block B renders its bodies before any step runs and registers each
         # one, so a focus symbol already in view needs no second copy. Turn 3
         # of the 29 July run spent 14551 of 32000 characters re-serving a body
@@ -19642,8 +19649,7 @@ class AgenticStepExecutor:
                     _cut = body[:_left]
                     _pct = 100 * len(_cut) // max(1, len(body))
                     served.append(
-                        _cut
-                        + f"\n\n# ── CUT: this is the first {_pct}% of "
+                        _cut + f"\n\n# ── CUT: this is the first {_pct}% of "
                         f"{sym}; the rest did not fit this step's budget. "
                         f"Something absent below this point may still exist "
                         f"in the body — say so rather than concluding it is "
@@ -19691,8 +19697,7 @@ class AgenticStepExecutor:
             f"🤖 Agentic: step {step.id} preloaded {len(served)} focus "
             f"body/bodies ({used} chars), {len(skipped)} left to request"
             + (
-                f" — {len(partial)} served CUT to fit: "
-                + ", ".join(partial)
+                f" — {len(partial)} served CUT to fit: " + ", ".join(partial)
                 if partial
                 else ""
             )
@@ -19763,9 +19768,7 @@ class AgenticStepExecutor:
         for _name, _gate in _recipe:
             if not _gates.get(_gate, False):
                 continue
-            _parts.append(
-                self._render_fragment(_name, step, broker, project_id)
-            )
+            _parts.append(self._render_fragment(_name, step, broker, project_id))
         if _sweep:
             self._f._log_debug(
                 f"🤖 Agentic: step {step.id} (investigate) — systematic "
@@ -19777,8 +19780,7 @@ class AgenticStepExecutor:
         return f"## Step instruction\n{instruction}"
 
     _TOOL_RE = re.compile(
-        r"^TOOL:\s*(EXPAND|WRITERS|CALLERS|CALLEES|DOC|GREP|MEMORY)"
-        r"\((.+?)\)\s*$",
+        r"^TOOL:\s*(EXPAND|WRITERS|CALLERS|CALLEES|DOC|GREP|MEMORY)" r"\((.+?)\)\s*$",
         re.M,
     )
 
@@ -19915,9 +19917,7 @@ class AgenticStepExecutor:
             # that cost a step 114 seconds alternated two symbols it had
             # been handed in the first round.
             _have.extend(f"{_n}({_a})" for _n, _a in seen)
-            _base = self.build_prompt(
-                step, workspace, broker, project_id
-            )
+            _base = self.build_prompt(step, workspace, broker, project_id)
             _tail = (
                 "\n\nYou ALREADY HAVE: "
                 + ", ".join(dict.fromkeys(_have))
@@ -20453,11 +20453,7 @@ class AgenticSynthesisComposer:
             ("```" in (s.output or "")) or ("```" in (s.digest or ""))
             for s in plan.steps
         )
-        _vc = (
-            ledger.verification_counts()
-            if ledger is not None
-            else {}
-        )
+        _vc = ledger.verification_counts() if ledger is not None else {}
         lines += self._answer_format_directive(
             ok,
             bad,
@@ -20512,7 +20508,7 @@ class AgenticSynthesisComposer:
             "This paragraph may not assert what you are about to list "
             "below as unverified or NOT CHECKED. If the mechanism rests "
             "on a body you did not read, name it AND say what it rests "
-            "on, in this paragraph — \"the reset appears to happen in "
+            'on, in this paragraph — "the reset appears to happen in '
             "X, though X's body was not read\" — not four paragraphs "
             "later. A reader who stops here, which is what putting it "
             "first invites, must not be left with a guess wearing the "
@@ -20764,6 +20760,7 @@ class AgenticOrchestrator:
                     "they respond.",
                 )
             )
+
     def _symbols_named_in(self, text: str, project_id: str) -> Set[str]:
         """Return the indexed symbols a free-text question names.
 
@@ -20775,10 +20772,7 @@ class AgenticOrchestrator:
         empty set for anything it does not know.
         """
         # ── Step 1: collect reference-shaped tokens ──
-        pattern = (
-            r"\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w+)+\b"
-            r"|\b[A-Za-z_]*_\w+\b"
-        )
+        pattern = r"\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w+)+\b" r"|\b[A-Za-z_]*_\w+\b"
         candidates = {token.strip(".") for token in re.findall(pattern, text)}
 
         # ── Step 2: keep the ones the symbol index resolves ──
@@ -21077,6 +21071,29 @@ class AgenticOrchestrator:
                 f"parsimony, anchors]: {len(_plausible)} plausible "
                 f"dossier(s) of {len(_dossiers)} sealed"
             )
+            # How each one ended, whenever there is one. The cause was
+            # rendered only on the path where nothing survived, so a turn
+            # that kept one and buried two said nothing about the two —
+            # and `falsified` (the evidence discriminated) against
+            # `unfounded` (we never got a grip) is the distinction that
+            # decides what to do next. "survived" is a cause too: a
+            # competition where everything lived and one where everything
+            # died read the same through a count.
+            if _dossiers:
+                try:
+                    _fates = "; ".join(
+                        f"'{(d.hypothesis or '')[:36]}' "
+                        f"({d.cause_of_death or ('survived' if d.status == 'plausible' else 'died')})"
+                        for d in _dossiers
+                    )
+                    self._f._log_debug(
+                        f"🔬 Competition outcome: {len(_plausible)}/"
+                        f"{len(_dossiers)} plausible — {_fates}"
+                    )
+                except Exception as _e_fates:
+                    self._f._log_debug(
+                        f"competition outcome line skipped ({_e_fates!r})"
+                    )
             if _plausible:
                 # S2: the serial judgment replaces the parallel
                 # competition entirely for plausible dossiers. The
@@ -21516,16 +21533,12 @@ class AgenticOrchestrator:
         )
         # Region: compact workspace digest for the evaluator
         workspace = self._render_workspace(
-                plan.steps,
-                budget=self._workspace_budget(),
-                estimate=getattr(
-                    self._f._tokens, "estimate_code_tokens", None
-                ),
-                shorten=getattr(
-                    self._f._tokens, "truncate_text_to_tokens", None
-                ),
-                note=self._f._log_debug,
-            )
+            plan.steps,
+            budget=self._workspace_budget(),
+            estimate=getattr(self._f._tokens, "estimate_code_tokens", None),
+            shorten=getattr(self._f._tokens, "truncate_text_to_tokens", None),
+            note=self._f._log_debug,
+        )
         workspace = self._f._tokens.truncate_text_to_tokens(workspace, 1200)
 
         prompt = (
@@ -21662,7 +21675,6 @@ class AgenticOrchestrator:
         return _close_dangling_fence(
             self._f._tokens.truncate_text_to_tokens(text, budget)
         )
-
 
     def _workspace_budget(self) -> int:
         """Tokens the workspace may occupy before the oldest are shortened.
@@ -22036,7 +22048,6 @@ class AgenticOrchestrator:
     # 7. The pipeline body
     # ──────────────────────────────────────────────────────────────────────
 
-
     def _question_type_or_intent(self, project_id: str) -> str:
         """The pre-planner's question type, or the turn's intent standing in.
 
@@ -22056,8 +22067,7 @@ class AgenticOrchestrator:
         """
         # ── Step 1: the pre-planner's own answer wins whenever it has one ──
         _pp = str(
-            getattr(self._preplanner, "last_stats", {}).get("question_type", "")
-            or ""
+            getattr(self._preplanner, "last_stats", {}).get("question_type", "") or ""
         ).strip()
         if _pp:
             return _pp
@@ -22065,10 +22075,11 @@ class AgenticOrchestrator:
         # ── Step 2: the intent the turn was already classified with ──
         try:
             _pstate = self._f._project_state_manager.get_pstate(project_id)
-            _intent = str(
-                (_pstate.get("turn_classification") or {}).get("intent", "")
-                or ""
-            ).strip().lower()
+            _intent = (
+                str((_pstate.get("turn_classification") or {}).get("intent", "") or "")
+                .strip()
+                .lower()
+            )
         except Exception:
             return ""
         _shape = {
@@ -22748,12 +22759,8 @@ class AgenticOrchestrator:
             workspace = self._render_workspace(
                 plan.steps,
                 budget=self._workspace_budget(),
-                estimate=getattr(
-                    self._f._tokens, "estimate_code_tokens", None
-                ),
-                shorten=getattr(
-                    self._f._tokens, "truncate_text_to_tokens", None
-                ),
+                estimate=getattr(self._f._tokens, "estimate_code_tokens", None),
+                shorten=getattr(self._f._tokens, "truncate_text_to_tokens", None),
                 note=self._f._log_debug,
             )
             await self._executor.run(
@@ -22875,7 +22882,7 @@ class AgenticOrchestrator:
             _open_gaps: List[str] = []
             if control["needs"]:
                 _next_step = None
-                for _s in plan.steps[idx + 1:]:
+                for _s in plan.steps[idx + 1 :]:
                     if _s.status in ("", "pending"):
                         _next_step = _s
                         break
@@ -22905,7 +22912,8 @@ class AgenticOrchestrator:
                         # the step found missing once it ran. The observation
                         # goes first.
                         _next_step.symbols = _served_names + [
-                            s for s in (_next_step.symbols or [])
+                            s
+                            for s in (_next_step.symbols or [])
                             if s not in _served_names
                         ]
                         # Attached is not served: the renderer takes the
@@ -22915,9 +22923,7 @@ class AgenticOrchestrator:
                         # budget finding and a coverage number nobody can
                         # explain.
                         _reach = _MAX_TOOLS_PER_ROUND
-                        _beyond = max(
-                            0, len(_next_step.symbols or []) - _reach
-                        )
+                        _beyond = max(0, len(_next_step.symbols or []) - _reach)
                         self._f._log_debug(
                             f"🤖 Agentic: step {step.id} asked for "
                             f"{len(_served_names)} body/bodies — attached to "
@@ -22929,9 +22935,7 @@ class AgenticOrchestrator:
                                 f"{len(_next_step.symbols or [])} focus "
                                 f"symbol(s) now fall beyond the {_reach} the "
                                 f"round serves: "
-                                + ", ".join(
-                                    (_next_step.symbols or [])[_reach:][:4]
-                                )
+                                + ", ".join((_next_step.symbols or [])[_reach:][:4])
                                 if _beyond
                                 else ""
                             )
@@ -22957,8 +22961,7 @@ class AgenticOrchestrator:
                     f"{len(_remaining)} unserved gap(s) with no capacity to "
                     f"chase them ({len(plan.steps)}/"
                     f"{self._f.valves.agentic_max_steps} steps, "
-                    f"{inserted}/2 insertions) — dropped: "
-                    + "; ".join(_lost_gaps)
+                    f"{inserted}/2 insertions) — dropped: " + "; ".join(_lost_gaps)
                 )
             if _needs_capacity:
                 # IR-2: a gap-fill investigation is pointed at the
@@ -23175,7 +23178,7 @@ class AgenticOrchestrator:
                 # investigation as a complete one.
                 _cancelled = [
                     later
-                    for later in plan.steps[idx + 1:]
+                    for later in plan.steps[idx + 1 :]
                     if later.status not in ("done", "failed")
                 ]
                 for later in _cancelled:
@@ -23222,16 +23225,11 @@ class AgenticOrchestrator:
         # synthesis a reader acts on. Standing down for forge plans left
         # exactly those uncovered: three claims in each forge turn of the
         # 29 July run, against none in the turn that had no forge.
-        if _unchecked and getattr(
-            self._f.valves, "agentic_closing_verify", True
-        ):
+        if _unchecked and getattr(self._f.valves, "agentic_closing_verify", True):
             try:
                 _sweep = AgenticStep(
                     id=max((s.id for s in plan.steps), default=0) + 1,
-                    goal=(
-                        "Check the claims emitted after the plan's "
-                        "verify step"
-                    ),
+                    goal=("Check the claims emitted after the plan's " "verify step"),
                     kind="verify",
                 )
                 # Inserted BEFORE the terminal analyze, never appended:
@@ -23248,8 +23246,7 @@ class AgenticOrchestrator:
                     f"{len(_unchecked)} claim(s) with no verdict"
                 )
                 await self._f._emit_status(
-                    f"🤖 Agentic: checking {len(_unchecked)} remaining "
-                    f"claim(s)"
+                    f"🤖 Agentic: checking {len(_unchecked)} remaining " f"claim(s)"
                 )
                 await self._verifier.run_verify_step(
                     _sweep,
@@ -23261,9 +23258,7 @@ class AgenticOrchestrator:
                 )
                 if _sweep.status == "done":
                     _sweep.digest = self._digest(_sweep.output)
-                _left = sum(
-                    1 for c in self._ledger.claims if not c.verification
-                )
+                _left = sum(1 for c in self._ledger.claims if not c.verification)
                 self._f._log_debug(
                     f"🤖 Agentic: closing sweep done — {_left} claim(s) "
                     f"still without a verdict"
@@ -23273,7 +23268,6 @@ class AgenticOrchestrator:
                     f"🤖 Agentic: closing sweep failed ({_e_sw!r}) — the "
                     f"pipeline tail continues"
                 )
-
 
         # Region: generative evaluation + re-plan waves (Fase 9, Nivel 2)
         # The epistemic axis (is it correct?) closed with the verify step;
@@ -23356,16 +23350,14 @@ class AgenticOrchestrator:
                         f"{wstep.goal[:60]}"
                     )
                     workspace = self._render_workspace(
-                plan.steps,
-                budget=self._workspace_budget(),
-                estimate=getattr(
-                    self._f._tokens, "estimate_code_tokens", None
-                ),
-                shorten=getattr(
-                    self._f._tokens, "truncate_text_to_tokens", None
-                ),
-                note=self._f._log_debug,
-            )
+                        plan.steps,
+                        budget=self._workspace_budget(),
+                        estimate=getattr(self._f._tokens, "estimate_code_tokens", None),
+                        shorten=getattr(
+                            self._f._tokens, "truncate_text_to_tokens", None
+                        ),
+                        note=self._f._log_debug,
+                    )
                     await self._executor.run(
                         wstep,
                         aligned_prefix,
@@ -23425,9 +23417,7 @@ class AgenticOrchestrator:
             # right one; 'competing' was settled by the ranking and
             # 'complementary' makes the answer partial, not wrong.
             _rel = getattr(self._f, "_serial_rival_relations", None) or []
-            _cov["rivals_independent"] = sum(
-                1 for _r in _rel if _r == "independent"
-            )
+            _cov["rivals_independent"] = sum(1 for _r in _rel if _r == "independent")
             _cov["rivals_complementary"] = sum(
                 1 for _r in _rel if _r == "complementary"
             )
@@ -23453,9 +23443,7 @@ class AgenticOrchestrator:
             # attribute here is how five earlier patches in this series
             # shipped a name nothing writes.
             _cov["question_type"] = str(
-                getattr(self._preplanner, "last_stats", {}).get(
-                    "question_type", ""
-                )
+                getattr(self._preplanner, "last_stats", {}).get("question_type", "")
                 or "unknown"
             )
             _cov["had_hypothesize"] = any(
@@ -23493,9 +23481,7 @@ class AgenticOrchestrator:
                     _cov.get("structural", 0) or 0
                 )
                 _t_ind = int(_cov.get("rivals_independent", 0) or 0)
-                _t_pct = int(
-                    round(100 * (_t_ok / _t_all) / (1 + _t_ind))
-                )
+                _t_pct = int(round(100 * (_t_ok / _t_all) / (1 + _t_ind)))
                 _t_open = []
                 for _k, _w in (
                     ("read", "read but unresolved"),
@@ -23506,10 +23492,35 @@ class AgenticOrchestrator:
                     if _n_k:
                         _t_open.append(f"{_n_k} {_w}")
                 if _t_ind:
+                    # Whether another pass would help. A turn reported
+                    # 24% and the person asked for more investigation,
+                    # which worked — the turn already knew the rivals had
+                    # stalled rather than been weighed, and did not say so.
+                    _causes = [
+                        _c
+                        for _c in (getattr(self._f, "_serial_rival_causes", None) or [])
+                        if _c
+                    ]
+                    _ran_out = [_c for _c in _causes if _c in ("stalled", "budget")]
+                    _why = ""
+                    if _causes and len(_ran_out) == len(_causes):
+                        _why = (
+                            " — they ran out of cycles, so another pass "
+                            "may separate them"
+                            if _t_ind > 1
+                            else " — it ran out of cycles, so another "
+                            "pass may separate it"
+                        )
+                    elif _causes and not _ran_out:
+                        _why = (
+                            " — weighed and not separated, so another "
+                            "pass is unlikely to help"
+                        )
                     _t_open.append(
                         f"{_t_ind} rival account"
                         + ("s" if _t_ind > 1 else "")
                         + " the evidence did not rule out"
+                        + _why
                     )
                 _t_line = (
                     f"[Confidence: {_t_pct}% — {_t_ok}/{_t_all} claims "
@@ -23531,8 +23542,7 @@ class AgenticOrchestrator:
                     "with exactly this line, copied character for "
                     "character, and do NOT write a confidence line of "
                     "your own — your own estimate is not measured and "
-                    "predicts nothing:\n\n"
-                    + _t_line
+                    "predicts nothing:\n\n" + _t_line
                 )
                 self._f._log_debug(
                     f"🤖 Agentic: measured confidence handed to the final "
@@ -23540,8 +23550,7 @@ class AgenticOrchestrator:
                 )
         except Exception as _e_conf_inj:
             self._f._log_debug(
-                f"measured confidence injection skipped "
-                f"({_e_conf_inj!r})"
+                f"measured confidence injection skipped " f"({_e_conf_inj!r})"
             )
         if self._f.valves.agentic_premortem and self._ledger.claims:
             _t, _o, _b = self._ledger.counts()
@@ -25503,7 +25512,6 @@ class CommandRouter:
     # 7. Explicit commands (/forget, /status, /clean, /expand)
     # ═══════════════════════════════════════════════════════════════════════
 
-
     def _deliver_command_response(self, messages: list, response: str) -> list:
         """Put a command's answer where the reader will actually see it.
 
@@ -25529,8 +25537,7 @@ class CommandRouter:
                     "content": (
                         "Output the following text exactly as written, with "
                         "nothing added before or after it — no preamble, no "
-                        "commentary, no closing question:\n\n"
-                        + str(response)
+                        "commentary, no closing question:\n\n" + str(response)
                     ),
                 }
                 return messages[: _i + 1]
@@ -25546,7 +25553,6 @@ class CommandRouter:
         )
         return messages
 
-
     def command_prefix(self) -> str:
         """The prefix a person types, with its default in one place.
 
@@ -25554,9 +25560,7 @@ class CommandRouter:
         default that will be changed three times.
         """
         # ── Step 1: the valve, or the shipped default ──
-        return str(
-            getattr(self._f.valves, "command_prefix", "//") or "//"
-        )
+        return str(getattr(self._f.valves, "command_prefix", "//") or "//")
 
     def normalise_command(self, content: str) -> str:
         """Rewrite a typed command onto the slash the dispatch expects.
@@ -25570,7 +25574,7 @@ class CommandRouter:
         _pfx = self.command_prefix()
         _text = str(content or "")
         if _pfx != "/" and _text.startswith(_pfx):
-            return "/" + _text[len(_pfx):]
+            return "/" + _text[len(_pfx) :]
         return _text
 
     async def handle_explicit_commands(
@@ -25624,9 +25628,7 @@ class CommandRouter:
                         file_info = f" ({blk.file_path})" if blk.file_path else ""
                         lines.append(f"- `{h[:8]}...`{file_info}: {snippet}...")
                 response = "\n".join(lines)
-            return True, self._deliver_command_response(
-                messages, response
-            )
+            return True, self._deliver_command_response(messages, response)
 
         if (
             content.startswith("/clean")
@@ -25634,15 +25636,11 @@ class CommandRouter:
             and self._f.valves.cleanup_suggestions_enabled
         ):
             response = await self._handle_clean_command(content, project_id)
-            return True, self._deliver_command_response(
-                messages, response
-            )
+            return True, self._deliver_command_response(messages, response)
 
         if content.startswith("/expand"):
             response = await self._handle_expand_command(content, project_id)
-            return True, self._deliver_command_response(
-                messages, response
-            )
+            return True, self._deliver_command_response(messages, response)
 
         # /freeze [N] and /unfreeze: manual control of the Block A KV freeze.
         # Gated behind enable_freeze_command; when disabled, these fall through
@@ -25653,19 +25651,13 @@ class CommandRouter:
             content.startswith("/unfreeze") or content.startswith("/freeze")
         ):
             response = await self._handle_freeze_command(content, project_id)
-            return True, self._deliver_command_response(
-                messages, response
-            )
+            return True, self._deliver_command_response(messages, response)
         if self._f.valves.enable_accept_command and content.startswith("/accept"):
             response = await self._handle_accept_command(project_id)
-            return True, self._deliver_command_response(
-                messages, response
-            )
+            return True, self._deliver_command_response(messages, response)
         if content.startswith("/help"):
             response = self._handle_help_command()
-            return True, self._deliver_command_response(
-                messages, response
-            )
+            return True, self._deliver_command_response(messages, response)
 
         return False, None
 
@@ -25682,21 +25674,35 @@ class CommandRouter:
         # ── Step 1: one line per command, with its gate ──
         _v = self._f.valves
         _rows = [
-            ("/agent <question>", True,
-             "run the agentic pipeline on this question explicitly"),
-            ("/accept", getattr(_v, "enable_accept_command", True),
-             "record that the last diagnosis held up — the ONLY signal the "
-             "strategy history gets that something worked"),
+            (
+                "/agent <question>",
+                True,
+                "run the agentic pipeline on this question explicitly",
+            ),
+            (
+                "/accept",
+                getattr(_v, "enable_accept_command", True),
+                "record that the last diagnosis held up — the ONLY signal the "
+                "strategy history gets that something worked",
+            ),
             ("/expand <symbol>", True, "pull a symbol's full body into context"),
             ("/forget <topic>", True, "drop what the filter remembers about it"),
-            ("/freeze · /unfreeze", True,
-             "pin the static prefix so the KV cache survives edits"),
-            ("/clean", getattr(_v, "cleanup_command_enabled", True),
-             "drop inactive code blocks from the working set"),
-            ("/status",
-             getattr(_v, "cleanup_status_command_enabled", True)
-             and getattr(_v, "cleanup_suggestions_enabled", True),
-             "list the code blocks that have gone quiet"),
+            (
+                "/freeze · /unfreeze",
+                True,
+                "pin the static prefix so the KV cache survives edits",
+            ),
+            (
+                "/clean",
+                getattr(_v, "cleanup_command_enabled", True),
+                "drop inactive code blocks from the working set",
+            ),
+            (
+                "/status",
+                getattr(_v, "cleanup_status_command_enabled", True)
+                and getattr(_v, "cleanup_suggestions_enabled", True),
+                "list the code blocks that have gone quiet",
+            ),
             ("/help", True, "this list"),
         ]
 
@@ -25707,9 +25713,7 @@ class CommandRouter:
         _lines = ["**CodeAware commands**", ""]
         for _name, _on, _what in _rows:
             if _on:
-                _lines.append(
-                    f"- `{_name.replace(chr(47), _pfx)}` — {_what}"
-                )
+                _lines.append(f"- `{_name.replace(chr(47), _pfx)}` — {_what}")
         _lines += [
             "",
             "Anything else is treated as a normal question.",
@@ -25807,9 +25811,7 @@ class CommandRouter:
         last_msg = messages[-1]
         if last_msg.get("role") != "user":
             return messages, False
-        content = self.normalise_command(
-            str(last_msg.get("content", "") or "").strip()
-        )
+        content = self.normalise_command(str(last_msg.get("content", "") or "").strip())
         if self._f.valves.enable_forget_command and content.startswith("/forget"):
             parts = content.split(maxsplit=1)
             target = parts[1] if len(parts) > 1 else ""
@@ -30628,7 +30630,6 @@ class MetacognitiveReasoningEngine:
             ],
         }
 
-
     def _compute_effective_coverage(
         self,
         design: "ExperimentDesign",
@@ -32767,9 +32768,7 @@ class MetacognitiveReasoningEngine:
                     # prompts rather than the aligned prefix, which is
                     # not in scope here; the judge follows the same
                     # convention.
-                    _rulings = await AgenticEvidenceVerifier(
-                        self._f
-                    ).judge_texts(
+                    _rulings = await AgenticEvidenceVerifier(self._f).judge_texts(
                         _undecided_txt,
                         "\n\n".join(_expanded_parts),
                         "You check claims against code shown in full. "
@@ -32987,6 +32986,37 @@ class MetacognitiveReasoningEngine:
             if _verdict == "plausible":
                 _dossier.status = "plausible"
                 break
+            # Did this cycle's decided consequences bear on the
+            # hypothesis at all? A dossier sealed `plausible` with
+            # corroboration 0.386 while its own analysis called the
+            # mechanism structurally impossible — every confirmation was a
+            # true fact about a symbol the hypothesis never mentions. The
+            # count is not changed here, only reported: the thresholds are
+            # calibrated against it and cannot be re-tuned from outside a
+            # run.
+            try:
+                _hyp_names = set(re.findall(r"[A-Za-z_]\w*(?:\.\w+)*", hyp_text or ""))
+                _decided = [
+                    _c
+                    for _c in _claims
+                    if self._claim_verified(_c, evidence, project_id) is not None
+                ]
+                if _decided:
+                    _on_topic = 0
+                    for _c in _decided:
+                        _txt = str(_c.get("claim", "") if isinstance(_c, dict) else _c)
+                        _cn = set(re.findall(r"[A-Za-z_]\w*(?:\.\w+)*", _txt))
+                        if _cn & _hyp_names:
+                            _on_topic += 1
+                    if _on_topic == 0:
+                        self._f._log_debug(
+                            f"🔬 Forge c{_cycle}: {len(_decided)} decided "
+                            f"consequence(s), NONE naming anything the "
+                            f"hypothesis names — corroboration is being "
+                            f"earned off-topic"
+                        )
+            except Exception:
+                pass
             _resolvable_prev = _conf_n + _ref_n
             # ── Step 7b: deduce consequences for the NEXT cycle ──
             # Only on a continuing cycle: a sealed dossier would
@@ -33063,6 +33093,44 @@ class MetacognitiveReasoningEngine:
             await self._bury_hypothesis(_dossier, project_id)
         return _dossier
 
+    _HYP_FUNC_REF_RE = re.compile(r"`?\b([A-Za-z_]\w*(?:\.\w+)+|\w+)\(\)")
+
+    def _hypothesis_is_grounded(self, hypothesis: str, project_id: str) -> bool:
+        """Does this hypothesis name at least one symbol that exists?
+
+        A candidate whose named functions are all absent from the index
+        cannot be falsified against the index — every cycle it is given can
+        only end `unfounded`. One run spent twenty-three acts learning that
+        about `get_coverage_rate()` and `render_confidence_footer()`,
+        neither of which exists anywhere in the file.
+
+        Narrow on purpose. Two or more explicit references are required
+        before the question is even asked, because one loose mention is
+        prose; and a single resolvable name is enough to keep the
+        candidate, because the real symbol can still carry it.
+        """
+        # ── Step 1: the explicit function references it makes ──
+        try:
+            _refs = [
+                m.group(1) for m in self._HYP_FUNC_REF_RE.finditer(hypothesis or "")
+            ]
+        except Exception:
+            return True
+        if len(_refs) < 2:
+            return True
+
+        # ── Step 2: one that exists is enough ──
+        try:
+            _idx = self._f._symbol_index
+            _all = set(_idx.get_all_qualified_names(project_id))
+            _bare = {q.rsplit(".", 1)[-1] for q in _all}
+        except Exception:
+            return True
+        for _r in _refs:
+            if _r in _all or _r in _bare or _r.rsplit(".", 1)[-1] in _bare:
+                return True
+        return False
+
     async def _forge_all(
         self,
         question: str,
@@ -33088,6 +33156,33 @@ class MetacognitiveReasoningEngine:
             _sh = self._f._symbol_index.compute_structure_hash(project_id) or ""
         except Exception:
             _sh = ""
+        # A candidate naming only functions that do not exist cannot be
+        # falsified against the index and can only end `unfounded`. Dropped
+        # here rather than after eight acts have proved it.
+        if getattr(self._f.valves, "hypothesis_require_known_symbols", True):
+            _grounded, _ungrounded = [], []
+            for _h in seed_pool:
+                if self._hypothesis_is_grounded(str(_h), project_id):
+                    _grounded.append(_h)
+                else:
+                    _ungrounded.append(str(_h)[:60])
+            if _ungrounded and _grounded:
+                seed_pool = _grounded
+                self._f._log_debug(
+                    f"🔬 Forge: dropped {len(_ungrounded)} candidate(s) "
+                    f"naming no symbol that exists — " + "; ".join(_ungrounded[:3])
+                )
+            elif _ungrounded:
+                # All of them. Keeping them is worse than nothing: the turn
+                # would report zero dossiers, which reads as "we looked and
+                # found no mechanism" rather than "every candidate was
+                # about something that is not there".
+                self._f._log_debug(
+                    f"🔬 Forge: every candidate ({len(_ungrounded)}) names "
+                    f"only symbols that do not exist — forging anyway so "
+                    f"the turn reports a measured cause, not an empty pool"
+                )
+
         _grave = self._load_graveyard(project_id, _sh)
         # Only causes that are evidence AGAINST the hypothesis exclude it from
         # future generation. `unfounded` means the cycles ended with no facts
@@ -33167,13 +33262,10 @@ class MetacognitiveReasoningEngine:
                 # One slot is reserved for it, which is the least that
                 # keeps it alive.
                 _n_slots = int(self._f.valves.agentic_serial_hypothesis_count)
-                _rel = [
-                    t for t in _queue if self._CALL_RELATION_RE.search(t)
-                ]
+                _rel = [t for t in _queue if self._CALL_RELATION_RE.search(t)]
                 if _rel and _n_slots > 0 and len(_queue) > _n_slots:
                     if not any(
-                        self._CALL_RELATION_RE.search(t)
-                        for t in _queue[:_n_slots]
+                        self._CALL_RELATION_RE.search(t) for t in _queue[:_n_slots]
                     ):
                         _keep = _rel[0]
                         _queue.remove(_keep)
@@ -33556,7 +33648,39 @@ class MetacognitiveReasoningEngine:
         _note = f"differentiators: {_table}"
         if _crucis_log:
             _note += " | crucis: " + " ; ".join(_crucis_log)
-        if _winner.corroboration < _null_corr + _margin:
+        # Did anyone open what the hypothesis is about? A dossier passed
+        # this bar at 0.386 while its own analysis called the mechanism
+        # structurally impossible: its confirmations were true facts about
+        # a symbol it never names. Corroboration counts consequences, not
+        # their subject — so the subject is asked for separately, exactly
+        # as the `blind` bucket asks it of a claim.
+        _subject_unread = False
+        try:
+            _hyp_syms = set(
+                re.findall(
+                    r"[A-Za-z_]\w*(?:\.\w+)+|[A-Za-z_]\w*(?=\(\))",
+                    _winner.hypothesis or "",
+                )
+            )
+            if _hyp_syms:
+                _opened = set(_winner.nodes_expanded or [])
+                _opened_bare = {str(_o).rsplit(".", 1)[-1] for _o in _opened}
+                _subject_unread = not any(
+                    _h in _opened or _h.rsplit(".", 1)[-1] in _opened_bare
+                    for _h in _hyp_syms
+                )
+        except Exception:
+            _subject_unread = False
+        if _subject_unread:
+            _winner.status = "dead"
+            _winner.cause_of_death = "null_bar"
+            await self._bury_hypothesis(_winner, project_id)
+            _note += (
+                f" | null bar FAILED: not one symbol the hypothesis "
+                f"names was ever opened — corroboration "
+                f"{_winner.corroboration:.2f} was earned elsewhere"
+            )
+        elif _winner.corroboration < _null_corr + _margin:
             _winner.status = "dead"
             _winner.cause_of_death = "null_bar"
             await self._bury_hypothesis(_winner, project_id)
@@ -33645,6 +33769,16 @@ class MetacognitiveReasoningEngine:
             # whether the presented account is the right one, and it was
             # visible only here.
             self._f._serial_rival_relations = list(_rel_labels)
+            # Why each survived, beside what it is. "stalled" and "budget"
+            # mean the cycles ran out; anything else means the evidence
+            # weighed it and did not choose. The reader needs the
+            # difference: only the first is worth another pass.
+            try:
+                self._f._serial_rival_causes = [
+                    str(getattr(d, "cause_of_death", "") or "") for d in _rivals[:3]
+                ]
+            except Exception:
+                self._f._serial_rival_causes = []
             if _rel_labels:
                 _note += f"; relation to winner: {', '.join(_rel_labels)}"
             if any(_l == "complementary" for _l in _rel_labels):
@@ -38825,7 +38959,6 @@ class InletOrchestrator:
     # 3. User info extraction (last message, query, commands)
     # ═══════════════════════════════════════════════════════════════════════════
 
-
     @staticmethod
     def flatten_part_lists(messages: list) -> int:
         """Give every message's content one shape. Returns how many changed.
@@ -38856,7 +38989,6 @@ class InletOrchestrator:
             _n += 1
         return _n
 
-
     def mark_previous_answer(self, messages: list) -> None:
         """Add the turn mark to the previous answer if the model omitted it.
 
@@ -38874,9 +39006,7 @@ class InletOrchestrator:
         try:
             _msgs = messages or []
             _users = sum(
-                1
-                for _m in _msgs
-                if isinstance(_m, dict) and _m.get("role") == "user"
+                1 for _m in _msgs if isinstance(_m, dict) and _m.get("role") == "user"
             )
             _prev_turn = _users - 1
             if _prev_turn < 1:
@@ -39005,13 +39135,9 @@ class InletOrchestrator:
         # that flag is what gates the forget handler.
         is_explicit_command = bool(
             last_user_msg
-            and str(last_user_msg.get("content", "") or "").startswith(
-                (_pfx, "/")
-            )
+            and str(last_user_msg.get("content", "") or "").startswith((_pfx, "/"))
         )
-        self._f._log_debug(
-            f"⌨️ Command flag: {is_explicit_command} (prefix {_pfx!r})"
-        )
+        self._f._log_debug(f"⌨️ Command flag: {is_explicit_command} (prefix {_pfx!r})")
 
         # Capture every system message now, joined in order, before any
         # downstream compression/trim step can touch them.
@@ -42092,8 +42218,7 @@ class MessageAssembler:
         # --- 1. Gate: secondary compaction is off by default ---
         if not self._f.valves.enable_secondary_compaction:
             self._f._log_debug(
-                "Secondary compaction disabled "
-                "(enable_secondary_compaction=False)."
+                "Secondary compaction disabled " "(enable_secondary_compaction=False)."
             )
             return messages
 
@@ -42111,16 +42236,11 @@ class MessageAssembler:
             "## Código - Parte",
         )
         _CITATION_RE = re.compile(
-            r"```"
-            r"|`"
-            r"|\b[A-Za-z_]\w*_\w+\b"
-            r"|\b[A-Za-z_]\w*\.[A-Za-z_]\w+\b"
+            r"```" r"|`" r"|\b[A-Za-z_]\w*_\w+\b" r"|\b[A-Za-z_]\w*\.[A-Za-z_]\w+\b"
         )
 
         def _is_primary_compacted(content: str) -> bool:
-            return any(
-                marker in content for marker in _PRIMARY_COMPACTED_MARKERS
-            )
+            return any(marker in content for marker in _PRIMARY_COMPACTED_MARKERS)
 
         def _is_eligible(msg: dict) -> bool:
             role = msg.get("role", "")
@@ -43342,7 +43462,6 @@ class UserProfileManager:
         return out
 
 
-
 def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
     """Render the claim-coverage tally, or nothing when there is none.
 
@@ -43378,22 +43497,26 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
         f"code (hard + structural; the rows below are each bucket's own "
         f"share and round independently, so they need not sum to this)",
         "",
-        _row("hard", hard,
-             "a body was read and a quote from it verified"),
-        _row("read", coverage.get("read", 0),
-             "the body was read and does not settle it"),
-        _row("structural", coverage.get("structural", 0),
-             "a graph check settled it, with the body in view"),
-        _row("blind", coverage.get("blind", 0),
-             "asserted about a symbol whose body nobody read"),
-        _row("uncovered", coverage.get("uncovered", 0),
-             "nothing ran against it"),
+        _row("hard", hard, "a body was read and a quote from it verified"),
+        _row(
+            "read", coverage.get("read", 0), "the body was read and does not settle it"
+        ),
+        _row(
+            "structural",
+            coverage.get("structural", 0),
+            "a graph check settled it, with the body in view",
+        ),
+        _row(
+            "blind",
+            coverage.get("blind", 0),
+            "asserted about a symbol whose body nobody read",
+        ),
+        _row("uncovered", coverage.get("uncovered", 0), "nothing ran against it"),
     ]
     _uo = coverage.get("unoperationalizable", 0)
     if _uo:
         lines.append(
-            _row("no anchor", _uo,
-                 "unverifiable as written; no code could settle it")
+            _row("no anchor", _uo, "unverifiable as written; no code could settle it")
         )
     # The turn's shape, then every claim under the counts that
     # summarise it. Reading what a bucket has in common is the step
@@ -43426,6 +43549,7 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
         lines.append("</details>")
     lines += ["", ""]
     return "\n".join(lines)
+
 
 class ContextDumper:
     """
@@ -43833,9 +43957,7 @@ class ContextDumper:
                     # and it covers every path a turn can take.
                     _cov = getattr(self._f, "_agentic_coverage", None)
                     _af.write(
-                        self._render_agent_records(
-                            _ag_recs, turn, timestamp_str, _cov
-                        )
+                        self._render_agent_records(_ag_recs, turn, timestamp_str, _cov)
                     )
         except Exception as _e_ag:
             self._f._log_debug(f"agent dump skipped ({_e_ag!r})")
@@ -48129,6 +48251,19 @@ class Filter:
             ),
         )
 
+        hypothesis_require_known_symbols: bool = Field(
+            default=True,
+            description=(
+                "Drop a candidate hypothesis before forging when it makes two "
+                "or more explicit function references — name() or "
+                "Class.method — and none of them exists in the index. Such a "
+                "hypothesis cannot be falsified against the index, so it can "
+                "only end `unfounded`, and a run spent twenty-three acts "
+                "reaching that verdict about get_coverage_rate() and "
+                "render_confidence_footer(), neither of which exists. Off "
+                "restores the previous behaviour."
+            ),
+        )
         hypothesis_target_count: str = Field(
             default="4",
             description=(
@@ -49790,7 +49925,6 @@ class Filter:
             description="If True, record and log execution time for each background task run.",
         )
 
-
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Initialization
     # ═══════════════════════════════════════════════════════════════════════════
@@ -49918,6 +50052,9 @@ class Filter:
         # only once something has written it reads the same as one
         # nothing ever writes.
         self._serial_rival_relations: List[str] = []
+        # Why each surviving rival survived — "stalled", "budget", or empty
+        # when the evidence weighed it and did not choose.
+        self._serial_rival_causes: List[str] = []
         self._chroma_semaphore = asyncio.Semaphore(2)
         self._pending_llm: Dict[str, asyncio.Future] = {}
         self._pending_llm_lock = asyncio.Lock()
@@ -50514,15 +50651,14 @@ class Filter:
             if _al:
                 self._log_debug(
                     "\U0001f517 Prefix alignment: "
-                    + ", ".join(
-                        f"{k} x{v}" for k, v in sorted(_al.items())
-                    )
+                    + ", ".join(f"{k} x{v}" for k, v in sorted(_al.items()))
                 )
             self._align_outcomes_this_turn = {}
             # Written by the forge only when a rival survives, read on every
             # turn by the answer's confidence line. Without this, a turn whose
             # competition left no survivor is divided by the previous turn's.
             self._serial_rival_relations = []
+            self._serial_rival_causes = []
             _lf = getattr(self, "_llm_failures_this_turn", None) or {}
             if _lf.get("count"):
                 self._log_debug(
@@ -50572,14 +50708,10 @@ class Filter:
             # — and the second does `(target.get("content", "") or
             # "").rstrip()`, which raises on a list. The guard swallowed it
             # and the turn degraded before the normalisation was reached.
-            _flat_n = self._inlet_orch.flatten_part_lists(
-                body.get("messages") or []
-            )
+            _flat_n = self._inlet_orch.flatten_part_lists(body.get("messages") or [])
             # A backstop for the turn mark: asked of the model in
             # the trailing injection, added here when it did not.
-            self._inlet_orch.mark_previous_answer(
-                body.get("messages") or []
-            )
+            self._inlet_orch.mark_previous_answer(body.get("messages") or [])
             if _flat_n:
                 self._log_debug(
                     f"⌨️ Content shape: {_flat_n} message(s) arrived as part "
@@ -51405,21 +51537,14 @@ class Filter:
             if _last is None or not isinstance(_last.get("content"), str):
                 return
             _text = _last["content"]
-            _new, _n_sub = re.subn(
-                r"\[Confidence:\s*\d+\s*%\]", _line, _text
-            )
-            _last["content"] = (
-                _new if _n_sub else _text.rstrip() + "\n\n" + _line
-            )
+            _new, _n_sub = re.subn(r"\[Confidence:\s*\d+\s*%\]", _line, _text)
+            _last["content"] = _new if _n_sub else _text.rstrip() + "\n\n" + _line
             self._log_debug(
                 f"outlet: confidence footer {'replaced' if _n_sub else 'added'}"
                 f" with the measured tally ({_settled}/{_total})"
             )
         except Exception as _e_conf:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
-
-
-
 
     def _mark_answer_turn(self, body: dict) -> None:
         """Open the answer with the turn number it belongs to.
@@ -51439,9 +51564,7 @@ class Filter:
         try:
             _msgs = body.get("messages") or []
             _turn = sum(
-                1
-                for _m in _msgs
-                if isinstance(_m, dict) and _m.get("role") == "user"
+                1 for _m in _msgs if isinstance(_m, dict) and _m.get("role") == "user"
             )
             if _turn < 1:
                 return
