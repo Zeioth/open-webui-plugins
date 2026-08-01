@@ -368,6 +368,33 @@ _ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
 # served a stored artifact in ten seconds and still published `98% — 7/7
 # claims settled against code`, a shape the ledger never emits, over a turn
 # that opened no body and made no claim.
+# The whole answer when the artifact asked for does not exist. Fixed text,
+# not an instruction: the answer does not vary with the question, and every
+# turn that generated it instead produced sections about what it could not
+# verify, a list of git commands the reader cannot run from a chat, and a
+# confidence figure over a turn that opened no body — roughly two minutes to
+# say `there is no diff`.
+#
+# The fetcher's own note is interpolated verbatim so the reader can see WHERE
+# it was looked for. That note is the only part that carries information, and
+# it is also what makes this debuggable: a canned reply has no generation to
+# inspect afterwards.
+# Distinguishes the two things try_direct_retrieval returns: an instruction
+# to be injected, and a reply to be delivered. Stripped before delivery, so
+# it never reaches the reader.
+_DIRECT_ABSENCE_MARK = "\x00ABSENCE\x00"
+_DIRECT_ABSENCE_REPLY = (
+    "{note}\n\n"
+    "No artifact was composed for this answer. Nothing was reconstructed "
+    "from code that was read: an artifact assembled here would not be the "
+    "one asked for, and presenting it as such is worse than the absence.\n\n"
+    "This reply is fixed text, not a generated one — the pipeline looked, "
+    "found nothing, and said so without spending a model call. If you "
+    "believe the artifact does exist, that is a retrieval fault worth "
+    "reporting: the log line beginning `direct retrieval: the artifact does not exist` names where it looked."
+)
+
+
 _NO_MEASURED_FOOTER_NOTE = (
     "This turn answered without running the evidence pipeline, so nothing "
     "was counted. Write NO `[Confidence: N%]` line. A confidence line is a "
@@ -397,8 +424,8 @@ def _strip_answer_scaffolding(text: str) -> str:
     try:
         if not isinstance(text, str) or not text:
             return text
-        _out = _ANSWER_FOOTER_RE.sub("", text)
-        _out = _ANSWER_MARK_RE.sub("", _out)
+        _out = _ANSWER_FOOTER_RE.sub('', text)
+        _out = _ANSWER_MARK_RE.sub('', _out)
         return _out.strip() or text
     except Exception:
         return text
@@ -4016,6 +4043,7 @@ class ContextPager:
             max_tokens=0,
             temperature=0.0,
             label="paging_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -12644,6 +12672,7 @@ class LLMOrchestrator:
         effective_model: str,
         prompt: str = "",
         response_format: Optional[Any] = None,
+        reasons_about_code: bool = True,
     ) -> str:
         """Prepend the turn's preliminary system prompt to an auxiliary call.
 
@@ -12687,6 +12716,24 @@ class LLMOrchestrator:
         # the prefix and pays all of it. Measured: a 133-token prompt
         # producing 12 tokens took 94 seconds aligned and 0.8 unaligned,
         # the same call earlier in the same turn before _prelim existed.
+        # Declared by the caller, not inferred from size. The size floor
+        # below was written for exactly this case — its own comment says `a
+        # call that does not reason about the codebase gains nothing from
+        # the prefix and pays all of it` — but it measures the call's own
+        # system plus prompt in characters, and a classifier with a long
+        # instruction block clears it while asking nothing about the code.
+        # Traced through the server: classify_turn reported 46 tokens of
+        # prompt and the server processed 75685, at 90.4 seconds, to decide
+        # whether a message was a question.
+        #
+        # Whether a call reasons about the codebase is a property of the
+        # call, known where it is written. Size is a proxy for it and a bad
+        # one, so the callers that know say so and the floor keeps its
+        # original job for everyone else.
+        if not reasons_about_code:
+            self._note_align("caller needs no code prefix")
+            return system_prompt
+
         _floor = 0
         try:
             _floor = int(getattr(self._f.valves, "align_aux_min_prompt_tokens", 0) or 0)
@@ -12831,6 +12878,7 @@ class LLMOrchestrator:
         enable_thinking: bool = True,
         log_raw_response: bool = False,
         return_meta: bool = False,
+        reasons_about_code: bool = True,
     ) -> Optional[Union[str, "LLMResult"]]:
         """
         Call the LLM with in-memory response cache and call deduplication.
@@ -12990,6 +13038,7 @@ class LLMOrchestrator:
             model_override or self._f.valves.llm_model or "",
             prompt=prompt,
             response_format=response_format,
+            reasons_about_code=reasons_about_code,
         )
 
         # Region: anti-repetition. Built before the dedup and cache keys
@@ -14314,16 +14363,6 @@ class AgenticEvidenceLedger:
             return "hard" if _state in ("confirmed", "refuted") else "read"
         return "structural"
 
-    # A claim is negative when it denies its predicate. The vocabulary is
-    # small because the claims are machine-written to a contract: `does
-    # NOT`, `does not`, `never`, `no other`. Anything subtler is left
-    # positive, and the cost of that is two claims not collapsing, which
-    # is what happens today anyway.
-    _NEGATED_RE = re.compile(
-        r"\b(?:does\s+not|do\s+not|doesn't|don't|is\s+not|are\s+not|"
-        r"never|no\s+other|not\s+)\b",
-        re.I,
-    )
     # Strongest first: the survivor of a collapse is the best-evidenced
     # statement of the proposition, not the first one written.
     _BUCKET_RANK = (
@@ -14338,21 +14377,30 @@ class AgenticEvidenceLedger:
     def _proposition_key(self, claim: "LedgerClaim") -> tuple:
         """The assertion a claim makes, stripped of how it was worded.
 
-        Subject, the symbols it cites, and whether it affirms or denies.
-        This is the rule already trusted for structural claims, with
-        polarity added so that an assertion and its denial do not silently
-        merge into one.
+        Subject and the symbols it cites — the rule already trusted for
+        structural claims, unchanged. Wording is deliberately not part of
+        it: four claims in one turn said Filter.inlet initializes
+        _bodies_seen_this_turn, and two differed only in writing the
+        attribute `filt.` where the others wrote `self.`.
 
-        Wording is deliberately not part of the key. Four claims in one
-        turn said Filter.inlet initializes _bodies_seen_this_turn, and two
-        of them differed only in writing the attribute `filt.` where the
-        others wrote `self.` — no text comparison worth trusting separates
-        those from a genuinely different statement, and none needs to.
+        A polarity flag read from the text used to sit here as well, so
+        that an assertion and its denial would not merge. It was removed
+        with the check that consumed it. Detecting denial in prose means a
+        pattern over English, and the pattern fired on a subordinate
+        clause — `a module-level function (not a method on Filter)` — which
+        negates `method`, not the predicate. Four such splits in one turn
+        put ten `supported` claims into opposite polarities of the same
+        proposition and the check demoted eight of them, reporting 3/16
+        where the evidence had settled far more.
+
+        When two claims about the same symbols really do conflict, it will
+        show as one `confirmed` and one `refuted` from the same body —
+        verdicts and qids, both structured. That needs no reading of
+        English and this key does not attempt one.
         """
         return (
             claim.subject or "",
             tuple(sorted(getattr(claim, "valid_qids", None) or [])),
-            bool(self._NEGATED_RE.search(claim.text or "")),
         )
 
     def collapse_restatements(self) -> int:
@@ -14406,44 +14454,10 @@ class AgenticEvidenceLedger:
                     f"already recorded — {len(self.claims)} distinct "
                     f"assertion(s) remain of {_removed + len(self.claims)}"
                 )
-
-            # ── Step 4: the same assertion held both ways ──
-            # Two survivors sharing a subject and cited symbols but not a
-            # polarity cannot both be right, and counting both as settled
-            # publishes an impossibility inside the confidence figure. One
-            # turn settled `_build_activated_code does NOT consult
-            # _bodies_seen_this_turn` against the body and left three
-            # unsettled claims saying it does; the answer asserted the
-            # unsettled side and marked it verified.
-            #
-            # Both are demoted to unsupported rather than one being
-            # picked. The evidence did not separate them, and choosing a
-            # winner here would invent a separation nothing performed.
-            _by_pair: Dict[tuple, Dict[bool, Any]] = {}
-            for _c in self.claims:
-                _s, _q, _neg = self._proposition_key(_c)
-                _by_pair.setdefault((_s, _q), {})[_neg] = _c
-            _contested = 0
-            for (_s, _q), _sides in _by_pair.items():
-                if len(_sides) < 2 or not _s:
-                    continue
-                for _c in _sides.values():
-                    if _c.verification in ("confirmed", "refuted"):
-                        _c.verification = "unsupported"
-                        _c.verification_detail = (
-                            "contested: another claim asserts the opposite "
-                            "of this about the same symbols, and the "
-                            "evidence settled both"
-                        )
-                        _contested += 1
-                if _contested:
-                    self._f._log_debug(
-                        f"🤖 Ledger: '{_s}' is asserted and denied over the "
-                        f"same symbols — both sides demoted from settled, "
-                        f"because the evidence did not separate them"
-                    )
         except Exception as _e:
-            self._f._log_debug(f"🤖 Ledger: restatement collapse skipped ({_e!r})")
+            self._f._log_debug(
+                f"🤖 Ledger: restatement collapse skipped ({_e!r})"
+            )
         return _removed
 
     def refresh_unread(self) -> int:
@@ -14490,7 +14504,9 @@ class AgenticEvidenceLedger:
                     f"{len(_seen)} body/bodies actually read"
                 )
         except Exception as _e:
-            self._f._log_debug(f"🤖 Ledger: unread re-check skipped ({_e!r})")
+            self._f._log_debug(
+                f"🤖 Ledger: unread re-check skipped ({_e!r})"
+            )
         return _changed
 
     def coverage(self) -> Dict[str, Any]:
@@ -15618,9 +15634,10 @@ class AgenticEvidenceVerifier:
                     # exactly what happened. Relational claims keep the
                     # cross-body reading they were given.
                     _cl = claims[n - 1]
-                    if getattr(
-                        _cl, "claim_kind", ""
-                    ) == "behavioural" and not _CALL_TARGET_RE.search(_cl.text):
+                    if (
+                        getattr(_cl, "claim_kind", "") == "behavioural"
+                        and not _CALL_TARGET_RE.search(_cl.text)
+                    ):
                         _own_only += 1
                         out[n] = (
                             "indeterminate",
@@ -18713,16 +18730,28 @@ class AgenticPlanner:
         # how a fabricated artifact came to be published alongside the
         # statement that no artifact existed.
         if _art.lstrip().startswith("[No "):
-            return (
-                "## Retrieved for this turn\n\n"
-                "The user asked for an artifact and the pipeline looked "
-                "for it. It does not exist. Say so in one sentence, in "
-                "the words below, and stop.\n\n"
-                "Write NO fenced block and NO diff. Do not reconstruct, "
-                "infer or compose the artifact from code you have read: "
-                "an artifact you assemble yourself is not the one that "
-                "was asked for, and presenting it as such is worse than "
-                "the absence.\n\n" + _NO_MEASURED_FOOTER_NOTE + "\n\n" + _art
+            # Nothing to present, so nothing to compose. The instruction
+            # below asked the model to say one sentence and stop, and it
+            # obeyed the shape while spending a full generation on it:
+            # four hedged sections, a `How to proceed` list of git
+            # commands nobody can run from here, and a fabricated
+            # confidence footer over a turn that opened no body. A
+            # non-existent artifact has exactly one correct answer and it
+            # does not vary, so it is written here rather than asked for.
+            #
+            # `_art` carries the fetcher's own note — which row it looked
+            # in, what it found — and that note is the whole payload. It
+            # is logged as delivered because a canned answer is the
+            # hardest kind to debug: when the reader disputes it there is
+            # no generation to inspect, so the exact text and the reason
+            # this branch was taken have to be in the log instead.
+            self._f._log_debug(
+                f"direct retrieval: the artifact does not exist — "
+                f"answering from a fixed reply, no generation. "
+                f"fetcher said: {' '.join(_art.split())[:200]}"
+            )
+            return _DIRECT_ABSENCE_MARK + _DIRECT_ABSENCE_REPLY.format(
+                note=_art.strip()
             )
         return (
             "## Retrieved for this turn\n\n"
@@ -20994,7 +21023,9 @@ class AgenticSynthesisComposer:
         # uncertainty the reader still carries, the other is uncertainty
         # this turn removed, and a reader who cannot tell them apart
         # proposes back the account the evidence already killed.
-        _dead = [_d for _d in (eliminated_accounts or []) if _d.get("hypothesis")]
+        _dead = [
+            _d for _d in (eliminated_accounts or []) if _d.get("hypothesis")
+        ]
         if _dead:
             out += [
                 "",
@@ -23033,7 +23064,9 @@ class AgenticOrchestrator:
             if (
                 step.kind == "investigate"
                 and step.symbols
-                and getattr(self._f.valves, "agentic_skip_settled_focus", True)
+                and getattr(
+                    self._f.valves, "agentic_skip_settled_focus", True
+                )
             ):
                 try:
                     _settled = {
@@ -23044,7 +23077,9 @@ class AgenticOrchestrator:
                     }
                     _left = [_s for _s in step.symbols if _s not in _settled]
                     if _settled and len(_left) != len(step.symbols):
-                        _dropped = [_s for _s in step.symbols if _s in _settled]
+                        _dropped = [
+                            _s for _s in step.symbols if _s in _settled
+                        ]
                         self._f._log_debug(
                             f"🤖 Agentic: step {step.id} focus narrowed — "
                             f"{len(_dropped)} symbol(s) already carry a "
@@ -23060,7 +23095,9 @@ class AgenticOrchestrator:
                             )
                         step.symbols = _left
                 except Exception as _e_narrow:
-                    self._f._log_debug(f"focus narrowing skipped ({_e_narrow!r})")
+                    self._f._log_debug(
+                        f"focus narrowing skipped ({_e_narrow!r})"
+                    )
 
             # -- dynamic verification: extract + stub + execute ------------
             # Never step-cached (harness/result caching lives inside the
@@ -23613,7 +23650,9 @@ class AgenticOrchestrator:
                 # as a suggestion rather than as a budget that ran out. The
                 # difference decides whether asking again is worth it.
                 try:
-                    _prev = getattr(self._f, "_serial_dropped_gaps", None) or []
+                    _prev = (
+                        getattr(self._f, "_serial_dropped_gaps", None) or []
+                    )
                     self._f._serial_dropped_gaps = (_prev + _lost_gaps)[:5]
                 except Exception:
                     pass
@@ -23954,13 +23993,16 @@ class AgenticOrchestrator:
                     _s = _c.subject or ""
                     if not _s or _s in _seen or _s in _orphans:
                         continue
-                    if _s.rsplit(".", 1)[-1] in {_q.rsplit(".", 1)[-1] for _q in _seen}:
+                    if _s.rsplit(".", 1)[-1] in {
+                        _q.rsplit(".", 1)[-1] for _q in _seen
+                    }:
                         continue
                     _orphans.append(_s)
                 if _orphans:
                     self._f._log_debug(
                         f"🤖 Agentic: last-mile — {len(_orphans)} claim "
-                        f"subject(s) were never opened: " + ", ".join(_orphans[:5])
+                        f"subject(s) were never opened: "
+                        + ", ".join(_orphans[:5])
                     )
                     _lm = AgenticStep(
                         id=max((s.id for s in plan.steps), default=0) + 1,
@@ -23994,9 +24036,7 @@ class AgenticOrchestrator:
                         _s
                         for _s in _orphans
                         if _s
-                        not in (
-                            getattr(self._f, "_bodies_seen_this_turn", None) or set()
-                        )
+                        not in (getattr(self._f, "_bodies_seen_this_turn", None) or set())
                     ]
                     self._f._log_debug(
                         f"🤖 Agentic: last-mile done — "
@@ -24990,6 +25030,7 @@ class CommandRouter:
             max_tokens=0,
             temperature=0.0,
             label="contradiction_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -25317,6 +25358,7 @@ class CommandRouter:
                 max_tokens=200,
                 temperature=0.0,
                 label="classify_turn",
+                reasons_about_code=False,
                 response_format={"type": "json_object"},
                 enable_thinking=False,
             )
@@ -27684,7 +27726,8 @@ class CodeBlockManager:
                 if _rblocks:
                     _probe = _rblocks[0]
                     if not (
-                        hasattr(_probe, "start_byte") and hasattr(_probe, "end_byte")
+                        hasattr(_probe, "start_byte")
+                        and hasattr(_probe, "end_byte")
                     ):
                         self._f._log_debug(
                             f"extract_code_blocks: process() returned "
@@ -27692,9 +27735,11 @@ class CodeBlockManager:
                             f"byte offsets — falling through to regex. A "
                             f"chunk carries: {type(_probe).__name__}("
                             + ", ".join(
-                                sorted(a for a in dir(_probe) if not a.startswith("_"))[
-                                    :16
-                                ]
+                                sorted(
+                                    a
+                                    for a in dir(_probe)
+                                    if not a.startswith("_")
+                                )[:16]
                             )
                             + ")"
                         )
@@ -27726,9 +27771,11 @@ class CodeBlockManager:
                             else type(result).__name__
                             + "("
                             + ", ".join(
-                                sorted(a for a in dir(result) if not a.startswith("_"))[
-                                    :12
-                                ]
+                                sorted(
+                                    a
+                                    for a in dir(result)
+                                    if not a.startswith("_")
+                                )[:12]
                             )
                             + ")"
                         )
@@ -33954,23 +34001,8 @@ class MetacognitiveReasoningEngine:
     # as Class.attribute to a regex. Left in, a filename can be the one
     # token that clears a bar the hypothesis should have failed.
     _HYP_FILE_TAILS = frozenset(
-        {
-            "md",
-            "py",
-            "json",
-            "txt",
-            "yaml",
-            "yml",
-            "ini",
-            "log",
-            "csv",
-            "html",
-            "cfg",
-            "toml",
-            "sh",
-            "js",
-            "ts",
-        }
+        {"md", "py", "json", "txt", "yaml", "yml", "ini", "log", "csv",
+         "html", "cfg", "toml", "sh", "js", "ts"}
     )
 
     @classmethod
@@ -34053,7 +34085,8 @@ class MetacognitiveReasoningEngine:
 
             # ── Step 3: one match anywhere is enough to clear the bar ──
             return not any(
-                _h in _opened or _h.rsplit(".", 1)[-1] in _opened_bare for _h in _syms
+                _h in _opened or _h.rsplit(".", 1)[-1] in _opened_bare
+                for _h in _syms
             )
         except Exception:
             return False
@@ -34347,7 +34380,11 @@ class MetacognitiveReasoningEngine:
                         + "Guidance: the previous attempt was discarded "
                         "because it was built on names that do not exist "
                         "in this project"
-                        + (" (" + ", ".join(_ghosts) + ")" if _ghosts else "")
+                        + (
+                            " (" + ", ".join(_ghosts) + ")"
+                            if _ghosts
+                            else ""
+                        )
                         + ". Build the mechanism only out of symbols you "
                         "have actually been shown."
                     )
@@ -34763,7 +34800,9 @@ class MetacognitiveReasoningEngine:
             # chosen account at 0.85 and one at 0.28 read exactly alike,
             # and the rivals' numbers below have nothing to be compared to.
             try:
-                self._f._serial_winner_corroboration = round(_winner.corroboration, 2)
+                self._f._serial_winner_corroboration = round(
+                    _winner.corroboration, 2
+                )
             except Exception:
                 self._f._serial_winner_corroboration = None
             try:
@@ -36757,6 +36796,7 @@ class EnrichmentTasks:
         new_content: str,
         project_id: str = "",
         file_path: str = "",
+        has_symbols: bool = True,
     ) -> None:
         """
         Generate and persist a one-sentence change summary immediately.
@@ -36777,6 +36817,8 @@ class EnrichmentTasks:
             new_content: Block content after the change.
             project_id: Current project identifier ('' skips diff persistence).
             file_path: File path of the block, used as diff header.
+            has_symbols: Whether the block carries any extracted symbol.
+                False skips the summary call — see the guard below.
         """
         # ── Step 0: Persist the raw unified diff for NapMem ────────────────
         # Runs before the LLM call so the diff survives silent ingestion
@@ -36848,6 +36890,28 @@ class EnrichmentTasks:
             except Exception as e:
                 self._f._log_debug(f"NapMem diff persist failed: {e}")
 
+        # A block with no symbol on either side is not a code change, and a
+        # code-change summary of it is a sentence about nothing. One turn
+        # treated the previous assistant answer as a block — `0 syms, 5142
+        # chars` — and spent 91.8 seconds producing seventeen tokens: `No
+        # functional changes; only markdown formatting updated`. Every
+        # aligned auxiliary call on this stack re-prefills the whole static
+        # prefix, so a call that adds nothing costs the same as one that
+        # settles the turn.
+        #
+        # Placed after Step 0 on purpose: the raw diff is already stored and
+        # costs nothing, so the record survives and only the sentence is
+        # skipped. The signal is the extractor's symbol list, not a guess at
+        # the text: prose and code are told apart by whether anything
+        # parsed, which is the one question already answered upstream.
+        if not has_symbols:
+            self._f._log_debug(
+                f"change_summary skipped for {block_hash[:8]} — the block "
+                f"carries no symbol on either side, so there is no code "
+                f"change to summarise (the raw diff was stored)"
+            )
+            return
+
         model = self._f.valves.llm_model
         prompt = (
             f"Summarise the code change in ONE short sentence (max 15 words).\n\n"
@@ -36875,6 +36939,7 @@ class EnrichmentTasks:
                 max_tokens=160,
                 temperature=0.1,
                 label="change_summary",
+                reasons_about_code=False,
                 enable_thinking=False,
             )
             if summary:
@@ -36927,6 +36992,29 @@ class EnrichmentTasks:
         project_id = params["project_id"]
         code_state_hash = params.get("code_state_hash", "")
 
+        # Two routes reach this task and neither knew about the other. The
+        # lazy one runs inside the inlet when the message count hits the
+        # interval; the background one runs from the outlet on the same
+        # condition. Both fired on the same turn — 607 and 603 tokens of
+        # essentially the same prompt, nine minutes apart, two summaries of
+        # one conversation stored in LTM for 180 seconds of model time. The
+        # lazy one is the one that hurts: its 91 seconds sit inside the
+        # turn with the reader waiting.
+        #
+        # Guarded here rather than in either caller, because that is the
+        # single point both pass through and a guard in one route cannot
+        # see the other. The key is the message count the summary covers,
+        # which is what the interval gate already keys on: the same count
+        # summarised twice is the same summary.
+        _mc = int(params.get("message_count", 0) or 0)
+        _pstate = self._f._project_state_manager.get_pstate(project_id)
+        if _mc and _pstate.get("session_summary_done_at") == _mc:
+            self._f._log_debug(
+                f"session_summary skipped — message count {_mc} was "
+                f"already summarised this turn by the other route"
+            )
+            return False
+
         recent = await self._f._ltm.retrieve_historical_messages(
             query="recent conversation summary",
             project_id=project_id,
@@ -36954,6 +37042,7 @@ class EnrichmentTasks:
             max_tokens=self._f.valves.session_summary_max_tokens,
             temperature=0.2,
             label="session_summary",
+            reasons_about_code=False,
             enable_thinking=False,
         )
         if not summary:
@@ -36985,6 +37074,11 @@ class EnrichmentTasks:
             )
         )
         self._f._log_debug(f"Session summary stored in LTM (msg_id={msg_id})")
+        # Marked only after the summary is actually stored: a run that
+        # failed before this point should be retried by the other route,
+        # not silenced by it.
+        if _mc:
+            _pstate["session_summary_done_at"] = _mc
         return True
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -39216,6 +39310,7 @@ class ActiveCodeUpdater:
                     new_block.content,
                     project_id=project_id,
                     file_path=existing.file_path or "",
+                    has_symbols=bool(syms),
                 )
             return
 
@@ -39259,6 +39354,7 @@ class ActiveCodeUpdater:
                     new_block.content,
                     project_id=project_id,
                     file_path=existing.file_path or "",
+                    has_symbols=bool(syms),
                 )
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -39630,6 +39726,7 @@ class ActiveCodeUpdater:
                         block_info["code"],
                         project_id=project_id,
                         file_path=best_base.file_path or "",
+                        has_symbols=bool(best_base.symbols),
                     )
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -43050,6 +43147,35 @@ class MessageAssembler:
                 _direct = ""
                 self._f._log_debug(f"direct retrieval skipped ({_e_dr!r})")
             if _direct:
+                # An absence is delivered, not requested. Everything else
+                # is still a trailing injection: a fetched artifact needs
+                # a sentence of framing and only the model can write it,
+                # while `there is no diff` is the same answer every time
+                # and asking for it costs a full generation.
+                #
+                # Delivery goes through the command echo path, which is
+                # the only route text takes to the screen from an inlet:
+                # this filter cannot return a reply, so the last user
+                # message becomes an instruction to print it. The call
+                # still happens and is meant to — what it no longer does
+                # is decide what to say.
+                if _direct.startswith(_DIRECT_ABSENCE_MARK):
+                    self._f._log_debug(
+                        "direct retrieval: delivering the fixed absence "
+                        "reply verbatim — the model is asked to echo it, "
+                        "not to compose an answer"
+                    )
+                    # Sliced in place, not just called. The deliverer
+                    # rewrites the last user message AND returns the list
+                    # cut at that point, and every other caller returns
+                    # that value. Dropping it here would leave anything
+                    # sitting after the last user message in the request,
+                    # which is the exact shape the deliverer exists to
+                    # avoid.
+                    messages[:] = self._f._commands._deliver_command_response(
+                        messages, _direct[len(_DIRECT_ABSENCE_MARK):]
+                    )
+                    return
                 dynamic_injections.append(("trailing", _direct))
                 return
 
@@ -43891,6 +44017,9 @@ class MessageAssembler:
             self._f._log_debug(
                 f"  TOTAL system tokens:          ~{total_system_tok} tokens"
             )
+            # Read by the outlet when it reports the handover: the answer
+            # call carries this prompt and nothing in either log says so.
+            self._f._last_system_prompt_tokens = total_system_tok
             self._f._log_debug(f"  Prefix hash (Block A):        {prefix_hash}")
             self._f._log_debug(
                 "  → If hash matches previous:   KV cache HIT in llama.cpp"
@@ -44385,6 +44514,35 @@ class UserProfileManager:
         ]
         if len(msgs) < 2:
             return []
+        # Nothing left to learn is a reason not to ask. This call can only
+        # produce the fields in _INFERENCE_FIELDS, and `decay` has just run
+        # in the caller, so an authoritative entry present here is one that
+        # is both known and still current. When every inferable field is in
+        # that state the call cannot change the profile — one turn spent
+        # 84.9 seconds returning `{"language": "Spanish", 0.95}` for the
+        # fifth time, on a turn that answered from a SQLite row, and the
+        # profile logged `provisional now {...}` without promoting anything.
+        #
+        # Auxiliary calls on this stack re-prefill the whole static prefix
+        # regardless of how small their own prompt is, so this one costs the
+        # same as the step that settles the turn.
+        try:
+            _auth = self.get_authoritative(project_id) or {}
+            _missing = [
+                _n for _n in self._INFERENCE_FIELDS if _n not in _auth
+            ]
+            if not _missing:
+                self._f._log_debug(
+                    f"👤 User-profile inference skipped — all "
+                    f"{len(self._INFERENCE_FIELDS)} inferable field(s) are "
+                    f"already authoritative and survived decay; there is "
+                    f"nothing this call could add"
+                )
+                return []
+        except Exception as _e_prof:
+            self._f._log_debug(
+                f"user-profile completeness check skipped ({_e_prof!r})"
+            )
         numbered = "\n".join(f"- {m[:400]}" for m in msgs)
         field_lines = "\n".join(
             f"- {name}: {desc}" for name, desc in self._INFERENCE_FIELDS.items()
@@ -44419,6 +44577,7 @@ class UserProfileManager:
                 max_tokens=160,
                 temperature=0.2,
                 label="user_profile_infer",
+                reasons_about_code=False,
                 enable_thinking=False,
             )
         except Exception as e:
@@ -49133,7 +49292,8 @@ class Filter:
                 "tokens, produced 12, and took 94 seconds, of which about "
                 "93 were prefix. 628s of that run — 47% of all call time "
                 "— went to calls under 2000 tokens. Set to 0 to align "
-                "everything, which is the behaviour before this valve."
+                "everything, which is the behaviour before this valve.\n\n"
+                "What this valve trades is measurable and the trade is not the obvious one. Over one run, 44 prompts above 50k tokens reached the server and 27 of them reused the cached prefix outright — `cached n_tokens = 75024` and similar — while 17 re-processed from zero. Reuse is therefore normal, not exceptional, and it happens between consecutive calls that share this prefix.\n\n"                "The 17 that re-processed fall in two groups. Four came directly after a small unaligned prompt (158, 218, 260 tokens) which had replaced the slot contents, so the prefix was simply no longer there: the same contradiction_llm call cost 2.1s when it followed an aligned call and 86.7s when it followed a short one. Those four are the ones this valve causes. The other thirteen followed another large prompt and re-processed anyway, because the point where two aligned prompts diverge sits at the end of the preliminary prefix, right in the middle of where llama.cpp places its checkpoints (341 of them, p25 73155, p75 75629) — so whether a checkpoint lands before the divergence is close to a coin flip and nothing here controls it.\n\n"                "So lowering this recovers up to four re-processings per run by keeping the slot warm, at the cost of sending 74000 tokens for a 46-token call each time reuse misses. Neither direction is free and the run above is a single sample; measure before changing it."
             ),
         )
         align_aux_calls_to_prefix: bool = Field(
@@ -52303,6 +52463,19 @@ class Filter:
                             )
 
                     body["messages"] = messages
+                    # Sealed for the outlet. The call that writes the
+                    # answer is issued by the host, not by this file, so it
+                    # never appears in call_llm's log — and it is the one
+                    # the reader is waiting on. Four turns of one run each
+                    # showed a 106 to 121 second gap here that matched, in
+                    # time and in size, a full 74000-token re-processing on
+                    # the server, and neither log named it. Recording the
+                    # handover makes the largest single cost of a turn
+                    # visible without instrumenting the host.
+                    self._inlet_handoff_ts = time.monotonic()
+                    self._inlet_handoff_tokens = int(
+                        getattr(self, "_last_system_prompt_tokens", 0) or 0
+                    )
                     _inlet_timing("total_inlet (end-to-end)", inlet_start)
                     self._log_section(
                         "CONTEXT MANAGER - INLET END",
@@ -52669,6 +52842,41 @@ class Filter:
         except Exception as _e_conf:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
         self._audit_opening_against_ledger(body)
+        self._report_answer_handoff()
+
+    def _report_answer_handoff(self) -> None:
+        """Report the one call this file never sees: the answer itself.
+
+        Every auxiliary call is timed by call_llm and lands in the log with
+        its label. The call that actually writes the reply is issued by the
+        host with the system prompt assembled here, so it appears in neither
+        log — and it is the largest single cost of a turn and the one the
+        reader is waiting through.
+
+        Four turns of one run showed 106, 121, 111 and 110 seconds between
+        the inlet finishing and the outlet arriving, each matching a full
+        74000-token re-processing on the server that nothing in the plugin
+        log accounted for. That was found by aligning two logs by hand; this
+        makes it a line.
+
+        Measured from the inlet handover, so it includes queueing on the
+        single slot as well as prefill and generation — which is the number
+        that matters, because that is what the reader waits.
+        """
+        try:
+            _t0 = getattr(self, "_inlet_handoff_ts", None)
+            if not _t0:
+                return
+            _elapsed = time.monotonic() - _t0
+            self._inlet_handoff_ts = None
+            _tok = int(getattr(self, "_inlet_handoff_tokens", 0) or 0)
+            self._log_debug(
+                f"⏱️ Answer call: {_elapsed:.1f}s from inlet handover to "
+                f"outlet, carrying ~{_tok} system tokens. Issued by the host, "
+                f"so it is not in the call_llm tally above."
+            )
+        except Exception as _e_ho:
+            self._log_debug(f"answer-handoff report skipped ({_e_ho!r})")
 
     def _audit_opening_against_ledger(self, body: dict) -> None:
         """Report when the answer's opening rests on something unsettled.
