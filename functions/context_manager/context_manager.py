@@ -397,8 +397,8 @@ def _strip_answer_scaffolding(text: str) -> str:
     try:
         if not isinstance(text, str) or not text:
             return text
-        _out = _ANSWER_FOOTER_RE.sub('', text)
-        _out = _ANSWER_MARK_RE.sub('', _out)
+        _out = _ANSWER_FOOTER_RE.sub("", text)
+        _out = _ANSWER_MARK_RE.sub("", _out)
         return _out.strip() or text
     except Exception:
         return text
@@ -14443,9 +14443,7 @@ class AgenticEvidenceLedger:
                         f"because the evidence did not separate them"
                     )
         except Exception as _e:
-            self._f._log_debug(
-                f"🤖 Ledger: restatement collapse skipped ({_e!r})"
-            )
+            self._f._log_debug(f"🤖 Ledger: restatement collapse skipped ({_e!r})")
         return _removed
 
     def refresh_unread(self) -> int:
@@ -14492,9 +14490,7 @@ class AgenticEvidenceLedger:
                     f"{len(_seen)} body/bodies actually read"
                 )
         except Exception as _e:
-            self._f._log_debug(
-                f"🤖 Ledger: unread re-check skipped ({_e!r})"
-            )
+            self._f._log_debug(f"🤖 Ledger: unread re-check skipped ({_e!r})")
         return _changed
 
     def coverage(self) -> Dict[str, Any]:
@@ -15622,10 +15618,9 @@ class AgenticEvidenceVerifier:
                     # exactly what happened. Relational claims keep the
                     # cross-body reading they were given.
                     _cl = claims[n - 1]
-                    if (
-                        getattr(_cl, "claim_kind", "") == "behavioural"
-                        and not _CALL_TARGET_RE.search(_cl.text)
-                    ):
+                    if getattr(
+                        _cl, "claim_kind", ""
+                    ) == "behavioural" and not _CALL_TARGET_RE.search(_cl.text):
                         _own_only += 1
                         out[n] = (
                             "indeterminate",
@@ -15873,6 +15868,7 @@ class AgenticStaticVerifier:
         aligned_prefix: str,
         truncated_steps: Optional[List[AgenticStep]] = None,
         only_unchecked: bool = False,
+        only_subjects: Optional[List[str]] = None,
     ) -> None:
         """
         Execute a verify step in place: elicit checks, run them, stamp
@@ -15894,6 +15890,11 @@ class AgenticStaticVerifier:
             truncated_steps: Steps whose generation hit the token cap. Used
                 only to explain an empty ledger: their claims were cut off,
                 not withheld, so the verdict is "degraded", not "done".
+            only_unchecked: Restrict to claims carrying no verdict yet.
+            only_subjects: Restrict to claims about these subjects. Used by
+                the last-mile pass, whose whole purpose is to read the
+                bodies nobody opened and judge against those — scoping it
+                keeps it additive rather than revisionary.
         """
         started = time.monotonic()
         # A closing sweep asks only for what has no verdict yet. Re-eliciting
@@ -15901,6 +15902,14 @@ class AgenticStaticVerifier:
         # and, worse, let a second reading overturn a verdict the graph
         # already gave — the point of the sweep is coverage, not revision.
         claims = [c for c in ledger.claims if not (only_unchecked and c.verification)]
+        if only_subjects:
+            # The last-mile pass is scoped to the claims whose own subject
+            # was never opened. Re-eliciting the rest would spend the call
+            # re-deciding settled claims, and a second reading is allowed
+            # to overturn a verdict — which is the opposite of the point
+            # here: this pass adds evidence, it does not revise it.
+            _want = set(only_subjects)
+            claims = [c for c in claims if (c.subject or "") in _want]
         if not claims:
             # An empty ledger has two very different causes and they must not
             # read alike. If earlier steps were truncated, their claims were
@@ -18713,10 +18722,7 @@ class AgenticPlanner:
                 "infer or compose the artifact from code you have read: "
                 "an artifact you assemble yourself is not the one that "
                 "was asked for, and presenting it as such is worse than "
-                "the absence.\n\n"
-                + _NO_MEASURED_FOOTER_NOTE
-                + "\n\n"
-                + _art
+                "the absence.\n\n" + _NO_MEASURED_FOOTER_NOTE + "\n\n" + _art
             )
         return (
             "## Retrieved for this turn\n\n"
@@ -19672,7 +19678,7 @@ class AgenticStepExecutor:
         'same JSON: "resolved": true plus "confidence": 0.0-1.0 when your '
         "findings ALONE fully answer the overall question; "
         '"needs": ["<missing symbol or sub-question>"] when a specific gap '
-        "blocks you; "
+        "blocks you. A need is a note handed to the step after you, not a request answered during this call: nothing will arrive, so write it once and end. One step wrote its needs, said it would fetch them, received nothing because no call can, and re-emitted the same claims and the same needs six times over 206 seconds until the token ceiling stopped it. Naming a gap and stopping IS the complete answer when the gap is what blocks you; "
         '"ask": "<one concrete question>" when a genuine ambiguity in the '
         "user's request blocks correct work and guessing would risk a wrong "
         "answer (leave empty when you can reasonably proceed)."
@@ -19925,10 +19931,25 @@ class AgenticStepExecutor:
         _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
         served, skipped, used, already = [], [], 0, []
         partial: List[str] = []
-        for sym in names[:_MAX_TOOLS_PER_ROUND]:
-            if sym in _seen:
-                already.append(sym)
-                continue
+        # The round's slots are for bodies that will be served. A symbol
+        # already in view consumes nothing to show, so letting it take a
+        # slot spends the round on work that does not happen: one step
+        # arrived with seven focus symbols, three of its four slots went to
+        # bodies Block B had already rendered, exactly one body reached it,
+        # and the three it actually needed sat at positions five to seven,
+        # beyond the cut. It then spent 206 seconds restating its one claim
+        # six times against the token ceiling, because asking was the only
+        # move left to it.
+        #
+        # Partitioned before the cut rather than raising it. The cap is not
+        # what was strangling the step — in that same turn four served
+        # bodies came to 7441 characters and one came to 16252, so counting
+        # symbols never governed the size anyway. What was strangling it
+        # was spending slots on nothing.
+        _already_all = [_s for _s in names if _s in _seen]
+        _fetchable = [_s for _s in names if _s not in _seen]
+        already.extend(_already_all)
+        for sym in _fetchable[:_MAX_TOOLS_PER_ROUND]:
             body = broker.resolve("EXPAND", sym, project_id)
             if used + len(body) > budget and served:
                 # Cut, not dropped. A run lost `Filter.inlet` here — 44428
@@ -19957,7 +19978,7 @@ class AgenticStepExecutor:
                 continue
             served.append(body)
             used += len(body)
-        skipped.extend(names[_MAX_TOOLS_PER_ROUND:])
+        skipped.extend(_fetchable[_MAX_TOOLS_PER_ROUND:])
         if already:
             self._f._log_debug(
                 f"\U0001f916 Agentic: step {step.id} focus — {len(already)} "
@@ -20757,6 +20778,19 @@ class AgenticSynthesisComposer:
             _vc.get("unchecked", 0),
             _vc.get("unsupported", 0),
             getattr(self._f, "_serial_rival_accounts", None),
+            getattr(self._f, "_serial_dropped_gaps", None),
+            getattr(self._f, "_serial_unreadable_subjects", None),
+            getattr(self._f, "_serial_winner_corroboration", None),
+            getattr(self._f, "_serial_eliminated_accounts", None),
+            (
+                [
+                    " ".join((_c.text or "").split())[:180]
+                    for _c in ledger.claims
+                    if ledger.bucket_of(_c) not in ("hard", "structural")
+                ][:6]
+                if ledger is not None
+                else None
+            ),
         )
         return "\n".join(lines).rstrip()
 
@@ -20773,6 +20807,11 @@ class AgenticSynthesisComposer:
         n_unchecked: int = 0,
         n_unsupported: int = 0,
         rival_accounts: Optional[List[dict]] = None,
+        dropped_gaps: Optional[List[str]] = None,
+        unreadable_subjects: Optional[List[str]] = None,
+        winner_corroboration: Optional[float] = None,
+        eliminated_accounts: Optional[List[dict]] = None,
+        unsettled_claims: Optional[List[str]] = None,
     ) -> List[str]:
         """
         Instruct the final model on the SHAPE of its answer.
@@ -20802,6 +20841,8 @@ class AgenticSynthesisComposer:
             "evidence supports no single mechanism, say that instead "
             "of promoting the least bad candidate.",
             "",
+            "This paragraph is the one the reader keeps, so it is held to "
+            "what this turn established and nothing else.\n",
             "This paragraph may not assert what you are about to list "
             "below as unverified or NOT CHECKED. If the mechanism rests "
             "on a body you did not read, name it AND say what it rests "
@@ -20837,6 +20878,8 @@ class AgenticSynthesisComposer:
             or _scope_gap
             or n_unchecked > 0
             or n_unsupported > 0
+            or dropped_gaps
+            or unreadable_subjects
         ):
             out += [
                 "",
@@ -20867,6 +20910,35 @@ class AgenticSynthesisComposer:
                     "unchecked claim may well be true; what is certain is "
                     "that nothing here establishes it.",
                 ]
+            if dropped_gaps:
+                # Named as a decision, not as a suggestion. The reader who
+                # knows the pipeline stopped for budget asks again; the
+                # reader who reads it as advice does the work by hand.
+                out += [
+                    "",
+                    "This investigation identified what it still needed "
+                    "and ran out of room to fetch it: "
+                    + "; ".join(dropped_gaps)
+                    + ". Say so in that section, as a limit this run hit "
+                    "rather than as something the reader ought to look "
+                    "into — it is the difference between a gap that "
+                    "another pass would close and one that needs them.",
+                ]
+            if unreadable_subjects:
+                # These are not budget. The index could not produce a body
+                # for them at all, so no further pass helps and telling the
+                # reader to go and read them is telling them to look for
+                # something that is not there.
+                out += [
+                    "",
+                    "These symbols are asserted about and the index holds "
+                    "no body for them: "
+                    + ", ".join(unreadable_subjects)
+                    + ". Anything resting on them rests on their name "
+                    "alone. Do not tell the reader to read them — there "
+                    "is nothing to read; say the symbol could not be "
+                    "found, which is a different and more useful fact.",
+                ]
             if _scope_gap:
                 out += [
                     "",
@@ -20878,16 +20950,92 @@ class AgenticSynthesisComposer:
                     "conclusion's evidence stops where the "
                     "investigation stopped.",
                 ]
+        # ── Step 2.5: the sentences this turn did NOT establish ──
+        # Handed as a list rather than as a rule. The rule was already
+        # there — `may not assert what you are about to list below as
+        # unverified` — and an answer opened by stating a set is cleared
+        # at end of turn, then admitted four paragraphs later that nobody
+        # had read the function that would clear it. Asking the model to
+        # find the relevant verdicts, filter them and apply them is a join
+        # performed while generating, at the point in the answer where it
+        # has done least work and is under most pressure to sound
+        # definite.
+        #
+        # The measured-confidence line settled this question once already:
+        # the same model ignored `do not write an estimate of your own`
+        # for runs and then copied a supplied line character for character
+        # the turn it was given one. Copying beats applying, so the
+        # propositions are computed here and printed.
+        _unsettled = [_u for _u in (unsettled_claims or []) if _u]
+        if _unsettled:
+            out += [
+                "",
+                "These statements were put to the test this turn and did "
+                "NOT come back settled. Your opening paragraph may not "
+                "assert any of them, and may not assert their opposite "
+                "either — nothing here establishes the negative:",
+            ]
+            for _u in _unsettled[:6]:
+                out.append(f"  – {_u}")
+            out += [
+                "",
+                "If your mechanism rests on one of them, say so in that "
+                "paragraph, in the same breath as the mechanism, not four "
+                "paragraphs later. A reader who stops after the opening — "
+                "which is what putting it first invites — must not be left "
+                "holding a sentence this investigation failed to "
+                "establish.",
+            ]
+
         # ── Step 3: accounts the evidence did not eliminate ──
         # Only when one survived. A heading over an empty list teaches
         # the model to invent a rival, which is the opposite of the point.
+        # Ruled out, and said so. Separate from the survivors above: one is
+        # uncertainty the reader still carries, the other is uncertainty
+        # this turn removed, and a reader who cannot tell them apart
+        # proposes back the account the evidence already killed.
+        _dead = [_d for _d in (eliminated_accounts or []) if _d.get("hypothesis")]
+        if _dead:
+            out += [
+                "",
+                "**Accounts ruled out** — this turn built these "
+                "explanations and the index eliminated them. State each in "
+                "a sentence and say what killed it. This is a result, not "
+                "an apology: an explanation removed is work the reader "
+                "does not have to repeat, and the most useful thing you "
+                "can tell someone about to guess is which guesses are "
+                "already gone.",
+            ]
+            for _d in _dead[:3]:
+                # `falsified` means the evidence discriminated; anything
+                # else means we never got a grip on it. The reader needs
+                # that difference: only the first is really settled.
+                _c = str(_d.get("cause") or "")
+                _how = (
+                    "the index contradicted it"
+                    if _c == "falsified"
+                    else "no evidence could be brought to bear on it"
+                )
+                out += [
+                    "",
+                    f"- Ruled out: {_d.get('hypothesis', '')} — {_how}.",
+                ]
         _rivals = [_r for _r in (rival_accounts or []) if _r.get("hypothesis")]
         if _rivals:
             out += [
                 "",
                 "**Other plausible accounts** — the competition did not "
                 "eliminate these, and the confidence figure is divided by "
-                "them. State each one in a sentence, in your own words, "
+                "them."
+                + (
+                    f" Your chosen account carries corroboration "
+                    f"{winner_corroboration}; give the reader that number "
+                    f"beside the ones below, because a rival is only "
+                    f"close or distant relative to it."
+                    if winner_corroboration is not None
+                    else ""
+                )
+                + " State each one in a sentence, in your own words, "
                 "and say what would tell it apart from the account you "
                 "chose. Do not argue them down: they survived because the "
                 "evidence did not separate them, and presenting a "
@@ -20939,6 +21087,19 @@ class AgenticSynthesisComposer:
             "the one that settles the most uncertainty comes first: "
             "the symbol to read, the check to run, the thing to "
             "instrument. Actionable, not generic advice.",
+        ]
+        # Only truthful because the last-mile pass ran first. Before it,
+        # this would be asking the model to hide a gap; after it, every
+        # subject the index could produce has been read, so "go and read
+        # X" is either work already done or work nobody can do.
+        out += [
+            "",
+            "Do not propose reading a symbol in this codebase as a next "
+            "step. Every body the index holds for a symbol this answer "
+            "asserts about has already been read; one that has not is "
+            "named above as not found, and reading it is not available "
+            "to anyone. A step this pipeline should have taken itself, "
+            "or one the reader cannot act on, is not a next step.",
         ]
         if _rivals:
             # Ordering, not an extra instruction. A surviving account is
@@ -21470,6 +21631,24 @@ class AgenticOrchestrator:
             # decides what to do next. "survived" is a cause too: a
             # competition where everything lived and one where everything
             # died read the same through a count.
+            # Eliminated accounts reach the reader too. A turn spent 243
+            # seconds forging two mechanisms, falsified both against the
+            # index and buried them, and the answer mentioned none of it —
+            # so the strongest thing that turn did, ruling out two
+            # explanations, existed only in the log. A reader who is told
+            # what was tested and rejected does not propose it back.
+            try:
+                self._f._serial_eliminated_accounts = [
+                    {
+                        "hypothesis": (d.hypothesis or "")[:400],
+                        "cause": str(getattr(d, "cause_of_death", "") or ""),
+                        "cycles_used": getattr(d, "cycles_used", 0),
+                    }
+                    for d in _dossiers
+                    if d.status != "plausible"
+                ][:3]
+            except Exception:
+                self._f._serial_eliminated_accounts = []
             if _dossiers:
                 try:
                     _fates = "; ".join(
@@ -22830,6 +23009,59 @@ class AgenticOrchestrator:
                 idx += 1
                 continue
 
+            # -- a step does not re-investigate what is already settled ----
+            #
+            # The planner writes every step from the question, before any
+            # evidence exists, so two investigations can be handed
+            # overlapping goals and the second cannot learn that the first
+            # answered it. One turn planned `identify the guard` and `trace
+            # every consumer` as separate steps; step 1 returned `called
+            # from exactly three rendering paths`, named all three, at
+            # confidence 1.0, and the call graph verified it. Step 2's goal
+            # was that sentence. With its work done and its one remaining
+            # question out of reach, it restated step 1's answer six times
+            # verbatim until the token ceiling stopped it.
+            #
+            # Focus symbols already carrying a settled claim are dropped
+            # from the step, so its round is spent on what is left. The
+            # step still runs: its goal is prose and may cover ground the
+            # symbols do not name, and a step that reports nothing new is
+            # cheap where one that re-derives everything is not. Only when
+            # the plan named symbols and every one of them is settled does
+            # this say so, and the emptied focus is itself the finding —
+            # it means the planner wrote the same step twice.
+            if (
+                step.kind == "investigate"
+                and step.symbols
+                and getattr(self._f.valves, "agentic_skip_settled_focus", True)
+            ):
+                try:
+                    _settled = {
+                        _c.subject
+                        for _c in self._ledger.claims
+                        if _c.subject
+                        and self._ledger.bucket_of(_c) in ("hard", "structural")
+                    }
+                    _left = [_s for _s in step.symbols if _s not in _settled]
+                    if _settled and len(_left) != len(step.symbols):
+                        _dropped = [_s for _s in step.symbols if _s in _settled]
+                        self._f._log_debug(
+                            f"🤖 Agentic: step {step.id} focus narrowed — "
+                            f"{len(_dropped)} symbol(s) already carry a "
+                            f"settled claim from an earlier step ("
+                            + ", ".join(_dropped[:4])
+                            + f"); {len(_left)} left to investigate"
+                        )
+                        if not _left:
+                            self._f._log_debug(
+                                f"🤖 Agentic: step {step.id} has no "
+                                f"unsettled symbol left — the planner wrote "
+                                f"this step's ground twice"
+                            )
+                        step.symbols = _left
+                except Exception as _e_narrow:
+                    self._f._log_debug(f"focus narrowing skipped ({_e_narrow!r})")
+
             # -- dynamic verification: extract + stub + execute ------------
             # Never step-cached (harness/result caching lives inside the
             # verifier, keyed by qid and body_hash respectively).
@@ -23375,6 +23607,16 @@ class AgenticOrchestrator:
                 # clean turn. Named here so the bound can be sized against
                 # what it costs rather than guessed at.
                 _lost_gaps = [str(g)[:60] for g in _remaining[:3]]
+                # And to the reader, not only to the log. The pipeline knew
+                # what it was missing and decided against fetching it; the
+                # answer then offered the same thing as advice, which reads
+                # as a suggestion rather than as a budget that ran out. The
+                # difference decides whether asking again is worth it.
+                try:
+                    _prev = getattr(self._f, "_serial_dropped_gaps", None) or []
+                    self._f._serial_dropped_gaps = (_prev + _lost_gaps)[:5]
+                except Exception:
+                    pass
                 self._f._log_debug(
                     f"🤖 Agentic: step {step.id} reported "
                     f"{len(_remaining)} unserved gap(s) with no capacity to "
@@ -23688,6 +23930,88 @@ class AgenticOrchestrator:
                     f"pipeline tail continues"
                 )
 
+        # Region: last-mile — the subject bodies nobody opened
+        #
+        # The closing sweep above covers claims carrying no verdict. It
+        # does not cover the other failure: a claim WITH a verdict whose
+        # own subject was never opened, settled instead from whatever else
+        # was in the prompt. Those bodies are not missing, they are
+        # unrequested — one turn left AgenticSynthesisComposer.render
+        # unserved because it came fifth in a round that serves four, and
+        # then told the reader to go and read it.
+        #
+        # Fetching is deterministic and costs no model call: the subject
+        # comes from the claim and the body comes from the index. Only the
+        # re-judging costs one call, and it is the call that turns `read`
+        # and `blind` into `hard`. A step that hands the reader work this
+        # pipeline was equipped to do is the follow-up question it exists
+        # to prevent.
+        if getattr(self._f.valves, "agentic_last_mile_sweep", True):
+            try:
+                _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
+                _orphans = []
+                for _c in self._ledger.claims:
+                    _s = _c.subject or ""
+                    if not _s or _s in _seen or _s in _orphans:
+                        continue
+                    if _s.rsplit(".", 1)[-1] in {_q.rsplit(".", 1)[-1] for _q in _seen}:
+                        continue
+                    _orphans.append(_s)
+                if _orphans:
+                    self._f._log_debug(
+                        f"🤖 Agentic: last-mile — {len(_orphans)} claim "
+                        f"subject(s) were never opened: " + ", ".join(_orphans[:5])
+                    )
+                    _lm = AgenticStep(
+                        id=max((s.id for s in plan.steps), default=0) + 1,
+                        goal=(
+                            "Read the bodies of the symbols the answer "
+                            "asserts about but nobody opened"
+                        ),
+                        kind="verify",
+                    )
+                    _pos = (
+                        len(plan.steps) - 1
+                        if plan.steps and plan.steps[-1].kind == "analyze"
+                        else len(plan.steps)
+                    )
+                    plan.steps.insert(_pos, _lm)
+                    await self._f._emit_status(
+                        f"🔎 Reading {len(_orphans)} body/bodies the answer "
+                        f"relies on but no step opened"
+                    )
+                    await self._verifier.run_verify_step(
+                        _lm,
+                        self._ledger,
+                        project_id,
+                        aligned_prefix,
+                        truncated_steps=[s for s in plan.steps if s.truncated],
+                        only_subjects=_orphans,
+                    )
+                    if _lm.status == "done":
+                        _lm.digest = self._digest(_lm.output)
+                    _still = [
+                        _s
+                        for _s in _orphans
+                        if _s
+                        not in (
+                            getattr(self._f, "_bodies_seen_this_turn", None) or set()
+                        )
+                    ]
+                    self._f._log_debug(
+                        f"🤖 Agentic: last-mile done — "
+                        f"{len(_orphans) - len(_still)} body/bodies read and "
+                        f"re-judged, {len(_still)} not in the index"
+                    )
+                    # What the index could not produce is a real gap and
+                    # belongs in the answer, not in a log line.
+                    self._f._serial_unreadable_subjects = _still[:5]
+            except Exception as _e_lm:
+                self._f._log_debug(
+                    f"🤖 Agentic: last-mile sweep failed ({_e_lm!r}) — the "
+                    f"pipeline tail continues"
+                )
+
         # Region: generative evaluation + re-plan waves (Fase 9, Nivel 2)
         # The epistemic axis (is it correct?) closed with the verify step;
         # this is the generative axis (is there something better?). Each
@@ -23863,6 +24187,17 @@ class AgenticOrchestrator:
                     f"{' '.join(_c.text.split())[:70]}"
                 )
             _cov["per_claim"] = _per
+            # Read by the outlet's opening audit. Computed here, where the
+            # ledger is already collapsed and re-bucketed, so the audit
+            # cannot disagree with the tally about what was settled.
+            _cov["unsettled_subjects"] = sorted(
+                {
+                    _c.subject
+                    for _c in self._ledger.claims
+                    if _c.subject
+                    and self._ledger.bucket_of(_c) not in ("hard", "structural")
+                }
+            )[:8]
             # The shape of the turn, both of which had to be grepped out of
             # the server log to interpret a low number: a turn that never
             # formed a hypothesis reads like one whose hypothesis failed.
@@ -27349,8 +27684,7 @@ class CodeBlockManager:
                 if _rblocks:
                     _probe = _rblocks[0]
                     if not (
-                        hasattr(_probe, "start_byte")
-                        and hasattr(_probe, "end_byte")
+                        hasattr(_probe, "start_byte") and hasattr(_probe, "end_byte")
                     ):
                         self._f._log_debug(
                             f"extract_code_blocks: process() returned "
@@ -27358,11 +27692,9 @@ class CodeBlockManager:
                             f"byte offsets — falling through to regex. A "
                             f"chunk carries: {type(_probe).__name__}("
                             + ", ".join(
-                                sorted(
-                                    a
-                                    for a in dir(_probe)
-                                    if not a.startswith("_")
-                                )[:16]
+                                sorted(a for a in dir(_probe) if not a.startswith("_"))[
+                                    :16
+                                ]
                             )
                             + ")"
                         )
@@ -27394,11 +27726,9 @@ class CodeBlockManager:
                             else type(result).__name__
                             + "("
                             + ", ".join(
-                                sorted(
-                                    a
-                                    for a in dir(result)
-                                    if not a.startswith("_")
-                                )[:12]
+                                sorted(a for a in dir(result) if not a.startswith("_"))[
+                                    :12
+                                ]
                             )
                             + ")"
                         )
@@ -33624,8 +33954,23 @@ class MetacognitiveReasoningEngine:
     # as Class.attribute to a regex. Left in, a filename can be the one
     # token that clears a bar the hypothesis should have failed.
     _HYP_FILE_TAILS = frozenset(
-        {"md", "py", "json", "txt", "yaml", "yml", "ini", "log", "csv",
-         "html", "cfg", "toml", "sh", "js", "ts"}
+        {
+            "md",
+            "py",
+            "json",
+            "txt",
+            "yaml",
+            "yml",
+            "ini",
+            "log",
+            "csv",
+            "html",
+            "cfg",
+            "toml",
+            "sh",
+            "js",
+            "ts",
+        }
     )
 
     @classmethod
@@ -33708,8 +34053,7 @@ class MetacognitiveReasoningEngine:
 
             # ── Step 3: one match anywhere is enough to clear the bar ──
             return not any(
-                _h in _opened or _h.rsplit(".", 1)[-1] in _opened_bare
-                for _h in _syms
+                _h in _opened or _h.rsplit(".", 1)[-1] in _opened_bare for _h in _syms
             )
         except Exception:
             return False
@@ -34003,11 +34347,7 @@ class MetacognitiveReasoningEngine:
                         + "Guidance: the previous attempt was discarded "
                         "because it was built on names that do not exist "
                         "in this project"
-                        + (
-                            " (" + ", ".join(_ghosts) + ")"
-                            if _ghosts
-                            else ""
-                        )
+                        + (" (" + ", ".join(_ghosts) + ")" if _ghosts else "")
                         + ". Build the mechanism only out of symbols you "
                         "have actually been shown."
                     )
@@ -34418,6 +34758,14 @@ class MetacognitiveReasoningEngine:
             # the one place it would have been useful, because a reader
             # who can see a rival named can ask for it by name next turn,
             # and a reader who cannot is told only that confidence is low.
+            #
+            # The winner's own corroboration goes beside them. Without it a
+            # chosen account at 0.85 and one at 0.28 read exactly alike,
+            # and the rivals' numbers below have nothing to be compared to.
+            try:
+                self._f._serial_winner_corroboration = round(_winner.corroboration, 2)
+            except Exception:
+                self._f._serial_winner_corroboration = None
             try:
                 self._f._serial_rival_accounts = [
                     {
@@ -38535,6 +38883,66 @@ class ActiveCodeUpdater:
                 new_blocks_pending = [k[0] for k in _kept]
                 symbols_list = [k[1] for k in _kept]
                 extracted_blocks = [k[2] for k in _kept]
+
+        # ── Step 3.6: an assistant block may not rewrite indexed source ──
+        # The stub gate above catches a quoted signature. It does not catch
+        # the other shape, which is a complete and confident function body
+        # the model wrote from memory to illustrate a symbol the index
+        # already holds. One run answered four questions that way and every
+        # body was wrong — a double `// 4`, a `_floor` that is never bound,
+        # a `pstate.get('measured_confidence')` where the real code reads
+        # `self._agentic_coverage` — and each was indexed: docstrings
+        # harvested, data-flow edges extracted from a `path/to/` filename
+        # the model invented, CodePathViews invalidated, the edge count
+        # climbing 7081 → 7091 over four turns.
+        #
+        # That is worse than a wrong answer. The index is where hard
+        # evidence comes from, so a later turn can quote those lines and
+        # the verifier will call them settled against real code.
+        #
+        # A block is dropped only when EVERY symbol in it is already
+        # indexed: the assistant is then restating, and the user's paste is
+        # authoritative over the model's recollection of it. A block adding
+        # any genuinely new symbol still indexes in full, which is what the
+        # diff-against-index path needs to keep working.
+        if role == "assistant" and new_blocks_pending:
+            try:
+                _indexed = set(
+                    self._f._symbol_index.get_all_qualified_names(project_id)
+                )
+                _indexed_bare = {_q.rsplit(".", 1)[-1] for _q in _indexed}
+                _kept2 = []
+                for blk, syms, raw in zip(
+                    new_blocks_pending, symbols_list, extracted_blocks
+                ):
+                    _names = (
+                        [getattr(_s, "name", "") for _s in syms]
+                        if not isinstance(syms, Exception)
+                        else []
+                    )
+                    _names = [_n for _n in _names if _n]
+                    if _names and all(
+                        _n in _indexed or _n.rsplit(".", 1)[-1] in _indexed_bare
+                        for _n in _names
+                    ):
+                        self._f._log_debug(
+                            f"assistant block dropped — it restates "
+                            f"{len(_names)} symbol(s) the index already "
+                            f"holds from source ("
+                            + ", ".join(_names[:4])
+                            + "); the paste is authoritative over a body "
+                            "written from memory"
+                        )
+                        continue
+                    _kept2.append((blk, syms, raw))
+                if len(_kept2) != len(new_blocks_pending):
+                    new_blocks_pending = [k[0] for k in _kept2]
+                    symbols_list = [k[1] for k in _kept2]
+                    extracted_blocks = [k[2] for k in _kept2]
+            except Exception as _e_restate:
+                self._f._log_debug(
+                    f"assistant restatement check skipped ({_e_restate!r})"
+                )
 
         # ── Step 4: map block content → symbols (skip failed extractions) ──
         content_to_syms: Dict[str, List[CodeSymbol]] = {
@@ -49253,6 +49661,18 @@ class Filter:
             ),
         )
 
+        agentic_last_mile_sweep: bool = Field(
+            default=True,
+            description=(
+                "Before synthesising, read the bodies of any symbol the ledger asserts about that no step opened, and re-judge those claims against them. Fetching is deterministic and free; only the re-judging costs a call, and it is the call that turns `read` and `blind` into `hard`. One turn left AgenticSynthesisComposer.render unopened because it came fifth in a round that serves four, and then told the reader to go and read it — work this pipeline was equipped to do, handed back as advice. Off restores that."
+            ),
+        )
+        agentic_skip_settled_focus: bool = Field(
+            default=True,
+            description=(
+                "Drop from an investigate step's focus any symbol that already carries a settled claim from an earlier step. The planner writes every step from the question before any evidence exists, so it can hand two steps overlapping ground and the second cannot learn the first answered it: one turn had step 1 return the three call sites at confidence 1.0 and step 2 restate that same answer six times verbatim until the token ceiling stopped it, 206 seconds. The step still runs on whatever is left. Off restores the planner's list untouched."
+            ),
+        )
         agentic_closing_verify: bool = Field(
             default=True,
             description=(
@@ -51329,6 +51749,10 @@ class Filter:
             self._serial_rival_relations = []
             self._serial_rival_causes = []
             self._serial_rival_accounts = []
+            self._serial_dropped_gaps = []
+            self._serial_unreadable_subjects = []
+            self._serial_winner_corroboration = None
+            self._serial_eliminated_accounts = []
             _lf = getattr(self, "_llm_failures_this_turn", None) or {}
             if _lf.get("count"):
                 self._log_debug(
@@ -52244,6 +52668,78 @@ class Filter:
                 )
         except Exception as _e_conf:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
+        self._audit_opening_against_ledger(body)
+
+    def _audit_opening_against_ledger(self, body: dict) -> None:
+        """Report when the answer's opening rests on something unsettled.
+
+        The instruction forbidding it has been rewritten twice and broken
+        both times, and both times it was found by reading the answer by
+        hand. That does not scale, and an instruction whose compliance is
+        unobserved is an instruction nobody can iterate on.
+
+        Detection, not correction. Outlet edits do not reach the reader —
+        two turns measured against the next inlet's word count matched the
+        displayed text, not the edited text — so rewriting the paragraph
+        here would change nothing and hide the signal. A log line is worth
+        more: it says whether the supplied list of unsettled propositions
+        did the job the rule could not.
+
+        Matched on the symbols the opening names against the symbols of
+        claims that came back unsettled.
+
+        What this does NOT catch, stated because it is the case that
+        prompted it: an opening can rest on an unsettled claim without
+        writing the symbol's name. The answer that started this said the
+        set `is cleared at the close` while the unsettled claim was about
+        Filter.outlet — the same proposition, the name absent, and this
+        check reads green on it. Catching that means judging prose, which
+        is a second model's opinion about a first model's paragraph and
+        not obviously worth more than the paragraph.
+
+        So a red line here is real and a green one proves nothing. It is
+        still worth having: the explicit-mention shape is the common one,
+        and a rule whose compliance is never observed cannot be improved.
+        """
+        try:
+            _cov = getattr(self, "_agentic_coverage", None)
+            if not _cov:
+                return
+            _unsettled = _cov.get("unsettled_subjects") or []
+            if not _unsettled:
+                return
+            _msgs = body.get("messages") or []
+            _last = next(
+                (
+                    m
+                    for m in reversed(_msgs)
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None or not isinstance(_last.get("content"), str):
+                return
+            # The opening paragraph only: the sections below are allowed to
+            # discuss what was not settled, and are asked to.
+            _text = _ANSWER_MARK_RE.sub("", _last["content"]).lstrip()
+            _open = _text.split("\n\n", 2)
+            _head = " ".join(("\n\n".join(_open[:2])).split())[:1500]
+            _hits = [_s for _s in _unsettled if _s and _s in _head]
+            if _hits:
+                self._log_debug(
+                    f"🔴 Synthesis: the opening paragraph names "
+                    f"{len(_hits)} symbol(s) this turn did not settle ("
+                    + ", ".join(_hits[:4])
+                    + ") — the supplied list of unsettled propositions did "
+                    "not hold"
+                )
+            else:
+                self._log_debug(
+                    "🟢 Synthesis: the opening paragraph rests on nothing "
+                    "this turn left unsettled"
+                )
+        except Exception as _e_aud:
+            self._log_debug(f"opening audit skipped ({_e_aud!r})")
 
     def _mark_answer_turn(self, body: dict) -> None:
         """Open the answer with the turn number it belongs to.
