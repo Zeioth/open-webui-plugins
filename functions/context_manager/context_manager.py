@@ -26401,11 +26401,87 @@ class CommandRouter:
         if self._f.valves.enable_accept_command and content.startswith("/accept"):
             response = await self._handle_accept_command(project_id)
             return True, self._deliver_command_response(messages, response)
+        if content.startswith("/exhume"):
+            response = await self._handle_exhume_command(project_id)
+            return True, self._deliver_command_response(messages, response)
         if content.startswith("/help"):
             response = self._handle_help_command()
             return True, self._deliver_command_response(messages, response)
 
         return False, None
+
+    async def _handle_exhume_command(self, project_id: str) -> str:
+        """Empty the hypothesis graveyard for this project.
+
+        The graveyard already retires deaths by era: `_load_graveyard`
+        filters on structure_hash, so a mechanism buried against code that
+        has since changed is forgeable again without anyone asking. What
+        that filter cannot see is a burial the pipeline itself caused.
+
+        A candidate is buried `fabricated` when it names no symbol that
+        exists. That verdict is about the candidate, but the cause can be
+        upstream: before the generator was handed the investigation's
+        verified symbols it had the question and nothing else, and it
+        invented names — get_coverage_metrics(), get_claim_coverage(),
+        compute_confidence_score(). Those burials record a blind generator,
+        not a wrong mechanism, and they keep excluding that ground for as
+        long as the code hash holds still.
+
+        Manual, and deliberately so. Whether a burial was earned is a
+        judgement about what changed outside the code — a fixed prompt, a
+        corrected filter, a model swap — and nothing here observes those.
+        Same reasoning as /accept: the machine owns what it can eliminate,
+        the operator owns what it cannot.
+
+        Reports the causes it removed rather than only a count, because a
+        graveyard of twelve `fabricated` reads very differently from one of
+        twelve `falsified`: the first suggests the generator, the second
+        suggests the mechanisms really were wrong.
+        """
+        # ── Step 1: what is in there, by cause ──
+        try:
+            _rows = self._f._db_conn.execute(
+                "SELECT cause, COUNT(*) FROM hypothesis_graveyard "
+                "WHERE project_id = ? GROUP BY cause ORDER BY COUNT(*) DESC",
+                (project_id,),
+            ).fetchall()
+        except Exception as _e:
+            return f"/exhume failed: could not read the graveyard ({_e})"
+        _total = sum(int(_r[1]) for _r in _rows) if _rows else 0
+        if not _total:
+            return (
+                "/exhume: the graveyard is already empty for this "
+                "project — nothing was excluding a mechanism."
+            )
+        _breakdown = ", ".join(f"{int(_r[1])} {_r[0]}" for _r in _rows)
+
+        # ── Step 2: delete through the same queue every writer uses ──
+        try:
+            def _wipe(pid=project_id):
+                self._f._db_conn.execute(
+                    "DELETE FROM hypothesis_graveyard WHERE project_id = ?",
+                    (pid,),
+                )
+
+            await self._f._state_store._db_enqueue(_wipe)
+        except Exception as _e:
+            return f"/exhume failed: the delete did not run ({_e})"
+
+        # ── Step 3: say it loudly — this is not recoverable ──
+        self._f._log_debug(
+            f"/exhume: {_total} buried hypothesis/hypotheses removed for "
+            f"project {project_id} ({_breakdown}). Cross-run exclusions are "
+            f"gone; the forge may propose these mechanisms again."
+        )
+        return (
+            f"⚰️ Exhumed {_total} buried hypothesis/hypotheses "
+            f"({_breakdown}).\n\n"
+            f"The forge no longer excludes them, so it may propose these "
+            f"mechanisms again — including any that were buried for good "
+            f"reason. This does not undo anything else: sealed dossiers, "
+            f"competition history and the strategy the history taught are "
+            f"untouched."
+        )
 
     def _handle_help_command(self) -> str:
         """List the commands this router actually dispatches.
@@ -26432,6 +26508,12 @@ class CommandRouter:
                 "strategy history gets that something worked",
             ),
             ("/expand <symbol>", True, "pull a symbol's full body into context"),
+            (
+                "/exhume",
+                True,
+                "empty the hypothesis graveyard so mechanisms buried in an "
+                "earlier run can be forged again",
+            ),
             (
                 "/freeze · /unfreeze",
                 True,
@@ -34648,6 +34730,20 @@ class MetacognitiveReasoningEngine:
                 f"names was ever opened — corroboration "
                 f"{_winner.corroboration:.2f} was earned elsewhere"
             )
+            # Terminal, like the margin branch below. Without this the
+            # function buried the winner and carried on: it appended
+            # `null bar PASS` to the very note that had just said
+            # FAILED, then ranked rivals `alongside the winner` that no
+            # longer existed. Observed live — a dossier at corr 0.77 was
+            # buried for null_bar and the same second reported one rival
+            # surviving beside it, so the answer was built on a
+            # competition whose winner the judge had just rejected.
+            #
+            # The two branches say the same thing about the winner and
+            # must end the same way: no winner, and the note explains
+            # why. A survivor of a competition with no winner is not a
+            # rival — there is nothing for it to be a rival to.
+            return None, _note
         elif _winner.corroboration < _null_corr + _margin:
             _winner.status = "dead"
             _winner.cause_of_death = "null_bar"
@@ -34918,7 +35014,32 @@ class MetacognitiveReasoningEngine:
                     )
         return _winner, _note
 
-    _DOSSIER_SYM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{2,}")
+    # Dots only BETWEEN identifier parts, never trailing. The previous
+    # shape — `[A-Za-z_][A-Za-z0-9_.]{2,}` — accepted a dot anywhere, so
+    # every word that ended a sentence became a symbol: `early.`,
+    # `successfully.`, `execution.`, `paso.`, `asistente.` all entered the
+    # set and passed the identifier test on the strength of that final
+    # stop. Worse, `_run_pipeline_inner` and `_run_pipeline_inner.` were
+    # two members. With the cap at eight, prose filled the slots that
+    # decide whether two dossiers describe one mechanism.
+    _DOSSIER_SYM_RE = re.compile(
+        r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+    )
+
+    # Tokens that pass the identifier shape without being identifiers.
+    # `None` is a keyword and it appeared in all three dossiers of one
+    # turn, so every pair shared it and every overlap ratio was inflated
+    # by a token that says nothing about which mechanism is described.
+    # `Confidence` and `N` come from the `[Confidence: N%]` footer those
+    # hypotheses were about. Kept as a small explicit list rather than a
+    # cleverer pattern: these are the ones observed, and a rule that
+    # guesses at more would start discarding real symbols.
+    _DOSSIER_SYM_STOP = frozenset(
+        {
+            "None", "True", "False", "Optional", "List", "Dict", "Set",
+            "Tuple", "Any", "JSON", "TODO", "Confidence", "Step",
+        }
+    )
 
     @classmethod
     def _dossier_symbols(cls, d: "HypothesisDossier") -> Set[str]:
@@ -34930,13 +35051,44 @@ class MetacognitiveReasoningEngine:
         confirmed nothing. Filtered to identifier-shaped tokens
         (underscore or dotted or CamelCase), capped so the pairwise
         adjacency check below stays trivially bounded.
+
+        Two normalisations, both measured on the 18:03 run where three
+        dossiers described one mechanism and the overlap ratio had to
+        decide it:
+
+        Keywords are dropped. `None` sat in all three sets and lifted
+        every pairwise ratio by a token that identifies nothing.
+
+        The receiver is stripped, so `self._agentic_coverage`,
+        `self._f._agentic_coverage` and `_agentic_coverage` are one
+        symbol rather than three. They counted as three, which pushed
+        the union up and the ratio down — the opposite direction from
+        the keyword, and just as wrong. `Class.method` keeps its class:
+        that prefix identifies, a receiver does not.
         """
         _texts = d.confirmed_claims or [d.hypothesis]
         _out: Set[str] = set()
         for _t in _texts:
             for _m in cls._DOSSIER_SYM_RE.findall(_t or ""):
-                if "_" in _m or "." in _m or _m[0].isupper():
-                    _out.add(_m.split("(")[0])
+                _s = _m.split("(")[0]
+                # Receiver prefixes, longest first so `self._f.` is
+                # removed before `self.` can take half of it.
+                for _p in ("self._f.", "self._", "self.", "cls."):
+                    if _s.startswith(_p):
+                        _s = ("_" if _p == "self._" else "") + _s[len(_p):]
+                        break
+                if not _s or _s in cls._DOSSIER_SYM_STOP:
+                    continue
+                # A bare token under three characters is not a symbol in
+                # this codebase. The previous pattern enforced this with
+                # its `{2,}` quantifier and the rewrite above dropped it,
+                # which let the `N` of `[Confidence: N%]` into the set of
+                # a dossier that was about that very footer. A dotted
+                # token is exempt: `a.b` is short and still a path.
+                if len(_s) < 3 and "." not in _s:
+                    continue
+                if "_" in _s or "." in _s or _s[0].isupper():
+                    _out.add(_s)
                 if len(_out) >= 8:
                     return _out
         return _out
