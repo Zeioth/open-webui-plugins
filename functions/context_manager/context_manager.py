@@ -353,6 +353,48 @@ class CompetitionRecord:
 # without it they never can.
 _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 
+# ══ THE PREFIX INVARIANT ═════════════════════════════════════════════════
+# Every call this file makes must send the SAME system message, byte for
+# byte, for the whole session:
+#
+#     system = static_block + SEP + hub_tier + SEP
+#
+# Everything else — the user profile, Block B, each call's role, the
+# answer's workspace and format — rides in the user turn. Four separate
+# patches enforce this and each is useless without the others.
+#
+# WHY, because it is not guessable from the code. llama.cpp writes its KV
+# checkpoints at MESSAGE boundaries and a recurrent model cannot rewind to
+# anywhere else. So the only resumable position is the end of the system
+# message, and the only way a checkpoint survives is for that position to
+# hold the same content next time. A single token of difference costs a
+# full re-prefill of the whole prompt — 70000 tokens, 85 to 130 seconds —
+# and nothing fails, warns or looks wrong. The turn is just slow.
+#
+# Measured over one session: fifteen full re-prefills, three of them
+# missing by ONE token. Diagnosing it took four attempts and three false
+# theories (ChatML boundaries, tokenizer merges, checkpoint spacing); what
+# settled it was llama.cpp's --log-prompts-dir, because the difference is
+# made by the chat template AFTER this file has finished assembling.
+#
+# HOW IT BREAKS. Any of these puts content back in the system message and
+# the re-prefills return silently:
+#
+#   · appending anything to static_block or hub_tier that is not derived
+#     purely from the indexed code
+#   · _aligned_prefix returning something other than prelim + SEP
+#   · either assembler placing the profile or Block B differently from
+#     the other — the aligned prefix must stay a byte-prefix of the
+#     answer prompt
+#   · a chat template that separates roles in one token (the margin is
+#     four) or inserts anything between the system and the first user turn
+#
+# HOW TO TELL. `⏱️ Answer call` in the log: ~15-35s means the checkpoint is
+# being reached, ~110s means it is not. On the server,
+# `checking checkpoint with [N] against M` names the miss, and
+# `forcing full prompt re-processing` counts them.
+# ═════════════════════════════════════════════════════════════════════════
+
 _ANSWER_FOOTER_RE = re.compile(r"^[ \t]*\[Confidence:[^\]\n]*\][ \t]*$", re.M)
 _ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
 
@@ -5468,6 +5510,25 @@ class ContextBuilder:
             project_id, pstate_raw, structure_hash, freeze_active, is_continuation
         )
 
+        # Stashed HERE, above the three early returns below. Two of them
+        # serve Block A from cache and never reach the build, so a stash
+        # placed further down would leave the profile empty on exactly the
+        # turns Block A did not change — which is most of them. The profile
+        # would simply vanish from the prompt, silently, with the whole
+        # standing style contract inside it.
+        #
+        # Rendering it is cheap and it is already being read a few lines
+        # above for the cache key, so there is no work duplicated: only the
+        # text is kept rather than thrown away.
+        self._f._profile_block_this_turn = ""
+        if getattr(self._f.valves, "enable_user_profile", False):
+            try:
+                self._f._profile_block_this_turn = (
+                    self._f._user_profile.render_for_block_a(project_id) or ""
+                )
+            except Exception:
+                self._f._profile_block_this_turn = ""
+
         # --- 4. Build cache key using the effective (possibly frozen) hash ---
         cache_key = f"{effective_hash}__{mode}__{_profile_hash}"
         cached_text = psm.get_block_a_cached(project_id)
@@ -5514,11 +5575,7 @@ class ContextBuilder:
         #      llama.cpp only writes checkpoints at message boundaries.
         #      Volatile content has to leave the system, which is the same
         #      conclusion Block B reached.
-        self._f._profile_block_this_turn = ""
-        if getattr(self._f.valves, "enable_user_profile", False):
-            _profile_block = self._f._user_profile.render_for_block_a(project_id)
-            if _profile_block:
-                self._f._profile_block_this_turn = _profile_block
+        #      (rendered and stashed above, before the cache returns).
         #     part of the frozen prefix; fixed wording, no per-turn counter).
         if freeze_active and frozen_hash:
             parts.append(
@@ -5648,6 +5705,13 @@ class ContextBuilder:
             if feedback_ctx:
                 parts.append(feedback_ctx)
 
+        # SEE THE PREFIX INVARIANT beside _PREFIX_ROLE_SEPARATOR. Everything
+        # in `parts` becomes the system message that must not change between
+        # turns, so nothing may be appended here that is not derived purely
+        # from the indexed code. The user profile used to open this list and
+        # was moved out for exactly that reason: it changes once per session,
+        # when a field is corroborated twice, and that one change cost a full
+        # re-prefill of the entire prompt.
         static_block = "\n\n".join(p for p in parts if p.strip())
 
         # --- 6. Store in cache with the mode-aware (possibly frozen) key ---
@@ -12873,6 +12937,17 @@ class LLMOrchestrator:
         enable_thinking: bool = True,
         log_raw_response: bool = False,
         return_meta: bool = False,
+        # DECIDE THIS for any new call site. True attaches the whole code
+        # prefix — 70000 tokens — and the default is True so that a caller
+        # that needs it never silently loses it. The cost of getting it
+        # wrong the other way is invisible: a classifier that sends 46
+        # tokens and waits 90 seconds for them, which is what classify_turn,
+        # contradiction_llm and four others were doing until it was
+        # measured. The test is one question and it is not about size:
+        # does this call produce an identifier the index has to resolve?
+        # If yes it needs the prefix (agentic_verify sends 457 tokens and
+        # does); if no it does not (agentic_evidence sends 5884 and does
+        # not — it judges quotes against bodies carried in its own prompt).
         reasons_about_code: bool = True,
     ) -> Optional[Union[str, "LLMResult"]]:
         """
@@ -21531,6 +21606,12 @@ class AgenticOrchestrator:
     def _aligned_prefix(self, prelim_system: str) -> str:
         """
         Head-cap the preliminary system prompt for auxiliary calls.
+
+        SEE THE PREFIX INVARIANT beside _PREFIX_ROLE_SEPARATOR. What this
+        returns is the system prompt of six agentic call sites, and
+        call_llm cuts it back to the invariant boundary. Returning anything
+        that is not `prelim_system + separator` breaks that cut silently and
+        every heavy call of the turn re-prefills 70000 tokens.
 
         Same cap derivation as the aligned CoT path: the head is preserved,
         so the result is always a byte-prefix of the main call's system
@@ -45282,6 +45363,12 @@ class UserProfileManager:
         return promoted
 
     # ── Rendering (Block A + dump) ─────────────────────────────────────────
+    # NOTE: the name is historical. What this renders no longer goes into
+    # Block A — it opens the DYNAMIC region and travels in the user turn.
+    # SEE THE PREFIX INVARIANT beside _PREFIX_ROLE_SEPARATOR before wiring
+    # it back into the static block: its output changes once per session and
+    # sat at token zero, so that change re-prefilled all 70000 tokens behind
+    # it.
     def render_for_block_a(self, project_id: str) -> str:
         """
         Render the authoritative tier for injection at the top of Block A, or
