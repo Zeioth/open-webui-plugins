@@ -13019,6 +13019,51 @@ class LLMOrchestrator:
             reasons_about_code=reasons_about_code,
         )
 
+        # ── One system for every aligned call ─────────────────────────────
+        # The aligner produces `prelim + separator + role`, and the role is
+        # a different length for every caller, so a turn sends five or six
+        # system prompts that agree for 280000 characters and then do not.
+        # llama.cpp leaves its checkpoint one token past the end of the
+        # SHORTER of any two, and the longer one branches one token before
+        # it — `against 77365` beside `checkpoint 77366`, four times in one
+        # run, plus three more missing by 22 to 43. Seven full re-prefills,
+        # 628 seconds, all of them inside a single turn where the code
+        # context had not changed at all.
+        #
+        # Same shape as the answer call's, and the same remedy: the role
+        # rides in the user turn, so every aligned call sends byte-identical
+        # system content and the shared prefix runs on through the
+        # `<|im_end|><|im_start|>user` boundary where the checkpoint sits.
+        #
+        # At the HEAD of the prompt, not the tail — the opposite of where
+        # the answer call's workspace goes, and for the same reason. A role
+        # is an instruction about the data that follows it, and it sat
+        # before that data when it was in the system; the answer call's
+        # trailing block is an instruction about what to write next, and it
+        # sat last. Both keep the order they were written for.
+        #
+        # An earlier attempt at this moved the role inside the aligner,
+        # behind its `already aligned` guard, and reached one call of
+        # twelve — the agentic steps build their own prefix and never got
+        # past that guard, so the run proved nothing. Splitting here, on
+        # the single funnel every call passes through, reaches all of them:
+        # a step that already sends the bare prefix has an empty role and
+        # is left exactly as it was.
+        try:
+            _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
+            _pre_full = (_pre + _PREFIX_ROLE_SEPARATOR) if _pre else ""
+            if (
+                _pre_full
+                and system_prompt.startswith(_pre_full)
+                and len(system_prompt) > len(_pre_full)
+            ):
+                _role = system_prompt[len(_pre_full):].strip()
+                if _role:
+                    system_prompt = _pre_full
+                    prompt = _role + "\n\n" + (prompt or "")
+        except Exception:
+            pass
+
         # Region: anti-repetition. Built before the dedup and cache keys
         # because it changes what the sampler produces — valves are
         # live-editable in the UI, so two calls with different DRY settings
