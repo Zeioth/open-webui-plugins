@@ -5494,14 +5494,31 @@ class ContextBuilder:
         # --- 5. Build the static block ---
         parts: List[str] = []
 
-        # 5.-1 User profile (learned preferences) — FIRST in Block A so it
-        #      survives the head-cap and every agentic call inherits it. The
-        #      UserProfileManager owns the schema and rendering; here we just
-        #      inject whatever authoritative text it produces.
+        # 5.-1 User profile (learned preferences). It used to open Block A,
+        #      to survive the head-cap and be inherited by every agentic
+        #      call. It is stashed instead and rendered with the dynamic
+        #      block, which keeps both properties — the cap never fires
+        #      here (107000 tokens against a 70400 prelim) and every
+        #      aligned call carries the dynamic region in its user turn.
+        #
+        #      What it stops doing is sitting at token zero. The rendering
+        #      changes exactly once per session, when a field is
+        #      corroborated twice and promotes out of the provisional tier:
+        #      a line appears at the very top and every one of the 70000
+        #      tokens behind it shifts, so that turn re-prefills the whole
+        #      prompt. One guaranteed full re-processing per session, for a
+        #      change of about 600 characters.
+        #
+        #      Moving it to the END of Block A would not have helped: the
+        #      divergence would still fall inside the system message, and
+        #      llama.cpp only writes checkpoints at message boundaries.
+        #      Volatile content has to leave the system, which is the same
+        #      conclusion Block B reached.
+        self._f._profile_block_this_turn = ""
         if getattr(self._f.valves, "enable_user_profile", False):
             _profile_block = self._f._user_profile.render_for_block_a(project_id)
             if _profile_block:
-                parts.append(_profile_block)
+                self._f._profile_block_this_turn = _profile_block
         #     part of the frozen prefix; fixed wording, no per-turn counter).
         if freeze_active and frozen_hash:
             parts.append(
@@ -13049,18 +13066,31 @@ class LLMOrchestrator:
         # the single funnel every call passes through, reaches all of them:
         # a step that already sends the bare prefix has an empty role and
         # is left exactly as it was.
+        # Cut at the INVARIANT boundary, not at the turn's. Block A and the
+        # hub tier are byte-identical across every turn of a session; Block
+        # B is not, and leaving it in the system makes the system differ
+        # from turn to turn — which costs the first heavy call of each turn
+        # a full re-prefill of 70000 unchanged tokens. Cutting here sends
+        # one system for the whole session, so the checkpoint written at
+        # its boundary survives into the next turn.
+        #
+        # Reading order is preserved exactly: Block B sat between the hub
+        # tier and the role, and it still does — the three simply cross the
+        # message boundary together.
         try:
+            _stab = getattr(self._f, "_prelim_stable_this_turn", "") or ""
             _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
             _pre_full = (_pre + _PREFIX_ROLE_SEPARATOR) if _pre else ""
+            _cut = _stab if (_stab and system_prompt.startswith(_stab)) else _pre_full
             if (
-                _pre_full
-                and system_prompt.startswith(_pre_full)
-                and len(system_prompt) > len(_pre_full)
+                _cut
+                and system_prompt.startswith(_cut)
+                and len(system_prompt) > len(_cut)
             ):
-                _role = system_prompt[len(_pre_full):].strip()
-                if _role:
-                    system_prompt = _pre_full
-                    prompt = _role + "\n\n" + (prompt or "")
+                _moved = system_prompt[len(_cut):].strip()
+                if _moved:
+                    system_prompt = _cut
+                    prompt = _moved + "\n\n" + (prompt or "")
         except Exception:
             pass
 
@@ -42579,9 +42609,47 @@ class SystemPromptBuilder:
             )
 
         # ── Assemble with tier between static and dynamic ──
+        # The profile opens the dynamic region rather than the whole
+        # prompt. Same words, same reading order relative to the code, and
+        # on the volatile side of the boundary where its once-a-session
+        # change costs a few thousand tokens instead of seventy thousand.
         separator = "\n\n---\n\n"
+        _prof = getattr(self._f, "_profile_block_this_turn", "") or ""
+        if _prof:
+            dynamic_block = (
+                _prof + ("\n\n" + dynamic_block if dynamic_block.strip() else "")
+            )
         parts = [p for p in [static_block, hub_tier, dynamic_block] if p.strip()]
         prelim_system = separator.join(parts)
+
+        # Where the invariant part of the turn ends. Block A and the hub
+        # tier are the same 70360 tokens on every turn of a session — 96%
+        # of the system prompt — and Block B is the 3000 to 7800 that
+        # follow and change with the question.
+        #
+        # llama.cpp writes its context checkpoints at message boundaries,
+        # which is why they land at `system end + 1` and nowhere else. The
+        # end of the hub tier is not a boundary: it sits inside the system
+        # message, a couple of thousand tokens before it closes. So there
+        # is never a checkpoint there, and a turn whose Block B differs has
+        # nothing to resume from — the KV of Block A is still in the slot,
+        # intact and unusable, and 70360 unchanged tokens are re-processed
+        # because 3000 changed ones came after them.
+        #
+        # Stashed so the callers can cut here and send only this as the
+        # system, which makes the boundary a message boundary and puts the
+        # checkpoint where it has to be.
+        # One caveat worth naming: the user's own system prompt is appended
+        # AFTER the dynamic block below, so it sits in the volatile region
+        # and travels with it. It is empty in the deployment this was
+        # measured on (`User instructions (tail): ~0 tokens`), and moving it
+        # keeps its reading position; a deployment that puts a long standing
+        # instruction there would find it in the user turn instead of the
+        # system, which is a change of role and worth knowing about.
+        _stable = [p for p in [static_block, hub_tier] if p.strip()]
+        self._f._prelim_stable_this_turn = (
+            separator.join(_stable) + separator if _stable else ""
+        )
 
         # Append user's original system prompt if present (captured once per turn)
         base_content = getattr(self._f, "_original_system_prompt", "") or ""
@@ -44305,6 +44373,16 @@ class MessageAssembler:
                 if t
             )
 
+        # Same profile placement as the preliminary assembly. If only one
+        # of the two did this the aligned prefix would stop being a prefix
+        # of the answer prompt, which is the invariant three patches now
+        # depend on.
+        _prof = getattr(self._f, "_profile_block_this_turn", "") or ""
+        if _prof:
+            dynamic_block = (
+                _prof + ("\n\n" + dynamic_block if dynamic_block.strip() else "")
+            )
+
         # A verbatim echo carries no code context. Set by the direct
         # retrieval path when the answer is already written and the model's
         # only job is to print it; nothing between here and the host reads
@@ -44508,12 +44586,22 @@ class MessageAssembler:
         try:
             _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
             _pre_full = _pre + _PREFIX_ROLE_SEPARATOR if _pre else ""
+            _stab = getattr(self._f, "_prelim_stable_this_turn", "") or ""
             if (
                 _pre_full
                 and final_system.startswith(_pre_full)
                 and len(final_system) > len(_pre_full)
             ):
                 _moved = final_system[len(_pre_full):]
+                # Block B travels too, and it travels in FRONT of the
+                # question while the workspace travels behind it — the two
+                # positions they already occupied. The system keeps only
+                # what never changes, so it is the same string in every
+                # turn of the session and the checkpoint at its boundary
+                # outlives the turn that wrote it.
+                _head = ""
+                if _stab and _pre_full.startswith(_stab):
+                    _head = _pre_full[len(_stab):].strip()
                 _last_user = None
                 for _m in reversed(messages):
                     if isinstance(_m, dict) and _m.get("role") == "user":
@@ -44522,9 +44610,12 @@ class MessageAssembler:
                 if _last_user is not None and isinstance(
                     _last_user.get("content"), str
                 ):
-                    final_system = _pre_full
+                    final_system = _stab if _head else _pre_full
                     _last_user["content"] = (
-                        _last_user["content"].rstrip() + "\n\n" + _moved.lstrip()
+                        (_head + "\n\n" if _head else "")
+                        + _last_user["content"].rstrip()
+                        + "\n\n"
+                        + _moved.lstrip()
                     )
                     self._f._log_debug(
                         f"🔗 Answer prompt: {len(_moved)} chars of workspace "
@@ -52478,6 +52569,8 @@ class Filter:
             self._serial_rival_causes = []
             self._serial_rival_accounts = []
             self._answer_is_verbatim_echo = False
+            self._prelim_stable_this_turn = ""
+            self._profile_block_this_turn = ""
             self._serial_dropped_gaps = []
             self._serial_unreadable_subjects = []
             self._serial_winner_corroboration = None
