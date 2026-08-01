@@ -521,7 +521,24 @@ _MAX_TOOLS_PER_ROUND = 4
 # method's shape, and enough to look like the whole of it.
 _FOCUS_MIN_PARTIAL_CHARS = 4000
 
-_MAX_CLAIMS_PER_STEP = 12
+# The contract calls this a hard limit and not a target, and the model
+# behaves accordingly: 5.7 claims per step on average over 59 steps of
+# eight runs, 10 the highest, with the limit sitting at 12. Raising it
+# therefore does not make a step emit more — it only stops a dense step
+# from losing its tail, and a step that found three things still states
+# three.
+#
+# 20 rather than an arbitrary larger number, because the validation loop
+# below already sliced at 20 with no comment and no log. Two ceilings
+# that disagree mean the lower one is real and the higher one is
+# decoration; setting them equal removes a limit that could never have
+# been found from the outside.
+#
+# What does scale with claim count, and is bounded elsewhere: the
+# evidence prompt carries a body per subject under agentic_evidence_max_chars,
+# and the judge must return one verdict per claim inside its own token
+# ceiling. Both report when they bind; this does not.
+_MAX_CLAIMS_PER_STEP = 20
 
 _DEGENERACY_COMPRESSION_MAX = 0.13
 
@@ -13923,9 +13940,49 @@ class AgenticEvidenceLedger:
         # Trimmed to the number the contract states, from the same
         # constant. A limit enforced silently is how a generation gets
         # to spend four minutes producing what will be thrown away.
-        raw_claims = (data.get("claims", []) or [])[:_MAX_CLAIMS_PER_STEP]
-        if not isinstance(raw_claims, list):
-            raw_claims = []
+        _all_claims = data.get("claims", []) or []
+        if not isinstance(_all_claims, list):
+            _all_claims = []
+        raw_claims = _all_claims[:_MAX_CLAIMS_PER_STEP]
+        # The cut, said out loud. The contract asks for at most this many,
+        # so a step that exceeds it has ignored the contract — and the
+        # claims that fall off are the tail of the list, which is not the
+        # same as the least important. One of them may be the check that
+        # would have refuted the step's own account, and nothing here
+        # ranks them before slicing.
+        #
+        # Measured over 59 steps of eight runs: 5.7 claims per step on
+        # average, 10 the highest, so the ceiling has never bound. This
+        # line exists so that the first time it does, it is visible rather
+        # than inferred later from a coverage number that looks fine.
+        if len(_all_claims) > _MAX_CLAIMS_PER_STEP:
+            # Named, not just counted. There is no defensible order to
+            # slice by, and that is the finding rather than an omission:
+            # `confidence` is the model's own and predicts nothing here (88
+            # of 88 values at or above 0.9, and every claim the code later
+            # refuted came from the 1.0 bucket); dropping the ones citing
+            # no symbol looks principled until you notice those are exactly
+            # what feeds the unsettled-claims list the opening paragraph is
+            # held to, so removing them lets the answer assert them freely;
+            # and any ordering over the prose is the shape of check that
+            # already cost this file a patch.
+            #
+            # So the tail is dropped, and the tail is printed. When this
+            # fires the operator can read what was lost and decide whether
+            # the ceiling is wrong for this project — which is a judgement
+            # about their codebase, and the only place it can be made.
+            _lost = [
+                " ".join(str(_c.get("claim", "")).split())[:110]
+                for _c in _all_claims[_MAX_CLAIMS_PER_STEP:]
+                if isinstance(_c, dict)
+            ]
+            self._f._log_debug(
+                f"🤖 Ledger: step {step.id} emitted {len(_all_claims)} "
+                f"claim(s) and the contract caps them at "
+                f"{_MAX_CLAIMS_PER_STEP} — {len(_all_claims) - _MAX_CLAIMS_PER_STEP} "
+                f"discarded from the tail, unranked and unverified:"
+                + "".join(f"\n    · {_x}" for _x in _lost[:6])
+            )
 
         # Region: control signals (early-exit / re-plan markers)
         try:
@@ -13950,7 +14007,11 @@ class AgenticEvidenceLedger:
             pass
 
         # Region: build + validate each claim against the SymbolIndex
-        for rc in raw_claims[:20]:
+        # The same constant as the slice above, not a second literal. They
+        # were 12 and 20: the contract asked for at most 12, the slice
+        # enforced 12, and this loop would have discarded anything past 20
+        # a second time without a word. One ceiling, named once.
+        for rc in raw_claims[:_MAX_CLAIMS_PER_STEP]:
             try:
                 text = str(rc.get("claim", "")).strip()
                 qids = [str(q).strip() for q in rc.get("qids", []) if str(q).strip()]
@@ -13995,6 +14056,42 @@ class AgenticEvidenceLedger:
                     _canon in _known_here or _canon.rsplit(".", 1)[-1] in _known_bare
                 ):
                     claim.valid_qids.append(_canon)
+                    # The symbol exists — under a different parent than the
+                    # one cited. The resolver's last pass matches on the
+                    # bare tail and ignores any class prefix, which is what
+                    # rescues a camelCase or miscased spelling and is worth
+                    # keeping. It also silently accepts an invented parent:
+                    # one turn asserted `AgenticToolBroker._note_body_shown
+                    # is called by …`, and the evidence pass had already
+                    # REFUTED that such a method exists — the symbol is
+                    # module-level. The relation was true of
+                    # `_note_body_shown` and false of the method named, and
+                    # the claim sealed `structural`, settled, on a subject
+                    # that does not exist.
+                    #
+                    # Reported, not rejected. A cited parent can differ
+                    # legitimately when a method is inherited — `Child.run`
+                    # for a `run` defined on the parent is a correct
+                    # attribution and the index holds only the parent's
+                    # form. Telling those apart needs the class hierarchy,
+                    # which this check does not have, and a wrong rejection
+                    # costs a true claim. A run with this line in it says
+                    # how often it happens and which shape it takes.
+                    try:
+                        _cited_parent = qid.rsplit(".", 1)[0] if "." in qid else ""
+                        _canon_parent = (
+                            _canon.rsplit(".", 1)[0] if "." in _canon else ""
+                        )
+                        if _cited_parent and _cited_parent != _canon_parent:
+                            self._f._log_debug(
+                                f"🤖 Ledger: claim cites '{qid}' but the "
+                                f"index holds '{_canon}' — the symbol "
+                                f"exists under a different parent, so the "
+                                f"claim is about a member that does not "
+                                f"exist as written"
+                            )
+                    except Exception:
+                        pass
                 else:
                     claim.invalid_qids.append(qid)
             # #9: validate asserted call relations, not just symbol existence.
@@ -15301,7 +15398,19 @@ class AgenticEvidenceVerifier:
         "shown is discarded.\n\n"
         "Return ONLY a JSON object:\n"
         '{"verdicts": [{"claim": 1, "verdict": "supported", '
-        '"quote": "<literal text copied from the body>"}]}\n\n'
+        '"quote": "<literal text copied from the body>"}, '
+        '{"claim": 2, "verdict": "indeterminate", "quote": ""}]}\n\n'
+        "EVERY entry carries its own `claim` number, copied from the "
+        "number printed beside that claim above. It is not optional and "
+        "it does not carry over from the entry before: an entry without "
+        "it is discarded unread, because position cannot stand in for it "
+        "— one call was asked about six claims and returned five "
+        "verdicts, and reading them in order would have given a "
+        "body-backed ruling to a claim nobody looked at. Another wrote "
+        "`claim` on the first entry and left it off the next 22: one "
+        "ruling of 23 reached the ledger and 50 seconds of reading was "
+        "thrown away. Return one entry per claim, each naming its own "
+        "number.\n\n"
         'verdict is "supported" when the body states it, "contradicted" '
         'when the body states otherwise, "indeterminate" when the body '
         "shown does not settle it — which is a correct and useful answer, "
@@ -20758,6 +20867,18 @@ class AgenticSynthesisComposer:
                 if ledger is not None
                 else None
             ),
+            (
+                sorted(
+                    {
+                        _c.subject
+                        for _c in ledger.claims
+                        if _c.subject
+                        and ledger.bucket_of(_c) not in ("hard", "structural")
+                    }
+                )[:8]
+                if ledger is not None
+                else None
+            ),
         )
         return "\n".join(lines).rstrip()
 
@@ -20779,6 +20900,7 @@ class AgenticSynthesisComposer:
         winner_corroboration: Optional[float] = None,
         eliminated_accounts: Optional[List[dict]] = None,
         unsettled_claims: Optional[List[str]] = None,
+        unsettled_subjects: Optional[List[str]] = None,
     ) -> List[str]:
         """
         Instruct the final model on the SHAPE of its answer.
@@ -20952,6 +21074,33 @@ class AgenticSynthesisComposer:
                 "which is what putting it first invites — must not be left "
                 "holding a sentence this investigation failed to "
                 "establish.",
+            ]
+
+        # The symbols, beside the propositions. The list above names
+        # statements, and the answers that broke it did not restate them —
+        # they asserted something NEW about the same symbols. Four openings
+        # of one run named an unsettled symbol, and two of them gave
+        # Filter._audit_opening_against_ledger a causal role it does not
+        # have, saying it lowers the confidence figure when all it does is
+        # write a log line. A rule against restating a sentence does not
+        # reach that; a rule about the symbol does.
+        #
+        # Same set the outlet's audit uses, so the instruction and the
+        # check that reports on it are measuring one thing. They were
+        # measuring two, which is why one stayed quiet while the other
+        # fired on four turns in five.
+        _unsub = [_s for _s in (unsettled_subjects or []) if _s]
+        if _unsub:
+            out += [
+                "",
+                "Nothing this turn settled what these symbols DO:\n"
+                + "\n".join(f"  – {_s}" for _s in _unsub[:8]),
+                "",
+                "Your opening paragraph may name them — a mechanism often "
+                "has to — but it may not state what they do, what they "
+                "return, or what they cause. If one of them carries your "
+                "explanation, say in that same sentence that its behaviour "
+                "was not established this turn.",
             ]
 
         # ── Step 3: accounts the evidence did not eliminate ──
@@ -35041,8 +35190,9 @@ class MetacognitiveReasoningEngine:
         }
     )
 
-    @classmethod
-    def _dossier_symbols(cls, d: "HypothesisDossier") -> Set[str]:
+    def _dossier_symbols(
+        self, d: "HypothesisDossier", project_id: str = ""
+    ) -> Set[str]:
         """
         The identifiers a dossier's VERIFIED content stands on.
 
@@ -35066,10 +35216,40 @@ class MetacognitiveReasoningEngine:
         the keyword, and just as wrong. `Class.method` keeps its class:
         that prefix identifies, a receiver does not.
         """
+        # Every name the index holds, which is the only test that is not a
+        # guess. The shape rules below let `NOT`, `The`, `When` and `e.g`
+        # through — English capitalised at a sentence start, or carrying a
+        # dot — and they cannot be told from `Filter` by shape alone. They
+        # can be told apart by asking the index, which knows one and not
+        # the other. Local variables go the same way: `_conf`, `_total`,
+        # `_hard` are real identifiers in the prose and not symbols, and
+        # two dossiers sharing `_total` share nothing.
+        #
+        # Measured on the 19:10 competition: the three dossiers went from
+        # sets half-full of prose to three to five indexed symbols each,
+        # and the pair the shape rules scored 0.14 — two accounts of one
+        # mechanism — came back 0.40.
+        #
+        # Empty index means no filter rather than an empty answer: a
+        # project still indexing must not silently make every dossier
+        # look unrelated to every other.
+        # Straight from the index rather than through the ledger's
+        # _known_names: that helper lives on AgenticEvidenceLedger and this
+        # engine is not one, so calling it would have raised on the first
+        # competition of the first run.
+        _known: Set[str] = set()
+        if project_id:
+            try:
+                _all = set(
+                    self._f._symbol_index.get_all_qualified_names(project_id)
+                )
+                _known = _all | {_q.rsplit(".", 1)[-1] for _q in _all}
+            except Exception:
+                _known = set()
         _texts = d.confirmed_claims or [d.hypothesis]
         _out: Set[str] = set()
         for _t in _texts:
-            for _m in cls._DOSSIER_SYM_RE.findall(_t or ""):
+            for _m in self._DOSSIER_SYM_RE.findall(_t or ""):
                 _s = _m.split("(")[0]
                 # Receiver prefixes, longest first so `self._f.` is
                 # removed before `self.` can take half of it.
@@ -35077,7 +35257,7 @@ class MetacognitiveReasoningEngine:
                     if _s.startswith(_p):
                         _s = ("_" if _p == "self._" else "") + _s[len(_p):]
                         break
-                if not _s or _s in cls._DOSSIER_SYM_STOP:
+                if not _s or _s in self._DOSSIER_SYM_STOP:
                     continue
                 # A bare token under three characters is not a symbol in
                 # this codebase. The previous pattern enforced this with
@@ -35086,6 +35266,8 @@ class MetacognitiveReasoningEngine:
                 # a dossier that was about that very footer. A dotted
                 # token is exempt: `a.b` is short and still a path.
                 if len(_s) < 3 and "." not in _s:
+                    continue
+                if _known and _s.rsplit(".", 1)[-1] not in _known:
                     continue
                 if "_" in _s or "." in _s or _s[0].isupper():
                     _out.add(_s)
@@ -35119,8 +35301,8 @@ class MetacognitiveReasoningEngine:
         graph the pipeline already maintains.
         """
         # ── Step 1: the symbol sets ──
-        _a = self._dossier_symbols(winner)
-        _b = self._dossier_symbols(rival)
+        _a = self._dossier_symbols(winner, project_id)
+        _b = self._dossier_symbols(rival, project_id)
         if not _a or not _b:
             return "independent", 0.0
         _inter = _a & _b
@@ -38832,7 +39014,7 @@ class ActiveCodeUpdater:
         # ------------------------------------------------------------------
         self._f._log_debug("DIAG proc: extract+prepare blocks START")
         new_blocks_pending, symbols_list, content_to_syms, extracted_blocks = (
-            await self._extract_and_prepare_new_blocks(content, role)
+            await self._extract_and_prepare_new_blocks(content, role, project_id)
         )
         self._f._log_debug(
             f"DIAG proc: extract+prepare DONE ({len(new_blocks_pending)} block(s), "
@@ -38975,7 +39157,9 @@ class ActiveCodeUpdater:
     # 2. Extraction & preparation of new blocks
     # ═══════════════════════════════════════════════════════════════════════════
 
-    async def _extract_and_prepare_new_blocks(self, content: str, role: str) -> Tuple[
+    async def _extract_and_prepare_new_blocks(
+        self, content: str, role: str, project_id: str = ""
+    ) -> Tuple[
         List["CodeBlock"],
         List[List["CodeSymbol"]],
         Dict[str, List["CodeSymbol"]],
@@ -39127,7 +39311,11 @@ class ActiveCodeUpdater:
         # authoritative over the model's recollection of it. A block adding
         # any genuinely new symbol still indexes in full, which is what the
         # diff-against-index path needs to keep working.
-        if role == "assistant" and new_blocks_pending:
+        # project_id was read from a name this function never had: the
+        # NameError was caught by the except below and the whole guard
+        # became a no-op that logged once a turn and let every restated
+        # body through. It ran that way for every run since it was added.
+        if role == "assistant" and new_blocks_pending and project_id:
             try:
                 _indexed = set(
                     self._f._symbol_index.get_all_qualified_names(project_id)
@@ -43299,6 +43487,19 @@ class MessageAssembler:
                     messages[:] = self._f._commands._deliver_command_response(
                         messages, _direct[len(_DIRECT_ABSENCE_MARK):]
                     )
+                    # Nothing downstream needs the codebase. The reply is
+                    # already written and the only instruction left is
+                    # `print this exactly`, so Block A, the hub tier and
+                    # Block B are ~74000 tokens the model will not read
+                    # and the server will re-prefill: one turn spent a full
+                    # re-processing echoing four lines of fixed text.
+                    #
+                    # A command takes the same shape and does not pay it,
+                    # because handle_command returns from the inlet before
+                    # the assembly step. This path cannot return from
+                    # there — it runs several frames below — so it says so
+                    # here and the assembler reads it.
+                    self._f._answer_is_verbatim_echo = True
                     return
                 dynamic_injections.append(("trailing", _direct))
                 return
@@ -44059,6 +44260,24 @@ class MessageAssembler:
                 if t
             )
 
+        # A verbatim echo carries no code context. Set by the direct
+        # retrieval path when the answer is already written and the model's
+        # only job is to print it; nothing between here and the host reads
+        # the codebase, so sending it costs a full prefill for nothing.
+        #
+        # The trade is real and worth stating: the slot then holds a small
+        # prompt, so the next turn's first aligned call re-processes. That
+        # call is the first of its chain and re-processes on most turns
+        # anyway, while this one re-processes every time — but if a run
+        # shows the following turn getting slower, this is where to look.
+        if getattr(self._f, "_answer_is_verbatim_echo", False):
+            self._f._answer_is_verbatim_echo = False
+            self._f._log_debug(
+                "🔗 Answer prompt: verbatim echo — no code context sent "
+                "(the reply is already written; the model only prints it)"
+            )
+            return messages
+
         # Same part ordering and joiner as _assemble_prelim_system, so the
         # final prompt is byte-consistent with the preliminary one through
         # (Block A + tier) and the aligned-prefix invariant of auxiliary
@@ -44128,6 +44347,58 @@ class MessageAssembler:
             self._f._log_debug(
                 f"answer-prompt junction splice skipped ({_e_splice!r})"
             )
+
+        # ── The junction, counted in tokens ────────────────────────────────
+        # Diagnosis, not behaviour. The splice above makes the answer
+        # prompt begin with the same CHARACTERS the auxiliary calls sent —
+        # startswith proves that much. llama.cpp still reports the branch
+        # two tokens before the checkpoint the auxiliary calls left:
+        #
+        #     checking checkpoint with [72630, 72630] against 72628
+        #
+        # Same characters, different token counts, which leaves one
+        # explanation standing and it is the one _PREFIX_ROLE_SEPARATOR's
+        # own comment warns about: Qwen2 pre-tokenises punctuation with the
+        # newlines that follow it, so the last token of the separator can
+        # absorb the first character after it — a `<` here, a letter in an
+        # auxiliary role — and the shared prefix ends one or two tokens
+        # earlier than the shared text does.
+        #
+        # This measures both sides with the tokenizer this file already
+        # holds. If the two numbers below reproduce llama's pair, the
+        # merge is confirmed and the fix is to end the junction on a token
+        # that cannot absorb what follows. If they do not, the prompt that
+        # reaches the server is not the one assembled here, and that is a
+        # different and larger problem.
+        try:
+            _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
+            if _pre and self._f.tokenizer and final_system.startswith(_pre):
+                _t_junction = len(
+                    self._f.tokenizer.encode(_pre + _PREFIX_ROLE_SEPARATOR)
+                )
+                # The longest token-prefix the two actually share, found by
+                # encoding both and walking forward. Character identity does
+                # not imply token identity and this is the number that
+                # decides whether a checkpoint is reachable.
+                _a = self._f.tokenizer.encode(
+                    _pre + _PREFIX_ROLE_SEPARATOR + "You are"
+                )
+                _b = self._f.tokenizer.encode(final_system)
+                _shared = 0
+                for _x, _y in zip(_a, _b):
+                    if _x != _y:
+                        break
+                    _shared += 1
+                self._f._log_debug(
+                    f"🔗 Junction: prelim+SEP = {_t_junction} tokens · "
+                    f"longest shared token prefix with an auxiliary call = "
+                    f"{_shared} · delta {_t_junction - _shared}. Compare with "
+                    f"llama's `checking checkpoint with [N] against M`: a "
+                    f"matching delta confirms a tokenizer merge at the "
+                    f"junction."
+                )
+        except Exception as _e_tok:
+            self._f._log_debug(f"junction token probe skipped ({_e_tok!r})")
 
         if pending_summary:
             final_system = final_system + "\n\n" + pending_summary
@@ -52071,6 +52342,7 @@ class Filter:
             self._serial_rival_relations = []
             self._serial_rival_causes = []
             self._serial_rival_accounts = []
+            self._answer_is_verbatim_echo = False
             self._serial_dropped_gaps = []
             self._serial_unreadable_subjects = []
             self._serial_winner_corroboration = None
@@ -52728,6 +53000,25 @@ class Filter:
 
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
             self._seal_answer_handoff()
+            # The last thing said before the host takes over. Without it
+            # the status line left on screen is whichever pipeline step
+            # emitted last — in practice the generative evaluation, which
+            # costs 4 to 7 seconds — while the reader waits out the answer
+            # call, which carries the whole prefix and takes 35 to 110.
+            # The cost was being attributed to the cheapest step in the
+            # pipeline because it happened to hold the microphone.
+            #
+            # Says nothing it cannot know: the token count is the one the
+            # assembler measured for this very prompt, and no claim is
+            # made about how long it will take.
+            try:
+                _ho = int(getattr(self, "_inlet_handoff_tokens", 0) or 0)
+                await self._emit_status(
+                    "✍️ Writing the answer"
+                    + (f" (~{_ho} tokens of context)" if _ho else "")
+                )
+            except Exception:
+                pass
             self._log_section(
                 "CONTEXT MANAGER - INLET END",
                 duration=time.monotonic() - inlet_start,
