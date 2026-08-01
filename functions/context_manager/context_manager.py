@@ -360,6 +360,38 @@ class CompetitionRecord:
 _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 
 
+_ANSWER_FOOTER_RE = re.compile(r"^[ \t]*\[Confidence:[^\]\n]*\][ \t]*$", re.M)
+_ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
+
+
+def _strip_answer_scaffolding(text: str) -> str:
+    """Remove the turn mark and confidence footer from an answer.
+
+    Both are presentation this file requests, and both are re-read: the
+    previous answer is indexed and stored in long term memory, so whatever
+    ends it becomes the pattern the model imitates next turn. A measured
+    footer is only true of the turn that measured it, and carried forward
+    it is a number attached to the wrong evidence.
+
+    Every footer is removed, not the last one, because a turn can end with
+    more than one and the stale ones are exactly the problem. Matching is
+    anchored to whole lines so a footer discussed inside a sentence — this
+    project asks about its own footers — is left alone.
+
+    Returns the text unchanged on any failure: this runs on the path that
+    indexes the previous answer, and losing that is worse than keeping a
+    footer.
+    """
+    try:
+        if not isinstance(text, str) or not text:
+            return text
+        _out = _ANSWER_FOOTER_RE.sub('', text)
+        _out = _ANSWER_MARK_RE.sub('', _out)
+        return _out.strip() or text
+    except Exception:
+        return text
+
+
 def _note_body_shown(filt, qid: str) -> None:
     """
     Record that the model has now seen the body of a qid this turn.
@@ -14584,6 +14616,27 @@ class AgenticEvidenceLedger:
                         verified = True
                         break
                 if not verified:
+                    # A class is not a destination a call relation can have.
+                    # Such a claim is not false, it is unevaluable, and
+                    # counting it as invalid put it in the same bucket as a
+                    # claim the code actually contradicts — which is how a
+                    # true consequence ended up in a dossier's refuted list
+                    # while its own longer form sat in the confirmed one.
+                    _dst_kind = ""
+                    try:
+                        _dst_meta = self._f._symbol_index.get_symbol_meta(
+                            callee, project_id
+                        )
+                        _dst_kind = str((_dst_meta or {}).get("kind", "") or "")
+                    except Exception:
+                        _dst_kind = ""
+                    if _dst_kind == "class":
+                        self._f._log_debug(
+                            f"🔗 DIAG relation: '{caller} calls {callee}' "
+                            f"MALFORMED — the destination is a class, not a "
+                            f"callable; not counted either way"
+                        )
+                        continue
                     invalid.append(f"{caller}_calls_{callee}")
                     self._f._log_debug(
                         f"🔗 DIAG relation: '{caller} calls {callee}' "
@@ -18345,13 +18398,21 @@ class AgenticPlanner:
                 and bool(_target)
                 # The intent label used to gate this and no longer does. It
                 # is not stable — the same request came back "debug" three
-                # times and "modify" once across four runs — and the two
-                # conditions below already reject the case it was guarding:
-                # a compound ask, and one the classifier judged
-                # reasoning-heavy. A deterministic lookup should not depend
-                # on a label that moves.
+                # times and "modify" once across four runs. cot_level was
+                # put in its place and moved the same way: the identical
+                # request classified 1 on one run and 2 on the next, and
+                # the run where it came back 2 spent 164 seconds and eight
+                # model calls on a lookup. Both are the classifier's
+                # opinion of how hard the turn is, and that opinion is not
+                # a fact about whether an artifact was asked for.
+                #
+                # What remains are the conditions that describe the request
+                # rather than rate it: the flag, a named target, a single
+                # clause, and a target whose kind has one possible reading.
+                # A wrong answer here is cheap — the retrieval either finds
+                # the artifact or returns "" and the turn proceeds as it
+                # would have.
                 and _cls.get("multiclause") is not True
-                and int(_cls.get("cot_level", 1) or 1) == 1
                 and _kind in ("diff_stored", "diff_compute")
             )
         except Exception:
@@ -20999,6 +21060,36 @@ class AgenticOrchestrator:
         project_id: str,
         status_prefix: str = "",
     ) -> bool:
+        """Run the forge and charge its time to the step that owns it.
+
+        The serial hypothesize branch sets status and output but never
+        touched step.seconds, so the forge — the most expensive stage in
+        the pipeline — reported 0.0s and its minutes landed in the run
+        record as unattributed overhead. One turn read 103.7s of steps
+        against 517.3s of overhead while the forge ran for seven minutes.
+
+        Accumulates rather than assigns: on the uncached path the executor
+        has already timed the step's own LLM call, and that time is real.
+        """
+        _t0_forge = time.monotonic()
+        try:
+            return await self._maybe_compete_hypothesize_inner(
+                step, project_id, status_prefix=status_prefix
+            )
+        finally:
+            try:
+                step.seconds = float(getattr(step, "seconds", 0.0) or 0.0) + (
+                    time.monotonic() - _t0_forge
+                )
+            except Exception:
+                pass
+
+    async def _maybe_compete_hypothesize_inner(
+        self,
+        step: AgenticStep,
+        project_id: str,
+        status_prefix: str = "",
+    ) -> bool:
         """
         Proactively run the hypothesis competition on a hypothesize step
         (0030): its claims are rival root causes, which is exactly what
@@ -21066,11 +21157,18 @@ class AgenticOrchestrator:
                 f"agentic_serial_step_{step.id}",
             )
             _plausible = [d for d in _dossiers if d.status == "plausible"]
-            await self._f._emit_status(
-                f"⚔️ Final competition [ranked by corroboration, "
-                f"parsimony, anchors]: {len(_plausible)} plausible "
-                f"dossier(s) of {len(_dossiers)} sealed"
-            )
+            # No dossier means no competition was held, and announcing a
+            # ranking of nothing reads as a stage that ran and found
+            # nothing surviving — the opposite of what happened. The
+            # path was rare while the forge sealed everything it built,
+            # including candidates resting on invented names; dropping
+            # those made it ordinary.
+            if _dossiers:
+                await self._f._emit_status(
+                    f"⚔️ Final competition [ranked by corroboration, "
+                    f"parsimony, anchors]: {len(_plausible)} plausible "
+                    f"dossier(s) of {len(_dossiers)} sealed"
+                )
             # How each one ended, whenever there is one. The cause was
             # rendered only on the path where nothing survived, so a turn
             # that kept one and buried two said nothing about the two —
@@ -21089,6 +21187,34 @@ class AgenticOrchestrator:
                     self._f._log_debug(
                         f"🔬 Competition outcome: {len(_plausible)}/"
                         f"{len(_dossiers)} plausible — {_fates}"
+                    )
+                    # The dump recorded every sealed dossier and then the
+                    # devil's advocate, with nothing in between: the stage
+                    # that picks a winner and lets rivals live left no
+                    # forensic trace at all, and a surviving rival is what
+                    # divides the confidence the answer reports. One turn
+                    # published a 100% header beside a 50% footer with no
+                    # record anywhere of what halved it.
+                    self._f._record_agent_act(
+                        f"agentic_serial_step_{step.id}_competition",
+                        "contract",
+                        {
+                            "plausible": len(_plausible),
+                            "sealed": len(_dossiers),
+                            "dossiers": [
+                                {
+                                    "hypothesis": (d.hypothesis or "")[:200],
+                                    "status": d.status,
+                                    "cause_of_death": d.cause_of_death,
+                                    "corroboration": round(d.corroboration, 3),
+                                    "assumptions": d.assumptions,
+                                    "anchors_touched": d.anchors_touched,
+                                    "cycles_used": d.cycles_used,
+                                    "nodes_read": d.nodes_read,
+                                }
+                                for d in _dossiers
+                            ],
+                        },
                     )
                 except Exception as _e_fates:
                     self._f._log_debug(
@@ -23544,9 +23670,13 @@ class AgenticOrchestrator:
                     "your own — your own estimate is not measured and "
                     "predicts nothing:\n\n" + _t_line
                 )
+                # Logged whole. The cut used to be [:60], which landed
+                # exactly on the boundary where the reason a rival survived
+                # begins, so the one field worth reading was the one field
+                # the log could never show.
                 self._f._log_debug(
                     f"🤖 Agentic: measured confidence handed to the final "
-                    f"model — {_t_line[:60]}"
+                    f"model — {_t_line[:400]}"
                 )
         except Exception as _e_conf_inj:
             self._f._log_debug(
@@ -26928,6 +27058,15 @@ class CodeBlockManager:
                             ", ".join(sorted(result.keys())[:12])
                             if hasattr(result, "keys")
                             else type(result).__name__
+                            + "("
+                            + ", ".join(
+                                sorted(
+                                    a
+                                    for a in dir(result)
+                                    if not a.startswith("_")
+                                )[:12]
+                            )
+                            + ")"
                         )
                     )
             except Exception as e:
@@ -31569,7 +31708,6 @@ class MetacognitiveReasoningEngine:
         except (json.JSONDecodeError, Exception):
             return hypothesis
 
-    @staticmethod
     async def generate_predictions(
         self,
         hypothesis: str,
@@ -32979,13 +33117,6 @@ class MetacognitiveReasoningEngine:
                 + f" — {len(_expanded_qids)} node(s) of the call tree "
                 f"read so far"
             )
-            if _verdict == "dead":
-                _dossier.status = "dead"
-                _dossier.cause_of_death = _cause
-                break
-            if _verdict == "plausible":
-                _dossier.status = "plausible"
-                break
             # Did this cycle's decided consequences bear on the
             # hypothesis at all? A dossier sealed `plausible` with
             # corroboration 0.386 while its own analysis called the
@@ -32994,8 +33125,13 @@ class MetacognitiveReasoningEngine:
             # count is not changed here, only reported: the thresholds are
             # calibrated against it and cannot be re-tuned from outside a
             # run.
+            #
+            # This runs before the verdict is acted on. It used to sit
+            # below the two breaks, so the cycle that actually sealed a
+            # dossier was the one cycle never examined — precisely the
+            # cycle whose consequences decide what gets reported.
             try:
-                _hyp_names = set(re.findall(r"[A-Za-z_]\w*(?:\.\w+)*", hyp_text or ""))
+                _hyp_names = self._code_refs(hyp_text)
                 _decided = [
                     _c
                     for _c in _claims
@@ -33005,7 +33141,7 @@ class MetacognitiveReasoningEngine:
                     _on_topic = 0
                     for _c in _decided:
                         _txt = str(_c.get("claim", "") if isinstance(_c, dict) else _c)
-                        _cn = set(re.findall(r"[A-Za-z_]\w*(?:\.\w+)*", _txt))
+                        _cn = self._code_refs(_txt)
                         if _cn & _hyp_names:
                             _on_topic += 1
                     if _on_topic == 0:
@@ -33017,6 +33153,13 @@ class MetacognitiveReasoningEngine:
                         )
             except Exception:
                 pass
+            if _verdict == "dead":
+                _dossier.status = "dead"
+                _dossier.cause_of_death = _cause
+                break
+            if _verdict == "plausible":
+                _dossier.status = "plausible"
+                break
             _resolvable_prev = _conf_n + _ref_n
             # ── Step 7b: deduce consequences for the NEXT cycle ──
             # Only on a continuing cycle: a sealed dossier would
@@ -33025,11 +33168,27 @@ class MetacognitiveReasoningEngine:
             # the method — the forge was purely retrodictive
             # before, accumulating corroboration only from the
             # evidence each hypothesis was BUILT to explain.
+            # Binding the call is separated from awaiting it. A signature
+            # mismatch raises at call time and is a defect in this file; a
+            # failure inside the coroutine is a degraded run. Sharing one
+            # handler let an orphan @staticmethod report itself as a
+            # routine skip for several runs before anyone noticed.
+            _pred_call = None
             try:
-                _predictions = await self.generate_predictions(hyp_text, project_id)
-            except Exception as _e_pred:
-                _predictions = []
-                self._f._log_debug(f"forge predictions: skipped ({_e_pred})")
+                _pred_call = self.generate_predictions(hyp_text, project_id)
+            except TypeError as _e_bind:
+                self._f._log_debug(
+                    f"🔴 BUG: generate_predictions could not be called "
+                    f"({_e_bind}) — the deductive half of the cycle "
+                    f"did not run"
+                )
+            _predictions = []
+            if _pred_call is not None:
+                try:
+                    _predictions = await _pred_call
+                except Exception as _e_pred:
+                    _predictions = []
+                    self._f._log_debug(f"forge predictions: skipped ({_e_pred})")
             if _predictions:
                 if "deduction" not in _dossier.strategy_trace:
                     _dossier.strategy_trace.append("deduction")
@@ -33053,6 +33212,32 @@ class MetacognitiveReasoningEngine:
         _dossier.blind_spots = [
             f"rung:{r}" for r in self._INVESTIGATION_LADDER if r not in _walked
         ] + [f"symbol:{s[:60]}" for s in _dossier.unresolved_claims[:3]]
+        # A proposition cannot be both confirmed and refuted by the same
+        # dossier. When it happens it is not conflicting evidence, it is a
+        # polarity error: the analyze step writes 'refuted' meaning the
+        # HYPOTHESIS is refuted, and the consequence — which is true — is
+        # filed as false. One sealed dossier carried the same sentence in
+        # both lists and died of it while its identical twin survived.
+        # Reported, not repaired: repairing it needs the contract to name
+        # its subject, which is a change to the prompt and the parser.
+        try:
+            _norm = lambda s: "".join(
+                _ch for _ch in str(s).lower() if _ch.isalnum() or _ch == " "
+            ).strip()
+            _conf_norm = {_norm(_c)[:120] for _c in _dossier.confirmed_claims}
+            _both = [
+                _c
+                for _c in _dossier.refuted_claims
+                if _norm(_c)[:120] and _norm(_c)[:120] in _conf_norm
+            ]
+            if _both:
+                self._f._log_debug(
+                    f"🔬 Forge: seal is incoherent — {len(_both)} "
+                    f"proposition(s) recorded as BOTH confirmed and "
+                    f"refuted by the same dossier: '{_both[0][:80]}'"
+                )
+        except Exception:
+            pass
         # The sealed contract, recorded in execution order right after
         # the calls that produced it. This is the pair that makes the
         # dump forensic rather than archival: the calls above show what
@@ -33094,6 +33279,40 @@ class MetacognitiveReasoningEngine:
         return _dossier
 
     _HYP_FUNC_REF_RE = re.compile(r"`?\b([A-Za-z_]\w*(?:\.\w+)+|\w+)\(\)")
+    # The shapes that count as an explicit code reference inside prose: a
+    # dotted path, or a bare name written with attached parentheses. Bare
+    # words are excluded on purpose. "coverage", "render" and "confidence"
+    # are ordinary English in this domain, and a pattern that admitted them
+    # matched on "the" — which is why the off-topic check never once fired
+    # while a hypothesis earned all of its corroboration off-topic.
+    _HYP_CODE_REF_RE = re.compile(r"[A-Za-z_]\w*(?:\.\w+)+|[A-Za-z_]\w*(?=\s*\(\))")
+    # A dotted shape is not always code: `agents.md` and `models.ini` read
+    # as Class.attribute to a regex. Left in, a filename can be the one
+    # token that clears a bar the hypothesis should have failed.
+    _HYP_FILE_TAILS = frozenset(
+        {"md", "py", "json", "txt", "yaml", "yml", "ini", "log", "csv",
+         "html", "cfg", "toml", "sh", "js", "ts"}
+    )
+
+    @classmethod
+    def _code_refs(cls, text: str) -> set:
+        """The symbols a piece of prose explicitly names, filenames removed.
+
+        The single reader of _HYP_CODE_REF_RE. Three gates depend on this
+        answer — the phantom-candidate drop, the off-topic corroboration
+        check and the null bar — and they must not drift apart, because a
+        hypothesis that clears one of them on a technicality clears all
+        three.
+        """
+        try:
+            _out = set()
+            for _r in cls._HYP_CODE_REF_RE.findall(text or ""):
+                if "." in _r and _r.rsplit(".", 1)[-1].lower() in cls._HYP_FILE_TAILS:
+                    continue
+                _out.add(_r)
+            return _out
+        except Exception:
+            return set()
 
     def _hypothesis_is_grounded(self, hypothesis: str, project_id: str) -> bool:
         """Does this hypothesis name at least one symbol that exists?
@@ -33130,6 +33349,36 @@ class MetacognitiveReasoningEngine:
             if _r in _all or _r in _bare or _r.rsplit(".", 1)[-1] in _bare:
                 return True
         return False
+
+    def _subject_never_opened(self, dossier: "HypothesisDossier") -> bool:
+        """Did nobody open a single symbol this dossier's hypothesis names?
+
+        Corroboration counts consequences, not their subject, so a dossier
+        can accumulate true facts about symbols its own mechanism never
+        mentions and read as well supported. The subject is therefore asked
+        for separately, exactly as the `blind` bucket asks it of a claim.
+
+        A hypothesis that makes no explicit code reference at all returns
+        False: there is nothing to check, and abstaining is the only answer
+        that cannot kill a sound account by accident.
+        """
+        try:
+            # ── Step 1: the symbols the hypothesis itself names ──
+            _syms = self._code_refs(dossier.hypothesis or "")
+            if not _syms:
+                return False
+
+            # ── Step 2: what the investigation actually opened ──
+            _opened = set(dossier.nodes_expanded or [])
+            _opened_bare = {str(_o).rsplit(".", 1)[-1] for _o in _opened}
+
+            # ── Step 3: one match anywhere is enough to clear the bar ──
+            return not any(
+                _h in _opened or _h.rsplit(".", 1)[-1] in _opened_bare
+                for _h in _syms
+            )
+        except Exception:
+            return False
 
     async def _forge_all(
         self,
@@ -33382,6 +33631,51 @@ class MetacognitiveReasoningEngine:
                         f"_forge_all: candidate collides with a "
                         f"sealed/buried mechanism — discarded "
                         f"('{_cand[:60]}')"
+                    )
+                    _cand = None
+                    continue
+                # Region: groundedness — generated candidates only
+                # Step 1 filters the seed pool, but a generated candidate
+                # never passed here, and the EC-8 screen below cannot
+                # cover it: that screen needs three checks before it can
+                # be fatal, so a mechanism resting on exactly two invented
+                # function names sits one below the floor and walks
+                # through. Two such candidates once reached the judge,
+                # and one of them survived as a rival and halved the
+                # measured confidence of a turn whose own header read
+                # 100%.
+                if getattr(
+                    self._f.valves, "hypothesis_require_known_symbols", True
+                ) and not self._hypothesis_is_grounded(_cand, project_id):
+                    self._f._log_debug(
+                        f"🔬 Forge: dropped 1 generated candidate naming "
+                        f"no symbol that exists — '{_cand[:60]}'"
+                    )
+                    # The retry has to change the prompt or it is not a
+                    # retry. call_llm keys its cache on model, prompt,
+                    # system and sampler — the attempt label is not in
+                    # the key — so a second call with an unchanged prompt
+                    # is served from cache in 0.000s and returns the same
+                    # candidate, which fails the same check and forfeits
+                    # the slot. Naming the invented symbols does both
+                    # jobs: it breaks the key and it tells the generator
+                    # what went wrong, the way the S9 nudge above does.
+                    try:
+                        _ghosts = sorted(self._code_refs(_cand))[:4]
+                    except Exception:
+                        _ghosts = []
+                    _guidance = (
+                        (_guidance + "\n" if _guidance else "")
+                        + "Guidance: the previous attempt was discarded "
+                        "because it was built on names that do not exist "
+                        "in this project"
+                        + (
+                            " (" + ", ".join(_ghosts) + ")"
+                            if _ghosts
+                            else ""
+                        )
+                        + ". Build the mechanism only out of symbols you "
+                        "have actually been shown."
                     )
                     _cand = None
                     continue
@@ -33654,23 +33948,7 @@ class MetacognitiveReasoningEngine:
         # a symbol it never names. Corroboration counts consequences, not
         # their subject — so the subject is asked for separately, exactly
         # as the `blind` bucket asks it of a claim.
-        _subject_unread = False
-        try:
-            _hyp_syms = set(
-                re.findall(
-                    r"[A-Za-z_]\w*(?:\.\w+)+|[A-Za-z_]\w*(?=\(\))",
-                    _winner.hypothesis or "",
-                )
-            )
-            if _hyp_syms:
-                _opened = set(_winner.nodes_expanded or [])
-                _opened_bare = {str(_o).rsplit(".", 1)[-1] for _o in _opened}
-                _subject_unread = not any(
-                    _h in _opened or _h.rsplit(".", 1)[-1] in _opened_bare
-                    for _h in _hyp_syms
-                )
-        except Exception:
-            _subject_unread = False
+        _subject_unread = self._subject_never_opened(_winner)
         if _subject_unread:
             _winner.status = "dead"
             _winner.cause_of_death = "null_bar"
@@ -33740,7 +34018,27 @@ class MetacognitiveReasoningEngine:
         # full. That is where the multi-cause signal belongs anyway:
         # the reader is the one who can recognise that two surviving
         # accounts are both true of their own system.
-        _rivals = [d for d in _pool if d is not _winner and d.status == "plausible"]
+        # The subject test used to reach the winner only. A rival never
+        # faced it, and a surviving rival is not decorative: it becomes the
+        # independent-rival count that divides the reported confidence. One
+        # turn published a 100% header beside a 50% footer because the
+        # account that halved it named two functions that do not exist and
+        # was never asked whether anyone had opened them.
+        _rivals = []
+        for _d in _pool:
+            if _d is _winner or _d.status != "plausible":
+                continue
+            if self._subject_never_opened(_d):
+                _d.status = "dead"
+                _d.cause_of_death = "null_bar"
+                self._f._log_debug(
+                    f"🔬 Forge: rival dropped by the null bar — not one "
+                    f"symbol the hypothesis names was ever opened "
+                    f"(corroboration {_d.corroboration:.2f}): "
+                    f"'{_d.hypothesis[:60]}'"
+                )
+                continue
+            _rivals.append(_d)
         if _rivals:
             # RS-4: each survivor is classified against the winner
             # BEFORE reporting, so both the reader and the final model
@@ -39714,6 +40012,17 @@ class InletOrchestrator:
                     "prev-assistant: /expand expanded in history (LLM-visible only)"
                 )
 
+        # The confidence footer and the turn mark are scaffolding this
+        # file asks the model to write, not content the model produced.
+        # Stored, they come back through LTM and the history as the
+        # authoritative shape of an answer, and the model then recites a
+        # footer from an older run instead of copying the measured line
+        # it was handed this turn: one run published 59% / 17-29 in an
+        # answer the ledger had scored 84% / 21-25, and no claim in it
+        # came from a run with 29 claims. Removed here, at the single
+        # point where the previous answer enters both the index and long
+        # term memory, so the loop has nothing to feed on.
+        assistant_content = _strip_answer_scaffolding(assistant_content)
         assistant_msg = {"role": "assistant", "content": assistant_content}
 
         # ------------------------------------------------------------------
@@ -48251,6 +48560,12 @@ class Filter:
             ),
         )
 
+        outlet_write_probe: bool = Field(
+            default=False,
+            description=(
+                "Append an unmistakable token to the end of every answer from the outlet, as a one-run test of whether outlet edits reach the reader at all. Two turns measured against the word count the next inlet logged for the same answer matched the displayed text, not the edited text, which suggests every edit made there is discarded and that the turn marks and confidence footers now visible come from the workspace instructions instead. If the token does not appear, no outlet edit does, and the enforcement belongs in the prompt. Leave off outside that test."
+            ),
+        )
         hypothesis_require_known_symbols: bool = Field(
             default=True,
             description=(
@@ -51467,11 +51782,14 @@ class Filter:
                 )
                 if _last0 is None or not isinstance(_last0.get("content"), str):
                     return
-                _t0, _n0 = re.subn(
-                    r"\[Confidence:\s*(\d+)\s*%\]",
+                # Same whole-line shape as the measured branch, so a
+                # footer already carrying a breakdown is labelled too
+                # rather than skipped for not being the short form.
+                _t0, _n0 = _ANSWER_FOOTER_RE.subn(
                     lambda m: (
-                        f"[Confidence: {m.group(1)}% — the model's own "
-                        f"estimate; this turn verified nothing against code]"
+                        m.group(0).rstrip().rstrip("]")
+                        + " — the model's own estimate; this turn "
+                        "verified nothing against code]"
                     ),
                     _last0["content"],
                 )
@@ -51536,13 +51854,39 @@ class Filter:
             )
             if _last is None or not isinstance(_last.get("content"), str):
                 return
+            # Remove every footer, then write one. The pattern here used
+            # to be a substitution requiring `%]` adjacent, which is the
+            # short form the model wrote before it had examples to copy;
+            # once the history carried measured footers the model wrote
+            # those instead, nothing matched, and the branch fell through
+            # to appending — four turns of one run logged `added` and not
+            # one `replaced`, leaving the model's stale number in place
+            # with the measured one beneath it. Deleting first makes the
+            # result independent of how many footers there are and of
+            # which form each takes.
             _text = _last["content"]
-            _new, _n_sub = re.subn(r"\[Confidence:\s*\d+\s*%\]", _line, _text)
-            _last["content"] = _new if _n_sub else _text.rstrip() + "\n\n" + _line
+            _stripped, _n_gone = _ANSWER_FOOTER_RE.subn("", _text)
+            _last["content"] = _stripped.rstrip() + "\n\n" + _line
             self._log_debug(
-                f"outlet: confidence footer {'replaced' if _n_sub else 'added'}"
-                f" with the measured tally ({_settled}/{_total})"
+                f"outlet: confidence footer set to the measured tally "
+                f"({_settled}/{_total}); {_n_gone} pre-existing footer(s) "
+                f"removed"
             )
+            # Whether any of this reaches the reader is unproven. Two
+            # turns of one run were measured against the word count the
+            # next inlet logged for the same answer, and both matched the
+            # text as displayed rather than the text as edited here — so
+            # the edit appears to be discarded, and the marks and footers
+            # that do appear come from the instructions in the workspace
+            # instead. A token nothing else could produce settles it: if
+            # it never shows up in an answer, no outlet edit ever does,
+            # and every enforcement has to move into the prompt.
+            if getattr(self.valves, "outlet_write_probe", False):
+                _last["content"] += "\n\n⟪OUTLET-WRITE-PROBE⟫"
+                self._log_debug(
+                    "outlet: write probe appended — if it is absent from "
+                    "the answer, outlet edits do not reach the reader"
+                )
         except Exception as _e_conf:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
 
