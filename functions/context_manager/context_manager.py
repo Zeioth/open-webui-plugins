@@ -363,6 +363,18 @@ _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 _ANSWER_FOOTER_RE = re.compile(r"^[ \t]*\[Confidence:[^\]\n]*\][ \t]*$", re.M)
 _ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
 
+# Handed to the model on any path that answers without measuring. A footer
+# is a claim about evidence, and on these paths there is none: one turn
+# served a stored artifact in ten seconds and still published `98% — 7/7
+# claims settled against code`, a shape the ledger never emits, over a turn
+# that opened no body and made no claim.
+_NO_MEASURED_FOOTER_NOTE = (
+    "This turn answered without running the evidence pipeline, so nothing "
+    "was counted. Write NO `[Confidence: N%]` line. A confidence line is a "
+    "claim about measurement, and inventing one here states a measurement "
+    "that did not happen."
+)
+
 
 def _strip_answer_scaffolding(text: str) -> str:
     """Remove the turn mark and confidence footer from an answer.
@@ -14302,6 +14314,189 @@ class AgenticEvidenceLedger:
             return "hard" if _state in ("confirmed", "refuted") else "read"
         return "structural"
 
+    # A claim is negative when it denies its predicate. The vocabulary is
+    # small because the claims are machine-written to a contract: `does
+    # NOT`, `does not`, `never`, `no other`. Anything subtler is left
+    # positive, and the cost of that is two claims not collapsing, which
+    # is what happens today anyway.
+    _NEGATED_RE = re.compile(
+        r"\b(?:does\s+not|do\s+not|doesn't|don't|is\s+not|are\s+not|"
+        r"never|no\s+other|not\s+)\b",
+        re.I,
+    )
+    # Strongest first: the survivor of a collapse is the best-evidenced
+    # statement of the proposition, not the first one written.
+    _BUCKET_RANK = (
+        "hard",
+        "structural",
+        "read",
+        "blind",
+        "uncovered",
+        "unoperationalizable",
+    )
+
+    def _proposition_key(self, claim: "LedgerClaim") -> tuple:
+        """The assertion a claim makes, stripped of how it was worded.
+
+        Subject, the symbols it cites, and whether it affirms or denies.
+        This is the rule already trusted for structural claims, with
+        polarity added so that an assertion and its denial do not silently
+        merge into one.
+
+        Wording is deliberately not part of the key. Four claims in one
+        turn said Filter.inlet initializes _bodies_seen_this_turn, and two
+        of them differed only in writing the attribute `filt.` where the
+        others wrote `self.` — no text comparison worth trusting separates
+        those from a genuinely different statement, and none needs to.
+        """
+        return (
+            claim.subject or "",
+            tuple(sorted(getattr(claim, "valid_qids", None) or [])),
+            bool(self._NEGATED_RE.search(claim.text or "")),
+        )
+
+    def collapse_restatements(self) -> int:
+        """Merge claims that assert the same thing, keeping the best-evidenced.
+
+        The dedupe at extraction covers structural claims only, and the
+        behavioural ones are where the restating happens: an investigate
+        step states a fact, a later step states it again from the body it
+        has by then read, and the analyze step states it a third time in
+        the answer's own words. One turn recorded nineteen claims carrying
+        seven propositions, and three of its four blind claims had a hard
+        twin saying the same thing — so the metric reported unread bodies
+        for symbols whose bodies had been read and quoted.
+
+        Runs at tally time rather than at extraction because that is the
+        first moment the verdicts exist, and the point is to keep the
+        strongest of a set rather than the earliest. Rewrites self.claims
+        so the tally, the dump and the workspace all read one list — two
+        readings of a claim set is what produced a header at 86% over a
+        footer at 93% of the same turn.
+
+        Returns the number of claims removed. Never raises.
+        """
+        _removed = 0
+        try:
+            # ── Step 1: group by what each claim asserts ──
+            _groups: Dict[tuple, List[Any]] = {}
+            for _c in self.claims:
+                _groups.setdefault(self._proposition_key(_c), []).append(_c)
+
+            # ── Step 2: one survivor per proposition, best evidence first ──
+            _rank = {_b: _i for _i, _b in enumerate(self._BUCKET_RANK)}
+            _keep = []
+            for _key, _members in _groups.items():
+                if len(_members) == 1:
+                    _keep.append(_members[0])
+                    continue
+                _best = min(
+                    _members,
+                    key=lambda _m: _rank.get(self.bucket_of(_m), 99),
+                )
+                _keep.append(_best)
+                _removed += len(_members) - 1
+
+            # ── Step 3: rewrite in the original order ──
+            if _removed:
+                _kept = {id(_c) for _c in _keep}
+                self.claims = [_c for _c in self.claims if id(_c) in _kept]
+                self._f._log_debug(
+                    f"🤖 Ledger: {_removed} claim(s) restated a proposition "
+                    f"already recorded — {len(self.claims)} distinct "
+                    f"assertion(s) remain of {_removed + len(self.claims)}"
+                )
+
+            # ── Step 4: the same assertion held both ways ──
+            # Two survivors sharing a subject and cited symbols but not a
+            # polarity cannot both be right, and counting both as settled
+            # publishes an impossibility inside the confidence figure. One
+            # turn settled `_build_activated_code does NOT consult
+            # _bodies_seen_this_turn` against the body and left three
+            # unsettled claims saying it does; the answer asserted the
+            # unsettled side and marked it verified.
+            #
+            # Both are demoted to unsupported rather than one being
+            # picked. The evidence did not separate them, and choosing a
+            # winner here would invent a separation nothing performed.
+            _by_pair: Dict[tuple, Dict[bool, Any]] = {}
+            for _c in self.claims:
+                _s, _q, _neg = self._proposition_key(_c)
+                _by_pair.setdefault((_s, _q), {})[_neg] = _c
+            _contested = 0
+            for (_s, _q), _sides in _by_pair.items():
+                if len(_sides) < 2 or not _s:
+                    continue
+                for _c in _sides.values():
+                    if _c.verification in ("confirmed", "refuted"):
+                        _c.verification = "unsupported"
+                        _c.verification_detail = (
+                            "contested: another claim asserts the opposite "
+                            "of this about the same symbols, and the "
+                            "evidence settled both"
+                        )
+                        _contested += 1
+                if _contested:
+                    self._f._log_debug(
+                        f"🤖 Ledger: '{_s}' is asserted and denied over the "
+                        f"same symbols — both sides demoted from settled, "
+                        f"because the evidence did not separate them"
+                    )
+        except Exception as _e:
+            self._f._log_debug(
+                f"🤖 Ledger: restatement collapse skipped ({_e!r})"
+            )
+        return _removed
+
+    def refresh_unread(self) -> int:
+        """Re-ask which cited bodies went unread, now that the turn is over.
+
+        `unread_qids` is filled when a claim is recorded, against the set
+        of bodies served up to that moment. A body requested by an early
+        step arrives with a later one, and the claim that prompted the
+        request keeps a snapshot taken before its own answer arrived. One
+        turn asked for Filter.inlet, Filter.outlet and _note_body_shown at
+        step 1, was served all three at step 3, and still reported four
+        blind claims about them — beside hard claims stating the same
+        facts, read from the bodies that had by then arrived.
+
+        `blind` outranks every other bucket in bucket_of, deliberately, so
+        a stale snapshot does not merely mislabel a claim: it hides that
+        the retrieval it names as failed actually succeeded.
+
+        Only ever shrinks the unread list. A body served cannot become
+        unserved, and a claim recorded against a symbol nobody ever opened
+        stays blind, which is the case the bucket exists for.
+
+        Returns the number of claims whose unread list changed. Never
+        raises: this runs immediately before the tally and losing the
+        tally is worse than an over-cautious bucket.
+        """
+        _changed = 0
+        try:
+            _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
+            if not _seen:
+                return 0
+            for _c in self.claims:
+                _was = getattr(_c, "unread_qids", None) or []
+                if not _was:
+                    continue
+                _now = [_q for _q in _was if _q not in _seen]
+                if len(_now) != len(_was):
+                    _c.unread_qids = _now
+                    _changed += 1
+            if _changed:
+                self._f._log_debug(
+                    f"🤖 Ledger: {_changed} claim(s) cited a body that was "
+                    f"served later in the turn — re-checked against the "
+                    f"{len(_seen)} body/bodies actually read"
+                )
+        except Exception as _e:
+            self._f._log_debug(
+                f"🤖 Ledger: unread re-check skipped ({_e!r})"
+            )
+        return _changed
+
     def coverage(self) -> Dict[str, Any]:
         """Tally claims by the strength of the evidence behind them.
 
@@ -15349,6 +15544,7 @@ class AgenticEvidenceVerifier:
         dropped = 0
         unindexed = 0
         elsewhere = 0
+        _own_only = 0
         offtopic = 0
         _samples: List[str] = []
         for rv in raw:
@@ -15410,6 +15606,32 @@ class AgenticEvidenceVerifier:
                 _own = " ".join(bodies.get(by_index[n], "").split())
                 if any(_q not in _own for _q in _flats):
                     elsewhere += 1
+                    # For a behavioural claim the distinction above does
+                    # not hold. "A reads X from B" is settled by B's body
+                    # because the claim is about a relation; "A does P" is
+                    # a statement about A's own code and nothing in B can
+                    # settle it either way. One turn returned `contradicted`
+                    # for '_render_symbol_body_only calls _note_body_shown'
+                    # over a quote lifted from _resolve_hub_body, while the
+                    # call graph verified the same relation — one hard and
+                    # one structural claim pointing opposite ways, both
+                    # counted as settled against real code.
+                    #
+                    # Demoted to indeterminate, not dropped: the body was
+                    # read, so the claim lands in `read`, which says
+                    # exactly what happened. Relational claims keep the
+                    # cross-body reading they were given.
+                    _cl = claims[n - 1]
+                    if (
+                        getattr(_cl, "claim_kind", "") == "behavioural"
+                        and not _CALL_TARGET_RE.search(_cl.text)
+                    ):
+                        _own_only += 1
+                        out[n] = (
+                            "indeterminate",
+                            "quote came from another symbol's body",
+                        )
+                        continue
                 # A quote can be real code and still be the wrong line. For
                 # the one claim shape where the quote must name something —
                 # "A calls B" and its variants — check that it does. Counted,
@@ -15432,7 +15654,13 @@ class AgenticEvidenceVerifier:
             self._f._log_debug(
                 f"🤖 Evidence: {elsewhere} verdict(s) settled from a body "
                 f"other than the claim's own subject — cross-symbol "
-                f"readings, kept"
+                f"readings, {elsewhere - _own_only} kept"
+            )
+        if _own_only:
+            self._f._log_debug(
+                f"🤖 Evidence: {_own_only} behavioural verdict(s) demoted "
+                f"to indeterminate — the quote came from another symbol's "
+                f"body, which cannot settle what this symbol does"
             )
         if offtopic:
             self._f._log_debug(
@@ -18485,14 +18713,20 @@ class AgenticPlanner:
                 "infer or compose the artifact from code you have read: "
                 "an artifact you assemble yourself is not the one that "
                 "was asked for, and presenting it as such is worse than "
-                "the absence.\n\n" + _art
+                "the absence.\n\n"
+                + _NO_MEASURED_FOOTER_NOTE
+                + "\n\n"
+                + _art
             )
         return (
             "## Retrieved for this turn\n\n"
             "The user asked for an artifact and the pipeline fetched it "
             "directly. Present it verbatim inside a fenced block and add "
             "at most one sentence saying what it is. Do not investigate "
-            "and do not explain what might be wrong with it.\n\n" + _art
+            "and do not explain what might be wrong with it.\n\n"
+            + _NO_MEASURED_FOOTER_NOTE
+            + "\n\n"
+            + _art
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -20522,6 +20756,7 @@ class AgenticSynthesisComposer:
             getattr(self._f, "_serial_unwalked_rungs", None),
             _vc.get("unchecked", 0),
             _vc.get("unsupported", 0),
+            getattr(self._f, "_serial_rival_accounts", None),
         )
         return "\n".join(lines).rstrip()
 
@@ -20537,6 +20772,7 @@ class AgenticSynthesisComposer:
         unwalked_rungs: Optional[List[str]] = None,
         n_unchecked: int = 0,
         n_unsupported: int = 0,
+        rival_accounts: Optional[List[dict]] = None,
     ) -> List[str]:
         """
         Instruct the final model on the SHAPE of its answer.
@@ -20642,7 +20878,49 @@ class AgenticSynthesisComposer:
                     "conclusion's evidence stops where the "
                     "investigation stopped.",
                 ]
-        # ── Step 3: code, with an explicit fencing contract ──
+        # ── Step 3: accounts the evidence did not eliminate ──
+        # Only when one survived. A heading over an empty list teaches
+        # the model to invent a rival, which is the opposite of the point.
+        _rivals = [_r for _r in (rival_accounts or []) if _r.get("hypothesis")]
+        if _rivals:
+            out += [
+                "",
+                "**Other plausible accounts** — the competition did not "
+                "eliminate these, and the confidence figure is divided by "
+                "them. State each one in a sentence, in your own words, "
+                "and say what would tell it apart from the account you "
+                "chose. Do not argue them down: they survived because the "
+                "evidence did not separate them, and presenting a "
+                "settled contest is the failure this section exists to "
+                "prevent.",
+            ]
+            for _r in _rivals[:3]:
+                # `stalled` and `budget` mean the cycles ran out; anything
+                # else means the evidence weighed it and did not choose.
+                # The reader needs that difference, because only the first
+                # is worth spending another turn on.
+                _why = str(_r.get("cause") or "")
+                _spent = (
+                    "ran out of cycles before it could be separated"
+                    if _why in ("stalled", "budget")
+                    else "was weighed against the winner and not separated"
+                )
+                _rel = str(_r.get("relation") or "")
+                _kind = (
+                    " It is complementary: the mechanism may have more "
+                    "than one cause, and a fix addressing only the chosen "
+                    "account may be half a fix."
+                    if _rel == "complementary"
+                    else ""
+                )
+                out += [
+                    "",
+                    f"- Surviving account (corroboration "
+                    f"{_r.get('corroboration', 0)}): "
+                    f"{_r.get('hypothesis', '')}"
+                    f" — it {_spent}.{_kind}",
+                ]
+        # ── Step 4: code, with an explicit fencing contract ──
         if has_code:
             out += [
                 "",
@@ -20654,7 +20932,7 @@ class AgenticSynthesisComposer:
                 "outside them — an unclosed block swallows the rest of "
                 "the answer.",
             ]
-        # ── Step 4: where the reader goes next ──
+        # ── Step 5: where the reader goes next ──
         out += [
             "",
             "**How to proceed** — the next concrete step, ordered so "
@@ -20662,6 +20940,21 @@ class AgenticSynthesisComposer:
             "the symbol to read, the check to run, the thing to "
             "instrument. Actionable, not generic advice.",
         ]
+        if _rivals:
+            # Ordering, not an extra instruction. A surviving account is
+            # the largest single piece of uncertainty in the turn — it is
+            # what the confidence figure is divided by — so the step that
+            # separates it belongs at the top of a list already sorted by
+            # how much uncertainty it settles.
+            out += [
+                "",
+                "One of those steps must be the observation that would "
+                "separate the surviving account(s) from the one you "
+                "chose, and it goes first: nothing else in this turn "
+                "settles more. Name the account it would settle, using "
+                "the same words you used for it above, so the reader can "
+                "ask for that one by name.",
+            ]
         return out
 
 
@@ -23537,6 +23830,15 @@ class AgenticOrchestrator:
         # reads the ledger, so the dump carries the same numbers the answer
         # was built from rather than a later reconstruction of them.
         try:
+            # Before the tally, not after: coverage() and the dump's
+            # per-claim list both read bucket_of, and a bucket that moved
+            # between the two readings is the divergence this file already
+            # paid for once.
+            self._ledger.refresh_unread()
+            # After the unread re-check, never before: the survivor of a
+            # collapse is chosen by bucket, and a bucket still carrying a
+            # stale blind flag would win the wrong claim.
+            self._ledger.collapse_restatements()
             _cov = self._ledger.coverage()
             # Survivors the evidence did not separate from the winner. Only
             # 'independent' ones bear on whether the presented account is the
@@ -25816,7 +26118,6 @@ class CommandRouter:
                 "strategy history gets that something worked",
             ),
             ("/expand <symbol>", True, "pull a symbol's full body into context"),
-            ("/forget <topic>", True, "drop what the filter remembers about it"),
             (
                 "/freeze · /unfreeze",
                 True,
@@ -27022,16 +27323,49 @@ class CodeBlockManager:
                 config = ProcessConfig()
                 config.language = "markdown"
                 result = process(content, config)
-                # A mapping, not an object: ProcessResult carries keys, so
-                # `hasattr(result, "blocks")` was false every time and the
-                # branch below had never run. Both spellings accepted.
+                # ProcessResult is an object and it has no `blocks`. Its
+                # attributes were finally printed by the diagnostic below:
+                # chunks, comments, diagnostics, docstrings, exports,
+                # from_json, imports, language, metrics, structure,
+                # symbols. `chunks` is the fenced-span carrier, so that is
+                # what this reads; `blocks` stays first for a library
+                # version that grows it, and the mapping spelling stays
+                # for one that returns a dict.
                 _rblocks = None
-                if hasattr(result, "blocks"):
-                    _rblocks = result.blocks
-                elif hasattr(result, "get"):
+                for _attr in ("blocks", "chunks"):
+                    if hasattr(result, _attr):
+                        _rblocks = getattr(result, _attr)
+                        break
+                if _rblocks is None and hasattr(result, "get"):
                     try:
-                        _rblocks = result.get("blocks")
+                        _rblocks = result.get("blocks") or result.get("chunks")
                     except Exception:
+                        _rblocks = None
+                # A chunk whose offsets this code cannot read is not a
+                # block it can use. Rather than raise inside the loop and
+                # lose the regex fallback with it, the shape is checked
+                # once and reported, so the next run names the fields
+                # instead of leaving another guess in place.
+                if _rblocks:
+                    _probe = _rblocks[0]
+                    if not (
+                        hasattr(_probe, "start_byte")
+                        and hasattr(_probe, "end_byte")
+                    ):
+                        self._f._log_debug(
+                            f"extract_code_blocks: process() returned "
+                            f"{len(_rblocks)} chunk(s) but they carry no "
+                            f"byte offsets — falling through to regex. A "
+                            f"chunk carries: {type(_probe).__name__}("
+                            + ", ".join(
+                                sorted(
+                                    a
+                                    for a in dir(_probe)
+                                    if not a.startswith("_")
+                                )[:16]
+                            )
+                            + ")"
+                        )
                         _rblocks = None
                 if _rblocks is not None:
                     self._f._log_debug(
@@ -34077,6 +34411,26 @@ class MetacognitiveReasoningEngine:
                 ]
             except Exception:
                 self._f._serial_rival_causes = []
+            # The account itself, not only its label. A survivor was
+            # reported as a status line and nowhere else: it left the
+            # screen when the next status replaced it, never entered the
+            # answer, and so never entered the chat log either. That is
+            # the one place it would have been useful, because a reader
+            # who can see a rival named can ask for it by name next turn,
+            # and a reader who cannot is told only that confidence is low.
+            try:
+                self._f._serial_rival_accounts = [
+                    {
+                        "hypothesis": (_rv.hypothesis or "")[:400],
+                        "corroboration": round(_rv.corroboration, 2),
+                        "relation": _rv.relation_to_winner or "",
+                        "cause": str(getattr(_rv, "cause_of_death", "") or ""),
+                        "cycles_used": getattr(_rv, "cycles_used", 0),
+                    }
+                    for _rv in _rivals[:3]
+                ]
+            except Exception:
+                self._f._serial_rival_accounts = []
             if _rel_labels:
                 _note += f"; relation to winner: {', '.join(_rel_labels)}"
             if any(_l == "complementary" for _l in _rel_labels):
@@ -50974,6 +51328,7 @@ class Filter:
             # competition left no survivor is divided by the previous turn's.
             self._serial_rival_relations = []
             self._serial_rival_causes = []
+            self._serial_rival_accounts = []
             _lf = getattr(self, "_llm_failures_this_turn", None) or {}
             if _lf.get("count"):
                 self._log_debug(
