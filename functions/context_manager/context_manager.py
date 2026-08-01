@@ -44403,6 +44403,68 @@ class MessageAssembler:
         if pending_summary:
             final_system = final_system + "\n\n" + pending_summary
 
+        # ── The answer call's system is the auxiliary calls' system ───────
+        # Read off the server's own prompt logs, which is the only place
+        # this was visible. An agentic step sends `prelim + separator` as
+        # its whole system and nothing else; the chat template trims the
+        # separator's trailing newlines because they sit at the end of the
+        # message, so what reaches the model ends `…activated)_\n\n\n---`.
+        # The answer call sends the same 280499 characters and then 11944
+        # more — the workspace, the answer shape, the turn mark, the
+        # confidence line — so nothing is trimmed and the two prompts part
+        # company exactly at those two newlines, at 95.8% of the way in.
+        #
+        # llama.cpp creates its checkpoint one token past the end of the
+        # auxiliary system, on its `<|im_end|>`. The answer call branches
+        # one token before it — `checking checkpoint with [72752] against
+        # 72751`, four times in one run — and a recurrent model cannot
+        # rewind one token any more than seventy thousand. That is the
+        # whole of the 90-second re-prefill on every answer.
+        #
+        # Moving the tail into the user turn makes the two systems
+        # byte-identical, so both are trimmed the same way and the shared
+        # prefix runs on through `<|im_end|>\n<|im_start|>user\n` — about
+        # four tokens past the checkpoint rather than one short of it.
+        #
+        # Appended after the question, not before it. This file's own
+        # argument for the trailing slot is that the last thing read before
+        # generating is the thing obeyed; the tail keeps that position, and
+        # a workspace placed ahead of the question would read more like
+        # something the person wrote, which is the failure the block's own
+        # `NEVER reproduce this` line already exists to prevent.
+        try:
+            _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
+            _pre_full = _pre + _PREFIX_ROLE_SEPARATOR if _pre else ""
+            if (
+                _pre_full
+                and final_system.startswith(_pre_full)
+                and len(final_system) > len(_pre_full)
+            ):
+                _moved = final_system[len(_pre_full):]
+                _last_user = None
+                for _m in reversed(messages):
+                    if isinstance(_m, dict) and _m.get("role") == "user":
+                        _last_user = _m
+                        break
+                if _last_user is not None and isinstance(
+                    _last_user.get("content"), str
+                ):
+                    final_system = _pre_full
+                    _last_user["content"] = (
+                        _last_user["content"].rstrip() + "\n\n" + _moved.lstrip()
+                    )
+                    self._f._log_debug(
+                        f"🔗 Answer prompt: {len(_moved)} chars of workspace "
+                        f"and answer shape moved from the system to the end "
+                        f"of the user turn — the system is now byte-identical "
+                        f"to what the agentic steps send, so their KV "
+                        f"checkpoint is reachable"
+                    )
+        except Exception as _e_move:
+            self._f._log_debug(
+                f"answer-prompt tail move skipped ({_e_move!r})"
+            )
+
         if final_system.strip():
             messages = [m for m in messages if m.get("role") != "system"]
             messages.insert(0, {"role": "system", "content": final_system})
