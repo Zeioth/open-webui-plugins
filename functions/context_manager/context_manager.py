@@ -4295,6 +4295,7 @@ class ContextPager:
             max_tokens=0,
             temperature=0.0,
             label="purge_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -7108,6 +7109,7 @@ class ContextBuilder:
             max_tokens=0,
             temperature=0.0,
             label="use_case_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -8271,6 +8273,7 @@ Output only "YES" or "NO".
             max_tokens=5,
             temperature=0.0,
             label="lod3_relevance_llm",
+            reasons_about_code=False,
             enable_thinking=False,
         )
 
@@ -10922,6 +10925,7 @@ class LongTermMemory:
             max_tokens=0,
             temperature=0.0,
             label="duplicate_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
@@ -11042,6 +11046,7 @@ class LongTermMemory:
             max_tokens=0,
             temperature=0.4,
             label="multi_query_expand",
+            reasons_about_code=False,
             enable_thinking=False,
         )
 
@@ -11175,6 +11180,7 @@ class LongTermMemory:
             max_tokens=0,
             temperature=0.2,
             label="retrieval_context_llm",
+            reasons_about_code=False,
             enable_thinking=False,
         )
         if context and context.strip():
@@ -15478,6 +15484,7 @@ class AgenticEvidenceVerifier:
                 max_tokens=self._f.valves.agentic_verify_max_tokens,
                 temperature=0.1,
                 label="agentic_evidence",
+                reasons_about_code=False,
                 response_format={"type": "json_object"},
                 enable_thinking=False,
             )
@@ -25671,6 +25678,7 @@ class CommandRouter:
             max_tokens=0,
             temperature=0.0,
             label="intent_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -25933,6 +25941,7 @@ class CommandRouter:
             max_tokens=0,
             temperature=0.0,
             label="nl_intent_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -27365,6 +27374,7 @@ class CommandRouter:
             max_tokens=0,
             temperature=0.0,
             label="code_only_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -29459,6 +29469,7 @@ Output only the symbol name.
             max_tokens=48,
             temperature=0.0,
             label="seed_disambiguate_llm",
+            reasons_about_code=False,
             enable_thinking=False,
             # R26: no total_timeout — this call now uses the global
             # backstop (llm_request_timeout, 900s), like every other
@@ -36545,6 +36556,7 @@ Code context (recent symbols referenced):
             max_tokens=0,
             temperature=0.3,
             label="summarize_messages",
+            reasons_about_code=False,
             enable_thinking=False,
         )
 
@@ -40501,6 +40513,7 @@ class InletOrchestrator:
             max_tokens=0,
             temperature=0.0,
             label="session_classify_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -41868,6 +41881,7 @@ class SystemPromptBuilder:
             max_tokens=0,
             temperature=0.0,
             label="ltm_dedup_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -43567,6 +43581,7 @@ class MessageAssembler:
             max_tokens=self._f.valves.hierarchical_summary_max_tokens,
             temperature=0.2,
             label="hierarchical_summary",
+            reasons_about_code=False,
             enable_thinking=False,
         )
 
@@ -47362,6 +47377,7 @@ class SemanticSeedInferencer:
             max_tokens=0,
             temperature=0.0,
             label="should_infer_llm",
+            reasons_about_code=False,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
