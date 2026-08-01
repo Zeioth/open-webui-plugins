@@ -12807,52 +12807,17 @@ class LLMOrchestrator:
         # call shares. Appending leaves the prefix byte-identical (checkpoint
         # intact) and lets the later, more specific instruction win, which is
         # how the role already overrides Block A's general guidance.
-        # ── Experiment: keep the system message byte-identical ────────────
-        # Measured on the 15:14 run, three times, exactly: the checkpoint
-        # llama.cpp offers sits TWO tokens past the point where the answer
-        # call needs to branch.
-        #
-        #   checking checkpoint with [72603, 72603] against 72601 → full re-process
-        #   checking checkpoint with [72960, 72960] against 72958 → full re-process
-        #   checking checkpoint with [73516, 73516] against 73514 → full re-process
-        #
-        # Those two tokens are ChatML's `<|im_end|><|im_start|>`. The
-        # checkpoint is created at the start of the user message, so it
-        # always lands two past the end of the system content. An auxiliary
-        # call appends its role to the system, which makes its system
-        # longer than the answer call's; the answer call therefore branches
-        # INSIDE the system, two tokens before the only checkpoint there
-        # is, and a recurrent model cannot rewind two tokens any more than
-        # it can rewind seventy thousand.
-        #
-        # If the role rides in the user message instead, every aligned call
-        # sends the same system content, the branch moves past the
-        # `<|im_start|>user` boundary, and the checkpoint is reachable.
-        # That is the hypothesis; this valve exists to test it on one run
-        # before ~40 call sites are reshaped around it. Default off.
-        _role_in_user = bool(
-            getattr(self._f.valves, "align_role_in_user_message", False)
-        )
-        _countermand = ""
+        _aligned = f"{_prelim}{_PREFIX_ROLE_SEPARATOR}{system_prompt}"
         if response_format is not None:
             _suffix = (getattr(self._f.valves, "confidence_prompt", "") or "").strip()
             if _suffix and _suffix in _prelim:
-                _countermand = (
+                _aligned += (
                     "\n\nThis call returns ONLY the JSON object requested "
                     "above. Do NOT append a '[Confidence: XX%]' line or any "
                     "text after the closing brace; that instruction from the "
                     "system prefix does not apply here."
                 )
-        if _role_in_user:
-            # The role is handed back to call_llm, which prepends it to the
-            # user turn. The system message becomes exactly _prelim — the
-            # same bytes every aligned call sends this turn.
-            self._pending_role_for_user = (system_prompt or "") + _countermand
-            self._note_align("role moved to user message")
-            return _prelim
-        self._pending_role_for_user = ""
-        _aligned = f"{_prelim}{_PREFIX_ROLE_SEPARATOR}{system_prompt}"
-        return _aligned + _countermand
+        return _aligned
 
     async def call_llm(
         self,
@@ -13023,7 +12988,6 @@ class LLMOrchestrator:
         # session_summary, change_summary) reach here through overrides that
         # in single-model deployments resolve to the very slot holding the
         # prefix.
-        self._pending_role_for_user = ""
         system_prompt = self._align_system_to_prefix(
             system_prompt,
             model_override or self._f.valves.llm_model or "",
@@ -13031,14 +12995,6 @@ class LLMOrchestrator:
             response_format=response_format,
             reasons_about_code=reasons_about_code,
         )
-        # Set by the aligner when the experiment valve is on. Prepended
-        # rather than appended so the role still reads as instruction
-        # ahead of the data it applies to, which is the order every one
-        # of these prompts was written for.
-        _role = getattr(self, "_pending_role_for_user", "") or ""
-        if _role:
-            prompt = _role + "\n\n" + (prompt or "")
-            self._pending_role_for_user = ""
 
         # Region: anti-repetition. Built before the dedup and cache keys
         # because it changes what the sampler produces — valves are
@@ -43962,6 +43918,50 @@ class MessageAssembler:
             else:
                 final_system = "## User instructions\n" + base_content.strip()
 
+        # ── The junction, on the third route ──────────────────────────────
+        # _PREFIX_ROLE_SEPARATOR's own comment records this bug one route
+        # earlier: two places built the prefix/tail junction differently and
+        # it cost about ten minutes a run. It was fixed for the auxiliary
+        # calls and the agentic step sites. The answer call is the third
+        # route and was never included.
+        #
+        # Traced on the 16:11 run. Twelve auxiliary calls of one turn each
+        # created a checkpoint at exactly 72630 — the length of prelim plus
+        # the separator, which is where they stop resembling each other. The
+        # answer call arrived needing 72628, the length of prelim alone,
+        # because its system continues with the workspace and never carries
+        # the separator. Two tokens short of the only checkpoint there is,
+        # and a recurrent model cannot rewind two tokens: 88 seconds of
+        # re-prefill, every turn, on all four turns of both runs measured.
+        #
+        # Spliced rather than computed. Which injections the prelim happened
+        # to hold is not tracked here, and guessing the boundary would move
+        # the junction somewhere new and break the auxiliary route as well —
+        # the exact failure the constant was introduced to end. startswith
+        # asks the question directly instead: when the final prompt really
+        # does begin with the preliminary one, the junction is at that
+        # length and nowhere else.
+        try:
+            _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
+            if (
+                _pre
+                and final_system.startswith(_pre)
+                and len(final_system) > len(_pre)
+                and not final_system.startswith(_pre + _PREFIX_ROLE_SEPARATOR)
+            ):
+                _tail = final_system[len(_pre):].lstrip("\n")
+                if _tail:
+                    final_system = _pre + _PREFIX_ROLE_SEPARATOR + _tail
+                    self._f._log_debug(
+                        "🔗 Answer prompt: separator spliced at the prelim "
+                        "junction so the auxiliary calls' checkpoint is "
+                        "reachable from here"
+                    )
+        except Exception as _e_splice:
+            self._f._log_debug(
+                f"answer-prompt junction splice skipped ({_e_splice!r})"
+            )
+
         if pending_summary:
             final_system = final_system + "\n\n" + pending_summary
 
@@ -49276,18 +49276,6 @@ class Filter:
             ),
         )
 
-        align_role_in_user_message: bool = Field(
-            default=True,
-            description=(
-                "EXPERIMENT. Send every aligned auxiliary call the same system message — the turn prefix and nothing else — and move the call's own role instruction to the head of its user message.\n\n"
-            
-                "The answer call re-processes its whole 75000-token prompt every turn, about 90 seconds of the ~100 a reader waits. It does so by two tokens: llama.cpp offers a checkpoint at 72603 while the branch is needed at 72601, three times in one run, exactly. Those two tokens are ChatML's `<|im_end|><|im_start|>`, because the checkpoint is created at the start of the user message and therefore always lands two past the end of the system content. An auxiliary call that appends its role to the system has a longer system than the answer call, so the answer call branches inside the system, just before the only checkpoint available.\n\n"
-            
-                "With the role in the user message every aligned call sends byte-identical system content, and the branch moves past the user boundary where the checkpoint sits.\n\n"
-            
-                "Unproven, and it changes what ~40 auxiliary prompts look like to the model: a role at the head of a user turn is not the same instruction as a role in the system message, and output quality may move. Run it once, read the run, then decide. Off restores the previous shape exactly."
-            ),
-        )
         align_aux_min_prompt_tokens: int = Field(
             default=400,
             description=(
