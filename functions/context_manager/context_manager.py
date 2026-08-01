@@ -44432,6 +44432,34 @@ class MessageAssembler:
         # a workspace placed ahead of the question would read more like
         # something the person wrote, which is the failure the block's own
         # `NEVER reproduce this` line already exists to prevent.
+        #
+        # ON CHANGING THE MODEL. The BUG above was caused by a chat
+        # template — Qwen's trims trailing whitespace off a message, so the
+        # separator survived in one route and not the other. This FIX does
+        # not depend on that and must not be simplified away on the
+        # assumption that it does: it makes the two system prompts the same
+        # string BEFORE any template sees them, so whatever a template does
+        # to one it does to the other. Identity survives a template change;
+        # it was the asymmetry that never did.
+        #
+        # Two things a different model can still move, neither of them here:
+        #
+        #   The margin. llama.cpp puts its checkpoint one token past the end
+        #   of the system, and the shared prefix now runs on through the
+        #   `<|im_end|>\n<|im_start|>user\n` boundary — about four tokens on
+        #   Qwen, so three to spare. A template that separates roles in one
+        #   token leaves none, and a template that inserts anything between
+        #   the system and the first user turn — a tools block, a system-side
+        #   thinking tag — cuts the shared prefix before the checkpoint and
+        #   the re-prefill returns.
+        #
+        #   The symptom, which is silent. Nothing here fails loudly if the
+        #   margin is lost; the answer call simply costs 90 seconds again.
+        #   `⏱️ Answer call` is the number that says so: ~15s means the
+        #   checkpoint is being reached, ~110s means it is not, and the
+        #   server's `checking checkpoint with [N] against M` names by how
+        #   much. Measured on Qwen: [72753] against 72757, four tokens of
+        #   margin, prefill 2572 tokens of 75326.
         try:
             _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
             _pre_full = _pre + _PREFIX_ROLE_SEPARATOR if _pre else ""
