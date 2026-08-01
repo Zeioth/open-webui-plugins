@@ -137,11 +137,9 @@ _CROSS_ENCODER_LOCK = threading.Lock()
 # Global lock for SQLite operations (prevents "database is locked" errors)
 _db_global_lock = threading.Lock()
 
-
 # ---------------------------------------------------------------------------
 # Models & Enums (to be cleaned up, some util functions are still inside)
 # ---------------------------------------------------------------------------
-
 
 @dataclass
 class ExperimentDesign:
@@ -174,7 +172,6 @@ class ExperimentDesign:
     unknown_claims: List[str]
     hypothesis_hash: str = ""
 
-
 @dataclass
 class PeerReviewResult:
     """
@@ -195,7 +192,6 @@ class PeerReviewResult:
     critiques: List[str]
     reviewer_model: str
     is_external: bool = False
-
 
 @dataclass
 class HypothesisDossier:
@@ -254,7 +250,6 @@ class HypothesisDossier:
     # Reporting metadata only — it never touches the ranking.
     relation_to_winner: str = ""
 
-
 @dataclass
 class CompetitionRecord:
     """
@@ -295,7 +290,6 @@ class CompetitionRecord:
     # gate by (project, question_type). Same safe defaulted
     # widening as external_validation; old rows hydrate to "".
     question_type: str = ""
-
 
 # Compression ratio below which a generation is degenerate. Measured:
 # the most repetitive legitimate output of 25 samples compressed to
@@ -359,7 +353,6 @@ class CompetitionRecord:
 # without it they never can.
 _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 
-
 _ANSWER_FOOTER_RE = re.compile(r"^[ \t]*\[Confidence:[^\]\n]*\][ \t]*$", re.M)
 _ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
 
@@ -394,14 +387,12 @@ _DIRECT_ABSENCE_REPLY = (
     "reporting: the log line beginning `direct retrieval: the artifact does not exist` names where it looked."
 )
 
-
 _NO_MEASURED_FOOTER_NOTE = (
     "This turn answered without running the evidence pipeline, so nothing "
     "was counted. Write NO `[Confidence: N%]` line. A confidence line is a "
     "claim about measurement, and inventing one here states a measurement "
     "that did not happen."
 )
-
 
 def _strip_answer_scaffolding(text: str) -> str:
     """Remove the turn mark and confidence footer from an answer.
@@ -430,7 +421,6 @@ def _strip_answer_scaffolding(text: str) -> str:
     except Exception:
         return text
 
-
 def _note_body_shown(filt, qid: str) -> None:
     """
     Record that the model has now seen the body of a qid this turn.
@@ -457,7 +447,6 @@ def _note_body_shown(filt, qid: str) -> None:
         _seen.add(qid.rsplit(".", 1)[-1])
     except Exception:
         pass
-
 
 def _resolve_symbol_name(sym: str, find_blocks, qualified_for, all_names):
     """
@@ -527,7 +516,6 @@ def _resolve_symbol_name(sym: str, find_blocks, qualified_for, all_names):
         pass
     return ""
 
-
 _MAX_TOOLS_PER_ROUND = 4
 # A body cut below this is worse than an honest omission: too little to carry a
 # method's shape, and enough to look like the whole of it.
@@ -536,7 +524,6 @@ _FOCUS_MIN_PARTIAL_CHARS = 4000
 _MAX_CLAIMS_PER_STEP = 12
 
 _DEGENERACY_COMPRESSION_MAX = 0.13
-
 
 def _output_is_degenerate(text: str) -> str:
     """
@@ -610,7 +597,6 @@ def _output_is_degenerate(text: str) -> str:
         return f"compression {_ratio:.3f} ({_shape})"
     except Exception:  # noqa: BLE001 - diagnostics never raise
         return ""
-
 
 class DetectionCatalog:
     """
@@ -828,7 +814,6 @@ class DetectionCatalog:
         )
         return "\n".join(_out)
 
-
 # The two sides of an experimentum crucis round. The model answers
 # "if_true_supports": "A" or "B", meaning the FIRST or the SECOND of the
 # two rival dossiers being compared — nothing to do with UseCase, whose
@@ -837,7 +822,6 @@ class DetectionCatalog:
 # hypothesis slot.
 _CRUCIS_FIRST = "A"
 _CRUCIS_SECOND = "B"
-
 
 class UseCase(str, Enum):
     """
@@ -906,12 +890,10 @@ class UseCase(str, Enum):
             "E": "Scaffolding/Boilerplate",
         }[self.value]
 
-
 # R12: OpenWebUI names pasted-code uploads 'Pasted_Text_<epoch_ms>'. That
 # synthetic filename must never become a module prefix in a qualified id
 # (see qualify_symbol_name). Matches the stem, with or without extension.
 _PASTED_UPLOAD_RE = re.compile(r"^Pasted_Text_\d+$", re.IGNORECASE)
-
 
 def qualify_symbol_name(
     name: str, parent_symbol: str, file_path: Optional[str] = None
@@ -946,7 +928,6 @@ def qualify_symbol_name(
             return f"{module}.{name}"
     return name
 
-
 def qualify_symbol(sym: "CodeSymbol") -> str:
     """
     Convenience wrapper: qualify a CodeSymbol using ALL the identity
@@ -957,7 +938,6 @@ def qualify_symbol(sym: "CodeSymbol") -> str:
     inconsistency that caused them to go unmatched in several lookups.
     """
     return qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
-
 
 def _get_cross_encoder(
     model_name: str = "Qwen/Qwen3-Reranker-0.6B",
@@ -975,7 +955,6 @@ def _get_cross_encoder(
                     return None
     return _CROSS_ENCODER
 
-
 class ContentType(str, Enum):
     """Classification of a code block's role in the conversation."""
 
@@ -985,7 +964,6 @@ class ContentType(str, Enum):
     GENERAL = "general"  # Plain conversation text
     TOOL_CALL = "tool_call"  # Structured tool / function call payload
     ERROR = "error"  # Traceback or error message
-
 
 class CodeSymbol(BaseModel):
     """A single function, method, or class extracted from source code."""
@@ -1020,7 +998,6 @@ class CodeSymbol(BaseModel):
 
     calls: List[str] = Field(default_factory=list)  # Bare names called by this symbol
     docstring: str = ""
-
 
 class CodeBlock(BaseModel):
     """A chunk of code managed by the context system.
@@ -1116,7 +1093,6 @@ class CodeBlock(BaseModel):
             (base_score + keyword_boost) * mention_boost * recency_factor * penalty
         )
 
-
 class Edge(BaseModel):
     """A directed relationship between two symbols in the call graph.
 
@@ -1151,7 +1127,6 @@ class Edge(BaseModel):
         """Effective weight used in activation propagation (PPR)."""
         return self.weight * self.confidence
 
-
 # ---------------------------------------------------------------------------
 # Activation Graph — query‑conditioned node activation
 # ---------------------------------------------------------------------------
@@ -1176,7 +1151,6 @@ class ActivationState(BaseModel):
 
     depth: int
     source: str
-
 
 class SymbolIndex:
     """Central index that stores every known symbol under a **qualified id**
@@ -1981,7 +1955,6 @@ class SymbolIndex:
 
     # ── Internal helpers (iteration) ─────────────────────────────────────
 
-
 class ConversationState(BaseModel):
     """
     Persistent conversation state for a single project.
@@ -2052,7 +2025,6 @@ class ConversationState(BaseModel):
         self.wm_batch_too_small = False
         self.wm_degradation_guard = False
         self.wm_tokens_freed = 0
-
 
 class ConversationStateManager:
     """
@@ -2587,7 +2559,6 @@ class ConversationStateManager:
                 f"ConversationStateManager: evicted LRU project '{oldest_pid}'"
             )
 
-
 class ActivationGraph:
     """Personalised PageRank (PPR) engine for the symbol call graph.
 
@@ -2733,7 +2704,6 @@ class ActivationGraph:
             return 0.0
         return sum(active) / len(active)
 
-
 # ---------------------------------------------------------------------------
 # Query model and SubgraphExtractor skeleton
 # ---------------------------------------------------------------------------
@@ -2784,7 +2754,6 @@ class SubgraphExtractor:
                 if edge.dst in included_nodes:
                     included_edges.append(edge)
         return included_nodes, included_edges
-
 
 # ---------------------------------------------------------------------------
 # CodePathView — a cached projection of an activated subgraph
@@ -2838,7 +2807,6 @@ class CodePathView(BaseModel):
             or self.call_graph_hash != current_call_graph
         )
 
-
 # ---------------------------------------------------------------------------
 # StaticEvidence – deterministic proof from the SymbolGraph
 # ---------------------------------------------------------------------------
@@ -2873,7 +2841,6 @@ class StaticEvidence(BaseModel):
     # ═══════════════════════════════════════════════════════════════════════════
 
     objective_score: float  # Fraction of verifiable claims that hold
-
 
 # ---------------------------------------------------------------------------
 # PathIndex — index of CodePathViews
@@ -2961,7 +2928,6 @@ class PathIndex:
                 result.add(qid)
         return result
 
-
 # ---------------------------------------------------------------------------
 # AppliedChangeFeedback
 # ---------------------------------------------------------------------------
@@ -2994,11 +2960,9 @@ class AppliedChangeFeedback(BaseModel):
     user_comment: str = ""
     resolved: bool = False
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 # CLASSES — Module level, before class Filter
 # ═══════════════════════════════════════════════════════════════════════════
-
 
 class HubSymbolIndex:
     """
@@ -3605,7 +3569,6 @@ class HubSymbolIndex:
                 parts.append(f"\n  → calls: {', '.join(sorted(callees))}")
 
         return "".join(parts)
-
 
 class ContextPager:
     """
@@ -4491,7 +4454,6 @@ class ContextPager:
 
         return block
 
-
 class RaptorCodeIndex:
     """
     Hierarchical clustering of code symbols (RAPTOR adapted for code).
@@ -5255,7 +5217,6 @@ class RaptorCodeIndex:
             return result if result is not None else default
         except Exception:
             return default
-
 
 class ContextBuilder:
     """
@@ -8329,7 +8290,6 @@ Output only "YES" or "NO".
         )
         return True
 
-
 # ---------------------------------------------------------------------------
 # SignatureExtractor – tree‑sitter based symbol and call extraction
 # ---------------------------------------------------------------------------
@@ -9011,7 +8971,6 @@ class SignatureExtractor:
             if doc:
                 sym.docstring = doc
 
-
 class ControlFlowExtractor:
     """
     Extracts a compressed control-flow skeleton for a single function or
@@ -9618,7 +9577,6 @@ class ControlFlowExtractor:
             logger.debug("[CFG] _classify_except_role: MATCH error path")
             return "error path"
 
-
 class ReentrantAsyncLock:
     """Reentrant asyncio lock with optional timeout to prevent deadlocks."""
 
@@ -9676,7 +9634,6 @@ class ReentrantAsyncLock:
     async def __aexit__(self, *args) -> None:
         """Async context manager exit."""
         self.release()
-
 
 class StateStore:
     """
@@ -10524,7 +10481,6 @@ class StateStore:
             if project_id not in self._f._project_locks:
                 self._f._project_locks[project_id] = ReentrantAsyncLock()
             return self._f._project_locks[project_id]
-
 
 class LongTermMemory:
     """Manages long‑term conversational and code memory using ChromaDB.
@@ -12610,7 +12566,6 @@ class LongTermMemory:
             self._f._log_debug(f"LTM: could not validate embedding model: {e}")
             return True
 
-
 class LLMOrchestrator:
     """Centralised LLM caller with built‑in response cache, retry logic,
     and task deduplication.
@@ -12852,17 +12807,52 @@ class LLMOrchestrator:
         # call shares. Appending leaves the prefix byte-identical (checkpoint
         # intact) and lets the later, more specific instruction win, which is
         # how the role already overrides Block A's general guidance.
-        _aligned = f"{_prelim}{_PREFIX_ROLE_SEPARATOR}{system_prompt}"
+        # ── Experiment: keep the system message byte-identical ────────────
+        # Measured on the 15:14 run, three times, exactly: the checkpoint
+        # llama.cpp offers sits TWO tokens past the point where the answer
+        # call needs to branch.
+        #
+        #   checking checkpoint with [72603, 72603] against 72601 → full re-process
+        #   checking checkpoint with [72960, 72960] against 72958 → full re-process
+        #   checking checkpoint with [73516, 73516] against 73514 → full re-process
+        #
+        # Those two tokens are ChatML's `<|im_end|><|im_start|>`. The
+        # checkpoint is created at the start of the user message, so it
+        # always lands two past the end of the system content. An auxiliary
+        # call appends its role to the system, which makes its system
+        # longer than the answer call's; the answer call therefore branches
+        # INSIDE the system, two tokens before the only checkpoint there
+        # is, and a recurrent model cannot rewind two tokens any more than
+        # it can rewind seventy thousand.
+        #
+        # If the role rides in the user message instead, every aligned call
+        # sends the same system content, the branch moves past the
+        # `<|im_start|>user` boundary, and the checkpoint is reachable.
+        # That is the hypothesis; this valve exists to test it on one run
+        # before ~40 call sites are reshaped around it. Default off.
+        _role_in_user = bool(
+            getattr(self._f.valves, "align_role_in_user_message", False)
+        )
+        _countermand = ""
         if response_format is not None:
             _suffix = (getattr(self._f.valves, "confidence_prompt", "") or "").strip()
             if _suffix and _suffix in _prelim:
-                _aligned += (
+                _countermand = (
                     "\n\nThis call returns ONLY the JSON object requested "
                     "above. Do NOT append a '[Confidence: XX%]' line or any "
                     "text after the closing brace; that instruction from the "
                     "system prefix does not apply here."
                 )
-        return _aligned
+        if _role_in_user:
+            # The role is handed back to call_llm, which prepends it to the
+            # user turn. The system message becomes exactly _prelim — the
+            # same bytes every aligned call sends this turn.
+            self._pending_role_for_user = (system_prompt or "") + _countermand
+            self._note_align("role moved to user message")
+            return _prelim
+        self._pending_role_for_user = ""
+        _aligned = f"{_prelim}{_PREFIX_ROLE_SEPARATOR}{system_prompt}"
+        return _aligned + _countermand
 
     async def call_llm(
         self,
@@ -13033,6 +13023,7 @@ class LLMOrchestrator:
         # session_summary, change_summary) reach here through overrides that
         # in single-model deployments resolve to the very slot holding the
         # prefix.
+        self._pending_role_for_user = ""
         system_prompt = self._align_system_to_prefix(
             system_prompt,
             model_override or self._f.valves.llm_model or "",
@@ -13040,6 +13031,14 @@ class LLMOrchestrator:
             response_format=response_format,
             reasons_about_code=reasons_about_code,
         )
+        # Set by the aligner when the experiment valve is on. Prepended
+        # rather than appended so the role still reads as instruction
+        # ahead of the data it applies to, which is the order every one
+        # of these prompts was written for.
+        _role = getattr(self, "_pending_role_for_user", "") or ""
+        if _role:
+            prompt = _role + "\n\n" + (prompt or "")
+            self._pending_role_for_user = ""
 
         # Region: anti-repetition. Built before the dedup and cache keys
         # because it changes what the sampler produces — valves are
@@ -13525,7 +13524,6 @@ class LLMOrchestrator:
     # 4. CrossEncoder helper (keep full code decision)
     # ═══════════════════════════════════════════════════════════════════════════
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 # GOVERNING PRINCIPLES OF THE AGENTIC PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════
@@ -13654,7 +13652,6 @@ class LLMOrchestrator:
 # claims normally. Confirm on the next real run.
 # ═══════════════════════════════════════════════════════════════════════════
 
-
 @dataclass
 class AgenticStep:
     """Single unit of work in the agentic pipeline (Fase 1: fixed kinds)."""
@@ -13680,7 +13677,6 @@ class AgenticStep:
         0  # 1-based execution position for user-facing labels; id stays the stable cache/ledger key
     )
 
-
 @dataclass
 class AgenticPlan:
     """Ordered steps plus provenance, for execution, logging and dry runs."""
@@ -13691,7 +13687,6 @@ class AgenticPlan:
     ask: str = (
         ""  # planner-level clarification question; honored only when steps is empty
     )
-
 
 @dataclass
 class LedgerClaim:
@@ -13730,7 +13725,6 @@ class LedgerClaim:
     # relation needs no body — but a claim about what a method DOES,
     # carrying one of these, was written from the signature.
     unread_qids: List[str] = field(default_factory=list)
-
 
 class AgenticEvidenceLedger:
     """
@@ -14860,7 +14854,6 @@ class AgenticEvidenceLedger:
             return invalid
         return invalid
 
-
 class AgenticStepCache:
     """
     SQLite-backed cache of step results keyed by (kind, normalized goal),
@@ -14989,7 +14982,6 @@ class AgenticStepCache:
             await self._f._state_store._db_enqueue(_write)
         except Exception as e:
             self._f._log_debug(f"🤖 StepCache: write failed — {e}")
-
 
 class AgenticToolBroker:
     """
@@ -15306,13 +15298,11 @@ class AgenticToolBroker:
             )
         return _out
 
-
 # The one claim shape whose quote must mention something specific: a named
 # call target. Anything vaguer cannot be checked this way without guessing.
 _CALL_TARGET_RE = re.compile(
     r"\b(?:calls|invokes|delegates to|passes .{0,40}? to)\s+" r"([A-Za-z_][\w.]*)"
 )
-
 
 class AgenticEvidenceVerifier:
     """Settle behavioural claims by reading the code they describe.
@@ -15834,7 +15824,6 @@ class AgenticEvidenceVerifier:
                 settled += 1
         return settled
 
-
 class AgenticStaticVerifier:
     """
     Fase 4 static verification: turns ledger claims into typed checks and
@@ -16310,7 +16299,6 @@ class AgenticStaticVerifier:
             lines.append(f"- [C{ch['claim']}] {ch['kind']}: {tag} — {detail}")
         return "\n".join(lines)
 
-
 class AgenticTestabilityClassifier:
     """
     AST-based, zero-LLM router deciding whether a symbol body can be
@@ -16507,7 +16495,6 @@ class AgenticTestabilityClassifier:
             parts.append(cur.id)
         return list(reversed(parts))
 
-
 class AgenticSandboxRunner:
     """
     Executes a composed harness in an isolated Python subprocess.
@@ -16675,7 +16662,6 @@ class AgenticSandboxRunner:
                 }
 
         return await anyio.to_thread.run_sync(_run_blocking)
-
 
 class AgenticDynamicVerifier:
     """
@@ -17583,7 +17569,6 @@ if __name__ == "__main__":
         await self._cache_put(project_id, pseudo, "", tests, {"status": "pending"})
         self._f._log_debug(f"🤖 DynamicVerifier: design tests persisted as {pseudo}")
 
-
 class AgenticPreplanner:
     """
     Agentic pre-planning stage: discover the correct WHAT before the planner
@@ -18151,7 +18136,6 @@ class AgenticPreplanner:
         else:
             self._f._log_debug("🧭 Preplanner: parsed but no usable framing — no brief")
         return brief, ""
-
 
 class AgenticPlanner:
     """
@@ -19294,7 +19278,6 @@ class AgenticPlanner:
             )
         return steps
 
-
 # R32: every scaffolding header the agentic machinery injects into
 # prompts. These exact strings are OURS — a model reply has no
 # legitimate reason to contain any of them, so their presence in an
@@ -19309,7 +19292,6 @@ _AGENTIC_SCAFFOLD_MARKERS: Tuple[str, ...] = (
     "<agentic_findings>",
     "## Claims to verify",
 )
-
 
 # EC-10 (precaution): consequence patterns that mark a hypothesis as
 # CRITICAL — mechanisms which, if real, imply data loss, corruption,
@@ -19360,7 +19342,6 @@ _EC10_CRITICAL_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 # The context renderer emits this pointer under every call site it
 # resolves within a tier. It is built at RUNTIME (an f-string over a
 # qualified id), so a reply containing it is echoing injected context,
@@ -19385,7 +19366,6 @@ _TIER_POINTER_RE = re.compile(
 # confirmed pointer to the top of the block being recited.
 _SKELETON_RULE_RE = re.compile(r"^[ \t]*\u2500{2,}", re.MULTILINE)
 
-
 def _close_dangling_fence(text: str) -> str:
     """
     Close a code fence left open by a hard truncation.
@@ -19401,7 +19381,6 @@ def _close_dangling_fence(text: str) -> str:
     if not text or text.count("```") % 2 == 0:
         return text
     return text.rstrip() + "\n```"
-
 
 def _find_context_echo(text: str, min_pos: int = 0) -> int:
     """
@@ -19432,7 +19411,6 @@ def _find_context_echo(text: str, min_pos: int = 0) -> int:
             break
     return cut if cut >= min_pos else -1
 
-
 def _find_scaffold_echo(text: str, min_pos: int = 1) -> int:
     """
     Earliest LINE-START occurrence of a scaffolding marker, or -1.
@@ -19456,13 +19434,11 @@ def _find_scaffold_echo(text: str, min_pos: int = 1) -> int:
             p = text.find(m, p + 1)
     return best
 
-
 _ALREADY_IN_VIEW_NOTE = (
     "\n\nTheir bodies are already in the context above. Anything you assert "
     "about these symbols must come from that code; if it does not settle a "
     "point, say so rather than inferring it from the signature.\n"
 )
-
 
 class AgenticStepExecutor:
     """
@@ -20360,7 +20336,6 @@ class AgenticStepExecutor:
             step.output = "(empty response)"
             step.status = "failed"
 
-
 class AgenticSynthesisComposer:
     """Renders the agentic workspace block the main call synthesizes from."""
 
@@ -21148,7 +21123,6 @@ class AgenticSynthesisComposer:
                 "ask for that one by name.",
             ]
         return out
-
 
 class AgenticOrchestrator:
     """
@@ -24452,7 +24426,6 @@ class AgenticOrchestrator:
             except Exception:
                 pass
 
-
 class MultiPhasePlanner:
     """Generates the multi‑phase protocol instructions injected into the
     system prompt when the response budget is tight, and appends wrap‑up
@@ -24676,7 +24649,6 @@ class MultiPhasePlanner:
             "content": messages[last_user_idx].get("content", "") + hint,
         }
         return messages
-
 
 class CommandRouter:
     """
@@ -27471,7 +27443,6 @@ class CommandRouter:
             return True
         return False
 
-
 class CodeBlockManager:
     """
     Extract, classify, and manage code blocks throughout the conversation lifecycle.
@@ -28946,7 +28917,6 @@ class CodeBlockManager:
 
         _DataFlowVisitor().visit(tree)
         return edges
-
 
 class ActivationEngine:
     """Builds activation graphs from query seeds and the symbol call graph,
@@ -31288,7 +31258,6 @@ Output only the symbol name.
     # 10. Static evidence (for scientific CoT)
     # ======================================================================
 
-
 class MetacognitiveReasoningEngine:
     """
     Operates above ActivationEngine as the scientific-method engine.
@@ -32801,14 +32770,50 @@ class MetacognitiveReasoningEngine:
         # S9: one-line class guidance from the Bayesian nudge —
         # present only on a nudged regeneration, never persistent.
         _guid = f"\n{guidance}\n" if guidance else ""
+        # The symbols the investigation has already settled against code.
+        # Without them this prompt asked for real identifiers while showing
+        # none: 66 tokens, the question and nothing else. A generator with
+        # no vocabulary invents one, and it did — get_coverage_metrics(),
+        # get_claim_coverage(), compute_confidence_score(), none of which
+        # exist — while the ledger, in that same moment, held
+        # AgenticEvidenceLedger.coverage, .counts and
+        # Filter._replace_asserted_confidence, each verified against the
+        # code by the step that had just run. Both candidates were dropped
+        # as fabricated and the turn forged nothing.
+        #
+        # Offered as vocabulary, not as a constraint: a mechanism may well
+        # involve a symbol no step has reached yet, and the groundedness
+        # filter downstream still decides. What this removes is the case
+        # where the model had no way to name anything real.
+        _known = ""
+        try:
+            _subjects = []
+            for _c in getattr(self._f._agentic._ledger, "claims", []) or []:
+                _s = (_c.subject or "").strip()
+                if _s and _s not in _subjects:
+                    _subjects.append(_s)
+            if _subjects:
+                _known = (
+                    "\nSymbols this investigation has already read and "
+                    "verified against the code — prefer these; they are the "
+                    "only names known to exist:\n"
+                    + "\n".join(f"- {_s}" for _s in _subjects[:20])
+                    + "\n"
+                )
+        except Exception:
+            _known = ""
         prompt = (
             f"Question under investigation:\n{question[:400]}\n"
+            + _known
             + _excl
             + _comp
             + _guid
             + "\nPropose ONE falsifiable hypothesis about the root "
             "mechanism. It must name real code identifiers (functions, "
-            "classes) and assert concrete, checkable relations."
+            "classes) and assert concrete, checkable relations. Do not "
+            "invent a plausible-sounding function name: a hypothesis "
+            "built on a symbol that does not exist cannot be falsified "
+            "and will be discarded."
         )
         # Region: LLM call and tolerant parse
         try:
@@ -34444,9 +34449,16 @@ class MetacognitiveReasoningEngine:
                 self._f._log_debug(
                     f"_forge_all: slot {_slot} forfeited (no viable "
                     f"candidate after queue + {_gen_attempts} "
-                    f"generation attempt(s))"
+                    f"generation attempt(s)) — continuing to the next slot"
                 )
-                break
+                # One barren slot is not a barren competition. This was a
+                # `break`, so a turn whose first slot produced two
+                # fabricated candidates ended the whole forge and reported
+                # `no hypothesis could be forged` without ever attempting
+                # slots 2 and 3 — and those slots start from a longer
+                # exclusion list, which is exactly the state most likely to
+                # steer the generator somewhere new.
+                continue
             _tag = f" [{', '.join(_strat_flags)}]" if _strat_flags else ""
             await self._f._emit_status(
                 f"🧪 Hypothesis {_slot}/{_n_target}{_tag} — " f"candidate: {_cand[:70]}"
@@ -35539,7 +35551,6 @@ class MetacognitiveReasoningEngine:
         if design.critical_claims:
             lines.append("Critical claims: " + "; ".join(design.critical_claims[:5]))
         return "\n".join(lines)
-
 
 class HistoryCompressor:
     """
@@ -36699,7 +36710,6 @@ Code context (recent symbols referenced):
                 f"({tok} tokens > {self._f.valves.max_code_block_tokens} limit)"
             )
 
-
 class TokenUtils:
     """Token‑level utilities for budget management and text truncation.
 
@@ -36755,7 +36765,6 @@ class TokenUtils:
                 truncated = truncated[: last + len(pattern)]
                 break
         return truncated.rstrip()
-
 
 class EnrichmentTasks:
     """Runs post‑processing enrichment after each user or assistant message,
@@ -38652,7 +38661,6 @@ class EnrichmentTasks:
         # Return filtered sets
         return (deleted_qids - migrated_old), (added_qids - migrated_new)
 
-
 class ActiveCodeUpdater:
     """Processes a new user or assistant message through the full code‑aware
     pipeline, keeping the active block set and SymbolIndex in sync.
@@ -39885,7 +39893,6 @@ class ActiveCodeUpdater:
                 self._f._log_debug(
                     f"Soft-evicted {len(candidates)} block(s) via ContextPager"
                 )
-
 
 class InletOrchestrator:
     """Handles the early stages of request processing: extracting user
@@ -41306,7 +41313,6 @@ class InletOrchestrator:
         )
         return messages
 
-
 # ── System-prompt injection ordering contract ────────────────────────────
 # Two axes that a single priority tag used to conflate:
 #
@@ -41341,7 +41347,6 @@ _INJECTION_PRIORITY = {
 _INJECTION_KEEP_UNDER_PRESSURE = ("critical", "high", "trailing")
 _INJECTION_TRAILING = ("trailing",)
 
-
 def _order_injections_for_render(
     selected: List[Tuple[str, str]],
 ) -> List[Tuple[str, str]]:
@@ -41352,7 +41357,6 @@ def _order_injections_for_render(
     preliminary one instead of interleaving with it.
     """
     return sorted(selected, key=lambda x: 1 if x[0] in _INJECTION_TRAILING else 0)
-
 
 class SystemPromptBuilder:
     """Assembles the complete system prompt from two layers: a stable,
@@ -42233,7 +42237,6 @@ class SystemPromptBuilder:
 
         return prelim_system
 
-
 class WindowManager:
     """
     Single owner of the prose history window policy.
@@ -42890,7 +42893,6 @@ class WindowManager:
         if not last_assistant:
             return False
         return any(marker in last_assistant.get("content", "") for marker in _MARKERS)
-
 
 class MessageAssembler:
     """
@@ -43983,6 +43985,12 @@ class MessageAssembler:
         if self._f.tokenizer and final_system.strip():
             total_system_tok = len(self._f.tokenizer.encode(final_system))
             psm.set_last_system_tokens(project_id, total_system_tok)
+            # Read by the outlet when it reports the handover. It sat inside
+            # the token-breakdown block below, which is gated on the debug
+            # valve, so the report read zero — beside a duration that was
+            # also wrong. Written here, with the metric that is already
+            # unconditional, for the same reason that one is.
+            self._f._last_system_prompt_tokens = total_system_tok
 
         # ── Token breakdown log ─────────────────────────────────────────
         if self._f.valves.debug and self._f.tokenizer and final_system.strip():
@@ -44017,9 +44025,6 @@ class MessageAssembler:
             self._f._log_debug(
                 f"  TOTAL system tokens:          ~{total_system_tok} tokens"
             )
-            # Read by the outlet when it reports the handover: the answer
-            # call carries this prompt and nothing in either log says so.
-            self._f._last_system_prompt_tokens = total_system_tok
             self._f._log_debug(f"  Prefix hash (Block A):        {prefix_hash}")
             self._f._log_debug(
                 "  → If hash matches previous:   KV cache HIT in llama.cpp"
@@ -44066,7 +44071,6 @@ class MessageAssembler:
                 self._f._log_debug(f"Context dump scheduling failed: {_dump_err}")
 
         return messages
-
 
 class ContextAssembler:
     """
@@ -44230,7 +44234,6 @@ class ContextAssembler:
                             f"{type(exc).__name__}: {exc}; skipping degenerate "
                             f"fallback snapshot (traceback is the useful record)"
                         )
-
 
 # ---------------------------------------------------------------------------
 # ContextDumper — per-turn context snapshots for evolution tracking
@@ -44691,7 +44694,6 @@ class UserProfileManager:
             out.append("- _(empty)_")
         return out
 
-
 def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
     """Render the claim-coverage tally, or nothing when there is none.
 
@@ -44779,7 +44781,6 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
         lines.append("</details>")
     lines += ["", ""]
     return "\n".join(lines)
-
 
 class ContextDumper:
     """
@@ -45540,7 +45541,6 @@ class ContextDumper:
             except Exception:
                 pass
 
-
 class TaskRegistry:
     """
     Registry and orchestrator for all background/lazy tasks.
@@ -46263,7 +46263,6 @@ class TaskRegistry:
             project_id, last_response, stop_event=None
         )
 
-
 # ============================================================================
 # ProjectStateManager — per‑project volatile state (SRP)
 # ============================================================================
@@ -46632,11 +46631,9 @@ class ProjectStateManager:
         """Set the one-shot flag to force multi-phase protocol this turn."""
         self.get_pstate(project_id)["force_multi_phase_this_turn"] = value
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 # BackgroundTask — Definition of task lazy + background
 # ═══════════════════════════════════════════════════════════════════════════
-
 
 class BackgroundTask:
     """
@@ -46751,7 +46748,6 @@ class BackgroundTask:
         state["in_progress"] = False
         state["completed"] = False
         pstate[self.state_key] = state
-
 
 class BackgroundTaskManager:
     """
@@ -47112,7 +47108,6 @@ class BackgroundTaskManager:
                 if self._tasks.get(name) is _me:
                     self._tasks.pop(name, None)
                     self._stop_events.pop(name, None)
-
 
 class SemanticSeedInferencer:
     """
@@ -47717,7 +47712,6 @@ class SemanticSeedInferencer:
         seeds = self._parse_and_resolve(tokens, project_id)
         self._f._log_debug(f"DIAG infer: RETURN {len(seeds)} seed(s)")
         return seeds
-
 
 # ---------------------------------------------------------------------------
 # Valves
@@ -49282,6 +49276,18 @@ class Filter:
             ),
         )
 
+        align_role_in_user_message: bool = Field(
+            default=True,
+            description=(
+                "EXPERIMENT. Send every aligned auxiliary call the same system message — the turn prefix and nothing else — and move the call's own role instruction to the head of its user message.\n\n"
+            
+                "The answer call re-processes its whole 75000-token prompt every turn, about 90 seconds of the ~100 a reader waits. It does so by two tokens: llama.cpp offers a checkpoint at 72603 while the branch is needed at 72601, three times in one run, exactly. Those two tokens are ChatML's `<|im_end|><|im_start|>`, because the checkpoint is created at the start of the user message and therefore always lands two past the end of the system content. An auxiliary call that appends its role to the system has a longer system than the answer call, so the answer call branches inside the system, just before the only checkpoint available.\n\n"
+            
+                "With the role in the user message every aligned call sends byte-identical system content, and the branch moves past the user boundary where the checkpoint sits.\n\n"
+            
+                "Unproven, and it changes what ~40 auxiliary prompts look like to the model: a role at the head of a user turn is not the same instruction as a role in the system message, and output quality may move. Run it once, read the run, then decide. Off restores the previous shape exactly."
+            ),
+        )
         align_aux_min_prompt_tokens: int = Field(
             default=400,
             description=(
@@ -52463,19 +52469,7 @@ class Filter:
                             )
 
                     body["messages"] = messages
-                    # Sealed for the outlet. The call that writes the
-                    # answer is issued by the host, not by this file, so it
-                    # never appears in call_llm's log — and it is the one
-                    # the reader is waiting on. Four turns of one run each
-                    # showed a 106 to 121 second gap here that matched, in
-                    # time and in size, a full 74000-token re-processing on
-                    # the server, and neither log named it. Recording the
-                    # handover makes the largest single cost of a turn
-                    # visible without instrumenting the host.
-                    self._inlet_handoff_ts = time.monotonic()
-                    self._inlet_handoff_tokens = int(
-                        getattr(self, "_last_system_prompt_tokens", 0) or 0
-                    )
+
                     _inlet_timing("total_inlet (end-to-end)", inlet_start)
                     self._log_section(
                         "CONTEXT MANAGER - INLET END",
@@ -52577,6 +52571,7 @@ class Filter:
             body["messages"] = messages
 
             _inlet_timing("total_inlet (end-to-end)", inlet_start)
+            self._seal_answer_handoff()
             self._log_section(
                 "CONTEXT MANAGER - INLET END",
                 duration=time.monotonic() - inlet_start,
@@ -52843,6 +52838,28 @@ class Filter:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
         self._audit_opening_against_ledger(body)
         self._report_answer_handoff()
+
+    def _seal_answer_handoff(self) -> None:
+        """Stamp the moment the inlet hands the turn to the host.
+
+        Placed on the main inlet exit, which every ordinary turn takes. The
+        first version of this sat on the `prepare code session` early return
+        instead: it fired on one turn in five, and the stamp it left was
+        consumed by the NEXT turn's outlet, reporting 371.5s for a gap that
+        was 103. A measurement that only some turns produce, and that dates
+        from a different turn when it does, is worse than none.
+
+        Read here rather than at report time so the token count belongs to
+        the prompt actually handed over; the assembler writes it a few frames
+        earlier in the same turn.
+        """
+        try:
+            self._inlet_handoff_ts = time.monotonic()
+            self._inlet_handoff_tokens = int(
+                getattr(self, "_last_system_prompt_tokens", 0) or 0
+            )
+        except Exception:
+            self._inlet_handoff_ts = None
 
     def _report_answer_handoff(self) -> None:
         """Report the one call this file never sees: the answer itself.
