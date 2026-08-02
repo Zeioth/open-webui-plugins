@@ -13166,6 +13166,28 @@ class LLMOrchestrator:
                 if _moved:
                     system_prompt = _cut
                     prompt = _moved + "\n\n" + (prompt or "")
+                    # Once per turn, not per call: forty of these would
+                    # drown the log. Silence here is what let an earlier
+                    # guard sit broken across several runs, so the fact
+                    # that the cut happened, where it cut and whether it
+                    # reached the invariant boundary all have to be
+                    # visible from one line.
+                    if not getattr(
+                        self._f, "_cut_logged_this_turn", False
+                    ):
+                        self._f._cut_logged_this_turn = True
+                        self._f._log_debug(
+                            f"🔗 Aligned calls: system cut to "
+                            f"{len(_cut)} chars "
+                            + (
+                                "at the INVARIANT boundary (Block A + hub) "
+                                if _cut == _stab
+                                else "at the TURN prelim — Block B is still "
+                                "in the system, so the next turn will "
+                                "re-prefill "
+                            )
+                            + f"· {len(_moved)} chars moved to the user turn"
+                        )
         except Exception:
             pass
 
@@ -52658,6 +52680,7 @@ class Filter:
             self._answer_is_verbatim_echo = False
             self._prelim_stable_this_turn = ""
             self._profile_block_this_turn = ""
+            self._cut_logged_this_turn = False
             self._serial_dropped_gaps = []
             self._serial_unreadable_subjects = []
             self._serial_winner_corroboration = None
