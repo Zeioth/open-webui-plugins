@@ -12806,10 +12806,23 @@ class LLMOrchestrator:
                     return system_prompt
             except Exception:
                 pass
+        # The turn's own prelim when it exists, the session invariant when
+        # it does not. The first heavy call of a turn runs in the inlet,
+        # before Block B is assembled and therefore before the turn prelim
+        # is published, and returning bare there costs more than it saves: a
+        # bare call leaves the slot holding a few hundred bytes of system,
+        # so the NEXT call, arriving with the correct ~280k one, re-prefills
+        # everything. Measured on a 1431-token preplanner prompt: 92.0s.
+        # Aligning to the invariant sends the exact bytes the slot already
+        # holds. Only the first turn of a session reaches the bare path now,
+        # where nothing is cached anyway.
         _prelim = getattr(self._f, "_prelim_system_this_turn", "") or ""
         if not _prelim:
-            self._note_align("no prelim stashed yet")
-            return system_prompt
+            _prelim = getattr(self._f, "_prefix_invariant", "") or ""
+            if not _prelim:
+                self._note_align("no prelim stashed yet")
+                return system_prompt
+            self._note_align("aligned to session invariant")
         # ── Guard: idempotence, by HEAD rather than by whole prefix ────────
         # AgenticStepExecutor._aligned_prefix head-caps its copy when prelim
         # exceeds the window, and a capped copy does not satisfy
@@ -13153,7 +13166,27 @@ class LLMOrchestrator:
         # tier and the role, and it still does — the three simply cross the
         # message boundary together.
         try:
+            # The invariant describes the SESSION, not the turn, so it is
+            # remembered the moment it is published and read from there
+            # afterwards. Reading only the per-turn slot meant the first
+            # heavy call of a new turn — which runs before that slot is
+            # filled — found it empty and fell through to the PREVIOUS
+            # turn's prelim, sending a system 816 bytes longer than the
+            # invariant. The boundary moved, the checkpoint became
+            # unreachable, and the run paid 96.6s on that call plus 84.9s
+            # on the next one, which arrived with the right system and found
+            # the slot holding the wrong one.
+            #
+            # Freshness is not what makes this correct: the startswith below
+            # is. A Block A that changed since it was remembered simply
+            # fails that test and the call goes out uncut — slower, never
+            # wrong — and the next published prefix replaces the memory, so
+            # a changed Block A costs one call and heals itself.
             _stab = getattr(self._f, "_prelim_stable_this_turn", "") or ""
+            if _stab:
+                self._f._prefix_invariant = _stab
+            else:
+                _stab = getattr(self._f, "_prefix_invariant", "") or ""
             _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
             _pre_full = (_pre + _PREFIX_ROLE_SEPARATOR) if _pre else ""
             _cut = _stab if (_stab and system_prompt.startswith(_stab)) else _pre_full
@@ -40577,6 +40610,12 @@ class InletOrchestrator:
             # calls go out bare (correct, merely uncached) until this
             # project's Block B populates the stash again.
             self._f._prelim_system_this_turn = ""
+            # Same argument, one level up: the invariant is Block A and the
+            # hub tier, which are this project's code. Carrying it across a
+            # project switch would align the new project's early calls to
+            # the old project's architecture map — the cross-project leak
+            # described above, and a prefix no future turn here will extend.
+            self._f._prefix_invariant = ""
 
         self._f._last_project_id = project_id
 
@@ -52081,11 +52120,23 @@ class Filter:
         # Preliminary system prompt of the current turn, stashed by
         # SystemPromptBuilder after Block B assembly and consumed by
         # LLMOrchestrator._align_system_to_prefix. Cleared on project switch
-        # (see InletOrchestrator.inlet_preprocess); deliberately NOT cleared
-        # between turns of the same project, so background tasks that run
-        # after outlet (docstrings, raptor) align to the prefix the slot
-        # still holds.
+        # (see InletOrchestrator.inlet_preprocess) and at the top of every
+        # inlet: it describes ONE turn, and one that outlived its own turn is
+        # what made the first heavy call of the next turn align against a
+        # Block B that had already been replaced.
         self._prelim_system_this_turn: str = ""
+        # The invariant half of that prefix — the static block plus the hub
+        # tier — remembered for the whole SESSION rather than for the turn.
+        # Everything that runs before Block B is assembled (the inlet's own
+        # calls, the background tasks that outlive the outlet) has no turn
+        # prelim to align to, and going out bare there is not the safe
+        # option it looks like: it leaves the slot holding a few hundred
+        # bytes of system, so the next call re-prefills the whole context.
+        # Those callers align to this instead, and it is also the exact text
+        # the slot still holds after the answer call, since the answer cuts
+        # its own system here too. Never cleared between turns; cleared on
+        # project switch, where it would describe another project's code.
+        self._prefix_invariant: str = ""
         self._align_reject_logged_this_turn: bool = False
 
         # -- Tracking of active LLM tasks --
@@ -52679,6 +52730,15 @@ class Filter:
             self._serial_rival_accounts = []
             self._answer_is_verbatim_echo = False
             self._prelim_stable_this_turn = ""
+            # The turn prelim belongs to ONE turn. Left standing it was
+            # still there at the next inlet, before that turn's Block B
+            # existed, and the first heavy call aligned against it — 816
+            # bytes of the previous turn's Block B riding inside the system
+            # message, where they move the boundary llama.cpp checkpoints
+            # at. Callers that run this early align to _prefix_invariant
+            # instead, which is the half that really is identical across
+            # turns.
+            self._prelim_system_this_turn = ""
             self._profile_block_this_turn = ""
             self._cut_logged_this_turn = False
             self._serial_dropped_gaps = []
