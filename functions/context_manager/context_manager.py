@@ -5884,9 +5884,30 @@ class ContextBuilder:
         psm.set_block_a_cache_key(project_id, None)
         psm.set_block_a_cached(project_id, None)
 
+        # The remembered prefix invariant IS the previous Block A plus the
+        # hub tier, so it stops being true at exactly this moment. Keyed to
+        # the project it was cleared on a project switch, which never
+        # happens between two chats of the same project — so a new chat kept
+        # aligning its first heavy call to the previous chat's architecture
+        # map while the answer call carried the new one. Measured: two
+        # different system messages inside one turn, 283989 and 284085
+        # bytes, and the re-prefill back with them.
+        self._f._prefix_invariant = ""
+
         raw = psm.get_pstate(project_id)
         raw["skeleton_tier_cache_key"] = None
         raw["skeleton_tier_cached"] = None
+
+        # Every caller passes a reason and none of them was ever recorded.
+        # SystemPromptBuilder's class docstring claims "M7 – computes and
+        # stores block_a_rebuild_reason in pstate"; nothing in that class
+        # does, the pstate key was seeded to None and read by the dumper, and
+        # eighteen days of evolution.jsonl carry None on all 557 turns — 86 of
+        # which are Block A rebuilds nobody can now explain. Each one costs a
+        # full prefill, so the reason is the single most useful thing that
+        # record could have carried.
+        if reason:
+            raw["block_a_rebuild_reason"] = reason
 
         if recompute_centrality:
             try:
@@ -12806,10 +12827,23 @@ class LLMOrchestrator:
                     return system_prompt
             except Exception:
                 pass
+        # The turn's own prelim when it exists, the session invariant when
+        # it does not. The first heavy call of a turn runs in the inlet,
+        # before Block B is assembled and therefore before the turn prelim
+        # is published, and returning bare there costs more than it saves: a
+        # bare call leaves the slot holding a few hundred bytes of system,
+        # so the NEXT call, arriving with the correct ~280k one, re-prefills
+        # everything. Measured on a 1431-token preplanner prompt: 92.0s.
+        # Aligning to the invariant sends the exact bytes the slot already
+        # holds. Only the first turn of a session reaches the bare path now,
+        # where nothing is cached anyway.
         _prelim = getattr(self._f, "_prelim_system_this_turn", "") or ""
         if not _prelim:
-            self._note_align("no prelim stashed yet")
-            return system_prompt
+            _prelim = getattr(self._f, "_prefix_invariant", "") or ""
+            if not _prelim:
+                self._note_align("no prelim stashed yet")
+                return system_prompt
+            self._note_align("aligned to session invariant")
         # ── Guard: idempotence, by HEAD rather than by whole prefix ────────
         # AgenticStepExecutor._aligned_prefix head-caps its copy when prelim
         # exceeds the window, and a capped copy does not satisfy
@@ -13153,7 +13187,27 @@ class LLMOrchestrator:
         # tier and the role, and it still does — the three simply cross the
         # message boundary together.
         try:
+            # The invariant describes the SESSION, not the turn, so it is
+            # remembered the moment it is published and read from there
+            # afterwards. Reading only the per-turn slot meant the first
+            # heavy call of a new turn — which runs before that slot is
+            # filled — found it empty and fell through to the PREVIOUS
+            # turn's prelim, sending a system 816 bytes longer than the
+            # invariant. The boundary moved, the checkpoint became
+            # unreachable, and the run paid 96.6s on that call plus 84.9s
+            # on the next one, which arrived with the right system and found
+            # the slot holding the wrong one.
+            #
+            # Freshness is not what makes this correct: the startswith below
+            # is. A Block A that changed since it was remembered simply
+            # fails that test and the call goes out uncut — slower, never
+            # wrong — and the next published prefix replaces the memory, so
+            # a changed Block A costs one call and heals itself.
             _stab = getattr(self._f, "_prelim_stable_this_turn", "") or ""
+            if _stab:
+                self._f._prefix_invariant = _stab
+            else:
+                _stab = getattr(self._f, "_prefix_invariant", "") or ""
             _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
             _pre_full = (_pre + _PREFIX_ROLE_SEPARATOR) if _pre else ""
             _cut = _stab if (_stab and system_prompt.startswith(_stab)) else _pre_full
@@ -40555,6 +40609,53 @@ class InletOrchestrator:
     # 2. Preprocessing (project switch, cache load)
     # ═══════════════════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def resolve_chat_id(chat_id: Optional[str], metadata: Optional[dict]) -> str:
+        """Identity of the conversation this request belongs to, or "".
+
+        OpenWebUI has always offered this. Its filter loader builds the
+        parameters as
+
+            params | {k: v for k, v in {**extra_params, "__id__": id}.items()
+                      if k in sig.parameters}
+
+        so a handler receives exactly those extras whose names appear in its
+        own signature and nothing else, silently. This file asked for `body`,
+        `__user__` and `__event_emitter__`, so `__chat_id__` and
+        `__metadata__` were dropped on the floor every turn — which is why a
+        new chat was never an event here, and why the ingestion registry, the
+        turn counter and the previous answer all carried over into it.
+
+        Reading it from `body["metadata"]` would not have worked: the host
+        sets `form_data["metadata"]` well after the inlet filters run, so at
+        this point the key is not there yet.
+
+        Both parameters are read because the pair is version-dependent:
+        `__metadata__` has been in the inlet's extras for a long time,
+        `__chat_id__` is newer, and the outlet is given the former but not the
+        latter. A deployment that supplies neither leaves both at their
+        defaults and this returns "", which every caller treats as "no
+        identity available" and steps around.
+
+        Args:
+            chat_id:  The host's `__chat_id__`, when it supplies one.
+            metadata: The host's `__metadata__`, when it supplies one.
+
+        Returns:
+            The conversation id as a string, or "" when none is available.
+        """
+        try:
+            if isinstance(chat_id, str) and chat_id.strip():
+                return chat_id.strip()
+            if isinstance(metadata, dict):
+                for _key in ("chat_id", "session_id"):
+                    _val = metadata.get(_key)
+                    if isinstance(_val, str) and _val.strip():
+                        return _val.strip()
+        except Exception:
+            pass
+        return ""
+
     async def inlet_preprocess(self, body: dict, project_id: str) -> list:
         """Handle project switching and symbol cache loading."""
         messages = body.get("messages", [])
@@ -40577,8 +40678,37 @@ class InletOrchestrator:
             # calls go out bare (correct, merely uncached) until this
             # project's Block B populates the stash again.
             self._f._prelim_system_this_turn = ""
+            # Same argument, one level up: the invariant is Block A and the
+            # hub tier, which are this project's code. Carrying it across a
+            # project switch would align the new project's early calls to
+            # the old project's architecture map — the cross-project leak
+            # described above, and a prefix no future turn here will extend.
+            self._f._prefix_invariant = ""
 
         self._f._last_project_id = project_id
+
+        # ── conversation change: reported, not yet acted on ──────────────
+        # Deliberately mute. The reset this line will grow into deletes
+        # persisted state, and a field classified into the wrong scope costs
+        # either the symbol index or the Block A freeze window. So the
+        # detection ships first and on its own: one run, one line, and only
+        # then does anything hang off it.
+        _chat = getattr(self._f, "_chat_id_this_turn", "") or ""
+        if _chat:
+            _prev = getattr(self._f, "_last_chat_id", "") or ""
+            if _prev and _prev != _chat:
+                self._f._log_debug(
+                    f"💬 Conversation changed: {_prev} → {_chat} "
+                    f"(project '{project_id}' unchanged — nothing reset yet)"
+                )
+            elif not _prev:
+                self._f._log_debug(f"💬 Conversation identity: {_chat}")
+            self._f._last_chat_id = _chat
+        else:
+            self._f._log_debug(
+                "💬 Conversation identity unavailable — the host supplied "
+                "neither __chat_id__ nor __metadata__.chat_id"
+            )
 
         # ── load persisted CodePathViews if index is empty ──
         if self._f.valves.enable_path_analysis and HAS_TREE_SITTER:
@@ -41694,6 +41824,12 @@ class InletOrchestrator:
         project_id = self.get_project_id()
         pstate = self._f._project_state_manager.get_pstate(project_id)
         pstate["merged_file_blocks"] = None
+        # Companion of the channel above and cleared with it. Set when an
+        # attachment is recognised as already ingested, so the silent-
+        # ingestion gate can tell "this was never code" from "this is code we
+        # already hold" — two facts that both arrive as an empty symbol list
+        # and want opposite answers.
+        pstate["paste_already_indexed"] = False
 
         # ── Step 2: collect references from both locations, dedup by id ──
         refs = (body.get("files") or []) + (body.get("metadata", {}).get("files") or [])
@@ -41741,6 +41877,7 @@ class InletOrchestrator:
                 merged_text.append(
                     self._indexed_reference_line(name, known.get("symbols", "?"))
                 )
+                pstate["paste_already_indexed"] = True
                 self._f._log_debug(
                     f"merge_pasted_files: '{name}' unchanged "
                     f"(md5={raw_md5}) — skipping re-ingestion, spliced reference"
@@ -42168,6 +42305,86 @@ class SystemPromptBuilder:
         return await self._render_ltm_section(
             project_id, all_meta, current_messages=current_messages
         )
+
+    def _mask_stale_ltm_bodies(self, dynamic_block: str) -> str:
+        """Replace code an LTM fragment quotes when this turn already showed it.
+
+        A retrieved fragment is the text of a past answer, and a past answer
+        about a symbol usually contains that symbol. So when the question is
+        about `X`, the activation renderer puts the current body of `X` in the
+        prompt and retrieval puts a past rendering of `X` a few thousand
+        characters below it — edited, with its docstring shortened and its
+        comments in whatever language that conversation was held in. The model
+        receives two versions of one function and nothing tells it which is the
+        code that exists today.
+
+        The overlap is not bad luck. It is what relevance guarantees: the
+        better retrieval works, the more certain it becomes. Measured across
+        the dumps, of the five with code inside their LTM section, four quoted
+        a body the same prompt had already rendered from source.
+
+        Deduplicating by qid cannot reach this. `_bodies_seen_this_turn` is
+        keyed by symbol, and a fragment is free text that happens to contain a
+        fence — it carries no qid to look up. So the match is made on the
+        `def` or `class` line inside the fence, against the same set, and only
+        the fence is replaced. The prose around it is why the fragment was
+        retrieved and it stays.
+
+        Runs at assembly rather than in _render_ltm_section, which composes its
+        text during Block B step 1-2, before the activation of step 3 has put
+        anything in the set.
+
+        Args:
+            dynamic_block: The joined Block B text, LTM section included.
+
+        Returns:
+            str: The same text with stale quoted bodies replaced by a pointer,
+                 or the input unchanged when there is nothing to replace.
+        """
+        # ── Step 1: locate the section, and bail out cheaply ──
+        _marker = "## Relevant Past Context (long-term memory)"
+        _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
+        if not _seen or _marker not in dynamic_block:
+            return dynamic_block
+        _i = dynamic_block.find(_marker)
+        _j = dynamic_block.find("\n## ", _i + len(_marker))
+        _end = _j if _j > 0 else len(dynamic_block)
+        _section = dynamic_block[_i:_end]
+
+        # ── Step 2: rewrite each fence whose subject was already rendered ──
+        _masked = []
+
+        def _replace(_m):
+            _code = _m.group(2)
+            _nm = re.search(
+                r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)", _code, re.M
+            ) or re.search(r"^\s*class\s+([A-Za-z_]\w*)", _code, re.M)
+            if not _nm:
+                return _m.group(0)
+            _name = _nm.group(1)
+            if _name not in _seen:
+                return _m.group(0)
+            _masked.append(_name)
+            # Deliberately not "an older copy of it": the fence may have
+            # held a proposed change rather than a quotation, and this has
+            # no way to tell. What is true either way, and is the thing the
+            # model needs, is which of the two is the code that exists.
+            return (
+                f"_(code for `{_name}` omitted here — it appears above as it "
+                f"stands in the current source; this version is from a past "
+                f"conversation)_"
+            )
+
+        _new = re.sub(r"```(\w*)\n(.*?)```", _replace, _section, flags=re.S)
+        if not _masked:
+            return dynamic_block
+
+        # ── Step 3: report and splice ──
+        self._f._log_debug(
+            f"🧠 LTM: masked {len(_masked)} quoted body/bodies already "
+            f"rendered this turn from source ({', '.join(sorted(set(_masked)))})"
+        )
+        return dynamic_block[:_i] + _new + dynamic_block[_end:]
 
     async def _render_ltm_section(
         self, project_id: str, memories: list, current_messages: list = None
@@ -42710,6 +42927,11 @@ class SystemPromptBuilder:
                 for _, t in _order_injections_for_render(list(dynamic_injections))
                 if t
             )
+
+        # Last point at which the activation has already run and the block
+        # is still one string, which is what makes the LTM section findable
+        # and the set of rendered bodies complete.
+        dynamic_block = self._mask_stale_ltm_bodies(dynamic_block)
 
         # ── Assemble with tier between static and dynamic ──
         # The profile opens the dynamic region rather than the whole
@@ -45934,11 +46156,24 @@ class ContextDumper:
         timestamp_str = datetime.fromtimestamp(
             payload["timestamp"], tz=timezone.utc
         ).strftime("%Y%m%d_%H%M%S")
-        md_filename = f"{timestamp_str}_turn_{turn:04d}.md"
+        # The turn number is the count of user messages in the list, so every
+        # conversation restarts it at 1 and two chats produce two files called
+        # turn_0001 with nothing to tell them apart. The identity the host
+        # supplies goes in the name, shortened to eight characters — enough to
+        # group a session's snapshots by eye, and absent (with the name
+        # unchanged) on a deployment that supplies none.
+        _chat = (getattr(self._f, "_chat_id_this_turn", "") or "")[:8]
+        _chat_sfx = f"_c{re.sub(r'[^0-9A-Za-z]', '', _chat)}" if _chat else ""
+        md_filename = f"{timestamp_str}_turn_{turn:04d}{_chat_sfx}.md"
         md_path = os.path.join(project_dir, md_filename)
 
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)
+        # The success line downstream says a turn number and nothing about
+        # where, so a folder that stops filling up looks identical to a writer
+        # that stopped running. Observed: 54 snapshots on disk whose newest was
+        # days older than the log's last "Context dump written".
+        self._f._log_debug(f"📄 Context dump → {md_path}")
 
         # ── 2b. Write the agent forensics sibling ────────────────────────────
         # Same prefix as its context dump on purpose: one file says what
@@ -45950,7 +46185,8 @@ class ContextDumper:
             _ag_recs = payload.get("agent_records") or []
             if self._f.valves.enable_agent_dump and _ag_recs:
                 _ag_path = os.path.join(
-                    project_dir, f"{timestamp_str}_turn_{turn:04d}.agents.md"
+                    project_dir,
+                    f"{timestamp_str}_turn_{turn:04d}{_chat_sfx}.agents.md",
                 )
                 with open(_ag_path, "w", encoding="utf-8") as _af:
                     # Read, not consumed. The dump is scheduled from the
@@ -45961,7 +46197,9 @@ class ContextDumper:
                     # and it covers every path a turn can take.
                     _cov = getattr(self._f, "_agentic_coverage", None)
                     _af.write(
-                        self._render_agent_records(_ag_recs, turn, timestamp_str, _cov)
+                        self._render_agent_records(
+                            _ag_recs, turn, timestamp_str, _cov, _chat_sfx
+                        )
                     )
         except Exception as _e_ag:
             self._f._log_debug(f"agent dump skipped ({_e_ag!r})")
@@ -46053,6 +46291,7 @@ class ContextDumper:
         turn: int,
         timestamp_str: str,
         coverage: Optional[Dict[str, int]] = None,
+        chat_suffix: str = "",
     ) -> str:
         """
         Render this turn's agent acts as readable Markdown.
@@ -46072,8 +46311,8 @@ class ContextDumper:
             "",
             _COVERAGE_BLOCK(coverage)
             + f"{len(records)} act(s), in execution order. Pair this file "
-            f"with {timestamp_str}_turn_{turn:04d}.md, which holds the "
-            "context these agents were given.",
+            f"with {timestamp_str}_turn_{turn:04d}{chat_suffix}.md, which "
+            "holds the context these agents were given.",
             "",
         ]
         for _r in records:
@@ -46300,10 +46539,22 @@ class ContextDumper:
             return
         try:
             # Find all snapshots with the new format: XXXX_turn_...md
+            # The pattern below is the one _write_sync produces:
+            # {YYYYMMDD}_{HHMMSS}_turn_{NNNN}.md. It used to be
+            # {NNNN}_turn_{N}.md, and when the name gained its timestamp the
+            # prune kept the old expression and silently stopped matching
+            # anything — so context_dump_max_files_per_project has not been
+            # enforced since. Sorting by name is sorting by time, which is what
+            # the excess slice below assumes.
+            # The optional _cXXXXXXXX group is the conversation id added to
+            # the name in the same patch as this line. Widening the pattern
+            # here rather than after the next run is the whole lesson of the
+            # previous breakage: the name changed, the pattern did not, and
+            # nothing was pruned for weeks without a single error anywhere.
             snapshots = sorted(
                 f
                 for f in os.listdir(project_dir)
-                if re.match(r"^\d{4}_turn_\d+\.md$", f)
+                if re.match(r"^\d{8}_\d{6}_turn_\d+(?:_c[0-9A-Za-z]+)?\.md$", f)
             )
         except Exception:
             return
@@ -46311,6 +46562,18 @@ class ContextDumper:
         for fname in snapshots[: max(0, excess)]:
             try:
                 os.remove(os.path.join(project_dir, fname))
+            except Exception:
+                pass
+            # The forensics sibling is not matched by the pattern above and
+            # was never pruned with its snapshot. That cost nothing while the
+            # pattern matched nothing either; now that pruning works again it
+            # would leave an orphan .agents.md for every file removed. Guarded
+            # separately so a missing sibling is not an error — most turns
+            # never produce one.
+            try:
+                os.remove(
+                    os.path.join(project_dir, fname[: -len(".md")] + ".agents.md")
+                )
             except Exception:
                 pass
 
@@ -52081,11 +52344,23 @@ class Filter:
         # Preliminary system prompt of the current turn, stashed by
         # SystemPromptBuilder after Block B assembly and consumed by
         # LLMOrchestrator._align_system_to_prefix. Cleared on project switch
-        # (see InletOrchestrator.inlet_preprocess); deliberately NOT cleared
-        # between turns of the same project, so background tasks that run
-        # after outlet (docstrings, raptor) align to the prefix the slot
-        # still holds.
+        # (see InletOrchestrator.inlet_preprocess) and at the top of every
+        # inlet: it describes ONE turn, and one that outlived its own turn is
+        # what made the first heavy call of the next turn align against a
+        # Block B that had already been replaced.
         self._prelim_system_this_turn: str = ""
+        # The invariant half of that prefix — the static block plus the hub
+        # tier — remembered for the whole SESSION rather than for the turn.
+        # Everything that runs before Block B is assembled (the inlet's own
+        # calls, the background tasks that outlive the outlet) has no turn
+        # prelim to align to, and going out bare there is not the safe
+        # option it looks like: it leaves the slot holding a few hundred
+        # bytes of system, so the next call re-prefills the whole context.
+        # Those callers align to this instead, and it is also the exact text
+        # the slot still holds after the answer call, since the answer cuts
+        # its own system here too. Never cleared between turns; cleared on
+        # project switch, where it would describe another project's code.
+        self._prefix_invariant: str = ""
         self._align_reject_logged_this_turn: bool = False
 
         # -- Tracking of active LLM tasks --
@@ -52103,6 +52378,16 @@ class Filter:
 
         # -- Project tracking --
         self._last_project_id: str = ""
+        # Which conversation the previous turn belonged to, and which one this
+        # turn belongs to. The project is a valve — one fixed string — so two
+        # different chats have always been the same scope to this file, and
+        # everything keyed by project leaked between them: the ingestion
+        # registry, the turn counter, the summaries, the previous answer. Both
+        # start empty and stay empty when the host gives no identity, which
+        # keeps the behaviour of every earlier build for anyone whose
+        # OpenWebUI does not supply one.
+        self._last_chat_id: str = ""
+        self._chat_id_this_turn: str = ""
 
         # Symbol index and path index
         self._symbol_index = SymbolIndex()
@@ -52601,6 +52886,8 @@ class Filter:
         body: dict,
         __user__: Optional[dict] = None,
         __event_emitter__=None,
+        __metadata__: Optional[dict] = None,
+        __chat_id__: Optional[str] = None,
     ) -> dict:
         """
         Pre-process the incoming request before the LLM sees it.
@@ -52632,6 +52919,17 @@ class Filter:
         _build_activated_code() → build_block_b(), so the rest of the turn
         reuses this single classification.
         """
+
+        # ------------------------------------------------------------------
+        # Region: conversation identity for this turn
+        # ------------------------------------------------------------------
+        # Resolved here because this is the only place the host's parameters
+        # are in scope; the comparison and everything that hangs off it live
+        # in InletOrchestrator.inlet_preprocess, next to the project switch it
+        # mirrors.
+        self._chat_id_this_turn = InletOrchestrator.resolve_chat_id(
+            __chat_id__, __metadata__
+        )
 
         # ------------------------------------------------------------------
         # Region: bind event emitter — always cleared in finally
@@ -52679,6 +52977,15 @@ class Filter:
             self._serial_rival_accounts = []
             self._answer_is_verbatim_echo = False
             self._prelim_stable_this_turn = ""
+            # The turn prelim belongs to ONE turn. Left standing it was
+            # still there at the next inlet, before that turn's Block B
+            # existed, and the first heavy call aligned against it — 816
+            # bytes of the previous turn's Block B riding inside the system
+            # message, where they move the boundary llama.cpp checkpoints
+            # at. Callers that run this early align to _prefix_invariant
+            # instead, which is the half that really is identical across
+            # turns.
+            self._prelim_system_this_turn = ""
             self._profile_block_this_turn = ""
             self._cut_logged_this_turn = False
             self._serial_dropped_gaps = []
@@ -53070,7 +53377,22 @@ class Filter:
                 #    ordinary prose as code-only. If symbol extraction found
                 #    nothing, this was never a code paste — abandon silent
                 #    ingestion and fall through to the normal pipeline.
-                if not raw_symbols:
+                #
+                #    An empty symbol list has two meanings and the net used to
+                #    read only one. "This was never code" wants the abort.
+                #    "This is code we already hold" wants the opposite: the
+                #    paste was recognised by md5, merge_pasted_files replaced
+                #    it with a one-line reference, and there is nothing left to
+                #    parse BECAUSE the work is already done. Aborting there
+                #    sent a message whose entire content was that reference
+                #    line into the full pipeline, which assembled 280 KB of
+                #    context and answered the previous conversation's question.
+                _already_indexed = bool(pstate_local.get("paste_already_indexed"))
+                # Acknowledge-only holds when EVERY attachment this turn was
+                # already held. One new file alongside a known one still has
+                # real symbols to index, and must take the full path.
+                _ack_only = _already_indexed and not raw_symbols
+                if not raw_symbols and not _already_indexed:
                     self._log_debug(
                         "Silent ingestion aborted: is_code_only_message "
                         "classified this as code, but symbol extraction "
@@ -53105,35 +53427,51 @@ class Filter:
                         "[TURN-PATH] is_code_session=True → silent-ingestion "
                         "(code-only paste indexed, no reasoning)"
                     )
-                    try:
-                        await self._update_active_code(_msg_to_index, project_id)
-                    finally:
-                        pass
-
-                    # -- resolve cross-chunk edges (cheap; needed before Block A)
-                    # The path-index rebuild that used to run here is the
-                    # dominant cost on a large ingestion (a build_activation_graph
-                    # per entry point). It now runs off the critical path as the
-                    # 'path_index' background task, with a lazy fallback on the
-                    # next turn — see TaskRegistry._build_tasks. Block A keeps its
-                    # correct centrality via invalidate_block_a_cache below, which
-                    # recomputes it independently of the path index.
-                    await self._activation.resolve_dangling_edges(project_id)
-
-                    # -- invalidate and rebuild Block A eagerly ----------------
-                    if self.valves.block_a_freeze_break_on_ingestion:
-                        _pstate_freeze = psm.get_pstate(project_id)
-                        _pstate_freeze["block_a_freeze_active"] = False
-                        _pstate_freeze["block_a_frozen_structure_hash"] = None
-                        _pstate_freeze["block_a_frozen_profile_hash"] = None
-                        _pstate_freeze["block_a_freeze_edits_used"] = 0
+                    # Everything below re-indexes and rebuilds, and every
+                    # step of it is wrong when the paste is one we already
+                    # hold: nothing changed, so breaking the freeze and
+                    # invalidating Block A would throw away the exact prefix
+                    # the next turn needs. Measured on this model, that prefix
+                    # is worth ~74k tokens of reprocessing, because the
+                    # recurrent state can only be restored at a checkpoint and
+                    # the shared one sits at the end of it.
+                    if _ack_only:
                         self._log_debug(
-                            "Block A freeze: broken by silent ingestion "
-                            "(structure changed wholesale)"
+                            "[TURN-PATH] paste already indexed → acknowledging "
+                            "without re-indexing; freeze, Block A and the "
+                            "cached prefix are left untouched"
                         )
-                    await self._ctx_builder.invalidate_block_a_cache(
-                        project_id, "new chunk ingested", recompute_centrality=True
-                    )
+                    else:
+                        try:
+                            await self._update_active_code(_msg_to_index, project_id)
+                        finally:
+                            pass
+
+                        # -- resolve cross-chunk edges (cheap; before Block A)
+                        # The path-index rebuild that used to run here is the
+                        # dominant cost on a large ingestion (a
+                        # build_activation_graph per entry point). It now runs
+                        # off the critical path as the 'path_index' background
+                        # task, with a lazy fallback on the next turn — see
+                        # TaskRegistry._build_tasks. Block A keeps its correct
+                        # centrality via invalidate_block_a_cache below, which
+                        # recomputes it independently of the path index.
+                        await self._activation.resolve_dangling_edges(project_id)
+
+                        # -- invalidate and rebuild Block A eagerly ------------
+                        if self.valves.block_a_freeze_break_on_ingestion:
+                            _pstate_freeze = psm.get_pstate(project_id)
+                            _pstate_freeze["block_a_freeze_active"] = False
+                            _pstate_freeze["block_a_frozen_structure_hash"] = None
+                            _pstate_freeze["block_a_frozen_profile_hash"] = None
+                            _pstate_freeze["block_a_freeze_edits_used"] = 0
+                            self._log_debug(
+                                "Block A freeze: broken by silent ingestion "
+                                "(structure changed wholesale)"
+                            )
+                        await self._ctx_builder.invalidate_block_a_cache(
+                            project_id, "new chunk ingested", recompute_centrality=True
+                        )
                     try:
                         static_block = await self._ctx_builder.build_block_a(
                             project_id, is_code_session=True, is_continuation=False
@@ -53200,21 +53538,77 @@ class Filter:
                         response.encode()
                     ).hexdigest()[:12]
 
-                    messages.append({"role": "assistant", "content": response})
-                    messages[:] = self._inlet_orch.ensure_last_message_is_user(messages)
+                    # Third instance of the idiom _deliver_command_response
+                    # was written to retire, and the only one still using it.
+                    # Appending the acknowledgement as an assistant message and
+                    # then calling ensure_last_message_is_user truncates
+                    # everything after the last USER message — which deletes
+                    # the acknowledgement that was just appended. The comment
+                    # further down ("the model generates its own wording for
+                    # the ack") records the symptom: nobody was generating a
+                    # wording, the model was being handed a stub with no answer
+                    # attached and inventing one. Delivered properly, the
+                    # reader gets the real counts and the next turn's guard can
+                    # recognise the text it wrote.
+                    messages[:] = self._commands._deliver_command_response(
+                        messages, response
+                    )
 
-                    # -- record the ack hash so next turn's prologue skips
-                    #    it: the code is already indexed, and caching the ack
-                    #    would let an identical future paste replay it -------
-                    pstate_local["_last_silent_ack_hash"] = hashlib.md5(
-                        response.encode()
-                    ).hexdigest()[:12]
+                    # An ingestion turn used to leave the host a prompt of 589
+                    # bytes with no system message at all. On this model that
+                    # is not merely a small prompt: the slot ends the turn
+                    # holding a prefix that shares nothing with the ~74k-token
+                    # one the next turn needs, and since the recurrent state
+                    # can only be restored at a checkpoint, the next real
+                    # question pays a full re-prefill. Measured at 74050
+                    # tokens / 83.7 s, once per chat, across 145 ingestions in
+                    # eighteen days.
+                    #
+                    # The invariant is exactly what every aligned call sends as
+                    # its system, byte for byte, so handing it to this call
+                    # ends the turn with the slot holding the prefix the next
+                    # turn will ask for. Empty on a project's first ingestion,
+                    # and empty right after a real re-index — both cases where
+                    # there is no valid prefix to keep, and where this
+                    # correctly does nothing.
+                    _inv = getattr(self, "_prefix_invariant", "") or ""
+                    if _inv and not any(
+                        m.get("role") == "system" for m in messages
+                    ):
+                        messages.insert(0, {"role": "system", "content": _inv})
+                        self._log_debug(
+                            f"🔗 Ingestion call carries the session invariant "
+                            f"as its system ({len(_inv)} chars) — the slot ends "
+                            f"this turn holding the next turn's prefix"
+                        )
+                        # The count recorded further up is Block A alone,
+                        # because that was the whole of what this turn used to
+                        # assemble. The invariant is Block A plus the hub tier,
+                        # so leaving it would hand the next turn's
+                        # WindowManager a system_prev some six thousand tokens
+                        # short and a budget that generous. Re-recorded here,
+                        # where what was sent is known.
+                        if self.tokenizer:
+                            try:
+                                psm.set_last_system_tokens(
+                                    project_id, len(self.tokenizer.encode(_inv))
+                                )
+                            except Exception:
+                                pass
 
-                    # The model generates its own wording for the ack, so the
-                    # hash guard above cannot recognise it next turn. This
-                    # explicit pending flag is the authoritative signal: the
-                    # very next prev-assistant pass skips indexing/LTM for the
-                    # ack regardless of its text.
+                    # The same four lines stood here and thirty lines above,
+                    # character for character, comment included. One is enough.
+                    #
+                    # The note that used to sit here said the model generates
+                    # its own wording for the ack and the hash guard therefore
+                    # cannot recognise it. That was a description of the bug
+                    # fixed two edits up: nothing was choosing a wording, the
+                    # acknowledgement was being appended and then deleted by
+                    # the truncation, and the model was inventing a
+                    # replacement. It is now delivered verbatim, so the hash
+                    # above matches what comes back. The flag stays as the
+                    # belt to that braces: it is authoritative regardless of
+                    # text, and costs one boolean.
                     pstate_local["_silent_ack_pending"] = True
 
                     # -- optional context dump --------------------------------
@@ -53224,7 +53618,14 @@ class Filter:
                                 project_id=project_id,
                                 static_block=static_block,
                                 dynamic_block="",
-                                final_system=static_block,
+                                # What was actually sent, which since this turn
+                                # started carrying the invariant is Block A
+                                # plus the hub tier rather than Block A alone.
+                                # The snapshot is the instrument every one of
+                                # these fixes is read through; an instrument
+                                # that reports a system the model never saw is
+                                # worse than none.
+                                final_system=(_inv or static_block),
                                 messages=messages,
                                 dump_kind="silent_ingestion",
                             )
@@ -53321,11 +53722,33 @@ class Filter:
             _inlet_timing("Step 6/6: Assemble context and final messages", step_start)
 
             if cached_response:
-                messages.pop()
-                messages.append(
-                    {"role": "assistant", "content": cached_response["response"]}
+                # A cached answer is delivered exactly like a command's,
+                # through the one path that reaches the reader. The idiom
+                # this replaces — drop the question, append the answer as an
+                # assistant message, then call ensure_last_message_is_user —
+                # is the one _deliver_command_response was written to
+                # retire, and its docstring says why: that helper truncates
+                # everything after the LAST USER message, so it deleted the
+                # answer it had just been handed.
+                #
+                # For commands the damage was a reply about the wrong thing.
+                # Here it was worse, because what survived the truncation
+                # was the conversation up to the PREVIOUS user message, and
+                # in a fresh chat that is the ingestion turn, whose content
+                # is emptied once it stops being current. The host received
+                # a single blank user turn and was asked to continue it:
+                # 69 bytes of prompt, no system, no question, no answer.
+                # Reproduced twice in one session, and only visible at all
+                # because the response cache needs the same question under
+                # an unchanged code state — which is precisely what asking
+                # again in a new chat produces.
+                #
+                # The echo costs one generation, so a cache hit is cheap
+                # rather than free. A cached answer nobody receives is worth
+                # less than that.
+                messages = self._commands._deliver_command_response(
+                    messages, cached_response["response"]
                 )
-                messages = self._inlet_orch.ensure_last_message_is_user(messages)
                 body["messages"] = messages
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
                 self._log_section(
