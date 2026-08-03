@@ -5521,6 +5521,27 @@ class ContextBuilder:
             # --- 4a. Cache hit: same (effective) code + same mode ---
             return cached_text
 
+        # A miss rebuilds ~66k tokens and, because the render is not
+        # byte-stable across rebuilds, moves the prefix every call of the
+        # session shares. Which of the three key components moved is the
+        # whole diagnosis, and until now a miss was silent: a rebuild in the
+        # middle of a turn looked identical in the log to no rebuild at all.
+        _why = "no stored key" if not stored_key else (
+            "no cached text" if cached_text is None else "key changed"
+        )
+        if stored_key and stored_key != cache_key:
+            _old = stored_key.split("__")
+            _new = cache_key.split("__")
+            _parts = [
+                n for n, o, c in zip(("structure", "mode", "profile"), _old, _new)
+                if o != c
+            ]
+            _why = f"key changed in {'+'.join(_parts) or 'shape'}"
+        self._f._log_debug(
+            f"🧱 Block A REBUILD ({_why}) · stored={stored_key!r} "
+            f"new={cache_key!r}"
+        )
+
         # --- 4b. Cache miss or continuation freeze ---
         if is_continuation and cached_text is not None:
             self._f._log_debug("Block A: frozen for AutoContinue (KV cache stability)")
@@ -6236,7 +6257,7 @@ class ContextBuilder:
         psm.set_skeleton_tier_qids(project_id, rendered_qids)
 
         self._f._log_debug(
-            f"Skeleton tier rendered (structure_hash={structure_hash}, "
+            f"Skeleton tier RE-RENDERED (structure_hash={structure_hash}, "
             f"~{self._f._tokens.estimate_code_tokens(tier)} tokens, "
             f"{len(rendered_qids)} qids registered)"
         )
@@ -13154,6 +13175,7 @@ class LLMOrchestrator:
         # session_summary, change_summary) reach here through overrides that
         # in single-model deployments resolve to the very slot holding the
         # prefix.
+        _before_align = system_prompt
         system_prompt = self._align_system_to_prefix(
             system_prompt,
             model_override or self._f.valves.llm_model or "",
@@ -13161,6 +13183,67 @@ class LLMOrchestrator:
             response_format=response_format,
             reasons_about_code=reasons_about_code,
         )
+
+        # ── Drop a skeleton the aligned prefix already carries ─────────────
+        # Two callers paste a project skeleton into their own prompt:
+        # SemanticSeedInferencer ("Project skeleton (signatures only — no
+        # bodies)") and generate_predictions ("Code structure (signatures
+        # only)"). Both are aligned here, so their system IS the invariant,
+        # which contains the complete skeleton — and the copy they attach is
+        # truncated: measured at 9 of 59 classes for the first and 2000
+        # characters for the second, cut alphabetically, so everything from
+        # AgenticSandboxRunner onward is invisible. The prompt then asks for
+        # "the exact identifiers from the skeleton", which for those classes
+        # the model cannot produce; in the run that motivated this, 10 seeds
+        # came back, 0 resolved exactly and 8 were discarded, and the two
+        # survivors named classes only the prefix could have shown.
+        #
+        # So this removes 13569 tokens per run of reprocessing AND widens what
+        # the caller can see from 15% of the project to all of it. Done here
+        # rather than at the callers because only here is it known that
+        # alignment actually happened: when it declines — once in 75 calls,
+        # on the turn with no prefix to inherit — the prompt is left exactly
+        # as it is today and nothing is lost.
+        if system_prompt is not _before_align and prompt:
+            try:
+                _sk_hdr = re.compile(r"(?m)^## Classes\b")
+                if _sk_hdr.search(system_prompt):
+                    for _lead, _fenced in (
+                        ("Project skeleton (signatures only — no bodies):", True),
+                        ("Code structure (signatures only):", False),
+                    ):
+                        _i = prompt.find(_lead)
+                        if _i < 0:
+                            continue
+                        _body = prompt[_i + len(_lead):]
+                        if _fenced:
+                            _o = _body.find("```")
+                            _c = _body.find("```", _o + 3) if _o >= 0 else -1
+                            _end = (_i + len(_lead) + _c + 3) if _c > 0 else -1
+                        else:
+                            _b = _body.find("\n\n")
+                            _end = (_i + len(_lead) + _b) if _b > 0 else -1
+                        if _end <= _i:
+                            continue
+                        _dropped = _end - _i
+                        prompt = (
+                            prompt[:_i]
+                            + "The project skeleton is already above, in the "
+                            + "'## Project Skeleton' section of the system "
+                            + "message. Use it: it lists every class and every "
+                            + "signature, and the identifiers it shows are the "
+                            + "exact ones to answer with."
+                            + prompt[_end:]
+                        )
+                        self._f._log_debug(
+                            f"✂️ {label or 'call'}: dropped {_dropped} chars of "
+                            f"skeleton already present in the aligned prefix "
+                            f"(which carries it complete and untruncated)"
+                        )
+            except Exception as _exc:
+                self._f._log_debug(
+                    f"✂️ skeleton dedup skipped: {type(_exc).__name__}"
+                )
 
         # ── One system for every aligned call ─────────────────────────────
         # The aligner produces `prelim + separator + role`, and the role is
@@ -13222,6 +13305,19 @@ class LLMOrchestrator:
             # a changed Block A costs one call and heals itself.
             _stab = getattr(self._f, "_prelim_stable_this_turn", "") or ""
             if _stab:
+                # The third axis of the same diagnosis. The invariant moving
+                # mid-session is what a full re-prefill looks like from this
+                # side, and it was silent: two calls a minute apart could send
+                # different prefixes with nothing in the log between them.
+                # Reported only on change, so a healthy session logs it once.
+                _prev_inv = getattr(self._f, "_prefix_invariant", "") or ""
+                if _prev_inv != _stab:
+                    self._f._log_debug(
+                        f"🔑 Prefix invariant "
+                        f"{'set' if not _prev_inv else 'CHANGED'}: "
+                        f"{len(_prev_inv)} → {len(_stab)} chars "
+                        f"(md5 {hashlib.md5(_stab.encode()).hexdigest()[:12]})"
+                    )
                 self._f._prefix_invariant = _stab
             else:
                 _stab = getattr(self._f, "_prefix_invariant", "") or ""
@@ -42961,6 +43057,60 @@ class SystemPromptBuilder:
                 if t
             )
 
+        # ── Injection census and static/dynamic overlap detector ──────────
+        # Two questions this answers, both of which cost a full run each time
+        # they were asked one hypothesis at a time. First: which injection
+        # produced a given piece of Block B — the list is assembled from a
+        # dozen contributors and, once joined, nothing downstream can tell
+        # them apart. Second, and the reason this exists: a turn was observed
+        # whose Block B was a byte-identical copy of the 137181-byte skeleton
+        # that Block A already carried, so the prompt held it twice and every
+        # call of that turn reprocessed ~34k tokens for nothing. Ruling out
+        # build_block_b took a run; ruling out the next candidate would have
+        # taken another. The detector below fires only when the pathology is
+        # present and names the section, so there is no next run to spend.
+        try:
+            _census = []
+            for _prio, _text in _order_injections_for_render(
+                list(dynamic_injections)
+            ):
+                if not _text:
+                    continue
+                _head = next(
+                    (l for l in _text.splitlines() if l.startswith("#")), "(no header)"
+                )
+                _census.append(f"[{_prio} {len(_text)}B {_head[:44]!r}]")
+            if _census:
+                self._f._log_debug(
+                    f"🧩 Block B injections ({len(_census)}): {' '.join(_census)}"
+                )
+
+            # Any Block A section header appearing in the dynamic region means
+            # the same text is being sent twice in one prompt.
+            # Anchored to the start of a line: a bare substring test also
+            # matches "## Class Index" inside the body of a rendered docstring
+            # and would cry wolf on a healthy prompt.
+            for _mark in (
+                "## Class Index",
+                "## Full Call Graph",
+                "## Project Skeleton",
+                "## Classes",
+                "## Core Implementation",
+            ):
+                _pat = re.compile(r"(?m)^" + re.escape(_mark) + r"\b")
+                _dm = _pat.search(dynamic_block)
+                if _dm and _pat.search(static_block):
+                    _d = _dm.start()
+                    _nm = re.compile(r"(?m)^## ").search(dynamic_block, _dm.end())
+                    _sz = (_nm.start() if _nm else len(dynamic_block)) - _d
+                    self._f._log_debug(
+                        f"⚠️ DUPLICATE IN PROMPT: '{_mark}' is in Block A and "
+                        f"again in Block B ({_sz} chars at offset {_d} of the "
+                        f"dynamic region) — this text is being sent twice"
+                    )
+        except Exception as _exc:
+            self._f._log_debug(f"🧩 injection census failed: {type(_exc).__name__}")
+
         # Last point at which the activation has already run and the block
         # is still one string, which is what makes the LTM section findable
         # and the set of rendered bodies complete.
@@ -48198,7 +48348,12 @@ class SemanticSeedInferencer:
 
     COST AND KV CACHE
     ─────────────────
-    - ONE auxiliary call bounded by seed_inference_skeleton_max_tokens.
+    - ONE auxiliary call. Its prompt embeds a skeleton bounded by
+      seed_inference_skeleton_max_tokens, but that copy survives only on the
+      unaligned path: when the call is aligned, call_llm drops it and the
+      model reads the complete skeleton from the prefix instead. The cap
+      truncates alphabetically, so on the path where it does apply the model
+      sees the first classes and nothing after them.
     - Gated by slot_free (does not run during AutoContinue continuations).
     - Dirties the shared inference slot exactly like CoT/contradiction;
       llama.cpp's native context checkpoints recover the main prefix.
@@ -49528,10 +49683,21 @@ class Filter:
             description="Seed score assigned to LLM‑validated symbols (> lod3_threshold guarantees LOD‑3).",
         )
 
+        # Only reaches the model when the call is NOT aligned to the KV
+        # prefix. When it is — the normal case — call_llm removes the
+        # embedded skeleton entirely, because the aligned system already
+        # carries the complete one; this cap then bounds nothing that is
+        # sent. It is kept for the cold-start turn, where there is no prefix
+        # to inherit and this copy is the only skeleton the model gets:
+        # without a cap that call would carry the whole project, ~32000
+        # tokens, on the most expensive turn of the session.
         seed_inference_skeleton_max_tokens: int = Field(
             default=6000,
             ge=500,
-            description="Skeleton token cap sent to the planner LLM. 0 = no cap.",
+            description=(
+                "Skeleton token cap for the planner LLM, applied only when "
+                "the call cannot be aligned to the KV prefix. 0 = no cap."
+            ),
         )
 
         seed_inference_max_tokens: int = Field(
