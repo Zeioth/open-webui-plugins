@@ -3068,10 +3068,9 @@ class HubSymbolIndex:
         it only renders. Deterministic while the code is unchanged (alphabetical /
         centrality order), so llama.cpp's KV cache stays stable.
 
-        dirty_qids, when provided, is forwarded to the class outline and to
-        the hubs_only call-graph section so both order stable symbols before
-        recently-changed ones — see _build_class_outline and
-        _build_hub_section for the exact ordering rule. expanded_hubs and
+        dirty_qids is still forwarded for signature compatibility and is no
+        longer used for ordering by any receiver — see _format_skeleton for
+        why the stable-first split was retired. expanded_hubs and
         full_graph modes are NOT given this treatment in this change: their
         ordering already follows different rules (centrality-then-neighbors,
         and pure alphabetical respectively for KV-cache-stability reasons
@@ -3490,22 +3489,20 @@ class HubSymbolIndex:
         with its centrality score, incoming callers, and (when
         *enable_callees* is True) outgoing callees.
 
-        When dirty_qids is provided, hub symbols are split into two groups
-        before applying the existing per-file / by-centrality ordering
-        within each group: non-dirty hubs render first, dirty hubs render
-        after. This keeps the (typically larger) stable portion of the hub
-        listing as a contiguous, position-stable prefix across turns, at
-        the cost of hub symbols that did change always appearing at the
-        tail regardless of how central they are. Falls back to pure
-        centrality ordering, unchanged from the original behavior, when
-        dirty_qids is None or empty.
+        Ordered by centrality throughout, per file where the project has
+        more than one. dirty_qids is accepted and ignored: the split it used
+        to drive listed changed hubs last regardless of centrality — spending
+        the section's one ordering principle — and did not buy the stable
+        prefix it was written for, because the stable group's membership
+        changes with the dirty set and its entries move back on the next
+        build. See _format_skeleton for the full argument.
         """
-        if dirty_qids:
-            stable_hubs = [q for q in hub_qids if q not in dirty_qids]
-            dirty_hubs = [q for q in hub_qids if q in dirty_qids]
-            ordered_hub_qids = stable_hubs + dirty_hubs
-        else:
-            ordered_hub_qids = hub_qids
+        # Centrality order, unconditionally. The split this replaces cost the
+        # section twice over: it could not hold the prefix it was written to
+        # hold, and it paid for the attempt by listing the hubs that changed
+        # last no matter how central they were — degrading, for the model
+        # reading it, the one thing this section is ordered by.
+        ordered_hub_qids = hub_qids
 
         by_file: dict = {}
         for qid in ordered_hub_qids:
@@ -3520,16 +3517,9 @@ class HubSymbolIndex:
         ]
 
         if len(by_file) == 1 and None in by_file:
-            if dirty_qids:
-                stable_in_file = [q for q in by_file[None] if q not in dirty_qids]
-                dirty_in_file = [q for q in by_file[None] if q in dirty_qids]
-                stable_in_file.sort(key=lambda q: -centrality.get(q, 0))
-                dirty_in_file.sort(key=lambda q: -centrality.get(q, 0))
-                file_ordered = stable_in_file + dirty_in_file
-            else:
-                file_ordered = sorted(
-                    by_file[None], key=lambda q: -centrality.get(q, 0)
-                )
+            file_ordered = sorted(
+                by_file[None], key=lambda q: -centrality.get(q, 0)
+            )
             for qid in file_ordered:
                 lines.append(
                     self._format_symbol_line(
@@ -3542,16 +3532,9 @@ class HubSymbolIndex:
                     continue
                 lines.append(f"### {file_path}")
                 file_qids = by_file[file_path]
-                if dirty_qids:
-                    stable_in_file = [q for q in file_qids if q not in dirty_qids]
-                    dirty_in_file = [q for q in file_qids if q in dirty_qids]
-                    stable_in_file.sort(key=lambda q: -centrality.get(q, 0))
-                    dirty_in_file.sort(key=lambda q: -centrality.get(q, 0))
-                    file_ordered = stable_in_file + dirty_in_file
-                else:
-                    file_ordered = sorted(
-                        file_qids, key=lambda q: -centrality.get(q, 0)
-                    )
+                file_ordered = sorted(
+                    file_qids, key=lambda q: -centrality.get(q, 0)
+                )
                 for qid in file_ordered:
                     lines.append(
                         self._format_symbol_line(
@@ -5544,12 +5527,17 @@ class ContextBuilder:
             return cached_text
 
         # --- 4c. Diff current signatures against the last persisted snapshot ---
+        # Still computed, still forwarded, no longer used for ordering — the
+        # sections render from the symbol set alone so that two builds of the
+        # same code produce the same bytes. Kept because the number is the
+        # single most useful thing this line can say about why a prefix is
+        # about to change, and because the freeze reads the same set for its
+        # drift ratio.
         dirty_qids = self._compute_dirty_qids(project_id)
         if dirty_qids:
             self._f._log_debug(
                 f"Block A: {len(dirty_qids)} symbol(s) dirty since last build "
-                f"— ordering stable symbols first in Architecture Map, "
-                f"Skeleton, and Hub section"
+                f"— the prefix will change from the first of them onward"
             )
 
         # --- 5. Build the static block ---
@@ -6372,14 +6360,29 @@ class ContextBuilder:
 
         for qid in ordered:
             body, bh, lang = resolved[qid]
-            meta = self._f._symbol_index.get_symbol_meta(qid, project_id) or {}
-            doc = meta.get("docstring", "")
-            doc_line = f"_{doc}_\n" if doc else ""
-
+            # No docstring line above the body. This tier's contract is the
+            # complete implementation, and the line was one of two things and
+            # never a third: for a symbol documented in source it repeated,
+            # word for word, the docstring sitting two lines below inside the
+            # fence — measured at 12 of the 15 hubs that carried one, 985
+            # bytes of the section; and for a symbol whose docstring was
+            # generated in the background it was the only part of this tier
+            # that could change without the code changing, which is what a
+            # KV prefix cannot afford.
+            #
+            # The tier's own change signal already excludes it: bh is
+            # md5(body), so a docstring arriving moves the rendered text while
+            # the hash that decides ordering reports nothing. The render and
+            # the signal disagreed, and the render was the one that was wrong.
+            #
+            # Nothing is lost from the prompt. Every docstring's first line is
+            # in the Project Skeleton for all 863 symbols, and that section is
+            # cached on a hash that excludes docstrings — so it is the one
+            # place a generated docstring can appear without moving anything.
             kept_set = set(kept)
             body_with_xrefs = self._inject_tier_xrefs(body, qid, kept_set | {qid})
 
-            chunk = f"### `{qid}`\n{doc_line}```{lang}\n{body_with_xrefs}\n```\n"
+            chunk = f"### `{qid}`\n```{lang}\n{body_with_xrefs}\n```\n"
             tok = self._f._tokens.estimate_code_tokens(chunk)
             if budget > 0 and total + tok > budget:
                 excluded_by_cap.extend(ordered[ordered.index(qid) :])
@@ -6670,15 +6673,19 @@ class ContextBuilder:
     ) -> str:
         """Render the project skeleton: signatures of all indexed symbols.
 
-        Same stable-prefix ordering as _build_class_outline: when dirty_qids
-        is provided, classes with no dirty member render first (alphabetical
-        among themselves), classes with at least one dirty member render
-        after (alphabetical among themselves). Module-level functions follow
-        the same split. Method order WITHIN a class is left untouched
-        (source line order), since reordering individual method signatures
-        inside an otherwise-stable class would itself introduce a position
-        shift for no benefit — the class as a whole is the unit being
-        protected or sacrificed here.
+        Ordering is a function of the symbol set and nothing else: classes
+        alphabetically, methods within a class in source line order, module
+        functions after. Two builds of the same code therefore render the same
+        bytes, which is the only property the KV prefix can actually use.
+
+        dirty_qids is accepted and ignored, as on _build_class_outline. It used
+        to move classes with a changed member to the end so the unchanged head
+        would keep its positions; the head that survives that is the head of
+        the STABLE list, whose membership is itself a function of the dirty
+        set, so the following build — where those classes are clean again —
+        walks every one of them back. Two builds diverge at min(D_N Δ D_{N+1})
+        under the split and at min(D_{N+1}) without it, and the first is never
+        later than the second.
 
         Class-level docstrings are shown inline on the `class X:` line when
         present and skeleton_include_docstrings is on, symmetric to how
@@ -6698,17 +6705,14 @@ class ContextBuilder:
 
         classes = sorted(symbol_index.get_classes(project_id))
         if classes:
-            if dirty_qids:
-
-                def _class_is_dirty(class_name: str) -> bool:
-                    members = symbol_index.get_class_members(class_name, project_id)
-                    return any(qid in dirty_qids for qid in members)
-
-                stable_classes = [c for c in classes if not _class_is_dirty(c)]
-                dirty_classes = [c for c in classes if _class_is_dirty(c)]
-                ordered_classes = stable_classes + dirty_classes
-            else:
-                ordered_classes = classes
+            # Alphabetical, whatever changed. The split that used to live here
+            # pushed classes with a changed member to the end so the unchanged
+            # head would keep its positions, and that is not what happens: the
+            # head it preserves is the head of the STABLE list, whose
+            # membership changes with the dirty set, so the next build — where
+            # those classes are no longer dirty — walks every one of them back
+            # and moves everything after them.
+            ordered_classes = classes
 
             lines.append("## Classes")
             for cls_name in ordered_classes:
@@ -6747,11 +6751,9 @@ class ContextBuilder:
             == "function"
         ]
         if module_funcs:
-            if dirty_qids:
-                stable_funcs = [q for q in module_funcs if q not in dirty_qids]
-                dirty_funcs = [q for q in module_funcs if q in dirty_qids]
-                module_funcs = stable_funcs + dirty_funcs
-
+            # Same reasoning as the classes above: the order is a function of
+            # the symbol set alone, so two builds of the same code render the
+            # same bytes.
             if lines:
                 lines.append("")
             lines.append("## Module-level functions")
@@ -53458,20 +53460,69 @@ class Filter:
                         # recomputes it independently of the path index.
                         await self._activation.resolve_dangling_edges(project_id)
 
-                        # -- invalidate and rebuild Block A eagerly ------------
-                        if self.valves.block_a_freeze_break_on_ingestion:
-                            _pstate_freeze = psm.get_pstate(project_id)
-                            _pstate_freeze["block_a_freeze_active"] = False
-                            _pstate_freeze["block_a_frozen_structure_hash"] = None
-                            _pstate_freeze["block_a_frozen_profile_hash"] = None
-                            _pstate_freeze["block_a_freeze_edits_used"] = 0
-                            self._log_debug(
-                                "Block A freeze: broken by silent ingestion "
-                                "(structure changed wholesale)"
-                            )
-                        await self._ctx_builder.invalidate_block_a_cache(
-                            project_id, "new chunk ingested", recompute_centrality=True
+                        # -- invalidate, but only if there is something to
+                        #    invalidate ------------------------------------
+                        # A paste arriving is not the same fact as the code
+                        # having changed. The index has already been updated
+                        # above, so the structure hash here is the new one, and
+                        # the hash the cached Block A was built for is the head
+                        # of its stored cache key. When they agree, everything
+                        # below would tear down state that is still exactly
+                        # right and rebuild it into a render that is not
+                        # byte-stable across rebuilds — measured at 74597
+                        # tokens and 85.8 s for a file whose 59 classes were
+                        # byte-identical to the previous ingestion's.
+                        #
+                        # Nothing is lost by leaving it alone. build_block_a
+                        # compares this same hash itself and rebuilds on a
+                        # mismatch; it recomputes centrality in place when the
+                        # tag on the stored scores has moved; the skeleton tier
+                        # keys itself the same way. This path was overriding
+                        # three mechanisms that already work.
+                        #
+                        # The freeze is broken on the same condition, for the
+                        # same reason: a window pinned to a structure that has
+                        # not changed is still pinned to the right one.
+                        #
+                        # What stays behind: docstrings harvested from the new
+                        # paste land in the index but not in the cached
+                        # skeleton until the structure moves. That is the trade
+                        # the freeze already makes on every turn it is active,
+                        # and the bodies themselves are unaffected — the hub
+                        # tier is rebuilt from the index each turn and has no
+                        # cache here to go stale.
+                        _current_hash = self._symbol_index.compute_structure_hash(
+                            project_id
                         )
+                        _stored_key = psm.get_block_a_cache_key(project_id) or ""
+                        _built_hash = _stored_key.split("__", 1)[0]
+                        _structure_moved = bool(
+                            not _built_hash or _built_hash != _current_hash
+                        )
+
+                        if _structure_moved:
+                            if self.valves.block_a_freeze_break_on_ingestion:
+                                _pstate_freeze = psm.get_pstate(project_id)
+                                _pstate_freeze["block_a_freeze_active"] = False
+                                _pstate_freeze["block_a_frozen_structure_hash"] = None
+                                _pstate_freeze["block_a_frozen_profile_hash"] = None
+                                _pstate_freeze["block_a_freeze_edits_used"] = 0
+                                self._log_debug(
+                                    "Block A freeze: broken by silent ingestion "
+                                    "(structure changed wholesale)"
+                                )
+                            await self._ctx_builder.invalidate_block_a_cache(
+                                project_id,
+                                "new chunk ingested",
+                                recompute_centrality=True,
+                            )
+                        else:
+                            self._log_debug(
+                                f"♻️ Ingestion: structure unchanged "
+                                f"({_current_hash}) — Block A, skeleton tier, "
+                                f"centrality and the cached prefix all kept; "
+                                f"no rebuild, no re-prefill"
+                            )
                     try:
                         static_block = await self._ctx_builder.build_block_a(
                             project_id, is_code_session=True, is_continuation=False
