@@ -13356,6 +13356,35 @@ class LLMOrchestrator:
                 if _moved:
                     system_prompt = _cut
                     prompt = _moved + "\n\n" + (prompt or "")
+
+                    # ── Cut census ────────────────────────────────────────
+                    # Per call, not per turn: the summary below fires once and
+                    # says nothing about how many calls shared the turn, which
+                    # is the whole variable. `volatile` is the prize — the
+                    # bytes that would have been inside the system had the cut
+                    # been made at the turn prelim instead, and that every
+                    # call of this turn therefore reprocesses.
+                    try:
+                        _c = getattr(self._f, "_cut_census_this_turn", None)
+                        if _c is None:
+                            _c = {}
+                            self._f._cut_census_this_turn = _c
+                        _c["calls"] = _c.get("calls", 0) + 1
+                        _c["at_invariant" if _cut == _stab else "at_turn_prelim"] = (
+                            _c.get(
+                                "at_invariant" if _cut == _stab else "at_turn_prelim",
+                                0,
+                            )
+                            + 1
+                        )
+                        _c["cut_bytes"] = len(_cut)
+                        if _pre_full and len(_pre_full) > len(_cut):
+                            _c["volatile"] = _c.get("volatile", 0) + (
+                                len(_pre_full) - len(_cut)
+                            )
+                            _c["volatile_per_call"] = len(_pre_full) - len(_cut)
+                    except Exception:
+                        pass
                     # Once per turn, not per call: forty of these would
                     # drown the log. Silence here is what let an earlier
                     # guard sit broken across several runs, so the fact
@@ -52543,6 +52572,18 @@ class Filter:
         # that exists only once something has written it reads the
         # same as one nothing ever writes.
         self._align_outcomes_this_turn: Dict[str, int] = {}
+        # What each heavy call left on the volatile side of the cut. The two
+        # candidate boundaries are both computed on every call — the session
+        # invariant (static + hub) and the turn prelim (that plus the profile
+        # and Block B) — and the second is only ever used as a fallback. Which
+        # of the two is cheaper is not a fixed answer: llama.cpp will only
+        # place a checkpoint where the user message starts, so cutting at the
+        # invariant makes turn boundaries free and charges every call of the
+        # turn ~30k tokens, while cutting at the turn prelim inverts that.
+        # Measured on a turn with eleven heavy calls the second is worth
+        # ~232000 tokens; on a two-call turn the first is. Nothing in the logs
+        # said which shape a given turn had, so the choice could not be made.
+        self._cut_census_this_turn: Dict[str, int] = {}
         # How many LLM calls died this turn, and the label of the last one.
         # A coverage number measured over a turn that lost most of its calls
         # is not comparable with one that lost none.
@@ -53200,6 +53241,22 @@ class Filter:
                     + ", ".join(f"{k} x{v}" for k, v in sorted(_al.items()))
                 )
             self._align_outcomes_this_turn = {}
+            # Read and cleared with the tally above, for the same reason: this
+            # is the only place that sees a whole turn at once.
+            _cc = getattr(self, "_cut_census_this_turn", None) or {}
+            if _cc.get("calls"):
+                _n = _cc["calls"]
+                _vol = _cc.get("volatile", 0)
+                _per = _cc.get("volatile_per_call", 0)
+                self._log_debug(
+                    f"📐 Cut census: {_n} heavy call(s) · "
+                    f"invariant x{_cc.get('at_invariant', 0)}, "
+                    f"turn-prelim x{_cc.get('at_turn_prelim', 0)} · "
+                    f"cut at {_cc.get('cut_bytes', 0)} B · "
+                    f"{_per} B (~{_per // 4} tokens) left volatile per call · "
+                    f"{_vol} B (~{_vol // 4} tokens) reprocessed this turn"
+                )
+            self._cut_census_this_turn = {}
             # Written by the forge only when a rival survives, read on every
             # turn by the answer's confidence line. Without this, a turn whose
             # competition left no survivor is divided by the previous turn's.
