@@ -5486,7 +5486,24 @@ class ContextBuilder:
             _profile_hash = "off"
 
         # --- 3. Resolved call graph mode ---
-        mode = psm.get_resolved_call_graph_mode(project_id) or "hubs_only"
+        # The fallback is the valve, not a literal. prepare_call_graph_mode
+        # pins the operator's choice into pstate and its docstring is explicit
+        # that the mode is "operator-chosen and constant for the session" —
+        # the whole point of removing the old 'auto' cascade was that a varying
+        # mode changes this cache key and forces a full prefill. A hardcoded
+        # 'hubs_only' here reintroduces exactly that variation on any path that
+        # builds Block A before the mode has been pinned, which the eager
+        # scaffold build inside silent ingestion does on every process start:
+        # pstate is volatile, so the first build reads None, renders in the
+        # wrong mode, and twelve seconds later the first real assembly rebuilds
+        # all ~66k tokens of it because the key no longer matches. Measured on
+        # a fresh process: 'hubs_only' at 16:47:43, 'full_graph' at 16:47:55,
+        # same structure hash, same profile hash.
+        mode = (
+            psm.get_resolved_call_graph_mode(project_id)
+            or self._f.valves.call_graph_context_mode
+            or "hubs_only"
+        )
 
         # --- 3b. One-time docstring flush (background coverage completed) ---
         self._consume_docstring_flush(
@@ -5677,8 +5694,14 @@ class ContextBuilder:
                     f"entries for project '{project_id}' before rendering "
                     f"symbol section"
                 )
+                # Same fallback as the cache key above, and it has to be the
+                # same one: if this rendered in a different mode from the one
+                # the key was computed with, the cached text and its key would
+                # describe different things.
                 resolved_mode = (
-                    psm.get_resolved_call_graph_mode(project_id) or "hubs_only"
+                    psm.get_resolved_call_graph_mode(project_id)
+                    or self._f.valves.call_graph_context_mode
+                    or "hubs_only"
                 )
                 self._f._log_debug(
                     f"Building Block A symbol section with mode='{resolved_mode}' "
