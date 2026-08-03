@@ -52002,8 +52002,17 @@ class Filter:
             description="Dump per‑turn context (Block A, Block B, message window) to disk for evolution tracking.",
         )
 
+        # Hyphen, not underscore: this is a mount point the operator declares,
+        # and it sits beside code-output and llama-logs, which are spelled the
+        # same way. The underscore form matched the directories this file
+        # creates for itself (conversation_state, long_term_memory) but those
+        # are never named outside it, so the resemblance bought nothing and the
+        # mismatch cost weeks of snapshots: writes landed in a path the log
+        # reported correctly and nobody had mounted, while the folder being
+        # watched stayed empty. Changed here rather than in the valve UI
+        # because a plugin reload restores defaults — which is what broke it.
         context_dump_dir: str = Field(
-            default="/app/backend/data/context_dumps",
+            default="/app/backend/data/context-dumps",
             description="Directory for per‑turn context snapshots.",
         )
 
