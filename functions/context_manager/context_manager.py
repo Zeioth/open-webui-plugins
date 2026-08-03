@@ -7463,6 +7463,11 @@ class ContextBuilder:
                         _sym_name, project_id, query
                     )
                     if skel:
+                        self._f._log_debug(
+                            f"🅱️ Block B fast path: SKELETON_SYMBOL "
+                            f"('{_sym_name}') → {len(skel)} chars, "
+                            f"LOD pipeline skipped · query={query[:90]!r}"
+                        )
                         return skel
 
         if self._f.valves.enable_skeleton_intent and self._SKELETON_INTENTS.search(
@@ -7470,12 +7475,22 @@ class ContextBuilder:
         ):
             skel = self._format_skeleton(project_id)
             if skel:
+                self._f._log_debug(
+                    f"🅱️ Block B fast path: SKELETON_INTENT → {len(skel)} "
+                    f"chars of full skeleton, LOD pipeline skipped · "
+                    f"query={query[:120]!r}"
+                )
                 return skel
 
         if self._LIST_INTENTS.search(query):
             all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
             if all_qids:
-                return await self._format_full_symbol_inventory(all_qids, project_id)
+                _inv = await self._format_full_symbol_inventory(all_qids, project_id)
+                self._f._log_debug(
+                    f"🅱️ Block B fast path: LIST_INTENT → {len(_inv)} chars, "
+                    f"LOD pipeline skipped · query={query[:120]!r}"
+                )
+                return _inv
 
         # ------------------------------------------------------------------
         # Step 3: Use case classification and seed inference.
@@ -42771,6 +42786,22 @@ class SystemPromptBuilder:
             )
 
             if active_ctx:
+                # One turn produced a Block B of 36753 tokens whose entire
+                # content was a verbatim copy of the 137181-byte skeleton that
+                # Block A already carries, and the assembled prompt therefore
+                # held it twice. Every candidate emitter was ruled out by
+                # reading: the LOD tiers all skip symbols in the skeleton tier,
+                # the normal assembly always emits its own "## Code Context"
+                # header (absent from that dump), the prediction path truncates
+                # to 2000 chars, and the inference path builds its own prompt.
+                # What is left is a fast-path return, and which one depends on
+                # what `query` holds this deep in the call chain — the one
+                # thing that cannot be settled by reading.
+                self._f._log_debug(
+                    f"🅱️ Block B: {len(active_ctx)} chars from build_block_b, "
+                    f"first header "
+                    f"{next((l for l in active_ctx.splitlines() if l.startswith('#')), '(none)')[:60]!r}"
+                )
                 return active_ctx
             elif suppress_sigs:
                 self._f._log_debug(
@@ -53636,6 +53667,37 @@ class Filter:
                         m.get("role") == "system" for m in messages
                     ):
                         messages.insert(0, {"role": "system", "content": _inv})
+
+                        # Countermand the confidence footer this call now
+                        # inherits. Block A carries "After your response … output
+                        # '[Confidence: XX%]'", and since the invariant IS Block A
+                        # plus the hub tier, handing it to the ingestion call
+                        # brings that instruction with it — which is why the
+                        # acknowledgement came back with a confidence line the
+                        # moment edit 18 started firing, and did not before, when
+                        # this call went out with no system at all.
+                        #
+                        # Appended to the user turn, never cut from the prefix:
+                        # the footer sits early in Block A with ~60k tokens behind
+                        # it, so excising it would move the boundary every other
+                        # call shares. The later, more specific instruction wins,
+                        # which is the same mechanism _align_system_to_prefix
+                        # already uses to keep the footer out of JSON replies.
+                        # Guarded on the footer actually being in the prefix, so
+                        # a deployment that does not use it gets no stray text.
+                        _conf = (
+                            getattr(self.valves, "confidence_prompt", "") or ""
+                        ).strip()
+                        if _conf and _conf in _inv and messages:
+                            _last = messages[-1]
+                            if _last.get("role") == "user":
+                                _last["content"] = (_last.get("content") or "") + (
+                                    "\n\nThis call returns ONLY the line above. Do "
+                                    "NOT append a '[Confidence: XX%]' line or any "
+                                    "text after it; that instruction from the "
+                                    "system prefix does not apply here."
+                                )
+
                         self._log_debug(
                             f"🔗 Ingestion call carries the session invariant "
                             f"as its system ({len(_inv)} chars) — the slot ends "
