@@ -567,12 +567,38 @@ class DetectionCatalog:
         # ── Per-turn LLM classification ──────────────────────────────
         # One call per turn, cached by content hash. Every field below
         # arrives from that single call; nothing here costs an extra one.
+        # ── The three classification axes ─────────────────────────────
+        # They sound alike, come from two different callers, and answer
+        # three DIFFERENT questions. Untangling that from the call sites
+        # took a week, so the framing lives here rather than in the
+        # reader's memory:
+        #   use_case      — how much material do I bring?
+        #   question_type — how hard do I think?
+        #   intent        — do I EXECUTE the code?
+        # Only the third can cause an effect outside the model.
         (
             "intent",
             "classify_turn (LLM)",
             "explain | modify | debug | refactor",
             "What the turn is ABOUT. Vetoes the retrieval gate only "
-            "when debug, since diagnosis is what the pipeline is for.",
+            "when debug, since diagnosis is what the pipeline is for. "
+            "Also the only axis able to act outside the model: 'debug' "
+            "is one of two ways _verify_dynamic_needed opens sandbox "
+            "execution — though across seven runs the planner emitted "
+            "237 steps and not one of kind verify_dynamic, so that "
+            "effect has never fired. Its live second role is standing "
+            "in for a failed pre-planner (_question_type_or_intent).",
+        ),
+        (
+            "question_type",
+            "AgenticPreplanner",
+            "descriptive | confirmatory | mechanism | exploratory",
+            "How hard the turn thinks: decides whether the plan carries "
+            "a hypothesize step, and therefore whether the forge and the "
+            "graveyard run at all. Self-agreement on repeated questions "
+            "measured at 83%, below use_case's 89% despite seeing more "
+            "context — it picks between four labels with no definition "
+            "of when each applies.",
         ),
         (
             "use_case",
