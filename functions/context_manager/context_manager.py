@@ -8,86 +8,6 @@ version: 10.0.0
 license: GPL3
 requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter==0.25.2, tree-sitter-language-pack==1.8.1, llmlingua>=0.2.2, scikit-learn==1.9.0
 """
-
-# ==========================================================================
-# FILE INDEX
-# ==========================================================================
-#
-# The module is laid out in the regions below, each opened by a banner of
-# the same '=' rule. Search for a region name to jump to it.
-#
-#  1. MODELS AND ENUMS
-#       ExperimentDesign · PeerReviewResult · HypothesisDossier
-#       CompetitionRecord · DetectionCatalog · UseCase · ContentType
-#       CodeSymbol · CodeBlock · Edge
-#
-#  2. SHARED UTILITIES
-#       _strip_answer_scaffolding · _note_body_shown
-#       _resolve_symbol_name · _output_is_degenerate · qualify_symbol_name
-#       qualify_symbol · _get_cross_encoder
-#
-#  3. SYMBOL INDEX AND ACTIVATION GRAPH
-#       ActivationState · SymbolIndex · ConversationState
-#       ConversationStateManager · ActivationGraph · SubgraphExtractor
-#       CodePathView · StaticEvidence · PathIndex · AppliedChangeFeedback
-#       ActivationEngine
-#
-#  4. CONTEXT CONSTRUCTION
-#       HubSymbolIndex · ContextPager · RaptorCodeIndex · ContextBuilder
-#
-#  5. STATIC EXTRACTION (tree-sitter)
-#       SignatureExtractor · ControlFlowExtractor
-#
-#  6. STATE, PERSISTENCE AND LONG-TERM MEMORY
-#       ReentrantAsyncLock · StateStore · LongTermMemory
-#
-#  7. LLM ORCHESTRATION
-#       JsonContracts · LLMOrchestrator
-#
-#  8. AGENTIC PIPELINE · MODELS
-#       AgenticStep · AgenticPlan · LedgerClaim
-#
-#  9. AGENTIC PIPELINE · VERIFICATION
-#       AgenticEvidenceLedger · AgenticEvidenceVerifier
-#       AgenticStaticVerifier · AgenticTestabilityClassifier
-#       AgenticSandboxRunner · AgenticDynamicVerifier
-#
-# 10. AGENTIC PIPELINE · PLANNING
-#       AgenticPreplanner · AgenticPlanner
-#
-# 11. AGENTIC PIPELINE · EXECUTION
-#       AgenticStepCache · AgenticToolBroker · _close_dangling_fence
-#       _find_context_echo · _find_scaffold_echo · AgenticStepExecutor
-#
-# 12. AGENTIC PIPELINE · ORCHESTRATION
-#       AgenticSynthesisComposer · AgenticOrchestrator
-#
-# 13. COMMANDS AND CODE BLOCKS
-#       MultiPhasePlanner · CommandRouter · CodeBlockManager
-#
-# 14. METACOGNITIVE REASONING
-#       MetacognitiveReasoningEngine · EpistemicStrategies
-#       HypothesisForge
-#
-# 15. CONTEXT PREPARATION
-#       HistoryCompressor · TokenUtils · EnrichmentTasks
-#       ActiveCodeUpdater · _order_injections_for_render
-#
-# 16. PROMPT ASSEMBLY
-#       SystemPromptBuilder · WindowManager · MessageAssembler
-#       ContextAssembler
-#
-# 17. INSTRUMENTATION AND BACKGROUND WORK
-#       UserProfileManager · _COVERAGE_BLOCK · ContextDumper
-#       TaskRegistry · ProjectStateManager · BackgroundTask
-#       BackgroundTaskManager · SemanticSeedInferencer
-#
-# 18. CONFIGURATION AND ENTRY POINT
-#       InletOrchestrator · Valves · Filter
-#
-# ==========================================================================
-
-
 import os
 import time
 import re
@@ -180,6 +100,85 @@ from shared_resources import (
     get_conversation_compressor as _shared_get_conversation_compressor,
     get_model_backend,
     LLMResult,
+
+# ==========================================================================
+# FILE INDEX
+# ==========================================================================
+#
+# The module is laid out in the regions below, each opened by a banner of
+# the same '=' rule. Search for a region name to jump to it.
+#
+#  1. MODELS AND ENUMS
+#       ExperimentDesign · PeerReviewResult · HypothesisDossier
+#       CompetitionRecord · DetectionCatalog · UseCase · ContentType
+#       CodeSymbol · CodeBlock · Edge
+#
+#  2. SHARED UTILITIES
+#       _strip_answer_scaffolding · _note_body_shown
+#       _resolve_symbol_name · _output_is_degenerate · qualify_symbol_name
+#       qualify_symbol · _get_cross_encoder
+#
+#  3. SYMBOL INDEX AND ACTIVATION GRAPH
+#       ActivationState · SymbolIndex · ConversationState
+#       ConversationStateManager · ActivationGraph · SubgraphExtractor
+#       CodePathView · StaticEvidence · PathIndex · AppliedChangeFeedback
+#       ActivationEngine
+#
+#  4. CONTEXT CONSTRUCTION
+#       HubSymbolIndex · ContextPager · RaptorCodeIndex · ContextBuilder
+#
+#  5. STATIC EXTRACTION (tree-sitter)
+#       SignatureExtractor · ControlFlowExtractor
+#
+#  6. STATE, PERSISTENCE AND LONG-TERM MEMORY
+#       ReentrantAsyncLock · StateStore · LongTermMemory
+#
+#  7. LLM ORCHESTRATION
+#       JsonContracts · LLMOrchestrator
+#
+#  8. AGENTIC PIPELINE · MODELS
+#       AgenticStep · AgenticPlan · LedgerClaim
+#
+#  9. AGENTIC PIPELINE · VERIFICATION
+#       AgenticEvidenceLedger · AgenticEvidenceVerifier
+#       AgenticStaticVerifier · AgenticTestabilityClassifier
+#       AgenticSandboxRunner · AgenticDynamicVerifier
+#
+# 10. AGENTIC PIPELINE · PLANNING
+#       AgenticPreplanner · AgenticPlanner
+#
+# 11. AGENTIC PIPELINE · EXECUTION
+#       AgenticStepCache · AgenticToolBroker · _close_dangling_fence
+#       _find_context_echo · _find_scaffold_echo · AgenticStepExecutor
+#
+# 12. AGENTIC PIPELINE · ORCHESTRATION
+#       AgenticSynthesisComposer · AgenticOrchestrator
+#
+# 13. COMMANDS AND CODE BLOCKS
+#       MultiPhasePlanner · CommandRouter · CodeBlockManager
+#
+# 14. METACOGNITIVE REASONING
+#       MetacognitiveReasoningEngine · EpistemicStrategies
+#       HypothesisForge
+#
+# 15. CONTEXT PREPARATION
+#       HistoryCompressor · TokenUtils · EnrichmentTasks
+#       ActiveCodeUpdater · _order_injections_for_render
+#
+# 16. PROMPT ASSEMBLY
+#       SystemPromptBuilder · WindowManager · MessageAssembler
+#       ContextAssembler
+#
+# 17. INSTRUMENTATION AND BACKGROUND WORK
+#       UserProfileManager · _COVERAGE_BLOCK · ContextDumper
+#       TaskRegistry · ProjectStateManager · BackgroundTask
+#       BackgroundTaskManager · SemanticSeedInferencer
+#
+# 18. CONFIGURATION AND ENTRY POINT
+#       InletOrchestrator · Valves · Filter
+#
+# ==========================================================================
+
 )
 
 _db_global_lock = threading.Lock()
