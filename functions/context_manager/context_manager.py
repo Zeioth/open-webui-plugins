@@ -23578,18 +23578,20 @@ class AgenticSynthesisComposer:
         # exempted. The abstention must fire on retrieval FAILURE, not on the
         # generative NATURE of the question.
         _use_case = ""
+        _asked_for_artifact = False
         if project_id:
             try:
-                _use_case = str(
-                    (
-                        self._f._project_state_manager.get_pstate(project_id).get(
-                            "turn_classification"
-                        )
-                        or {}
-                    ).get("use_case", "")
-                ).upper()
+                _tc = (
+                    self._f._project_state_manager.get_pstate(project_id).get(
+                        "turn_classification"
+                    )
+                    or {}
+                )
+                _use_case = str(_tc.get("use_case", "")).upper()
+                _asked_for_artifact = bool(_tc.get("direct_retrieval") is True)
             except Exception:
                 _use_case = ""
+                _asked_for_artifact = False
         _is_architecture_turn = _use_case == UseCase.ARCHITECTURE
         _investigative_done = [
             s
@@ -23936,6 +23938,8 @@ class AgenticSynthesisComposer:
                 if ledger is not None
                 else None
             ),
+            _use_case,
+            _asked_for_artifact,
         )
         return "\n".join(lines).rstrip()
 
@@ -23958,6 +23962,8 @@ class AgenticSynthesisComposer:
         eliminated_accounts: Optional[List[dict]] = None,
         unsettled_claims: Optional[List[str]] = None,
         unsettled_subjects: Optional[List[str]] = None,
+        use_case: str = "",
+        asked_for_artifact: bool = False,
     ) -> List[str]:
         """
         Instruct the final model on the SHAPE of its answer.
@@ -23973,19 +23979,89 @@ class AgenticSynthesisComposer:
         for when something really was left open, the code section only
         when code is in play. A heading with nothing under it teaches
         the model to pad.
+
+        THE SEVEN SECTIONS, AND WHAT DECIDES EACH
+        ─────────────────────────────────────────
+        Two are unconditional; five are gated. Which gate belongs to
+        which section was only discoverable by reading 317 lines of
+        conditionals, so it lives here:
+
+          Most likely explanation   always
+          What the evidence shows   always
+          What was not verified     when the turn left something open
+          Accounts ruled out        when a rival was actually refuted
+          Other plausible accounts  when a rival survived the evidence
+          Code                      when code is in play (has_code)
+          How to proceed            when a next step can be named
+
+        The gates read the EVIDENCE STATE, never the question. That is
+        deliberate for five of the seven — a heading over nothing is
+        worse than no heading — but it also means the two unconditional
+        ones are written in one register for every kind of turn. "Most
+        likely explanation — the single mechanism you hold responsible"
+        is exactly right for a diagnosis and says nothing for a plan.
+
+        The three classification axes (see DetectionCatalog) do reach
+        this shape today, but only indirectly: question_type decides
+        whether hypotheses are forged, and therefore whether the two
+        rival sections can exist at all; intent decides whether the
+        evidence includes anything that was executed rather than read.
+        Neither is consulted here. Nothing in this method knows which
+        kind of question it is answering.
         """
-        # ── Step 1: the two invariant sections ──
+        # ── Step 1: the opening section, and the invariant second ──
+        # Only the FIRST heading varies. "the single mechanism you hold
+        # responsible" is exactly what a diagnosis needs and says nothing
+        # for a plan or a structural question, and it was the one line in
+        # this method written in a single register for every kind of turn.
+        # The second section does not vary: "what the evidence shows"
+        # asks for the same thing in all five cases, and the confidence
+        # line already reports how much of it was settled against code.
+        #
+        # Scaffolding shares programming's opening on purpose. It is not a
+        # kind of work but a request about output FORMAT — the user asked
+        # for the mold — and the system already answers that by serving a
+        # skeleton. Changing the answer's shape as well would be deciding
+        # the same thing twice.
+        #
+        # An empty or unrecognised use_case falls back to the diagnostic
+        # opening, which is the previous behaviour exactly.
+        _openings = {
+            UseCase.ARCHITECTURE: (
+                "**How the pieces connect** — the relation that answers "
+                "the question, named concretely (which symbols, through "
+                "which calls), in a short paragraph. If the evidence "
+                "supports no single account of the structure, say that "
+                "instead of promoting the least bad one."
+            ),
+            UseCase.PLANNING: (
+                "**The decision, and the tradeoff it accepts** — what you "
+                "would do and what it costs, in a short paragraph. If the "
+                "evidence does not favour one option, say so and name what "
+                "would settle it, rather than promoting the least bad."
+            ),
+            UseCase.REFACTORING: (
+                "**What changes, and what must not** — the edit and the "
+                "callers it reaches, named concretely, in a short "
+                "paragraph. If the evidence does not establish the full "
+                "set of callers, say that instead of implying it does."
+            ),
+        }
+        _opening = _openings.get(
+            use_case,
+            "**Most likely explanation** — the single mechanism you "
+            "hold responsible, named concretely (the functions and the "
+            "causal chain between them), in a short paragraph. If the "
+            "evidence supports no single mechanism, say that instead "
+            "of promoting the least bad candidate.",
+        )
         out: List[str] = [
             "",
             "Structure your reply with these headed sections, in this "
             "order. Write each in your own prose — this is a shape to "
             "fill, never a template to copy:",
             "",
-            "**Most likely explanation** — the single mechanism you "
-            "hold responsible, named concretely (the functions and the "
-            "causal chain between them), in a short paragraph. If the "
-            "evidence supports no single mechanism, say that instead "
-            "of promoting the least bad candidate.",
+            _opening,
             "",
             "This paragraph is the one the reader keeps, so it is held to "
             "what this turn established and nothing else.\n",
@@ -24244,7 +24320,20 @@ class AgenticSynthesisComposer:
                     f" — it {_spent}.{_kind}",
                 ]
         # ── Step 4: code, with an explicit fencing contract ──
-        if has_code:
+        # has_code means a step pulled code into the workspace, which on an
+        # architecture or planning turn is satisfied merely by having quoted
+        # a body while answering something structural. Offering the heading
+        # there invites a snippet the reader did not ask for, in the two
+        # cases whose answer is a relation or a decision rather than an
+        # edit. For those, the classifier's own direct_retrieval — true
+        # only when the user asked to be GIVEN a concrete artifact — has to
+        # agree. Programming, refactoring and scaffolding keep the old gate:
+        # code IS the answer there.
+        _code_wanted = has_code and (
+            use_case not in (UseCase.ARCHITECTURE, UseCase.PLANNING)
+            or asked_for_artifact
+        )
+        if _code_wanted:
             out += [
                 "",
                 "**Code** — only if a concrete change or snippet is "
@@ -25861,8 +25950,16 @@ class AgenticOrchestrator:
             )
         except Exception:
             return ""
+        # "refactor" maps to exploratory for the same reason "debug" does,
+        # and it was the gap in this table: a refactor turn is the one whose
+        # whole value is knowing who calls what, so it is the case that most
+        # needs rivals forged and eliminated. With the entry missing, a
+        # failed pre-planner on a refactor turn returned "" and left the
+        # forge unreachable — the exact silent loss this method exists to
+        # prevent, on the one kind of turn least able to afford it.
         _shape = {
             "debug": "exploratory",
+            "refactor": "exploratory",
             "modify": "descriptive",
             "explain": "mechanism",
         }.get(_intent, "")
@@ -27475,8 +27572,77 @@ class AgenticOrchestrator:
                         + " the evidence did not rule out"
                         + _why
                     )
+                # ── How the turn was read, and what it actually did ──
+                # Two lines above the confidence one, for the same reason
+                # that one exists: the reader cannot otherwise tell "I
+                # looked and found nothing" from "I never looked, because
+                # I read the question as a different kind". The three axes
+                # each answer a different question — how much material,
+                # how hard to think, whether to execute — and each has a
+                # visible consequence here.
+                #
+                # The second line reports FACTS, never intentions. The
+                # forge has run and produced nothing (six candidates, all
+                # colliding with the graveyard), and verify_dynamic can
+                # run without executing a single symbol when the
+                # testability classifier calls them all io_bound. Saying
+                # "hypotheses forged" or "code executed" on those turns
+                # would make this line the kind of stale map the rest of
+                # this file spends its comments warning about. Every
+                # number below comes from a record of what happened.
+                _read_bits = []
+                _qt = ""
+                try:
+                    _rc = (
+                        self._f._project_state_manager.get_pstate(project_id).get(
+                            "turn_classification"
+                        )
+                        or {}
+                    )
+                    _uc = str(_rc.get("use_case", "") or "").strip()
+                    _in = str(_rc.get("intent", "") or "").strip()
+                    _qt = str(
+                        getattr(self._preplanner, "last_stats", {}).get(
+                            "question_type", ""
+                        )
+                        or ""
+                    ).strip()
+                    # Read from the pre-planner rather than from the value
+                    # the planner was handed, so a turn whose type came from
+                    # the intent fallback reports the intent it actually
+                    # used and does not claim a pre-planner verdict it never
+                    # received.
+                    _read_bits = [b for b in (_uc, _qt, _in) if b]
+                except Exception:
+                    _read_bits = []
+
+                _did_bits = []
+                try:
+                    _n_bodies = len(
+                        getattr(self._f, "_bodies_seen_this_turn", None) or set()
+                    )
+                    if _n_bodies:
+                        _did_bits.append(f"{_n_bodies} body/bodies read")
+                    _riv = getattr(self._f, "_serial_rival_accounts", None) or []
+                    _eli = getattr(self._f, "_serial_eliminated_accounts", None) or []
+                    if _riv or _eli:
+                        _did_bits.append(
+                            f"{len(_eli)} account(s) ruled out, "
+                            f"{len(_riv)} still standing"
+                        )
+                    elif _qt == "exploratory":
+                        _did_bits.append("forge ran, nothing new to test")
+                except Exception:
+                    pass
+
                 _t_line = (
-                    f"[Confidence: {_t_pct}% — {_t_ok}/{_t_all} claims "
+                    (
+                        f"[Reading: {' · '.join(_read_bits)}]\n"
+                        if _read_bits
+                        else ""
+                    )
+                    + (f"[Did: {' · '.join(_did_bits)}]\n" if _did_bits else "")
+                    + f"[Confidence: {_t_pct}% — {_t_ok}/{_t_all} claims "
                     f"settled against code"
                     + ("; " + ", ".join(_t_open) if _t_open else "")
                     + "]"
