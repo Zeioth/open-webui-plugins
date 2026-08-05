@@ -100,6 +100,8 @@ from shared_resources import (
     get_conversation_compressor as _shared_get_conversation_compressor,
     get_model_backend,
     LLMResult,
+)
+
 
 # ==========================================================================
 # FILE INDEX
@@ -178,8 +180,6 @@ from shared_resources import (
 #       InletOrchestrator · Valves · Filter
 #
 # ==========================================================================
-
-)
 
 _db_global_lock = threading.Lock()
 
@@ -471,7 +471,15 @@ _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 # `forcing full prompt re-processing` counts them.
 # ═════════════════════════════════════════════════════════════════════════
 
-_ANSWER_FOOTER_RE = re.compile(r"^[ \t]*\[Confidence:[^\]\n]*\][ \t]*$", re.M)
+# Reading and Did are stripped alongside Confidence. The reason that counts
+# is _strip_answer_scaffolding, which runs on the path that indexes the
+# PREVIOUS answer: a measured footer is only true of the turn that measured
+# it, and these two are as turn-specific as the number. Left in the pattern's
+# blind spot they would ride into the next turn's history attached to the
+# wrong evidence — the exact failure that function was written to prevent.
+_ANSWER_FOOTER_RE = re.compile(
+    r"^[ \t]*\[(?:Confidence|Reading|Did):[^\]\n]*\][ \t]*$", re.M
+)
 _ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
 
 # Handed to the model on any path that answers without measuring. A footer
@@ -605,7 +613,12 @@ class DetectionCatalog:
             "A architecture | B planning | C programming | "
             "D refactoring | E scaffolding",
             "The LOD profile: how much code, how many callers. "
-            "ARCHITECTURE also exempts the zero-claims abstention.",
+            "ARCHITECTURE also exempts the zero-claims abstention. And "
+            "the only axis that reaches the ANSWER: it picks the opening "
+            "heading in AgenticSynthesisComposer._answer_format_directive "
+            "— a diagnosis, a relation, a decision or an edit — and, for "
+            "ARCHITECTURE and PLANNING, suppresses the Code section "
+            "unless direct_retrieval says the user asked for an artifact.",
         ),
         (
             "cot_level",
@@ -23981,32 +23994,39 @@ class AgenticSynthesisComposer:
 
         THE SEVEN SECTIONS, AND WHAT DECIDES EACH
         ─────────────────────────────────────────
-        Two are unconditional; five are gated. Which gate belongs to
-        which section was only discoverable by reading 317 lines of
+        One section is always present but its HEADING varies, one is
+        always present unchanged, and five are gated. Which gate belongs
+        to which was only discoverable by reading 300 lines of
         conditionals, so it lives here:
 
-          Most likely explanation   always
-          What the evidence shows   always
+          the opening           always — heading chosen by use_case
+          What the evidence shows   always, unchanged in every case
           What was not verified     when the turn left something open
           Accounts ruled out        when a rival was actually refuted
           Other plausible accounts  when a rival survived the evidence
-          Code                      when code is in play (has_code)
+          Code                      when code is in play, and — for
+                                    architecture and planning only —
+                                    when the user asked for an artifact
           How to proceed            when a next step can be named
 
-        The gates read the EVIDENCE STATE, never the question. That is
-        deliberate for five of the seven — a heading over nothing is
-        worse than no heading — but it also means the two unconditional
-        ones are written in one register for every kind of turn. "Most
-        likely explanation — the single mechanism you hold responsible"
-        is exactly right for a diagnosis and says nothing for a plan.
+        The five gates read the EVIDENCE STATE, not the question: a
+        heading over nothing is worse than no heading. The opening is
+        the exception, and the reason is that it is not a label but an
+        instruction — "the single mechanism you hold responsible" tells
+        the model what to produce, which is exactly right for a
+        diagnosis and means nothing for a plan or a structural question.
 
-        The three classification axes (see DetectionCatalog) do reach
-        this shape today, but only indirectly: question_type decides
-        whether hypotheses are forged, and therefore whether the two
-        rival sections can exist at all; intent decides whether the
-        evidence includes anything that was executed rather than read.
-        Neither is consulted here. Nothing in this method knows which
-        kind of question it is answering.
+        Everything that REFERS to the opening from the gated sections
+        says "your opening" or "what you claim here", never "the
+        mechanism": four such references had to be rewritten when the
+        heading became variable, and a fifth would have pointed at
+        nothing on three of the five cases.
+
+        The other two axes (see DetectionCatalog) reach this shape only
+        indirectly: question_type decides whether hypotheses are forged,
+        and therefore whether the two rival sections can exist at all;
+        intent decides whether the evidence includes anything that was
+        executed rather than read.
         """
         # ── Step 1: the opening section, and the invariant second ──
         # Only the FIRST heading varies. "the single mechanism you hold
@@ -24064,11 +24084,16 @@ class AgenticSynthesisComposer:
             "",
             "This paragraph is the one the reader keeps, so it is held to "
             "what this turn established and nothing else.\n",
+            # "what you claim here" rather than "the mechanism": the
+            # opening heading now varies by use case, so a mechanism, a
+            # relation, a decision or an edit can each be what this
+            # paragraph carries. Naming only one of the four would leave
+            # the constraint pointing at nothing on the other three.
             "This paragraph may not assert what you are about to list "
-            "below as unverified or NOT CHECKED. If the mechanism rests "
-            "on a body you did not read, name it AND say what it rests "
-            'on, in this paragraph — "the reset appears to happen in '
-            "X, though X's body was not read\" — not four paragraphs "
+            "below as unverified or NOT CHECKED. If what you claim here "
+            "rests on a body you did not read, name it AND say what it "
+            'rests on, in this paragraph — "the reset appears to happen '
+            "in X, though X's body was not read\" — not four paragraphs "
             "later. A reader who stops here, which is what putting it "
             "first invites, must not be left with a guess wearing the "
             "voice of a finding.",
@@ -24200,8 +24225,8 @@ class AgenticSynthesisComposer:
                 out.append(f"  – {_u}")
             out += [
                 "",
-                "If your mechanism rests on one of them, say so in that "
-                "paragraph, in the same breath as the mechanism, not four "
+                "If your opening rests on one of them, say so in that "
+                "paragraph, in the same breath as the claim, not four "
                 "paragraphs later. A reader who stops after the opening — "
                 "which is what putting it first invites — must not be left "
                 "holding a sentence this investigation failed to "
@@ -24228,10 +24253,10 @@ class AgenticSynthesisComposer:
                 "Nothing this turn settled what these symbols DO:\n"
                 + "\n".join(f"  – {_s}" for _s in _unsub[:8]),
                 "",
-                "Your opening paragraph may name them — a mechanism often "
+                "Your opening paragraph may name them — an account often "
                 "has to — but it may not state what they do, what they "
                 "return, or what they cause. If one of them carries your "
-                "explanation, say in that same sentence that its behaviour "
+                "opening, say in that same sentence that its behaviour "
                 "was not established this turn.",
             ]
 
@@ -24305,9 +24330,9 @@ class AgenticSynthesisComposer:
                 )
                 _rel = str(_r.get("relation") or "")
                 _kind = (
-                    " It is complementary: the mechanism may have more "
-                    "than one cause, and a fix addressing only the chosen "
-                    "account may be half a fix."
+                    " It is complementary: what you described may have "
+                    "more than one cause, and a fix addressing only the "
+                    "chosen account may be half a fix."
                     if _rel == "complementary"
                     else ""
                 )
@@ -27598,19 +27623,22 @@ class AgenticOrchestrator:
                         )
                         or {}
                     )
-                    _uc = str(_rc.get("use_case", "") or "").strip()
+                    # The wire value is a single letter; the reader needs
+                    # the label. UseCase() raises on an unknown or empty
+                    # value, which is why this sits inside the try.
+                    _uc_raw = str(_rc.get("use_case", "") or "").strip().upper()
+                    try:
+                        _uc = UseCase(_uc_raw).label
+                    except Exception:
+                        _uc = ""
                     _in = str(_rc.get("intent", "") or "").strip()
-                    _qt = str(
-                        getattr(self._preplanner, "last_stats", {}).get(
-                            "question_type", ""
-                        )
-                        or ""
-                    ).strip()
-                    # Read from the pre-planner rather than from the value
-                    # the planner was handed, so a turn whose type came from
-                    # the intent fallback reports the intent it actually
-                    # used and does not claim a pre-planner verdict it never
-                    # received.
+                    # Both already computed into _cov a few lines above,
+                    # from the pre-planner's own last_stats. Re-reading the
+                    # source here would be a second path to the same fact
+                    # that can drift from the one the telemetry records.
+                    _qt = str(_cov.get("question_type", "") or "").strip()
+                    if _qt == "unknown":
+                        _qt = ""
                     _read_bits = [b for b in (_uc, _qt, _in) if b]
                 except Exception:
                     _read_bits = []
@@ -27629,18 +27657,24 @@ class AgenticOrchestrator:
                             f"{len(_eli)} account(s) ruled out, "
                             f"{len(_riv)} still standing"
                         )
-                    elif _qt == "exploratory":
+                    elif _cov.get("had_hypothesize"):
+                        # The plan CARRIED a hypothesize step and no account
+                        # came out of it, which is a different fact from
+                        # "the question type suggested one" — a turn can be
+                        # exploratory and never get the step planned.
                         _did_bits.append("forge ran, nothing new to test")
                 except Exception:
                     pass
 
+                # Stashed for the outlet, which rebuilds the whole footer
+                # rather than trusting the copy the model made of it.
+                _reading = (
+                    f"[Reading: {' · '.join(_read_bits)}]\n" if _read_bits else ""
+                ) + (f"[Did: {' · '.join(_did_bits)}]\n" if _did_bits else "")
+                self._f._measured_reading_lines = _reading
+
                 _t_line = (
-                    (
-                        f"[Reading: {' · '.join(_read_bits)}]\n"
-                        if _read_bits
-                        else ""
-                    )
-                    + (f"[Did: {' · '.join(_did_bits)}]\n" if _did_bits else "")
+                    _reading
                     + f"[Confidence: {_t_pct}% — {_t_ok}/{_t_all} claims "
                     f"settled against code"
                     + ("; " + ", ".join(_t_open) if _t_open else "")
@@ -27654,13 +27688,23 @@ class AgenticOrchestrator:
                         f"answer. The person refers back to turns by "
                         f"that mark."
                     )
+                # Plural: what follows may be one line or three. The two
+                # extra ones say how the turn was read and what it actually
+                # did, and they are as measured as the confidence figure —
+                # asking for "this line" while handing over three would
+                # leave the model to guess which of them to keep.
+                _n_lines = _t_line.count("\n") + 1
                 _workspace += (
-                    "\n\n## Your confidence line\n"
-                    "This turn's evidence was counted. End your answer "
-                    "with exactly this line, copied character for "
-                    "character, and do NOT write a confidence line of "
-                    "your own — your own estimate is not measured and "
-                    "predicts nothing:\n\n" + _t_line
+                    "\n\n## Your closing lines\n"
+                    "This turn's evidence was counted. End your answer with "
+                    + (
+                        "exactly these lines, all of them, in this order, "
+                        if _n_lines > 1
+                        else "exactly this line, "
+                    )
+                    + "copied character for character, and do NOT write a "
+                    "confidence line of your own — your own estimate is not "
+                    "measured and predicts nothing:\n\n" + _t_line
                 )
                 # Logged whole. The cut used to be [:60], which landed
                 # exactly on the boundary where the reason a rival survived
@@ -53063,6 +53107,11 @@ class Filter:
         # ~232000 tokens; on a two-call turn the first is. Nothing in the logs
         # said which shape a given turn had, so the choice could not be made.
         self._cut_census_this_turn: Dict[str, int] = {}
+        # The Reading/Did pair the pipeline measured this turn, handed to
+        # the outlet so the footer it writes is the pipeline's account and
+        # not the model's recollection of it. Cleared per turn beside the
+        # other per-turn state.
+        self._measured_reading_lines: str = ""
         # How many LLM calls died this turn, and the label of the last one.
         # A coverage number measured over a turn that lost most of its calls
         # is not comparable with one that lost none.
@@ -53742,6 +53791,7 @@ class Filter:
             self._serial_rival_relations = []
             self._serial_rival_causes = []
             self._serial_rival_accounts = []
+            self._measured_reading_lines = ""
             self._answer_is_verbatim_echo = False
             self._prelim_stable_this_turn = ""
             # The turn prelim belongs to ONE turn. Left standing it was
@@ -54843,6 +54893,21 @@ class Filter:
                 + ("; " + ", ".join(_open) if _open else "")
                 + "]"
             )
+            # Re-emitted from what the pipeline recorded rather than from
+            # what the model echoed, for the same reason the confidence
+            # figure is. Do NOT read this as a guarantee about what the
+            # reader sees: edits made here are computed and discarded —
+            # two turns measured against the next inlet's word count
+            # matched the displayed text, not the edited text — which is
+            # why the measured lines are injected into the workspace
+            # BEFORE the model writes. This keeps the two paths agreeing
+            # on the same text, and matters where outlet output does get
+            # consumed. Absent (no pipeline, or an empty pair) this is ""
+            # and the footer stays exactly as it was before these lines
+            # existed.
+            _pre = getattr(self, "_measured_reading_lines", "") or ""
+            if _pre:
+                _line = _pre.rstrip("\n") + "\n" + _line
 
             # ── Step 3: replace the asserted line, or append if absent ──
             _msgs = body.get("messages") or []
