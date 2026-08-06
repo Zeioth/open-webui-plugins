@@ -210,7 +210,6 @@ _CROSS_ENCODER_LOCK = threading.Lock()
 _db_global_lock = threading.Lock()
 
 
-@dataclass
 
 
 # ==========================================================================
@@ -218,6 +217,7 @@ _db_global_lock = threading.Lock()
 # Dataclasses, pydantic models and enums shared across the whole pipeline.
 # ==========================================================================
 
+@dataclass
 class ExperimentDesign:
     """
     Pre-evidence classification of hypothesis claims.
@@ -16697,7 +16697,6 @@ class LLMOrchestrator:
 # claims normally. Confirm on the next real run.
 # ═══════════════════════════════════════════════════════════════════════════
 
-@dataclass
 
 
 # ==========================================================================
@@ -16705,6 +16704,7 @@ class LLMOrchestrator:
 # The shapes a plan and its evidence take as they move through the loop.
 # ==========================================================================
 
+@dataclass
 class AgenticStep:
     """Single unit of work in the agentic pipeline (Fase 1: fixed kinds)."""
 
@@ -21037,8 +21037,10 @@ class AgenticPlanner:
         "code DOES rather than what it says: reach for it whenever an "
         "earlier step asserts a return value, a raised exception, or an "
         "edge-case behaviour, because reading a body cannot settle those "
-        "and running it can; schedule it right before the final analyze, "
-        "like verify. Symbols whose logic depends on I/O or the network "
+        "and running it can; schedule it AFTER the verify step and right "
+        "before the final analyze — it runs against the symbols the "
+        "verified claims cite, so it needs those claims to exist first. "
+        "Symbols whose logic depends on I/O or the network "
         "are filtered out automatically, so do not judge testability "
         "yourself), "
         "verify_regression (re-run the cached test harnesses of the direct "
@@ -24419,13 +24421,18 @@ class AgenticSynthesisComposer:
         if _code_wanted:
             out += [
                 "",
+                # The fence markers are named, not written. Spelling them
+                # literally put two of them inside this sentence, so the
+                # instruction rendered with its own middle as a code block
+                # — and taught by example the exact habit the sentence
+                # forbids: a fence inside a line of prose.
                 "**Code** — only if a concrete change or snippet is "
-                "warranted. Fence every block: open with "
-                "```python (or the correct language) on its own line, "
-                "close with ``` on its own line. Never leave a block "
-                "unterminated, never nest fences, and keep prose "
-                "outside them — an unclosed block swallows the rest of "
-                "the answer.",
+                "warranted. Fence every block: open with a line holding "
+                "three backticks followed by the language (python, and so "
+                "on), and close with a line holding three backticks and "
+                "nothing else. Never leave a block unterminated, never "
+                "nest fences, and keep prose outside them — an unclosed "
+                "block swallows the rest of the answer.",
             ]
         # ── Step 4.5: the tests, when a design_tests step wrote some ──
         # Only for design_tests. Its output is written to be KEPT and run
@@ -24659,7 +24666,13 @@ class AgenticSynthesisComposer:
                 "either — nothing here establishes the negative:",
             ]
             for _u in _unsettled[:6]:
-                out.append(f"  – {_u}")
+                # Hyphen, not an en dash: markdown only accepts -, * or +
+                # as a list marker, so "  – x" renders as indented prose
+                # that runs into the paragraph above it instead of as an
+                # item. The two sibling lists in this method already use a
+                # hyphen; these two did not, and they are the two the
+                # reader was seeing malformed.
+                out.append(f"- {_u}")
             out += [
                 "",
                 "If your opening rests on one of them, say so in that "
@@ -24688,7 +24701,7 @@ class AgenticSynthesisComposer:
             out += [
                 "",
                 "Nothing this turn settled what these symbols DO:\n"
-                + "\n".join(f"  – {_s}" for _s in _unsub[:8]),
+                + "\n".join(f"- {_s}" for _s in _unsub[:8]),
                 "",
                 "Your opening paragraph may name them — an account often "
                 "has to — but it may not state what they do, what they "
@@ -26517,7 +26530,8 @@ class AgenticOrchestrator:
 
         # Region: enforce the canonical scientific-method partial order.
         # The planner CONTRACT asks for investigate → hypothesize →
-        # design_tests → verify* → analyze, but nothing enforced it: the
+        # design_tests → verify → verify_dynamic → analyze, but nothing
+        # enforced it: the
         # only hard guarantees were analyze-last (parser) and the verify
         # auto-insert position. A plan the LLM returns out of order (e.g.
         # hypothesize before any investigate) used to run out of order,
@@ -26529,13 +26543,24 @@ class AgenticOrchestrator:
         # hypothesis-refutation retry below) place themselves by position
         # deliberately and are not re-sorted.
         if self._f.valves.agentic_enforce_step_order:
+            # verify BEFORE verify_dynamic, which is the opposite of the
+            # order these ranks first carried. _pick_targets chooses what
+            # to execute from the ledger's most-cited valid qids, and the
+            # ledger is filled by verify: sorted ahead of it, a dynamic
+            # step arrives at an almost empty ledger and executes nothing.
+            # Observed exactly that — a plan of
+            # [investigate, verify, verify_dynamic, analyze] was normalized
+            # to [investigate, verify_dynamic, verify, analyze] and the
+            # sandbox ran zero symbols on a turn that had asked for it by
+            # name. Reading precedes claiming, claiming precedes checking,
+            # and running the code is the last and most expensive check.
             _KIND_RANK = {
                 "investigate": 0,
                 "hypothesize": 1,
                 "design_tests": 2,
-                "verify_dynamic": 3,
+                "verify": 3,
                 "verify_regression": 4,
-                "verify": 5,
+                "verify_dynamic": 5,
                 "analyze": 6,
             }
             _before = [s.kind for s in plan.steps]
