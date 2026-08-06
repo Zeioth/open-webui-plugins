@@ -20089,7 +20089,6 @@ if __name__ == "__main__":
         )
         ledger.claims.append(claim)
 
-    @staticmethod
     def _note_verdict(self, status: str) -> None:
         """Record one target's outcome for the step to count.
 
@@ -20097,11 +20096,21 @@ if __name__ == "__main__":
         learn what happened to a target, and a counter that reads the
         rendered line instead is a second path to the same fact — the one
         that reported a clean 5/5 as inconclusive for a whole run.
+
+        NOTE the decorator boundary: _format_line below is a staticmethod,
+        and inserting this method immediately above it captured that
+        decorator — @staticmethod landed on this function and _format_line
+        lost it, so self._note_verdict("pass") passed one argument into
+        `self` and left `status` missing. The pipeline crashed on every
+        dynamic step, degraded to a plain turn, and the answer template
+        vanished with it. Anything added here goes AFTER the decorator's
+        target, never between a decorator and the thing it decorates.
         """
         if not hasattr(self, "_step_verdicts"):
             self._step_verdicts = []
         self._step_verdicts.append(status)
 
+    @staticmethod
     def _format_line(
         qid: str, verdict: str, result: Dict[str, Any], source: str
     ) -> str:
