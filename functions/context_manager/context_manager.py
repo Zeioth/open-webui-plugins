@@ -24118,6 +24118,16 @@ class AgenticSynthesisComposer:
             "order. Write each in your own prose — this is a shape to "
             "fill, never a template to copy:",
             "",
+            "The headings below are written in English because this "
+            "instruction is. They are LABELS, not literals: render each one "
+            "in the language you are answering in, and keep the order and "
+            "the meaning. A Spanish answer with English headings reads as "
+            "though the shape came from somewhere else, which is exactly "
+            "what it should not look like. The one exception is the Stats "
+            "block at the very end — that one is copied character for "
+            "character, in English, for the reason given where it is "
+            "handed to you.",
+            "",
             _opening,
             "",
             "This paragraph is the one the reader keeps, so it is held to "
@@ -27819,8 +27829,12 @@ class AgenticOrchestrator:
                         if _n_lines > 1
                         else "exactly this line, "
                     )
-                    + "copied character for character, and do NOT write a "
-                    "confidence line of your own — your own estimate is not "
+                    + "copied character for character. Do NOT translate this "
+                    "block, unlike the section headings above: the outlet "
+                    "matches these labels literally to replace them with the "
+                    "measured values, and a translated label is not replaced "
+                    "and rides into the next turn's history. And do NOT write "
+                    "a confidence line of your own — your own estimate is not "
                     "measured and predicts nothing:\n\n" + _t_line
                 )
                 # Logged whole. The cut used to be [:60], which landed
