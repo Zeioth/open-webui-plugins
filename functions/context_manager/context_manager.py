@@ -624,9 +624,10 @@ class DetectionCatalog:
             "D refactoring | E scaffolding",
             "The LOD profile: how much code, how many callers. "
             "ARCHITECTURE also exempts the zero-claims abstention. And "
-            "the only axis that reaches the ANSWER: it picks the opening "
-            "heading in AgenticSynthesisComposer._answer_format_directive "
-            "— a diagnosis, a relation, a decision or an edit — and, for "
+            "the only axis that reaches the ANSWER: the opening heading is "
+            "always Conclusion, and this picks what belongs UNDER it in "
+            "AgenticSynthesisComposer._answer_format_directive — a "
+            "diagnosis, a relation, a decision or an edit — and, for "
             "ARCHITECTURE and PLANNING, suppresses the Code section "
             "unless direct_retrieval says the user asked for an artifact.",
         ),
@@ -20946,13 +20947,33 @@ class AgenticPlanner:
         "NOT use it for factual lookups), "
         "verify (check earlier factual claims against the code graph; "
         "schedule right before the final analyze when steps will assert "
-        "structural facts), verify_dynamic (generate and execute a real "
-        "test harness for the pure-logic symbols under discussion; only "
-        "for behavioral claims), verify_regression (re-run the cached test "
-        "harnesses of the direct callers of an edited function; only after "
-        "an implement/fix step), design_tests (write executable acceptance "
-        "tests BEFORE an implementation is produced; only for 'implement "
-        "X' requests), analyze (reason and conclude).\n"
+        "structural facts), "
+        # The three kinds below were each described with a bare "only
+        # for…" and each was chosen ZERO times in 235 planned steps, while
+        # every kind carrying a positive invitation was chosen routinely —
+        # hypothesize went from rare to regular when its entry grew from a
+        # label into a paragraph saying when to reach for it. A restriction
+        # tells the planner when a kind is FORBIDDEN and never when it is
+        # wanted, so it reads as a fence and the kind stays unused. Each
+        # now says what it buys before it says what it excludes.
+        "verify_dynamic (generate and execute a real test harness against "
+        "the symbols under discussion — the only step that finds out what "
+        "code DOES rather than what it says: reach for it whenever an "
+        "earlier step asserts a return value, a raised exception, or an "
+        "edge-case behaviour, because reading a body cannot settle those "
+        "and running it can; schedule it right before the final analyze, "
+        "like verify. Symbols whose logic depends on I/O or the network "
+        "are filtered out automatically, so do not judge testability "
+        "yourself), "
+        "verify_regression (re-run the cached test harnesses of the direct "
+        "callers of an edited function — use it after any step that changes "
+        "behaviour, to find out which callers the change broke before the "
+        "reader does), "
+        "design_tests (write executable acceptance tests BEFORE the "
+        "implementation — use it whenever the request is to build or "
+        "implement something, so what follows can be checked against them "
+        "instead of merely read), "
+        "analyze (reason and conclude).\n"
         "- The LAST step must be analyze.\n"
         "- Each goal must be self-contained (understandable without the "
         "other steps).\n"
@@ -22031,6 +22052,45 @@ class AgenticPlanner:
                 "🤖 Planner: profile FULL — hypothesize missing from the "
                 f"planner output, inserted at position {_anchor} "
                 f"(parser enforcement)"
+            )
+
+        # Region: '!test' — an explicit request for execution, INSERTED
+        # ------------------------------------------------------------------
+        # '!test' used to be a permission, not a request: it was read by
+        # _verify_dynamic_needed, which gates a verify_dynamic step the
+        # planner had already emitted. Across 235 planned steps the planner
+        # emitted that kind zero times, so the flag permitted something that
+        # never existed and the sandbox was unreachable by asking for it.
+        # Inserting the step is what the word already promised.
+        #
+        # No symbols are attached on purpose. _pick_targets reads the
+        # planner's hints first and the ledger's most-cited valid qids
+        # second, so placing this before the terminal analyze — the position
+        # the contract already prescribes for `verify` — lets the turn's own
+        # investigation choose what to execute, rather than the reader
+        # guessing up front which symbol is worth a harness.
+        if "!test" in (question or "").lower() and not any(
+            s.kind == "verify_dynamic" for s in steps
+        ):
+            _rank_t = {"analyze": 0}
+            _anchor_t = next(
+                (i for i, s in enumerate(steps) if s.kind in _rank_t),
+                len(steps) - 1,
+            )
+            steps.insert(
+                _anchor_t,
+                AgenticStep(
+                    id=max(s.id for s in steps) + 1,
+                    goal=(
+                        "Execute a real test harness for the symbols this "
+                        "turn asserted behaviour about: " + question[:140]
+                    ),
+                    kind="verify_dynamic",
+                ),
+            )
+            self._f._log_debug(
+                f"🤖 Planner: '!test' requested — verify_dynamic inserted at "
+                f"position {_anchor_t} (parser enforcement)"
             )
         return steps
 
@@ -24071,15 +24131,25 @@ class AgenticSynthesisComposer:
         to which was only discoverable by reading 300 lines of
         conditionals, so it lives here:
 
-          the opening           always — heading chosen by use_case
-          What the evidence shows   always, unchanged in every case
-          What was not verified     when the turn left something open
-          Accounts ruled out        when a rival was actually refuted
-          Other plausible accounts  when a rival survived the evidence
+        In the order they are emitted, which is the order the reader
+        meets them:
+
+          Conclusion                always — fixed heading, body by
+                                    use_case; everything below develops it
+          How to proceed            when a next step can be named
           Code                      when code is in play, and — for
                                     architecture and planning only —
                                     when the user asked for an artifact
-          How to proceed            when a next step can be named
+          Other plausible accounts  when a rival survived the evidence
+          Accounts ruled out        when a rival was actually refuted
+          What the evidence shows   always, unchanged in every case
+          What was not verified     when the turn left something open
+
+        Three zones: what the reader came for, what is still open, then
+        the detail and its limits. The order is deliberate — the "what"
+        is worth more to the reader than the "why", and the why, being
+        the harder half to read, is worth more to the next turn's model
+        than to the person in front of it.
 
         The five gates read the EVIDENCE STATE, not the question: a
         heading over nothing is worse than no heading. The opening is
@@ -24123,34 +24193,43 @@ class AgenticSynthesisComposer:
         #
         # An empty or unrecognised use_case falls back to the diagnostic
         # opening, which is the previous behaviour exactly.
-        _openings = {
+        # The HEADING is fixed at "Conclusion" and the use case chooses
+        # what belongs UNDER it. Measured: with the heading itself varying,
+        # one turn in six renamed it — "Most likely explanation" came back
+        # as "La afirmación es correcta" — because an instruction to render
+        # a label in another language is read as licence to paraphrase, and
+        # a paraphrased heading is a heading the reader cannot find twice
+        # in the same place. A fixed name is also what makes the rest of
+        # the answer legible as its development rather than as a list of
+        # peers: the reader learns one landmark, not five.
+        _bodies = {
             UseCase.ARCHITECTURE: (
-                "**How the pieces connect** — the relation that answers "
-                "the question, named concretely (which symbols, through "
-                "which calls), in a short paragraph. If the evidence "
+                "the relation that answers the question, named concretely "
+                "(which symbols, through which calls). If the evidence "
                 "supports no single account of the structure, say that "
                 "instead of promoting the least bad one."
             ),
             UseCase.PLANNING: (
-                "**The decision, and the tradeoff it accepts** — what you "
-                "would do and what it costs, in a short paragraph. If the "
-                "evidence does not favour one option, say so and name what "
-                "would settle it, rather than promoting the least bad."
+                "what you would do and what it costs. If the evidence does "
+                "not favour one option, say so and name what would settle "
+                "it, rather than promoting the least bad."
             ),
             UseCase.REFACTORING: (
-                "**What changes, and what must not** — the edit and the "
-                "callers it reaches, named concretely, in a short "
-                "paragraph. If the evidence does not establish the full "
-                "set of callers, say that instead of implying it does."
+                "the edit and the callers it reaches, named concretely. If "
+                "the evidence does not establish the full set of callers, "
+                "say that instead of implying it does."
             ),
         }
-        _opening = _openings.get(
-            use_case,
-            "**Most likely explanation** — the single mechanism you "
-            "hold responsible, named concretely (the functions and the "
-            "causal chain between them), in a short paragraph. If the "
-            "evidence supports no single mechanism, say that instead "
-            "of promoting the least bad candidate.",
+        _opening = (
+            "**Conclusion** — "
+            + _bodies.get(
+                use_case,
+                "the single mechanism you hold responsible, named "
+                "concretely (the functions and the causal chain between "
+                "them). If the evidence supports no single mechanism, say "
+                "that instead of promoting the least bad candidate.",
+            )
+            + " One short paragraph. Everything below is its development."
         )
         out: List[str] = [
             "",
@@ -24158,25 +24237,34 @@ class AgenticSynthesisComposer:
             "order. Write each in your own prose — this is a shape to "
             "fill, never a template to copy:",
             "",
-            "The headings below are written in English because this "
-            "instruction is. They are LABELS, not literals: render each one "
-            "in the language you are answering in, and keep the order and "
-            "the meaning. A Spanish answer with English headings reads as "
-            "though the shape came from somewhere else, which is exactly "
-            "what it should not look like. The one exception is the Stats "
-            "block at the very end — that one is copied character for "
-            "character, in English, for the reason given where it is "
-            "handed to you.",
+            "TRANSLATE the headings below into the language you are "
+            "answering in — a Spanish answer with English headings reads as "
+            "though the shape came from somewhere else. Translate them; do "
+            "not reword them. 'Most likely explanation' became 'La "
+            "afirmación es correcta' on one turn, and a heading the reader "
+            "cannot find twice in the same place stops being a landmark. "
+            "The one exception is the Stats block at the very end — copied "
+            "character for character, in English, for the reason given "
+            "where it is handed to you.",
+            "",
+            "This list is CLOSED and each heading appears exactly ONCE. Do "
+            "not add sections of your own, and do not repeat one you "
+            "already wrote. Next steps in particular belong where they are "
+            "listed here and nowhere else: writing them again at the end "
+            "because that is where they usually go leaves the reader with "
+            "two answers to the same question and no way to tell which one "
+            "you meant. Omit any section whose content this turn does not "
+            "have; an empty heading is worse than a missing one.",
             "",
             _opening,
             "",
             "This paragraph is the one the reader keeps, so it is held to "
             "what this turn established and nothing else.\n",
             # "what you claim here" rather than "the mechanism": the
-            # opening heading now varies by use case, so a mechanism, a
-            # relation, a decision or an edit can each be what this
-            # paragraph carries. Naming only one of the four would leave
-            # the constraint pointing at nothing on the other three.
+            # heading is fixed but its CONTENT varies by use case, so a
+            # mechanism, a relation, a decision or an edit can each be what
+            # this paragraph carries. Naming only one of the four would
+            # leave the constraint pointing at nothing on the other three.
             "This paragraph may not assert what you are about to list "
             "below as unverified or NOT CHECKED. If what you claim here "
             "rests on a body you did not read, name it AND say what it "
@@ -24334,7 +24422,7 @@ class AgenticSynthesisComposer:
         out += [
             "",
             "**What the evidence shows** — the facts that carry the "
-            "explanation: the symbols, call relations and code paths "
+            "conclusion: the symbols, call relations and code paths "
             "that were checked against the indexed graph, each stated "
             "so the reader can go and confirm it. Never give an "
             "unverified claim the same voice as a verified one.",
