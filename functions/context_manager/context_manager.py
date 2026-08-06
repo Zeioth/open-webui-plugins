@@ -51969,7 +51969,7 @@ class Valves(BaseModel):
     )
 
     agentic_metacog_reinforce: str = Field(
-        default="shadow",
+        default="on",
         description=(
             "Per-step metacognitive reinforcement (Fase 8). A reasoning "
             "step whose ledger claims cite fabricated identifiers "
