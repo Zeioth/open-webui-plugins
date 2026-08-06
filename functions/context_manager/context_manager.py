@@ -24470,11 +24470,17 @@ class AgenticSynthesisComposer:
             out += [
                 "",
                 "**Tests** — the acceptance tests this turn wrote, in full, "
-                "in one fenced block. They are meant to be kept and run "
-                "against the implementation, so give them complete rather "
-                "than described. Do NOT reproduce any harness a dynamic "
-                "verification step generated: those are throwaway probes "
-                "built against stand-in objects, and their verdict is "
+                "in ONE fenced block that runs as it stands. Import only "
+                "the standard library, include the code under test in the "
+                "block rather than importing it from the project, and end "
+                "with the lines that execute the tests and report what "
+                "passed. The reader has a run button under every code "
+                "block: a block that needs a checkout, a path or a missing "
+                "import is a block that button cannot help with, and these "
+                "tests exist to be run. Do NOT reproduce any harness a "
+                "dynamic verification step generated: those are throwaway "
+                "probes built against stand-in objects, they will not run "
+                "outside the sandbox that made them, and their verdict is "
                 "already reported without them.",
             ]
 
