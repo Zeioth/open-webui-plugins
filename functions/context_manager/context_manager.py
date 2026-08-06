@@ -849,7 +849,7 @@ class UseCase(str, Enum):
     PROGRAMMING = "C"
 
     # Refactoring and impact analysis. The only mode that changes the
-    # caller budget (lod_intent_refactor_callers_max), because knowing
+    # caller budget (lod_use_case_refactor_callers_max), because knowing
     # who calls a symbol is the whole question when moving it, and it
     # shares ARCHITECTURE's inference boost for the same reason.
     REFACTORING = "D"
@@ -9427,7 +9427,7 @@ class ContextBuilder:
         # ── Fast path: explicit command prefix ──
         # Evaluated on the RAW query: a leading /arch etc. must keep working
         # regardless of what is pasted after it.
-        if self._f.valves.lod_intent_explicit_override:
+        if self._f.valves.lod_use_case_explicit_override:
             m = self._UC_COMMAND_RE.match(q)
             if m:
                 case_key = {
@@ -10084,40 +10084,35 @@ class ContextBuilder:
                 self._f._log_debug(self._f._activation._ppr_cache.stats)
 
         # ------------------------------------------------------------------
-        # Step 5: Adjust LOD thresholds by intent.
+        # Step 5: Adjust LOD thresholds by use case.
         # ------------------------------------------------------------------
-        debug_weight = code_action_vector.get("debug", 0.2)
-        modify_weight = code_action_vector.get("modify", 0.3)
-        refactor_weight = code_action_vector.get("refactor", 0.1)
-
+        # How much material to bring is the use case's question, and only
+        # its own. This block used to scale the thresholds a second way,
+        # from the code_action weights, on the branch taken when the
+        # profiles are off — a survivor of the design that preceded the
+        # per-use-case profiles. Two axes moving one number is how a
+        # reader ends up unable to say which of them widened a turn, and
+        # code_action's live job is a different one entirely: whether the
+        # sandbox opens. The off branch now scales by nothing, which is
+        # what "profiles disabled" should have meant all along.
         lod3 = self._f.valves.lod3_threshold
         lod2 = self._f.valves.lod2_threshold
         lod1 = self._f.valves.lod1_threshold
 
-        if self._f.valves.enable_lod_by_intent:
+        if self._f.valves.enable_lod_by_use_case:
             lod1 *= use_case_profile.get("lod1_mult", 1.0)
             lod2 *= use_case_profile.get("lod2_mult", 1.0)
             lod3 *= use_case_profile.get("lod3_mult", 1.0)
-        else:
-            if debug_weight + modify_weight > 0.6:
-                scale = 0.7
-            elif refactor_weight > 0.4:
-                scale = 0.0
-            else:
-                scale = 1.0
-            lod3 *= scale
-            lod2 *= scale
-            lod1 *= scale
 
         # ------------------------------------------------------------------
         # Step 6: Case D — pull in direct callers.
         # ------------------------------------------------------------------
         if (
-            self._f.valves.enable_lod_by_intent
+            self._f.valves.enable_lod_by_use_case
             and active_use_case == UseCase.REFACTORING
-            and self._f.valves.lod_intent_refactor_callers_max != 0
+            and self._f.valves.lod_use_case_refactor_callers_max != 0
         ):
-            max_callers = self._f.valves.lod_intent_refactor_callers_max
+            max_callers = self._f.valves.lod_use_case_refactor_callers_max
             pulled = 0
             for seed_qid in ag.get_seed_nodes():
                 meta = self._f._symbol_index.get_symbol_meta(seed_qid, project_id) or {}
@@ -19531,12 +19526,56 @@ if __name__ == "__main__":
             step.seconds = time.monotonic() - started
             return
 
+        # The one thing this pipeline does that leaves the model — a real
+        # subprocess running the reader's own code — was also the only
+        # thing it did without saying so. Up to agentic_dynamic_max_targets
+        # executions at agentic_exec_timeout_s each is twenty silent
+        # seconds, on a status stream that otherwise announces which
+        # bodies a step asked for. Announce BEFORE, because the wait is
+        # the part that needs explaining, and once per target after, since
+        # a verdict per symbol is the unit the reader can act on.
+        _pfx = f"🤖 Agentic: step {step.display_no}"
+        await self._f._emit_status(
+            f"{_pfx} · executing {len(targets)} symbol(s) in the sandbox…"
+        )
+
         report_lines = [f"## Dynamic verification ({len(targets)} target(s))"]
+        _passed = _failed = _other = 0
         for qid in targets:
             line = await self._verify_target(
                 qid, ledger, project_id, aligned_prefix, step.id
             )
             report_lines.append(line)
+            _up = line.upper()
+            if ": PASSED" in _up:
+                _passed += 1
+            elif ": FAILED" in _up:
+                _failed += 1
+            else:
+                _other += 1
+            await self._f._emit_status(f"{_pfx} · {line.lstrip('- ')[:110]}")
+
+        # Stashed for the Stats block, where the Code action line reports
+        # the effect of the axis that opened this gate. Counted from the
+        # rendered verdicts rather than from the target list, so a symbol
+        # the classifier refused or a harness that never ran is not
+        # reported as an execution that happened.
+        _bits = []
+        if _passed:
+            _bits.append(f"{_passed} passed")
+        if _failed:
+            _bits.append(f"{_failed} refuted")
+        if _other:
+            _bits.append(f"{_other} inconclusive")
+        if _bits:
+            self._f._measured_execution = (
+                f"{len(targets)} symbol{'' if len(targets) == 1 else 's'} "
+                f"executed, " + ", ".join(_bits)
+            )
+        await self._f._emit_status(
+            f"{_pfx} · dynamic verification: {len(targets)} run"
+            + (f", {_failed} refuted" if _failed else "")
+        )
 
         step.output = "\n".join(report_lines)
         step.seconds = time.monotonic() - started
@@ -27771,21 +27810,19 @@ class AgenticOrchestrator:
                     # ── Intent: whether anything was executed ──
                     _in = str(_rc.get("code_action", "") or "").strip()
                     if _in:
+                        # The sandbox is the effect this axis governs, so the
+                        # count belongs on this line and nowhere else. Read
+                        # from what the step recorded rather than from the
+                        # plan: a planned verify_dynamic that found no
+                        # verifiable target completes as "done" having run
+                        # nothing, and counting it here would put an
+                        # execution in the report that never happened.
                         _eff = []
-                        try:
-                            _dyn = [
-                                _s
-                                for _s in plan.steps
-                                if getattr(_s, "kind", "") == "verify_dynamic"
-                                and getattr(_s, "status", "") == "done"
-                            ]
-                            if _dyn:
-                                _eff.append(
-                                    f"{len(_dyn)} dynamic "
-                                    f"check{'' if len(_dyn) == 1 else 's'} run"
-                                )
-                        except Exception:
-                            pass
+                        _ex = str(
+                            getattr(self._f, "_measured_execution", "") or ""
+                        ).strip()
+                        if _ex:
+                            _eff.append(_ex)
                         _axes.append(
                             f"[Code action: {_in}"
                             + (" · " + ", ".join(_eff) if _eff else "")
@@ -50490,17 +50527,24 @@ class Valves(BaseModel):
         ),
     )
 
-    enable_lod_by_intent: bool = Field(
+    enable_lod_by_use_case: bool = Field(
         default=True,
-        description="Tune LOD policy per use case (Architecture, Planning, Programming, Refactor, Scaffolding).",
+        description=(
+            "Tune LOD policy per use case (Architecture, Planning, "
+            "Programming, Refactor, Scaffolding). RENAMED from "
+            "enable_lod_by_intent: the description always said 'per use "
+            "case' and only the name lagged, from the design that preceded "
+            "the profiles. A value you set under the old name is not "
+            "carried over — check this one in the panel after upgrading."
+        ),
     )
 
-    lod_intent_explicit_override: bool = Field(
+    lod_use_case_explicit_override: bool = Field(
         default=True,
         description="Allow explicit command prefix (/arch, /plan, /code, /refactor, /scaffold) to force the use case.",
     )
 
-    lod_intent_refactor_callers_max: int = Field(
+    lod_use_case_refactor_callers_max: int = Field(
         default=12,
         ge=0,
         description="Max direct callers pulled into Block B at LOD‑1 for refactor (case D). 0 = unlimited.",
@@ -53328,6 +53372,13 @@ class Filter:
         # three survived it and were not false. A reader who takes the first
         # number as the count of bad claims has read it backwards.
         self._measured_reinforcement: str = ""
+        # What the sandbox actually ran this turn, if it ran. Counted from
+        # the rendered verdicts, never from the target list: a symbol the
+        # testability classifier refused and a harness that never composed
+        # both leave a target behind without an execution, and reporting
+        # them as executions is the failure this whole subsystem's
+        # _suspect_reason_of guard exists to prevent one level down.
+        self._measured_execution: str = ""
         # How many LLM calls died this turn, and the label of the last one.
         # A coverage number measured over a turn that lost most of its calls
         # is not comparable with one that lost none.
@@ -54009,6 +54060,7 @@ class Filter:
             self._serial_rival_accounts = []
             self._measured_reading_lines = ""
             self._measured_reinforcement = ""
+            self._measured_execution = ""
             self._answer_is_verbatim_echo = False
             self._prelim_stable_this_turn = ""
             # The turn prelim belongs to ONE turn. Left standing it was
