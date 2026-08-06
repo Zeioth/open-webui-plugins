@@ -478,8 +478,8 @@ _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 # blind spot they would ride into the next turn's history attached to the
 # wrong evidence — the exact failure that function was written to prevent.
 _ANSWER_FOOTER_RE = re.compile(
-    r"^[ \t]*\[(?:Confidence|Use case|Question type|Code action):"
-    r"[^\]\n]*\]"
+    r"^[ \t]*(?:\*\*Stats\*\*|"
+    r"\[(?:Confidence|Use case|Question type|Code action):[^\]\n]*\])"
     r"[ \t]*$",
     re.M,
 )
@@ -24060,6 +24060,12 @@ class AgenticSynthesisComposer:
         intent decides whether the evidence includes anything that was
         executed rather than read.
         """
+        # Both derived up here rather than beside the section that renders
+        # them: the "How to proceed" block now sits far above those sections
+        # and needs to know whether a rival survived, so the value has to
+        # exist before the first block that reads it.
+        _rivals = [_r for _r in (rival_accounts or []) if _r.get("hypothesis")]
+
         # ── Step 1: the opening section, and the invariant second ──
         # Only the FIRST heading varies. "the single mechanism you hold
         # responsible" is exactly what a diagnosis needs and says nothing
@@ -24129,6 +24135,153 @@ class AgenticSynthesisComposer:
             "later. A reader who stops here, which is what putting it "
             "first invites, must not be left with a guess wearing the "
             "voice of a finding.",
+        ]
+        # ── Step 5: where the reader goes next ──
+        out += [
+            "",
+            "**How to proceed** — the next concrete step, ordered so "
+            "the one that settles the most uncertainty comes first: "
+            "the symbol to read, the check to run, the thing to "
+            "instrument. Actionable, not generic advice.",
+        ]
+        # Only truthful because the last-mile pass ran first. Before it,
+        # this would be asking the model to hide a gap; after it, every
+        # subject the index could produce has been read, so "go and read
+        # X" is either work already done or work nobody can do.
+        out += [
+            "",
+            "Do not propose reading a symbol in this codebase as a next "
+            "step. Every body the index holds for a symbol this answer "
+            "asserts about has already been read; one that has not is "
+            "named in the sections below as not found, and reading it "
+            "is not available "
+            "to anyone. A step this pipeline should have taken itself, "
+            "or one the reader cannot act on, is not a next step.",
+        ]
+        if _rivals:
+            # Ordering, not an extra instruction. A surviving account is
+            # the largest single piece of uncertainty in the turn — it is
+            # what the confidence figure is divided by — so the step that
+            # separates it belongs at the top of a list already sorted by
+            # how much uncertainty it settles.
+            out += [
+                "",
+                "One of those steps must be the observation that would "
+                "separate the surviving account(s) from the one you "
+                "chose, and it goes first: nothing else in this turn "
+                "settles more. Name the account it would settle, using "
+                "the same words the accounts section below uses for it, "
+                "so the reader can ask for that one by name.",
+            ]
+        # ── Step 4: code, with an explicit fencing contract ──
+        # has_code means a step pulled code into the workspace, which on an
+        # architecture or planning turn is satisfied merely by having quoted
+        # a body while answering something structural. Offering the heading
+        # there invites a snippet the reader did not ask for, in the two
+        # cases whose answer is a relation or a decision rather than an
+        # edit. For those, the classifier's own direct_retrieval — true
+        # only when the user asked to be GIVEN a concrete artifact — has to
+        # agree. Programming, refactoring and scaffolding keep the old gate:
+        # code IS the answer there.
+        _code_wanted = has_code and (
+            use_case not in (UseCase.ARCHITECTURE, UseCase.PLANNING)
+            or asked_for_artifact
+        )
+        if _code_wanted:
+            out += [
+                "",
+                "**Code** — only if a concrete change or snippet is "
+                "warranted. Fence every block: open with "
+                "```python (or the correct language) on its own line, "
+                "close with ``` on its own line. Never leave a block "
+                "unterminated, never nest fences, and keep prose "
+                "outside them — an unclosed block swallows the rest of "
+                "the answer.",
+            ]
+        # ── Step 3: accounts the evidence did not eliminate ──
+        # Only when one survived. A heading over an empty list teaches
+        # the model to invent a rival, which is the opposite of the point.
+        # Ruled out, and said so. Separate from the survivors above: one is
+        # uncertainty the reader still carries, the other is uncertainty
+        # this turn removed, and a reader who cannot tell them apart
+        # proposes back the account the evidence already killed.
+        _dead = [
+            _d for _d in (eliminated_accounts or []) if _d.get("hypothesis")
+        ]
+        if _rivals:
+            out += [
+                "",
+                "**Other plausible accounts** — the competition did not "
+                "eliminate these, and the confidence figure is divided by "
+                "them."
+                + (
+                    f" Your chosen account carries corroboration "
+                    f"{winner_corroboration}; give the reader that number "
+                    f"beside the ones below, because a rival is only "
+                    f"close or distant relative to it."
+                    if winner_corroboration is not None
+                    else ""
+                )
+                + " State each one in a sentence, in your own words, "
+                "and say what would tell it apart from the account you "
+                "chose. Do not argue them down: they survived because the "
+                "evidence did not separate them, and presenting a "
+                "settled contest is the failure this section exists to "
+                "prevent.",
+            ]
+            for _r in _rivals[:3]:
+                # `stalled` and `budget` mean the cycles ran out; anything
+                # else means the evidence weighed it and did not choose.
+                # The reader needs that difference, because only the first
+                # is worth spending another turn on.
+                _why = str(_r.get("cause") or "")
+                _spent = (
+                    "ran out of cycles before it could be separated"
+                    if _why in ("stalled", "budget")
+                    else "was weighed against the winner and not separated"
+                )
+                _rel = str(_r.get("relation") or "")
+                _kind = (
+                    " It is complementary: what you described may have "
+                    "more than one cause, and a fix addressing only the "
+                    "chosen account may be half a fix."
+                    if _rel == "complementary"
+                    else ""
+                )
+                out += [
+                    "",
+                    f"- Surviving account (corroboration "
+                    f"{_r.get('corroboration', 0)}): "
+                    f"{_r.get('hypothesis', '')}"
+                    f" — it {_spent}.{_kind}",
+                ]
+        if _dead:
+            out += [
+                "",
+                "**Accounts ruled out** — this turn built these "
+                "explanations and the index eliminated them. State each in "
+                "a sentence and say what killed it. This is a result, not "
+                "an apology: an explanation removed is work the reader "
+                "does not have to repeat, and the most useful thing you "
+                "can tell someone about to guess is which guesses are "
+                "already gone.",
+            ]
+            for _d in _dead[:3]:
+                # `falsified` means the evidence discriminated; anything
+                # else means we never got a grip on it. The reader needs
+                # that difference: only the first is really settled.
+                _c = str(_d.get("cause") or "")
+                _how = (
+                    "the index contradicted it"
+                    if _c == "falsified"
+                    else "no evidence could be brought to bear on it"
+                )
+                out += [
+                    "",
+                    f"- Ruled out: {_d.get('hypothesis', '')} — {_how}.",
+                ]
+        # ── the audit trail: what was checked, and how ──
+        out += [
             "",
             "**What the evidence shows** — the facts that carry the "
             "explanation: the symbols, call relations and code paths "
@@ -24292,150 +24445,6 @@ class AgenticSynthesisComposer:
                 "was not established this turn.",
             ]
 
-        # ── Step 3: accounts the evidence did not eliminate ──
-        # Only when one survived. A heading over an empty list teaches
-        # the model to invent a rival, which is the opposite of the point.
-        # Ruled out, and said so. Separate from the survivors above: one is
-        # uncertainty the reader still carries, the other is uncertainty
-        # this turn removed, and a reader who cannot tell them apart
-        # proposes back the account the evidence already killed.
-        _dead = [
-            _d for _d in (eliminated_accounts or []) if _d.get("hypothesis")
-        ]
-        if _dead:
-            out += [
-                "",
-                "**Accounts ruled out** — this turn built these "
-                "explanations and the index eliminated them. State each in "
-                "a sentence and say what killed it. This is a result, not "
-                "an apology: an explanation removed is work the reader "
-                "does not have to repeat, and the most useful thing you "
-                "can tell someone about to guess is which guesses are "
-                "already gone.",
-            ]
-            for _d in _dead[:3]:
-                # `falsified` means the evidence discriminated; anything
-                # else means we never got a grip on it. The reader needs
-                # that difference: only the first is really settled.
-                _c = str(_d.get("cause") or "")
-                _how = (
-                    "the index contradicted it"
-                    if _c == "falsified"
-                    else "no evidence could be brought to bear on it"
-                )
-                out += [
-                    "",
-                    f"- Ruled out: {_d.get('hypothesis', '')} — {_how}.",
-                ]
-        _rivals = [_r for _r in (rival_accounts or []) if _r.get("hypothesis")]
-        if _rivals:
-            out += [
-                "",
-                "**Other plausible accounts** — the competition did not "
-                "eliminate these, and the confidence figure is divided by "
-                "them."
-                + (
-                    f" Your chosen account carries corroboration "
-                    f"{winner_corroboration}; give the reader that number "
-                    f"beside the ones below, because a rival is only "
-                    f"close or distant relative to it."
-                    if winner_corroboration is not None
-                    else ""
-                )
-                + " State each one in a sentence, in your own words, "
-                "and say what would tell it apart from the account you "
-                "chose. Do not argue them down: they survived because the "
-                "evidence did not separate them, and presenting a "
-                "settled contest is the failure this section exists to "
-                "prevent.",
-            ]
-            for _r in _rivals[:3]:
-                # `stalled` and `budget` mean the cycles ran out; anything
-                # else means the evidence weighed it and did not choose.
-                # The reader needs that difference, because only the first
-                # is worth spending another turn on.
-                _why = str(_r.get("cause") or "")
-                _spent = (
-                    "ran out of cycles before it could be separated"
-                    if _why in ("stalled", "budget")
-                    else "was weighed against the winner and not separated"
-                )
-                _rel = str(_r.get("relation") or "")
-                _kind = (
-                    " It is complementary: what you described may have "
-                    "more than one cause, and a fix addressing only the "
-                    "chosen account may be half a fix."
-                    if _rel == "complementary"
-                    else ""
-                )
-                out += [
-                    "",
-                    f"- Surviving account (corroboration "
-                    f"{_r.get('corroboration', 0)}): "
-                    f"{_r.get('hypothesis', '')}"
-                    f" — it {_spent}.{_kind}",
-                ]
-        # ── Step 4: code, with an explicit fencing contract ──
-        # has_code means a step pulled code into the workspace, which on an
-        # architecture or planning turn is satisfied merely by having quoted
-        # a body while answering something structural. Offering the heading
-        # there invites a snippet the reader did not ask for, in the two
-        # cases whose answer is a relation or a decision rather than an
-        # edit. For those, the classifier's own direct_retrieval — true
-        # only when the user asked to be GIVEN a concrete artifact — has to
-        # agree. Programming, refactoring and scaffolding keep the old gate:
-        # code IS the answer there.
-        _code_wanted = has_code and (
-            use_case not in (UseCase.ARCHITECTURE, UseCase.PLANNING)
-            or asked_for_artifact
-        )
-        if _code_wanted:
-            out += [
-                "",
-                "**Code** — only if a concrete change or snippet is "
-                "warranted. Fence every block: open with "
-                "```python (or the correct language) on its own line, "
-                "close with ``` on its own line. Never leave a block "
-                "unterminated, never nest fences, and keep prose "
-                "outside them — an unclosed block swallows the rest of "
-                "the answer.",
-            ]
-        # ── Step 5: where the reader goes next ──
-        out += [
-            "",
-            "**How to proceed** — the next concrete step, ordered so "
-            "the one that settles the most uncertainty comes first: "
-            "the symbol to read, the check to run, the thing to "
-            "instrument. Actionable, not generic advice.",
-        ]
-        # Only truthful because the last-mile pass ran first. Before it,
-        # this would be asking the model to hide a gap; after it, every
-        # subject the index could produce has been read, so "go and read
-        # X" is either work already done or work nobody can do.
-        out += [
-            "",
-            "Do not propose reading a symbol in this codebase as a next "
-            "step. Every body the index holds for a symbol this answer "
-            "asserts about has already been read; one that has not is "
-            "named above as not found, and reading it is not available "
-            "to anyone. A step this pipeline should have taken itself, "
-            "or one the reader cannot act on, is not a next step.",
-        ]
-        if _rivals:
-            # Ordering, not an extra instruction. A surviving account is
-            # the largest single piece of uncertainty in the turn — it is
-            # what the confidence figure is divided by — so the step that
-            # separates it belongs at the top of a list already sorted by
-            # how much uncertainty it settles.
-            out += [
-                "",
-                "One of those steps must be the observation that would "
-                "separate the surviving account(s) from the one you "
-                "chose, and it goes first: nothing else in this turn "
-                "settles more. Name the account it would settle, using "
-                "the same words you used for it above, so the reader can "
-                "ask for that one by name.",
-            ]
         return out
 
 class AgenticOrchestrator:
@@ -27767,7 +27776,17 @@ class AgenticOrchestrator:
 
                 # Stashed for the outlet, which rebuilds the whole footer
                 # rather than trusting the copy the model made of it.
-                _reading = ("\n".join(_axes) + "\n") if _axes else ""
+                # A heading of its own, like every other section. The four
+                # lines are an account of how the turn was produced, and
+                # unlabelled at the foot of an answer they read as debris
+                # rather than as a section the reader can choose to read.
+                # It travels INSIDE _reading so the outlet re-emits it with
+                # the rest and the footer pattern strips the old one; a
+                # heading left outside would be orphaned above a freshly
+                # appended block.
+                _reading = (
+                    ("**Stats**\n" + "\n".join(_axes) + "\n") if _axes else ""
+                )
                 self._f._measured_reading_lines = _reading
 
                 _t_line = (
@@ -27792,8 +27811,9 @@ class AgenticOrchestrator:
                 # leave the model to guess which of them to keep.
                 _n_lines = _t_line.count("\n") + 1
                 _workspace += (
-                    "\n\n## Your closing lines\n"
-                    "This turn's evidence was counted. End your answer with "
+                    "\n\n## Your Stats section\n"
+                    "This turn's evidence was counted. Close your answer "
+                    "with a **Stats** section containing "
                     + (
                         "exactly these lines, all of them, in this order, "
                         if _n_lines > 1
