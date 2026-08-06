@@ -479,7 +479,8 @@ _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 # wrong evidence — the exact failure that function was written to prevent.
 _ANSWER_FOOTER_RE = re.compile(
     r"^[ \t]*(?:\*\*Stats\*\*|"
-    r"\[(?:Confidence|Use case|Question type|Code action):[^\]\n]*\])"
+    r"\[(?:Confidence|Use case|Question type|Code action|Reinforcement):"
+    r"[^\]\n]*\])"
     r"[ \t]*$",
     re.M,
 )
@@ -25374,6 +25375,15 @@ class AgenticOrchestrator:
             f"🤖 Agentic reinforcement: step {step.id} — {n_tested} tested, "
             f"{n_refuted} refuted in {time.monotonic() - t0:.1f}s"
         )
+        # Stashed for the Stats block. The status line above is emitted mid
+        # step and the next one overwrites it; across seventeen investigate
+        # steps in a run, two metacognitive lines go by unseen. This is the
+        # only place the result survives to where the reader looks.
+        if n_tested:
+            self._f._measured_reinforcement = (
+                f"{n_tested} claim{'' if n_tested == 1 else 's'} re-tested, "
+                f"{n_refuted} refuted"
+            )
         if n_tested:
             await self._f._emit_status(
                 f"{_prefix} · metacog: {n_tested} claim(s) tested, "
@@ -27781,6 +27791,18 @@ class AgenticOrchestrator:
                             + (" · " + ", ".join(_eff) if _eff else "")
                             + "]"
                         )
+                    # ── Reinforcement: how sound the reasoning came out ──
+                    # A fourth fact, and deliberately NOT hung off any of the
+                    # three axes: _should_reinforce_step reads the step's own
+                    # invalid_qids and reported confidence, never the question
+                    # type. A descriptive turn can escalate and an exploratory
+                    # one can fail to. Attaching it to an axis would make the
+                    # line assert something untrue of that axis.
+                    _rf = str(
+                        getattr(self._f, "_measured_reinforcement", "") or ""
+                    ).strip()
+                    if _rf:
+                        _axes.append(f"[Reinforcement: {_rf}]")
                 except Exception:
                     _axes = []
 
@@ -53300,6 +53322,12 @@ class Filter:
         # not the model's recollection of it. Cleared per turn beside the
         # other per-turn state.
         self._measured_reading_lines: str = ""
+        # What the metacognitive escalation re-tested this turn, if it ran.
+        # "re-tested" rather than "falsified": four claims went through a
+        # second, independent falsification attempt and ONE fell — the other
+        # three survived it and were not false. A reader who takes the first
+        # number as the count of bad claims has read it backwards.
+        self._measured_reinforcement: str = ""
         # How many LLM calls died this turn, and the label of the last one.
         # A coverage number measured over a turn that lost most of its calls
         # is not comparable with one that lost none.
@@ -53980,6 +54008,7 @@ class Filter:
             self._serial_rival_causes = []
             self._serial_rival_accounts = []
             self._measured_reading_lines = ""
+            self._measured_reinforcement = ""
             self._answer_is_verbatim_echo = False
             self._prelim_stable_this_turn = ""
             # The turn prelim belongs to ONE turn. Left standing it was
