@@ -19541,26 +19541,36 @@ if __name__ == "__main__":
         )
 
         report_lines = [f"## Dynamic verification ({len(targets)} target(s))"]
-        _passed = _failed = _other = 0
+        self._step_verdicts = []
         for qid in targets:
             line = await self._verify_target(
                 qid, ledger, project_id, aligned_prefix, step.id
             )
             report_lines.append(line)
-            _up = line.upper()
-            if ": PASSED" in _up:
-                _passed += 1
-            elif ": FAILED" in _up:
-                _failed += 1
-            else:
-                _other += 1
             await self._f._emit_status(f"{_pfx} · {line.lstrip('- ')[:110]}")
+
+        # Counted from what _note_verdict recorded, not from the lines just
+        # rendered. The sandbox reports "pass"/"fail"; the rendered line
+        # carries PASS and FAIL, and the previous counter searched it for
+        # PASSED and FAILED — so a run that passed 5/5 and a run that failed
+        # 4/5 both came out "inconclusive", and the Stats line said so for a
+        # whole session.
+        _v = list(getattr(self, "_step_verdicts", []) or [])
+        _passed = _v.count("pass")
+        _failed = _v.count("fail")
+        _skipped = _v.count("io_bound") + _v.count("skipped")
+        _other = len(_v) - _passed - _failed - _skipped
 
         # Stashed for the Stats block, where the Code action line reports
         # the effect of the axis that opened this gate. Counted from the
         # rendered verdicts rather than from the target list, so a symbol
         # the classifier refused or a harness that never ran is not
         # reported as an execution that happened.
+        # A symbol the classifier refused was never executed, so it is
+        # reported apart from one whose harness ran and said nothing
+        # conclusive. Collapsing the two would let "io_bound, left to
+        # static" read as a failed experiment.
+        _ran = _passed + _failed + _other
         _bits = []
         if _passed:
             _bits.append(f"{_passed} passed")
@@ -19568,14 +19578,20 @@ if __name__ == "__main__":
             _bits.append(f"{_failed} refuted")
         if _other:
             _bits.append(f"{_other} inconclusive")
-        if _bits:
-            self._f._measured_execution = (
-                f"{len(targets)} symbol{'' if len(targets) == 1 else 's'} "
-                f"executed, " + ", ".join(_bits)
+        _parts = []
+        if _ran:
+            _parts.append(
+                f"{_ran} symbol{'' if _ran == 1 else 's'} executed, "
+                + ", ".join(_bits)
             )
+        if _skipped:
+            _parts.append(f"{_skipped} not executable")
+        if _parts:
+            self._f._measured_execution = " · ".join(_parts)
         await self._f._emit_status(
-            f"{_pfx} · dynamic verification: {len(targets)} run"
+            f"{_pfx} · dynamic verification: {_ran} run"
             + (f", {_failed} refuted" if _failed else "")
+            + (f", {_skipped} not executable" if _skipped else "")
         )
 
         step.output = "\n".join(report_lines)
@@ -19671,7 +19687,17 @@ if __name__ == "__main__":
         self, step: AgenticStep, ledger: "AgenticEvidenceLedger"
     ) -> List[str]:
         """Planner hints first, then most-cited valid qids from the ledger."""
+        # Two caps, and the turn one is what actually bounds cost. The
+        # per-step cap bounds a step; a plan may carry several steps, so
+        # alone it bounds nothing that matters — 7 steps at 2 targets was a
+        # 14-execution ceiling at ten seconds apiece. Whatever the turn has
+        # already spent is subtracted here, so the second and third
+        # verify_dynamic step get what is left rather than a fresh
+        # allowance each.
         cap = max(1, self._f.valves.agentic_dynamic_max_targets)
+        _turn_cap = max(1, self._f.valves.agentic_dynamic_max_per_turn)
+        _spent = int(getattr(self._f, "_dynamic_targets_this_turn", 0) or 0)
+        cap = min(cap, max(0, _turn_cap - _spent))
         ordered: List[str] = []
         for q in step.symbols:
             if q and q not in ordered:
@@ -19683,7 +19709,9 @@ if __name__ == "__main__":
         for q, _n in sorted(counts.items(), key=lambda kv: -kv[1]):
             if q not in ordered:
                 ordered.append(q)
-        return ordered[:cap]
+        _chosen = ordered[:cap]
+        self._f._dynamic_targets_this_turn = _spent + len(_chosen)
+        return _chosen
 
     # ── Per-target flow ──────────────────────────────────────────────────
 
@@ -19699,9 +19727,11 @@ if __name__ == "__main__":
         report line; never raises."""
         body = self._body_of(qid, project_id)
         if not body:
+            self._note_verdict("skipped")
             return f"- {qid}: skipped (body not extractable)"
         verdict, reasons = self._classifier.classify(body)
         if verdict == "io_bound":
+            self._note_verdict("io_bound")
             return (
                 f"- {qid}: io_bound ({'; '.join(reasons)}) — left to static "
                 f"verification"
@@ -19718,7 +19748,8 @@ if __name__ == "__main__":
                 result = None
             if result:
                 self._append_evidence(ledger, step_id, qid, result, cached=True)
-                return self._format_line(qid, verdict, result, "cached-result")
+                self._note_verdict(str(result.get("status", "error")))
+            return self._format_line(qid, verdict, result, "cached-result")
 
         # -- tests: reuse stored ones (regression) or elicit once ----------
         tests = cached["tests"] if cached else ""
@@ -19726,7 +19757,8 @@ if __name__ == "__main__":
         if not tests:
             tests = await self._elicit_tests(body, verdict, reasons, aligned_prefix)
             if not tests:
-                return f"- {qid}: harness generation failed — no dynamic evidence"
+                self._note_verdict("no_harness")
+            return f"- {qid}: harness generation failed — no dynamic evidence"
 
         callee_src = self._resolve_callee_bodies(body, qid, project_id)
         harness = self._compose(body, tests, callee_src)
@@ -19768,9 +19800,16 @@ if __name__ == "__main__":
             # accounting, the Fase 4 downgrade path untouched).
             _detail_tail = str(result.get("detail", ""))[-500:]
             if result.get("status") == "error" and _detail_tail:
+                # The traceback used to go into the regeneration hint and
+                # nowhere else, so the model learned from the failure and
+                # the reader did not. A harness that will not run is the
+                # most instructive thing this subsystem produces — it says
+                # which part of the sandwich the composer gets wrong — and
+                # it was the one thing never written down.
                 self._f._log_debug(
-                    f"harness self-repair: {qid} infra error — "
-                    f"traceback included in regeneration hint"
+                    f"🤖 harness self-repair: {qid} infra error, "
+                    f"regenerating with the traceback. What failed:\n"
+                    f"{_detail_tail}"
                 )
                 _hint = (
                     "NOTE: the previous harness for this exact "
@@ -19832,6 +19871,22 @@ if __name__ == "__main__":
                     f"🤖 Agentic verify_dynamic: {qid} fresh run produced "
                     f"no evidence ({_r}) — parked as harness suspect"
                 )
+                # A harness parked as a suspect has survived a replication
+                # and still says nothing, which makes it the composer's
+                # hardest case. Write down what it ran and what came back,
+                # or the only record of the hardest case is that there was
+                # one. Log-only: the reader asked for a verdict, not for a
+                # throwaway probe built against fake valves.
+                self._f._log_debug(
+                    f"🤖 harness suspect detail — {qid}\n"
+                    f"status={result.get('status')} "
+                    f"passed={result.get('passed', 0)}/"
+                    f"{result.get('total', 0)}\n"
+                    f"detail: {str(result.get('detail', ''))[:600]}\n"
+                    f"failures: {str(result.get('failures', []))[:600]}\n"
+                    f"harness that ran:\n{str(tests)[:2000]}"
+                )
+        self._note_verdict(str(result.get("status", "error")))
         return self._format_line(qid, verdict, result, source)
 
     def _body_of(self, qid: str, project_id: str) -> str:
@@ -20035,10 +20090,31 @@ if __name__ == "__main__":
         ledger.claims.append(claim)
 
     @staticmethod
+    def _note_verdict(self, status: str) -> None:
+        """Record one target's outcome for the step to count.
+
+        Kept beside _format_line because the two are the only places that
+        learn what happened to a target, and a counter that reads the
+        rendered line instead is a second path to the same fact — the one
+        that reported a clean 5/5 as inconclusive for a whole run.
+        """
+        if not hasattr(self, "_step_verdicts"):
+            self._step_verdicts = []
+        self._step_verdicts.append(status)
+
     def _format_line(
         qid: str, verdict: str, result: Dict[str, Any], source: str
     ) -> str:
-        """One report line per target."""
+        """One report line per target.
+
+        Rendering only — it is a staticmethod and has no self to record
+        with. The outcome is recorded by the caller through _note_verdict,
+        because run_dynamic_step used to count by searching this line for
+        ": PASSED", which this method never writes: the sandbox reports
+        "pass"/"fail" and .upper() makes them PASS and FAIL. Every
+        execution therefore landed in the "inconclusive" bucket, including
+        a clean 5/5, for a whole session.
+        """
         status = result.get("status", "error")
         base = (
             f"- {qid} [{verdict}, tests: {source}]: {status.upper()} "
@@ -24048,6 +24124,16 @@ class AgenticSynthesisComposer:
             ("```" in (s.output or "")) or ("```" in (s.digest or ""))
             for s in plan.steps
         )
+        # A design_tests step that completed wrote acceptance tests meant to
+        # be kept; that is the only thing the Tests section is for. Read
+        # from the plan's own steps rather than from the presence of a fence
+        # somewhere, so a dynamic verification harness cannot open it.
+        _has_tests = any(
+            getattr(s, "kind", "") == "design_tests"
+            and getattr(s, "status", "") == "done"
+            and (s.output or "").strip()
+            for s in plan.steps
+        )
         _vc = ledger.verification_counts() if ledger is not None else {}
         lines += self._answer_format_directive(
             ok,
@@ -24084,6 +24170,7 @@ class AgenticSynthesisComposer:
             ),
             _use_case,
             _asked_for_artifact,
+            _has_tests,
         )
         return "\n".join(lines).rstrip()
 
@@ -24108,6 +24195,7 @@ class AgenticSynthesisComposer:
         unsettled_subjects: Optional[List[str]] = None,
         use_case: str = "",
         asked_for_artifact: bool = False,
+        has_tests: bool = False,
     ) -> List[str]:
         """
         Instruct the final model on the SHAPE of its answer.
@@ -24140,6 +24228,9 @@ class AgenticSynthesisComposer:
           Code                      when code is in play, and — for
                                     architecture and planning only —
                                     when the user asked for an artifact
+          Tests                     when a design_tests step completed;
+                                    its output is meant to be kept, unlike
+                                    a verify_dynamic harness
           Other plausible accounts  when a rival survived the evidence
           Accounts ruled out        when a rival was actually refuted
           What the evidence shows   always, unchanged in every case
@@ -24336,6 +24427,29 @@ class AgenticSynthesisComposer:
                 "outside them — an unclosed block swallows the rest of "
                 "the answer.",
             ]
+        # ── Step 4.5: the tests, when a design_tests step wrote some ──
+        # Only for design_tests. Its output is written to be KEPT and run
+        # again against the implementation, so the reader wants the code.
+        # A verify_dynamic harness is the opposite: a throwaway probe built
+        # against fake valves and a symbol torn out of its module, existing
+        # only to settle one claim. Pasting one of those under the answer —
+        # which is what happened, below the Stats block, for want of a
+        # section that said where tests go — hands the reader something
+        # that looks committable and is not. Measured, the harnesses in one
+        # run ran 417, 1189 and 1822 tokens; four of them would outweigh
+        # the answer they belong to.
+        if has_tests:
+            out += [
+                "",
+                "**Tests** — the acceptance tests this turn wrote, in full, "
+                "in one fenced block. They are meant to be kept and run "
+                "against the implementation, so give them complete rather "
+                "than described. Do NOT reproduce any harness a dynamic "
+                "verification step generated: those are throwaway probes "
+                "built against stand-in objects, and their verdict is "
+                "already reported without them.",
+            ]
+
         # ── Step 3: accounts the evidence did not eliminate ──
         # Only when one survived. A heading over an empty list teaches
         # the model to invent a rival, which is the opposite of the point.
@@ -52019,7 +52133,31 @@ class Valves(BaseModel):
         default=2,
         ge=1,
         le=5,
-        description="Maximum symbols a verify_dynamic step will test.",
+        description=(
+            "Maximum symbols ONE verify_dynamic step will test. Per step, "
+            "not per turn — see agentic_dynamic_max_per_turn, which is the "
+            "one that bounds the turn."
+        ),
+    )
+
+    agentic_dynamic_max_per_turn: int = Field(
+        default=4,
+        ge=1,
+        le=20,
+        description=(
+            "Maximum symbols executed across the WHOLE turn, however many "
+            "verify_dynamic steps ask for them. The per-step cap alone does "
+            "not bound a turn: nothing stops a plan from carrying several "
+            "such steps, so with 7 steps allowed and 2 targets each the "
+            "ceiling was 14 executions at 10s apiece. A request like "
+            "'check that everything is fine' is exactly the shape that "
+            "invites a planner to verify every step, and the wording that "
+            "now invites it to reach for verify_dynamic removed the "
+            "sentence that used to discourage that. This is the backstop: "
+            "once the turn has run this many, later steps report the cap "
+            "and fall back to static verification rather than queueing "
+            "more subprocesses."
+        ),
     )
 
     agentic_regression_max_callers: int = Field(
@@ -53472,6 +53610,10 @@ class Filter:
         # them as executions is the failure this whole subsystem's
         # _suspect_reason_of guard exists to prevent one level down.
         self._measured_execution: str = ""
+        # Symbols the sandbox has executed so far THIS turn, across every
+        # verify_dynamic step the plan carries. Cleared per turn beside the
+        # rest of the per-turn state.
+        self._dynamic_targets_this_turn: int = 0
         # How many LLM calls died this turn, and the label of the last one.
         # A coverage number measured over a turn that lost most of its calls
         # is not comparable with one that lost none.
@@ -54154,6 +54296,7 @@ class Filter:
             self._measured_reading_lines = ""
             self._measured_reinforcement = ""
             self._measured_execution = ""
+            self._dynamic_targets_this_turn = 0
             self._answer_is_verbatim_echo = False
             self._prelim_stable_this_turn = ""
             # The turn prelim belongs to ONE turn. Left standing it was
