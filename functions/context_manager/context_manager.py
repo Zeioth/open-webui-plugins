@@ -478,7 +478,9 @@ _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 # blind spot they would ride into the next turn's history attached to the
 # wrong evidence — the exact failure that function was written to prevent.
 _ANSWER_FOOTER_RE = re.compile(
-    r"^[ \t]*\[(?:Confidence|Reading|Did):[^\]\n]*\][ \t]*$", re.M
+    r"^[ \t]*\[(?:Confidence|Use case|Question type|Intent):[^\]\n]*\]"
+    r"[ \t]*$",
+    re.M,
 )
 _ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
 
@@ -27637,8 +27639,18 @@ class AgenticOrchestrator:
                 # would make this line the kind of stale map the rest of
                 # this file spends its comments warning about. Every
                 # number below comes from a record of what happened.
-                _read_bits = []
-                _qt = ""
+                # One line per axis, each naming what it detected and — only
+                # when there was one — what it caused. Three reasons for the
+                # shape. A compact "[Reading: A · B · C]" needs the reader to
+                # remember which position is which, and the person who
+                # designed it read two of them the wrong way round the first
+                # time. Effects belong next to the axis that produced them
+                # rather than pooled in a separate line, or the same fact
+                # appears twice. And an axis whose effect did not happen says
+                # nothing at all: "forge did not run" would ride on seven
+                # turns out of nine, and "code not executed" on all of them,
+                # since verify_dynamic has never yet been planned.
+                _axes = []
                 try:
                     _rc = (
                         self._f._project_state_manager.get_pstate(project_id).get(
@@ -27646,54 +27658,104 @@ class AgenticOrchestrator:
                         )
                         or {}
                     )
-                    # The wire value is a single letter; the reader needs
-                    # the label. UseCase() raises on an unknown or empty
-                    # value, which is why this sits inside the try.
+                    # The wire value is a single letter; the reader needs the
+                    # label. UseCase() raises on an unknown or empty value,
+                    # which is why this sits inside the try.
                     _uc_raw = str(_rc.get("use_case", "") or "").strip().upper()
                     try:
-                        _uc = UseCase(_uc_raw).label
+                        _uc = UseCase(_uc_raw)
                     except Exception:
-                        _uc = ""
-                    _in = str(_rc.get("intent", "") or "").strip()
-                    # Both already computed into _cov a few lines above,
-                    # from the pre-planner's own last_stats. Re-reading the
-                    # source here would be a second path to the same fact
-                    # that can drift from the one the telemetry records.
-                    _qt = str(_cov.get("question_type", "") or "").strip()
-                    if _qt == "unknown":
-                        _qt = ""
-                    _read_bits = [b for b in (_uc, _qt, _in) if b]
-                except Exception:
-                    _read_bits = []
+                        _uc = None
 
-                _did_bits = []
-                try:
-                    _n_bodies = len(
-                        getattr(self._f, "_bodies_seen_this_turn", None) or set()
-                    )
-                    if _n_bodies:
-                        _did_bits.append(f"{_n_bodies} body/bodies read")
-                    _riv = getattr(self._f, "_serial_rival_accounts", None) or []
-                    _eli = getattr(self._f, "_serial_eliminated_accounts", None) or []
-                    if _riv or _eli:
-                        _did_bits.append(
-                            f"{len(_eli)} account(s) ruled out, "
-                            f"{len(_riv)} still standing"
+                    # ── Use case: how much material was brought ──
+                    if _uc is not None:
+                        _eff = []
+                        _n_bodies = len(
+                            getattr(self._f, "_bodies_seen_this_turn", None) or set()
                         )
-                    elif _cov.get("had_hypothesize"):
-                        # The plan CARRIED a hypothesize step and no account
-                        # came out of it, which is a different fact from
-                        # "the question type suggested one" — a turn can be
-                        # exploratory and never get the step planned.
-                        _did_bits.append("forge ran, nothing new to test")
+                        if _n_bodies:
+                            _dir = ""
+                            try:
+                                _dir = str(
+                                    self._f._ctx_builder.LOD_PROFILES.get(
+                                        _uc.value, {}
+                                    ).get("activation_direction", "")
+                                )
+                            except Exception:
+                                _dir = ""
+                            # Named only when it is not the default three of
+                            # the five share; a word that prints the same on
+                            # most turns is not telling the reader anything.
+                            _named = {
+                                "callers": ", callers followed",
+                                "both": ", callers and callees",
+                            }.get(_dir, "")
+                            _eff.append(
+                                f"{_n_bodies} "
+                                f"bod{'y' if _n_bodies == 1 else 'ies'} "
+                                f"read{_named}"
+                            )
+                        _axes.append(
+                            f"[Use case: {_uc.label}"
+                            + (" · " + ", ".join(_eff) if _eff else "")
+                            + "]"
+                        )
+
+                    # ── Question type: how hard the turn thought ──
+                    _qt = str(_cov.get("question_type", "") or "").strip()
+                    if _qt and _qt != "unknown":
+                        _eff = []
+                        _riv = getattr(self._f, "_serial_rival_accounts", None) or []
+                        _eli = (
+                            getattr(self._f, "_serial_eliminated_accounts", None) or []
+                        )
+                        if _riv or _eli:
+                            _n_acc = len(_eli) + len(_riv)
+                            _eff.append(
+                                f"{_n_acc} account{'' if _n_acc == 1 else 's'} "
+                                f"forged, {len(_riv)} survived"
+                            )
+                        elif _cov.get("had_hypothesize"):
+                            # The plan CARRIED a hypothesize step and nothing
+                            # came out of it — a different fact from "the
+                            # question type suggested one", since a turn can
+                            # be exploratory and never get the step planned.
+                            _eff.append("forge ran, nothing new to test")
+                        _axes.append(
+                            f"[Question type: {_qt}"
+                            + (" · " + ", ".join(_eff) if _eff else "")
+                            + "]"
+                        )
+
+                    # ── Intent: whether anything was executed ──
+                    _in = str(_rc.get("intent", "") or "").strip()
+                    if _in:
+                        _eff = []
+                        try:
+                            _dyn = [
+                                _s
+                                for _s in plan.steps
+                                if getattr(_s, "kind", "") == "verify_dynamic"
+                                and getattr(_s, "status", "") == "done"
+                            ]
+                            if _dyn:
+                                _eff.append(
+                                    f"{len(_dyn)} dynamic "
+                                    f"check{'' if len(_dyn) == 1 else 's'} run"
+                                )
+                        except Exception:
+                            pass
+                        _axes.append(
+                            f"[Intent: {_in}"
+                            + (" · " + ", ".join(_eff) if _eff else "")
+                            + "]"
+                        )
                 except Exception:
-                    pass
+                    _axes = []
 
                 # Stashed for the outlet, which rebuilds the whole footer
                 # rather than trusting the copy the model made of it.
-                _reading = (
-                    f"[Reading: {' · '.join(_read_bits)}]\n" if _read_bits else ""
-                ) + (f"[Did: {' · '.join(_did_bits)}]\n" if _did_bits else "")
+                _reading = ("\n".join(_axes) + "\n") if _axes else ""
                 self._f._measured_reading_lines = _reading
 
                 _t_line = (
@@ -44185,11 +44247,20 @@ class MessageAssembler:
             # a fresh prefix and a full ~85k-token reprocess, about 150
             # seconds apiece. The cut never needed more than _stab: the
             # inflated systems started with those exact 283,722 bytes.
+            # ORDER MATTERS, and it is the opposite of call_llm's. There the
+            # whole tail just moves; here the split point decides POSITION:
+            # cutting at _pre_full sends Block B in front of the question and
+            # the workspace behind it, the two places they already occupied.
+            # Cutting at _stab sends both behind. So _pre_full is tried first
+            # and keeps every turn that works today byte-for-byte unchanged;
+            # _stab is the rescue for the turns where _pre_full no longer
+            # matches, and it accepts Block B moving rather than paying a
+            # full reprocess to keep it where it was.
             _cut = ""
-            if _stab and final_system.startswith(_stab):
-                _cut = _stab
-            elif _pre_full and final_system.startswith(_pre_full):
+            if _pre_full and final_system.startswith(_pre_full):
                 _cut = _pre_full
+            elif _stab and final_system.startswith(_stab):
+                _cut = _stab
             if _cut and len(final_system) > len(_cut):
                 _moved = final_system[len(_cut):]
                 # Block B travels too, and it travels in FRONT of the
