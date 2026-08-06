@@ -478,7 +478,8 @@ _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 # blind spot they would ride into the next turn's history attached to the
 # wrong evidence — the exact failure that function was written to prevent.
 _ANSWER_FOOTER_RE = re.compile(
-    r"^[ \t]*\[(?:Confidence|Use case|Question type|Intent):[^\]\n]*\]"
+    r"^[ \t]*\[(?:Confidence|Use case|Question type|Code action):"
+    r"[^\]\n]*\]"
     r"[ \t]*$",
     re.M,
 )
@@ -583,20 +584,26 @@ class DetectionCatalog:
         # reader's memory:
         #   use_case      — how much material do I bring?
         #   question_type — how hard do I think?
-        #   intent        — do I EXECUTE the code?
+        #   code_action   — do I EXECUTE the code?
         # Only the third can cause an effect outside the model.
         (
-            "intent",
-            "classify_turn (LLM)",
+            "code_action",
+            "classify_turn (LLM), wire key 'intent'",
             "explain | modify | debug | refactor",
-            "What the turn is ABOUT. Vetoes the retrieval gate only "
-            "when debug, since diagnosis is what the pipeline is for. "
-            "Also the only axis able to act outside the model: 'debug' "
-            "is one of two ways _verify_dynamic_needed opens sandbox "
-            "execution — though across seven runs the planner emitted "
-            "237 steps and not one of kind verify_dynamic, so that "
-            "effect has never fired. Its live second role is standing "
-            "in for a failed pre-planner (_question_type_or_intent).",
+            "Which operation the user wants ON THE CODE. Vetoes the "
+            "retrieval gate only when debug, since diagnosis is what the "
+            "pipeline is for. Also the only axis able to act outside the "
+            "model: 'debug' is one of two ways _verify_dynamic_needed "
+            "opens sandbox execution — though across seven runs the "
+            "planner emitted 237 steps and not one of kind "
+            "verify_dynamic, so that effect has never fired. Its live "
+            "second role is standing in for a failed pre-planner "
+            "(_question_type_or_code_action). NAME NOTE: the wire key "
+            "the model emits is still 'intent' and the prompt still asks "
+            "for it — that wording is what the 89% self-agreement figure "
+            "was measured against, so renaming it would be a change of "
+            "behaviour rather than of naming. classify_turn translates "
+            "at the boundary; nothing downstream sees 'intent'.",
         ),
         (
             "question_type",
@@ -3982,7 +3989,7 @@ Output only the symbol name.
         # ── Step 0: Strip code from mega-queries before seeding ───────────────
         # A pasted file flowing in as the query makes all_names ∩ query_words
         # match the whole codebase (observed: exact=648 of 648), which seeds
-        # every node equally and erases activation focus. classify_intent
+        # every node equally and erases activation focus. classify_code_action
         # already solves this with _extract_text_for_classification; reuse it,
         # gated by size so pasted tracebacks in normal-sized queries still
         # reach _extract_traceback_seeds intact. The structural-line pass then
@@ -9392,7 +9399,7 @@ class ContextBuilder:
     # ═══════════════════════════════════════════════════════════════════════
 
     async def classify_use_case(
-        self, query: str, intent_vector: dict, project_id: str
+        self, query: str, code_action_vector: dict, project_id: str
     ) -> Tuple[str, dict, str]:
         """
         Classify the query into one of five use cases using a cascade.
@@ -9403,7 +9410,7 @@ class ContextBuilder:
         3. CrossEncoder scores the use case against definitions.
         4. If confident (diff >= CE_THRESHOLD), use CrossEncoder result.
         5. If extremely uncertain (diff < LLM_THRESHOLD), call LLM with CE context.
-        6. Middle zone: use intent_vector fallback (original heuristic).
+        6. Middle zone: use code_action_vector fallback (original heuristic).
 
         The explicit-detection regexes run over a code-stripped view of the
         query: a pasted file contains words like 'skeleton'/'stub'/'scaffold'
@@ -9440,7 +9447,7 @@ class ContextBuilder:
         # No explicit /command prefix (that closed set stays a regex above).
         # The use-case dimension comes from the single per-turn classification
         # shared across the inlet; it returns A-E directly, matching UseCase's
-        # values. The CrossEncoder + intent_vector cascade below stays only as
+        # values. The CrossEncoder + code_action_vector cascade below stays only as
         # the fallback when the unified classifier is unavailable.
         _cls = await self._f._commands._classify_turn_cached_for(q, project_id)
         if _cls is not None:
@@ -9561,14 +9568,14 @@ class ContextBuilder:
                 # a different profile.
                 scores_reinforced = list(scores)
                 h_weight = self._f.valves.heuristic_reinforcement_weight
-                if intent_vector.get("debug", 0) > 0.3:
+                if code_action_vector.get("debug", 0) > 0.3:
                     scores_reinforced[3] += h_weight * 0.2  # refactor
-                if intent_vector.get("explain", 0) > 0.4:
+                if code_action_vector.get("explain", 0) > 0.4:
                     if _n_syms_masked:
                         scores_reinforced[2] += h_weight * 0.2  # programming
                     else:
                         scores_reinforced[0] += h_weight * 0.2  # architecture
-                if intent_vector.get("modify", 0) > 0.4:
+                if code_action_vector.get("modify", 0) > 0.4:
                     scores_reinforced[2] += h_weight * 0.1  # programming
                 if _n_syms_masked:
                     # A named indexed symbol is a strong prior for pointwise
@@ -9609,8 +9616,8 @@ class ContextBuilder:
                     )
                 # else: middle zone → fall through to heuristic
 
-        # ── Fallback: intent_vector-based heuristic ──
-        iv = intent_vector or {}
+        # ── Fallback: code_action_vector-based heuristic ──
+        iv = code_action_vector or {}
         refactor_w = iv.get("refactor", 0.0)
         debug_w = iv.get("debug", 0.0)
         modify_w = iv.get("modify", 0.0)
@@ -9619,7 +9626,7 @@ class ContextBuilder:
         if refactor_w >= 0.30 and refactor_w >= max(debug_w, modify_w, explain_w):
             case = UseCase.REFACTORING
             self._f._log_debug(
-                f"classify_use_case: fallback to '{case.label}' via intent_vector (refactor={refactor_w:.2f})"
+                f"classify_use_case: fallback to '{case.label}' via code_action_vector (refactor={refactor_w:.2f})"
             )
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
@@ -9632,13 +9639,13 @@ class ContextBuilder:
                 case = UseCase.PROGRAMMING
                 self._f._log_debug(
                     f"classify_use_case: fallback to '{case.label}' via "
-                    f"intent_vector (explain={explain_w:.2f}, "
+                    f"code_action_vector (explain={explain_w:.2f}, "
                     f"{_n_syms_masked} symbol(s) named)"
                 )
                 return case.value, dict(self.LOD_PROFILES[case.value]), case.label
             case = UseCase.ARCHITECTURE
             self._f._log_debug(
-                f"classify_use_case: fallback to '{case.label}' via intent_vector (explain={explain_w:.2f})"
+                f"classify_use_case: fallback to '{case.label}' via code_action_vector (explain={explain_w:.2f})"
             )
             return case.value, dict(self.LOD_PROFILES[case.value]), case.label
 
@@ -9773,7 +9780,7 @@ class ContextBuilder:
     # ═══════════════════════════════════════════════════════════════════════
 
     async def prepare_call_graph_mode(
-        self, project_id: str, query: str, intent_vector: dict
+        self, project_id: str, query: str, code_action_vector: dict
     ) -> str:
         """
         Apply the fixed call-graph mode for this turn and persist it before
@@ -9802,7 +9809,7 @@ class ContextBuilder:
         Args:
             project_id: Current project identifier.
             query: The user query string (used only for global-scope detection).
-            intent_vector: Retained for signature stability; no longer consulted.
+            code_action_vector: Retained for signature stability; no longer consulted.
 
         Returns:
             The configured call-graph mode string ('hubs_only', 'expanded_hubs',
@@ -9911,7 +9918,7 @@ class ContextBuilder:
         query: str,
         messages: list,
         slot_free: bool,
-        intent_vector: dict,
+        code_action_vector: dict,
         is_continuation: bool,
         use_case_override: Optional[str] = None,
     ) -> str:
@@ -9929,7 +9936,7 @@ class ContextBuilder:
             slot_free: False on a cold start (no model resident yet),
                 meaning auxiliary LLM calls would each pay the model
                 load. Not a llama.cpp slot: that machinery is gone.
-            intent_vector: Intent classification results.
+            code_action_vector: Code-action classification results.
             is_continuation: Whether this is a continuation turn.
             use_case_override: Pre-classified use case key; when provided,
                 classify_use_case is skipped (single classification per turn,
@@ -10029,7 +10036,7 @@ class ContextBuilder:
         else:
             self._f._log_debug("DIAG bbb: >>> classify_use_case (may hit CE/LLM)…")
             active_use_case, use_case_profile, _ = await self.classify_use_case(
-                query, intent_vector, project_id
+                query, code_action_vector, project_id
             )
             self._f._log_debug(f"DIAG bbb: <<< classify_use_case → {active_use_case!r}")
 
@@ -10039,7 +10046,7 @@ class ContextBuilder:
             inferred_seeds = await self._f._seed_inferencer.infer_seeds(
                 query=query,
                 project_id=project_id,
-                intent_vector=intent_vector,
+                code_action_vector=code_action_vector,
                 use_case=active_use_case,
                 slot_free=slot_free,
             )
@@ -10078,9 +10085,9 @@ class ContextBuilder:
         # ------------------------------------------------------------------
         # Step 5: Adjust LOD thresholds by intent.
         # ------------------------------------------------------------------
-        debug_weight = intent_vector.get("debug", 0.2)
-        modify_weight = intent_vector.get("modify", 0.3)
-        refactor_weight = intent_vector.get("refactor", 0.1)
+        debug_weight = code_action_vector.get("debug", 0.2)
+        modify_weight = code_action_vector.get("modify", 0.3)
+        refactor_weight = code_action_vector.get("refactor", 0.1)
 
         lod3 = self._f.valves.lod3_threshold
         lod2 = self._f.valves.lod2_threshold
@@ -10139,7 +10146,7 @@ class ContextBuilder:
         resolved_graph_mode = psm.get_resolved_call_graph_mode(project_id)
         if resolved_graph_mode is None:
             resolved_graph_mode = await self.prepare_call_graph_mode(
-                project_id, query, intent_vector
+                project_id, query, code_action_vector
             )
 
         # ------------------------------------------------------------------
@@ -10414,7 +10421,7 @@ class ContextBuilder:
         # ------------------------------------------------------------------
         if self._f.valves.enable_cfg_skeletons and (
             active_use_case == UseCase.REFACTORING
-            or intent_vector.get("debug", 0.0)
+            or code_action_vector.get("debug", 0.0)
             >= self._f.valves.cfg_skeleton_debug_intent_threshold
         ):
             cfg_candidates = [
@@ -10424,7 +10431,7 @@ class ContextBuilder:
             ]
             self._f._log_debug(
                 f"CFG gate TRIGGERED: use_case={active_use_case}, "
-                f"debug_intent={intent_vector.get('debug', 0.0):.2f}, "
+                f"debug_code_action={code_action_vector.get('debug', 0.0):.2f}, "
                 f"candidates={cfg_candidates}"
             )
             if cfg_candidates:
@@ -10432,7 +10439,7 @@ class ContextBuilder:
         else:
             self._f._log_debug(
                 f"CFG gate NOT triggered: use_case={active_use_case}, "
-                f"debug_intent={intent_vector.get('debug', 0.0):.2f}, "
+                f"debug_code_action={code_action_vector.get('debug', 0.0):.2f}, "
                 f"enable_cfg_skeletons={self._f.valves.enable_cfg_skeletons}"
             )
 
@@ -10543,7 +10550,7 @@ class ContextBuilder:
                 cfg_skeleton = ""
                 if self._f.valves.enable_cfg_skeletons and (
                     active_use_case == UseCase.REFACTORING
-                    or intent_vector.get("debug", 0.0)
+                    or code_action_vector.get("debug", 0.0)
                     >= self._f.valves.cfg_skeleton_debug_intent_threshold
                 ):
                     cfg_skeleton = self._f._symbol_index.get_cfg(qid, project_id) or ""
@@ -13620,7 +13627,7 @@ class LongTermMemory:
         A code-bearing mega-query (a pasted file) blows past the embedder's
         max sequence length (observed: 280k tokens vs a 40960 cap), costing
         minutes of CPU per encode and producing a truncated, semantically
-        useless vector. Strip code the same way classify_intent and seed
+        useless vector. Strip code the same way classify_code_action and seed
         extraction do, gated by the shared size valve. Both the read side
         (lookups) and the write side (cache store) must apply this so cached
         entries and later lookups share the same semantic key.
@@ -21815,9 +21822,9 @@ class AgenticPlanner:
                 "turn_classification"
             )
             if _cls:
-                _intent = str(_cls.get("intent", "")).strip()
-                if _intent:
-                    parts.append(f"Turn intent: {_intent}")
+                _action = str(_cls.get("code_action", "")).strip()
+                if _action:
+                    parts.append(f"Turn code action: {_action}")
         except Exception:
             pass
         if not parts:
@@ -24816,7 +24823,7 @@ class AgenticOrchestrator:
             _cls = self._f._project_state_manager.get_pstate(project_id).get(
                 "turn_classification"
             )
-            if _cls and str(_cls.get("intent", "")) == "debug":
+            if _cls and str(_cls.get("code_action", "")) == "debug":
                 return True
         except Exception:
             pass
@@ -25965,7 +25972,7 @@ class AgenticOrchestrator:
     # 7. The pipeline body
     # ──────────────────────────────────────────────────────────────────────
 
-    def _question_type_or_intent(self, project_id: str) -> str:
+    def _question_type_or_code_action(self, project_id: str) -> str:
         """The pre-planner's question type, or the turn's intent standing in.
 
         A pre-planner whose call fails returns ("", "") and leaves no type,
@@ -25993,7 +26000,12 @@ class AgenticOrchestrator:
         try:
             _pstate = self._f._project_state_manager.get_pstate(project_id)
             _intent = (
-                str((_pstate.get("turn_classification") or {}).get("intent", "") or "")
+                str(
+                    (_pstate.get("turn_classification") or {}).get(
+                        "code_action", ""
+                    )
+                    or ""
+                )
                 .strip()
                 .lower()
             )
@@ -26159,7 +26171,7 @@ class AgenticOrchestrator:
             difficulty=str(
                 getattr(self._preplanner, "last_stats", {}).get("difficulty", "") or ""
             ),
-            question_type=self._question_type_or_intent(project_id),
+            question_type=self._question_type_or_code_action(project_id),
         )
         self._f._log_debug(
             f"🤖 Agentic: plan ready ({len(plan.steps)} steps, "
@@ -27728,7 +27740,7 @@ class AgenticOrchestrator:
                         )
 
                     # ── Intent: whether anything was executed ──
-                    _in = str(_rc.get("intent", "") or "").strip()
+                    _in = str(_rc.get("code_action", "") or "").strip()
                     if _in:
                         _eff = []
                         try:
@@ -27746,7 +27758,7 @@ class AgenticOrchestrator:
                         except Exception:
                             pass
                         _axes.append(
-                            f"[Intent: {_in}"
+                            f"[Code action: {_in}"
                             + (" · " + ", ".join(_eff) if _eff else "")
                             + "]"
                         )
@@ -28166,7 +28178,7 @@ class CommandRouter:
       assistant's response for ``/expand`` commands and replaces them inline
       with the actual symbol bodies from the SymbolIndex, so the user sees
       the code immediately.
-    * ``classify_intent(query, project_id)`` — returns a probability
+    * ``classify_code_action(query, project_id)`` — returns a probability
       distribution over explain / modify / debug / refactor using the
       CrossEncoder.
     * ``suggest_commands(project_id, state)`` — returns context‑management
@@ -28639,7 +28651,7 @@ class CommandRouter:
         re.MULTILINE,
     )
 
-    # Explain-intent keywords, shared by classify_intent's keyword
+    # Explain-intent keywords, shared by classify_code_action's keyword
     # reinforcement and classify_use_case's deterministic pointwise shortcut
     # so both read the same definition of "the user is asking what/why".
     # Unaccented "que hace" / "por que" are deliberately excluded: both match
@@ -28678,7 +28690,7 @@ class CommandRouter:
         instead of six that can disagree.
 
         Runs at most once per turn: the result is memoized in pstate under a
-        content hash, so every consumer (is_code_only_message, classify_intent,
+        content hash, so every consumer (is_code_only_message, classify_code_action,
         classify_use_case, classify_session, detect_cot_configuration) reads
         the same dict without a second call.
 
@@ -28716,7 +28728,7 @@ class CommandRouter:
             "is_code_only": False,
             "has_request": True,
             "is_code_session": True,
-            "intent": "explain",
+            "code_action": "explain",
             "use_case": "C",
             "cot_level": 1,
             "negates_reasoning": False,
@@ -28874,13 +28886,20 @@ class CommandRouter:
                     result["has_request"] = data["has_request"]
                 if isinstance(data.get("is_code_session"), bool):
                     result["is_code_session"] = data["is_code_session"]
+                # The WIRE key stays "intent": this prompt's wording is the
+                # one the 89%-self-agreement figure was measured against, and
+                # changing what the model is asked to emit is a change of
+                # behaviour, not of naming. The rename stops at this line —
+                # everything downstream reads code_action. Same shape as
+                # use_case, whose wire value is a bare letter and whose
+                # internal form is an enum with a label.
                 if str(data.get("intent", "")).lower() in (
                     "explain",
                     "modify",
                     "debug",
                     "refactor",
                 ):
-                    result["intent"] = str(data["intent"]).lower()
+                    result["code_action"] = str(data["intent"]).lower()
                 if str(data.get("use_case", "")).upper() in UseCase.keys():
                     result["use_case"] = str(data["use_case"]).upper()
                 try:
@@ -28908,7 +28927,8 @@ class CommandRouter:
         self._f._log_debug(
             f"classify_turn [{result['_source']}]: "
             f"code_only={result['is_code_only']} req={result['has_request']} "
-            f"sess={result['is_code_session']} intent={result['intent']} "
+            f"sess={result['is_code_session']} "
+            f"code_action={result['code_action']} "
             f"uc={result['use_case']} L{result['cot_level']} "
             f"neg={result['negates_reasoning']} multi={result['multiclause']}"
         )
@@ -28955,9 +28975,9 @@ class CommandRouter:
 
         return text
 
-    async def classify_intent(self, user_query: str, project_id: str) -> dict:
+    async def classify_code_action(self, user_query: str, project_id: str) -> dict:
         """
-        Classify the user's intent using a cascade: CrossEncoder → LLM.
+        Classify the user's code action using a cascade: CrossEncoder → LLM.
 
         1. CrossEncoder provides initial scores for explain/modify/debug/refactor.
         2. Heuristic reinforcement adjusts scores based on keywords.
@@ -28976,32 +28996,34 @@ class CommandRouter:
         # ── Unified turn classifier shortcut ──────────────────────────────
         # The intent dimension comes from the single per-turn classification
         # shared across the inlet. Downstream consumers read this vector by
-        # threshold (intent_vector.get("debug", 0) > 0.3), so a one-hot
+        # threshold (code_action_vector.get("debug", 0) > 0.3), so a one-hot
         # distribution — 1.0 for the chosen intent, 0.0 for the rest — clears
         # the active threshold and leaves the others below, preserving every
         # existing comparison. The CrossEncoder cascade below stays only as
         # the fallback when the unified classifier is unavailable.
         _cls = await self._classify_turn_cached_for(user_query, project_id)
         if _cls is not None:
-            _intent = _cls.get("intent", "explain")
+            _action = _cls.get("code_action", "explain")
             vector = {
                 "explain": 0.0,
                 "modify": 0.0,
                 "debug": 0.0,
                 "refactor": 0.0,
             }
-            if _intent in vector:
-                vector[_intent] = 1.0
+            if _action in vector:
+                vector[_action] = 1.0
             else:
                 vector["explain"] = 1.0
-            self._f._log_debug(f"classify_intent [unified]: {_intent} (one-hot)")
+            self._f._log_debug(
+                f"classify_code_action [unified]: {_action} (one-hot)"
+            )
             return vector
 
         classifier_input = self._extract_text_for_classification(user_query)
         # Same contamination as classify_use_case: a verb embedded in an
         # identifier ("build" in build_block_b) reads as intent to the
         # CrossEncoder and skews the explain/modify balance for a question
-        # that is *about* that symbol. The resulting intent_vector feeds the
+        # that is *about* that symbol. The resulting code_action_vector feeds the
         # use-case reinforcement, the CFG gate and activation_direction, so it
         # is cleaned at the source. Masking is morphology-gated (see
         # _neutralize_symbol_names), so intent keywords in plain prose are
@@ -29014,12 +29036,12 @@ class CommandRouter:
         )
         if _n_syms_masked:
             self._f._log_debug(
-                f"classify_intent: masked {_n_syms_masked} indexed symbol "
+                f"classify_code_action: masked {_n_syms_masked} indexed symbol "
                 f"name(s) before intent scoring"
             )
 
         self._f._log_debug(
-            f"classify_intent: input truncated from {len(user_query.split())} words "
+            f"classify_code_action: input truncated from {len(user_query.split())} words "
             f"to {len(classifier_input.split())} (code stripped)"
         )
 
@@ -29141,14 +29163,14 @@ class CommandRouter:
                     f"Intent: CrossEncoder uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
                     "using LLM with CrossEncoder context"
                 )
-                return await self._classify_intent_with_llm(
+                return await self._classify_code_action_with_llm(
                     user_query, scores, classifier_input, project_id
                 )
 
         self._f._log_debug("Intent: using conservative heuristic distribution")
         return {"explain": 0.2, "modify": 0.3, "debug": 0.3, "refactor": 0.2}
 
-    async def _classify_intent_with_llm(
+    async def _classify_code_action_with_llm(
         self,
         user_query: str,
         ce_scores: Optional[List[float]] = None,
@@ -29175,10 +29197,10 @@ class CommandRouter:
                   where the winning intent is 1.0 and the rest are 0.0.
                   Falls back to a conservative distribution on failure.
         """
-        _INTENT_NAMES = ["Explain", "Modify", "Debug", "Refactor"]
+        _CODE_ACTION_NAMES = ["Explain", "Modify", "Debug", "Refactor"]
 
         if ce_scores is not None:
-            best = _INTENT_NAMES[int(np.argmax(ce_scores))]
+            best = _CODE_ACTION_NAMES[int(np.argmax(ce_scores))]
             ce_block = (
                 f"CrossEncoder scores — "
                 f"Explain: {ce_scores[0]:.2f}, "
@@ -29200,14 +29222,15 @@ class CommandRouter:
             f"  Modify    — change or create code; clues: 'write', 'fix', 'add'\n"
             f"  Debug     — fix errors or unexpected behaviour; clues: 'bug', 'error', 'traceback'\n"
             f"  Refactor  — restructure without changing behaviour; clues: 'refactor', 'clean'\n\n"
-            f'Output only the JSON object, e.g. {{"intent": "Debug"}}'
+            f'Output only the JSON object, e.g. {{"code_action": "Debug"}}'
         )
 
         response = await self._f._llm_orchestrator.call_llm(
             prompt=prompt,
             system_prompt=(
                 "You are an intent classifier. "
-                "Output ONLY a valid JSON object with a single string field 'intent' "
+                "Output ONLY a valid JSON object with a single string field "
+            "'code_action' "
                 "whose value is one of: Explain, Modify, Debug, Refactor. "
                 "Your entire response must start with { and end with }."
             ),
@@ -29230,27 +29253,27 @@ class CommandRouter:
 
         if not response:
             self._f._log_debug(
-                "_classify_intent_with_llm: empty response, using conservative fallback"
+                "_classify_code_action_with_llm: empty response, using conservative fallback"
             )
             return _CONSERVATIVE_FALLBACK
 
         try:
             data = json.loads(response)
-            raw = str(data.get("intent", "")).strip().lower()
+            raw = str(data.get("code_action", "")).strip().lower()
             _valid = {"explain", "modify", "debug", "refactor"}
             if raw in _valid:
                 result = {"explain": 0.0, "modify": 0.0, "debug": 0.0, "refactor": 0.0}
                 result[raw] = 1.0
-                self._f._log_debug(f"_classify_intent_with_llm: intent={raw!r}")
+                self._f._log_debug(f"_classify_code_action_with_llm: code_action={raw!r}")
                 return result
             self._f._log_debug(
-                f"_classify_intent_with_llm: unknown intent {raw!r}, "
+                f"_classify_code_action_with_llm: unknown code action {raw!r}, "
                 f"using conservative fallback"
             )
             return _CONSERVATIVE_FALLBACK
         except (json.JSONDecodeError, Exception):
             self._f._log_debug(
-                f"_classify_intent_with_llm: JSON parse error — "
+                f"_classify_code_action_with_llm: JSON parse error — "
                 f"response: {response[:200]!r}, using conservative fallback"
             )
             return _CONSERVATIVE_FALLBACK
@@ -41274,7 +41297,7 @@ class SystemPromptBuilder:
         state: dict,
         slot_busy: bool = False,
         is_continuation: bool = False,
-        intent_vector: Optional[dict] = None,
+        code_action_vector: Optional[dict] = None,
         use_case: Optional[str] = None,
         use_case_label: Optional[str] = None,
     ) -> Tuple[str, List[Tuple[str, str]], Optional[dict], str]:
@@ -41283,12 +41306,12 @@ class SystemPromptBuilder:
 
         Performance notes:
           - use_case / use_case_label: when the caller (inlet(), via
-            classify_intent_with_continuation) already computed these this
+            classify_code_action_with_continuation) already computed these this
             turn, pass them in to skip a redundant classify_use_case() call
             in Step 4a. Both are threaded further into _build_activated_code()
             / build_block_b(), eliminating what was previously up to 3
             additional classify_use_case() calls and 1 additional
-            classify_intent() call per turn.
+            classify_code_action() call per turn.
           - Step 4b (LTM retrieval) and Step 4c (parallel checks) are
             independent, read-mostly operations against ChromaDB/CrossEncoder
             and now run concurrently via asyncio.gather() instead of
@@ -41334,7 +41357,7 @@ class SystemPromptBuilder:
         # 4a: Compute use_case label
         if use_case is None or use_case_label is None:
             use_case, _, use_case_label = await self._f._ctx_builder.classify_use_case(
-                user_query, intent_vector or {}, project_id
+                user_query, code_action_vector or {}, project_id
             )
 
         # 4b + 4c: LTM retrieval and parallel checks, run concurrently.
@@ -41395,7 +41418,7 @@ class SystemPromptBuilder:
             messages,
             is_code_session,
             slot_free,
-            intent_vector=intent_vector,
+            code_action_vector=code_action_vector,
             use_case=use_case,
         )
         if active_ctx:
@@ -41985,7 +42008,7 @@ class SystemPromptBuilder:
         messages: List[dict],
         is_code_session: bool,
         slot_free: bool,
-        intent_vector: Optional[dict] = None,
+        code_action_vector: Optional[dict] = None,
         use_case: Optional[str] = None,
     ) -> Optional[str]:
         """Obtain LOD-activated code context for the current query, if applicable."""
@@ -41993,8 +42016,8 @@ class SystemPromptBuilder:
             return None
 
         if self._f.valves.enable_path_analysis:
-            if intent_vector is None:
-                intent_vector = await self._f._commands.classify_intent(
+            if code_action_vector is None:
+                code_action_vector = await self._f._commands.classify_code_action(
                     user_query, project_id
                 )
 
@@ -42003,7 +42026,7 @@ class SystemPromptBuilder:
                 query=user_query,
                 messages=messages,
                 slot_free=slot_free,
-                intent_vector=intent_vector,
+                code_action_vector=code_action_vector,
                 is_continuation=not slot_free,
                 use_case_override=use_case,
             )
@@ -42013,7 +42036,7 @@ class SystemPromptBuilder:
                 active_use_case = use_case
             else:
                 active_use_case, _, _ = await self._f._ctx_builder.classify_use_case(
-                    user_query, intent_vector, project_id
+                    user_query, code_action_vector, project_id
                 )
             suppress_sigs = (
                 self._f.valves.skeleton_tier_suppresses_block_b_signatures
@@ -44472,7 +44495,7 @@ class ContextAssembler:
         has_code_blocks: bool,
         slot_busy: bool = False,
         is_continuation: bool = False,
-        intent_vector: Optional[dict] = None,
+        code_action_vector: Optional[dict] = None,
         use_case: Optional[str] = None,
         use_case_label: Optional[str] = None,
     ) -> Tuple[List[dict], Optional[dict]]:
@@ -44514,7 +44537,7 @@ class ContextAssembler:
                     state=state,
                     slot_busy=slot_busy,
                     is_continuation=is_continuation,
-                    intent_vector=intent_vector,
+                    code_action_vector=code_action_vector,
                     use_case=use_case,
                     use_case_label=use_case_label,
                 )
@@ -47600,7 +47623,7 @@ class SemanticSeedInferencer:
         self,
         query: str,
         project_id: str,
-        intent_vector: dict,
+        code_action_vector: dict,
         use_case: str,
     ) -> bool:
         """
@@ -47611,7 +47634,7 @@ class SemanticSeedInferencer:
         Args:
             query: The user's query.
             project_id: Current project identifier.
-            intent_vector: Intent probabilities.
+            code_action_vector: Code-action probabilities.
             use_case: The detected use case (A, B, C, D, E).
 
         Returns:
@@ -47993,7 +48016,7 @@ class SemanticSeedInferencer:
         self,
         query: str,
         project_id: str,
-        intent_vector: dict,
+        code_action_vector: dict,
         use_case: str,
         slot_free: bool = True,
     ) -> Dict[str, float]:
@@ -48009,7 +48032,7 @@ class SemanticSeedInferencer:
         Args:
             query: The user query.
             project_id: Current project identifier.
-            intent_vector: Intent probabilities.
+            code_action_vector: Code-action probabilities.
             use_case: Detected use case.
             slot_free: False on a cold start, where each auxiliary LLM
                 call would pay the model load. Not a llama.cpp slot.
@@ -48049,7 +48072,7 @@ class SemanticSeedInferencer:
         self._f._log_debug(
             "DIAG infer: no literal seeds → _should_infer (CrossEncoder)…"
         )
-        if not await self._should_infer(query, project_id, intent_vector, use_case):
+        if not await self._should_infer(query, project_id, code_action_vector, use_case):
             self._f._log_debug("DIAG infer: _should_infer=False → return {}")
             return {}
         self._f._log_debug("DIAG infer: _should_infer=True → building skeleton…")
@@ -48962,19 +48985,19 @@ class InletOrchestrator:
         return messages
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 7. Intent classification with continuation inheritance
+    # 7. Code-action classification with continuation inheritance
     # ═══════════════════════════════════════════════════════════════════════════
 
     # ── E2: continuation detection ──────────────────────────────────────────
-    async def classify_intent_with_continuation(
+    async def classify_code_action_with_continuation(
         self,
         user_query: str,
         project_id: str,
-        intent_vector: Optional[dict] = None,
+        code_action_vector: Optional[dict] = None,
         is_continuation: bool = False,
     ) -> Tuple[str, dict, str]:
-        if intent_vector is None:
-            intent_vector = await self._f._commands.classify_intent(
+        if code_action_vector is None:
+            code_action_vector = await self._f._commands.classify_code_action(
                 user_query, project_id
             )
         (
@@ -48982,7 +49005,7 @@ class InletOrchestrator:
             profile_copy,
             human_label,
         ) = await self._f._ctx_builder.classify_use_case(
-            user_query, intent_vector, project_id
+            user_query, code_action_vector, project_id
         )
         pstate = self._f._project_state_manager.get_pstate(project_id)
 
@@ -53845,7 +53868,7 @@ class Filter:
         is the single source of truth.
 
         use_case_key / use_case_label, computed once here via
-        classify_intent_with_continuation(), are threaded through
+        classify_code_action_with_continuation(), are threaded through
         assemble_for_turn() → SystemPromptBuilder.build() →
         _build_activated_code() → build_block_b(), so the rest of the turn
         reuses this single classification.
@@ -54696,11 +54719,11 @@ class Filter:
             # 🧠 ENRICHMENT
             #   Classify intent and use case; run lazy tasks; resolve call-graph mode
             # ----------------------------------------------------------------
-            intent_vector = await self._commands.classify_intent(user_query, project_id)
+            code_action_vector = await self._commands.classify_code_action(user_query, project_id)
 
             use_case_key, use_case_profile, use_case_label = (
-                await self._inlet_orch.classify_intent_with_continuation(
-                    user_query, project_id, intent_vector, is_continuation
+                await self._inlet_orch.classify_code_action_with_continuation(
+                    user_query, project_id, code_action_vector, is_continuation
                 )
             )
 
@@ -54722,7 +54745,7 @@ class Filter:
             self._ctx_builder._evaluate_block_a_freeze(project_id)
 
             await self._ctx_builder.prepare_call_graph_mode(
-                project_id, user_query, intent_vector
+                project_id, user_query, code_action_vector
             )
 
             # 🧠📦 ENRICHMENT + COMPRESSION + ASSEMBLY
@@ -54743,7 +54766,7 @@ class Filter:
                 has_code_blocks=has_code_blocks,
                 slot_busy=slot_busy,
                 is_continuation=is_continuation,
-                intent_vector=intent_vector,
+                code_action_vector=code_action_vector,
                 use_case=use_case_key,
                 use_case_label=use_case_label,
             )
