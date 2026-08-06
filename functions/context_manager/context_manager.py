@@ -9950,8 +9950,31 @@ class ContextBuilder:
         # ------------------------------------------------------------------
         # Step 2: Fast paths for skeleton and inventory queries.
         # ------------------------------------------------------------------
+        # Match on what the USER wrote, not on the file they attached. When a
+        # paste arrives, `query` is the whole file — and this file contains
+        # the word "skeleton" dozens of times, so _SKELETON_INTENTS matched
+        # every ingestion turn and Block B returned the entire 137k-char
+        # skeleton that Block A already carried. Observed: one turn shipped
+        # it twice in the same prompt, ~34k tokens reprocessed on every call
+        # of that turn, and the duplicate detector named the section.
+        #
+        # Same stripping the seed extractor and LTM retrieval already apply,
+        # with the same guard: below the valve's length there is nothing to
+        # strip, and a strip that leaves almost nothing is discarded rather
+        # than trusted.
+        _intent_q = query
+        if query and len(query) > self._f.valves.seed_extraction_strip_min_chars:
+            _sq = self._f._commands._extract_text_for_classification(query)
+            if _sq and len(_sq.strip()) >= 10:
+                self._f._log_debug(
+                    f"Block B fast paths: matching intent on the user's text "
+                    f"only ({len(query)} chars → {len(_sq)}); an attached "
+                    f"file is not a request"
+                )
+                _intent_q = _sq
+
         if self._f.valves.enable_skeleton_intent:
-            _sym_match = self._SKELETON_SYMBOL_RE.search(query)
+            _sym_match = self._SKELETON_SYMBOL_RE.search(_intent_q)
             if _sym_match:
                 _sym_name = _sym_match.group("sym")
                 _all = self._f._symbol_index.get_all_names(project_id)
@@ -9968,7 +9991,7 @@ class ContextBuilder:
                         return skel
 
         if self._f.valves.enable_skeleton_intent and self._SKELETON_INTENTS.search(
-            query
+            _intent_q
         ):
             skel = self._format_skeleton(project_id)
             if skel:
@@ -9979,7 +10002,7 @@ class ContextBuilder:
                 )
                 return skel
 
-        if self._LIST_INTENTS.search(query):
+        if self._LIST_INTENTS.search(_intent_q):
             all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
             if all_qids:
                 _inv = await self._format_full_symbol_inventory(all_qids, project_id)
@@ -44150,20 +44173,39 @@ class MessageAssembler:
             _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
             _pre_full = _pre + _PREFIX_ROLE_SEPARATOR if _pre else ""
             _stab = getattr(self._f, "_prelim_stable_this_turn", "") or ""
-            if (
-                _pre_full
-                and final_system.startswith(_pre_full)
-                and len(final_system) > len(_pre_full)
-            ):
-                _moved = final_system[len(_pre_full):]
+            # Gate on the STABLE half, falling back to the full prelim —
+            # the same cascade call_llm and the agentic step sites already
+            # use. This route kept the stricter gate and paid for it: the
+            # full prelim carries the dynamic region, and on a turn that
+            # ingests a paste that region is rebuilt between the moment the
+            # prelim is stashed and the moment this assembles, so
+            # startswith(_pre_full) failed and the whole cut was skipped.
+            # Measured: three paste turns in one run shipped 313k, 315k and
+            # 348k-char systems where the other six shipped 283,722 — each
+            # a fresh prefix and a full ~85k-token reprocess, about 150
+            # seconds apiece. The cut never needed more than _stab: the
+            # inflated systems started with those exact 283,722 bytes.
+            _cut = ""
+            if _stab and final_system.startswith(_stab):
+                _cut = _stab
+            elif _pre_full and final_system.startswith(_pre_full):
+                _cut = _pre_full
+            if _cut and len(final_system) > len(_cut):
+                _moved = final_system[len(_cut):]
                 # Block B travels too, and it travels in FRONT of the
                 # question while the workspace travels behind it — the two
                 # positions they already occupied. The system keeps only
                 # what never changes, so it is the same string in every
                 # turn of the session and the checkpoint at its boundary
                 # outlives the turn that wrote it.
+                # When the cut lands on _stab there is nothing to prepend:
+                # everything past it is already in _moved. _head only exists
+                # on the fallback route, where the cut lands on the full
+                # prelim and the dynamic region between _stab and it has to
+                # travel in front of the question, the position it already
+                # occupied.
                 _head = ""
-                if _stab and _pre_full.startswith(_stab):
+                if _cut is _pre_full and _stab and _pre_full.startswith(_stab):
                     _head = _pre_full[len(_stab):].strip()
                 _last_user = None
                 for _m in reversed(messages):
@@ -44173,7 +44215,7 @@ class MessageAssembler:
                 if _last_user is not None and isinstance(
                     _last_user.get("content"), str
                 ):
-                    final_system = _stab if _head else _pre_full
+                    final_system = _stab if _head else _cut
                     _last_user["content"] = (
                         (_head + "\n\n" if _head else "")
                         + _last_user["content"].rstrip()
@@ -44187,6 +44229,24 @@ class MessageAssembler:
                         f"to what the agentic steps send, so their KV "
                         f"checkpoint is reachable"
                     )
+            elif _pre_full:
+                # The silent branch is why this took nine prompt dumps and an
+                # md5 census to find: when the cut does not happen the answer
+                # simply ships a bigger system and says nothing, and the only
+                # trace is a full reprocess in llama.log. Name the divergence
+                # point so the next one is a single grep away.
+                _c = 0
+                _lim = min(len(final_system), len(_pre_full))
+                while _c < _lim and final_system[_c] == _pre_full[_c]:
+                    _c += 1
+                self._f._log_debug(
+                    f"⚠️ Answer prompt NOT cut: system {len(final_system)} B "
+                    f"stays whole · stable {len(_stab)} B matches="
+                    f"{bool(_stab and final_system.startswith(_stab))} · "
+                    f"prelim {len(_pre_full)} B diverges at {_c} "
+                    f"(system {final_system[_c:_c + 40]!r} vs "
+                    f"prelim {_pre_full[_c:_c + 40]!r})"
+                )
         except Exception as _e_move:
             self._f._log_debug(
                 f"answer-prompt tail move skipped ({_e_move!r})"
