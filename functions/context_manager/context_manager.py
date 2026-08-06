@@ -25264,7 +25264,7 @@ class AgenticOrchestrator:
         Returns:
             True if a dynamic verification ran, else False.
         """
-        mode = self._f.valves.agentic_gate_verify_dynamic
+        mode = self._f.valves.agentic_dynamic_adhoc
         if mode == "off":
             return False
         if getattr(self._f.valves, "agentic_exec_mode", "off") != "subprocess":
@@ -26483,7 +26483,7 @@ class AgenticOrchestrator:
                 # Gate it on need: run only when the turn intent is debugging
                 # or the user asked with '!test'. Otherwise skip to static
                 # verify. 'shadow' logs the decision without skipping.
-                _vdg = self._f.valves.agentic_verify_dynamic_gated
+                _vdg = self._f.valves.agentic_dynamic_skip_when_cheap
                 if _vdg in ("shadow", "on"):
                     _needed = self._verify_dynamic_needed(question, project_id)
                     if not _needed and _vdg == "shadow":
@@ -51841,7 +51841,7 @@ class Valves(BaseModel):
         ),
     )
 
-    agentic_verify_dynamic_gated: str = Field(
+    agentic_dynamic_skip_when_cheap: str = Field(
         default="shadow",
         description=(
             "#10: gate the (expensive, sandbox-executing) verify_dynamic "
@@ -51856,9 +51856,14 @@ class Valves(BaseModel):
         ),
     )
 
-    agentic_gate_verify_dynamic: str = Field(
-        default="shadow",
+    agentic_dynamic_adhoc: str = Field(
+        default="on",
         description=(
+            "RENAMED from agentic_gate_verify_dynamic. This one OPENS "
+            "execution; agentic_dynamic_skip_when_cheap CLOSES it. The two "
+            "old names were the same words reordered for opposite jobs, "
+            "which is a coin flip under pressure. A value set under the old "
+            "name is not carried over — check this one in the panel. "
             "NUEVO-2/P3: let the difficulty gate trigger an ad-hoc "
             "verify_dynamic for an escalated step whose claims are "
             "behavioral (execution/logic), even when the plan scheduled "
