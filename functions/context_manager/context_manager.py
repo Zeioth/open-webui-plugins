@@ -24242,8 +24242,9 @@ class AgenticSynthesisComposer:
           Tests                     when a design_tests step completed;
                                     its output is meant to be kept, unlike
                                     a verify_dynamic harness
-          Other plausible accounts  when a rival survived the evidence
-          Accounts ruled out        when a rival was actually refuted
+          Other plausible hypotheses
+                                    when a rival survived the evidence
+          Hypotheses ruled out      when a rival was actually refuted
           What the evidence shows   always, unchanged in every case
           What was not verified     when the turn left something open
 
@@ -24308,7 +24309,7 @@ class AgenticSynthesisComposer:
             UseCase.ARCHITECTURE: (
                 "the relation that answers the question, named concretely "
                 "(which symbols, through which calls). If the evidence "
-                "supports no single account of the structure, say that "
+                "supports no single explanation of the structure, say that "
                 "instead of promoting the least bad one."
             ),
             UseCase.PLANNING: (
@@ -24336,18 +24337,29 @@ class AgenticSynthesisComposer:
         out: List[str] = [
             "",
             "Structure your reply with these headed sections, in this "
-            "order. Write each in your own prose — this is a shape to "
-            "fill, never a template to copy:",
+            "order, EVERY heading translated into the language you are "
+            "answering in. Write each in your own prose — this is a shape "
+            "to fill, never a template to copy:",
             "",
             "TRANSLATE the headings below into the language you are "
-            "answering in — a Spanish answer with English headings reads as "
-            "though the shape came from somewhere else. Translate them; do "
-            "not reword them. 'Most likely explanation' became 'La "
-            "afirmación es correcta' on one turn, and a heading the reader "
-            "cannot find twice in the same place stops being a landmark. "
-            "The one exception is the Stats block at the very end — copied "
+            "answering in — ALL of them, including the last ones. Measured: "
+            "one answer carried English headings over Spanish prose all the "
+            "way down, which is what happens when this instruction is read "
+            "once at the top and the list runs long. Translate them; do not "
+            "reword them. 'Most likely explanation' came back as 'La "
+            "afirmación es correcta', and a heading the reader cannot find "
+            "twice in the same place stops being a landmark. The one "
+            "exception is the Stats block at the very end — copied "
             "character for character, in English, for the reason given "
             "where it is handed to you.",
+            "",
+            "The FIRST heading is the word Conclusion, translated and "
+            "nothing else. It is not a slot for what you concluded: two "
+            "runs in a row it came back as 'La afirmación es correcta', "
+            "which is the finding and not the label, and a reader "
+            "scanning for the same landmark in every answer no longer "
+            "finds one. Put the finding in the paragraph underneath, "
+            "where it belongs.",
             "",
             "This list is CLOSED and each heading appears exactly ONCE. Do "
             "not add sections of your own, and do not repeat one you "
@@ -24407,10 +24419,10 @@ class AgenticSynthesisComposer:
             out += [
                 "",
                 "One of those steps must be the observation that would "
-                "separate the surviving account(s) from the one you "
+                "separate the surviving hypothesis(es) from the one you "
                 "chose, and it goes first: nothing else in this turn "
-                "settles more. Name the account it would settle, using "
-                "the same words the accounts section below uses for it, "
+                "settles more. Name the hypothesis it would settle, using "
+                "the same words the hypotheses section below uses for it, "
                 "so the reader can ask for that one by name.",
             ]
         # ── Step 4: code, with an explicit fencing contract ──
@@ -24466,7 +24478,17 @@ class AgenticSynthesisComposer:
                 "already reported without them.",
             ]
 
-        # ── Step 3: accounts the evidence did not eliminate ──
+        # ── Step 3: explanations the evidence did not eliminate ──
+        # "hypothesis", not "account". Two reasons, and the second is the
+        # one that settles it. First, "account" carries a second sense
+        # that translates ahead of the intended one: a run rendered these
+        # as "Otras cuentas plausibles" and "Cuentas descartadas", which
+        # in Spanish is a statement about bank ledgers — a word with one
+        # meaning survives translation, a word with two survives it only
+        # by luck. Second, the field these rows are built from is called
+        # `hypothesis`, and HypothesisForge is what produces them; naming
+        # the section after the data means the code and the prose stop
+        # drifting apart.
         # Only when one survived. A heading over an empty list teaches
         # the model to invent a rival, which is the opposite of the point.
         # Ruled out, and said so. Separate from the survivors above: one is
@@ -24479,11 +24501,11 @@ class AgenticSynthesisComposer:
         if _rivals:
             out += [
                 "",
-                "**Other plausible accounts** — the competition did not "
+                "**Other plausible hypotheses** — the competition did not "
                 "eliminate these, and the confidence figure is divided by "
                 "them."
                 + (
-                    f" Your chosen account carries corroboration "
+                    f" Your chosen hypothesis carries corroboration "
                     f"{winner_corroboration}; give the reader that number "
                     f"beside the ones below, because a rival is only "
                     f"close or distant relative to it."
@@ -24491,7 +24513,7 @@ class AgenticSynthesisComposer:
                     else ""
                 )
                 + " State each one in a sentence, in your own words, "
-                "and say what would tell it apart from the account you "
+                "and say what would tell it apart from the hypothesis you "
                 "chose. Do not argue them down: they survived because the "
                 "evidence did not separate them, and presenting a "
                 "settled contest is the failure this section exists to "
@@ -24512,13 +24534,13 @@ class AgenticSynthesisComposer:
                 _kind = (
                     " It is complementary: what you described may have "
                     "more than one cause, and a fix addressing only the "
-                    "chosen account may be half a fix."
+                    "chosen hypothesis may be half a fix."
                     if _rel == "complementary"
                     else ""
                 )
                 out += [
                     "",
-                    f"- Surviving account (corroboration "
+                    f"- Surviving hypothesis (corroboration "
                     f"{_r.get('corroboration', 0)}): "
                     f"{_r.get('hypothesis', '')}"
                     f" — it {_spent}.{_kind}",
@@ -24526,7 +24548,7 @@ class AgenticSynthesisComposer:
         if _dead:
             out += [
                 "",
-                "**Accounts ruled out** — this turn built these "
+                "**Hypotheses ruled out** — this turn built these "
                 "explanations and the index eliminated them. State each in "
                 "a sentence and say what killed it. This is a result, not "
                 "an apology: an explanation removed is work the reader "
@@ -24712,7 +24734,7 @@ class AgenticSynthesisComposer:
                 "Nothing this turn settled what these symbols DO:\n"
                 + "\n".join(f"- {_s}" for _s in _unsub[:8]),
                 "",
-                "Your opening paragraph may name them — an account often "
+                "Your opening paragraph may name them — an explanation often "
                 "has to — but it may not state what they do, what they "
                 "return, or what they cause. If one of them carries your "
                 "opening, say in that same sentence that its behaviour "
