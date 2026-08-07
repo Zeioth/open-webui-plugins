@@ -19763,7 +19763,20 @@ if __name__ == "__main__":
             if result:
                 self._append_evidence(ledger, step_id, qid, result, cached=True)
                 self._note_verdict(str(result.get("status", "error")))
-            return self._format_line(qid, verdict, result, "cached-result")
+                self._f._log_debug(
+                    f"🤖 verify_dynamic {qid}: reused cached result "
+                    f"status={result.get('status')} "
+                    f"{result.get('passed', 0)}/{result.get('total', 0)}"
+                )
+                return self._format_line(qid, verdict, result, "cached-result")
+            # Unparseable cache row. The return used to sit outside the
+            # guard, so a corrupt entry reached _format_line as None and
+            # died on result.get(). Falling through re-elicits and re-runs,
+            # which is what a cache miss should do.
+            self._f._log_debug(
+                f"🤖 verify_dynamic {qid}: cached result unreadable — "
+                f"re-running instead of trusting it"
+            )
 
         # -- tests: reuse stored ones (regression) or elicit once ----------
         tests = cached["tests"] if cached else ""
@@ -19771,12 +19784,21 @@ if __name__ == "__main__":
         if not tests:
             tests = await self._elicit_tests(body, verdict, reasons, aligned_prefix)
             if not tests:
+                # All three inside the guard. Adding the log line at the
+                # outer level left the return outside it too, so a target
+                # whose harness generated perfectly still returned "no
+                # dynamic evidence" and recorded no verdict — the step ran
+                # thirty-one seconds and its Stats clause was omitted, with
+                # the log claiming a generation failure that had not
+                # happened. Two runs were spent explaining that.
                 self._note_verdict("no_harness")
-            self._f._log_debug(
-                f"🤖 verify_dynamic {qid}: harness generation returned "
-                f"nothing usable — no dynamic evidence"
-            )
-            return f"- {qid}: harness generation failed — no dynamic evidence"
+                self._f._log_debug(
+                    f"🤖 verify_dynamic {qid}: harness generation returned "
+                    f"nothing usable — no dynamic evidence"
+                )
+                return (
+                    f"- {qid}: harness generation failed — no dynamic evidence"
+                )
 
         callee_src = self._resolve_callee_bodies(body, qid, project_id)
         harness = self._compose(body, tests, callee_src)
