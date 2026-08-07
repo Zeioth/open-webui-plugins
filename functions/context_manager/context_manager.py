@@ -19588,6 +19588,17 @@ if __name__ == "__main__":
             _parts.append(f"{_skipped} not executable")
         if _parts:
             self._f._measured_execution = " · ".join(_parts)
+        # The step's own summary, on every path including the empty one. A
+        # step that picks targets, spends thirty seconds and records no
+        # verdicts leaves the Stats line without its execution clause, and
+        # until this line there was no way to tell that from a step that
+        # never picked a target at all.
+        self._f._log_debug(
+            f"🤖 verify_dynamic step {step.display_no}: "
+            f"{len(targets)} target(s) picked ({', '.join(targets) or 'none'}) · "
+            f"verdicts={_v or 'NONE RECORDED'} · "
+            f"stats clause={self._f._measured_execution or '(omitted)'}"
+        )
         await self._f._emit_status(
             f"{_pfx} · dynamic verification: {_ran} run"
             + (f", {_failed} refuted" if _failed else "")
@@ -19732,6 +19743,9 @@ if __name__ == "__main__":
         verdict, reasons = self._classifier.classify(body)
         if verdict == "io_bound":
             self._note_verdict("io_bound")
+            self._f._log_debug(
+                f"🤖 verify_dynamic {qid}: io_bound — {'; '.join(reasons)}"
+            )
             return (
                 f"- {qid}: io_bound ({'; '.join(reasons)}) — left to static "
                 f"verification"
@@ -19758,6 +19772,10 @@ if __name__ == "__main__":
             tests = await self._elicit_tests(body, verdict, reasons, aligned_prefix)
             if not tests:
                 self._note_verdict("no_harness")
+            self._f._log_debug(
+                f"🤖 verify_dynamic {qid}: harness generation returned "
+                f"nothing usable — no dynamic evidence"
+            )
             return f"- {qid}: harness generation failed — no dynamic evidence"
 
         callee_src = self._resolve_callee_bodies(body, qid, project_id)
@@ -19887,6 +19905,28 @@ if __name__ == "__main__":
                     f"harness that ran:\n{str(tests)[:2000]}"
                 )
         self._note_verdict(str(result.get("status", "error")))
+        # Every target, every time. The six log lines above this one all
+        # describe anomalies — replicas, self-repair, parked suspects — so
+        # a target that classified, composed, ran and returned a verdict
+        # left no trace at all. Two dynamic steps ran in one session and
+        # only one reached the Stats line; the other could not be
+        # explained afterwards because nothing about it had been written
+        # down. An outcome nobody records is an outcome nobody can debug.
+        self._f._log_debug(
+            f"🤖 verify_dynamic {qid}: verdict={verdict} tests={source} "
+            f"status={result.get('status')} "
+            f"{result.get('passed', 0)}/{result.get('total', 0)}"
+            + (
+                f" detail={str(result.get('detail'))[:200]}"
+                if result.get("detail")
+                else ""
+            )
+            + (
+                f" first_failure={str(result.get('failures', [''])[0])[:200]}"
+                if result.get("failures")
+                else ""
+            )
+        )
         return self._format_line(qid, verdict, result, source)
 
     def _body_of(self, qid: str, project_id: str) -> str:
@@ -49485,6 +49525,41 @@ class InletOrchestrator:
                 )
                 assistant_content = _repaired
                 last_assistant["content"] = _repaired
+
+        # ------------------------------------------------------------------
+        # Region: drop a degenerate previous answer before it propagates
+        #
+        # _output_is_degenerate already guards every call_llm makes, but the
+        # FINAL answer is not one of those — OpenWebUI generates it from the
+        # messages inlet returns — so the one output the reader actually
+        # reads had nothing watching it. Measured: one turn looped and
+        # emitted 49,267 tokens, eight verbatim copies of its own answer
+        # including eight Stats blocks. Compression ratio 0.0504 against a
+        # 0.13 threshold and 0.2958 for a healthy answer of the same
+        # conversation — a factor of six, not a borderline call.
+        #
+        # The damage is not the bad turn, which is already spent. It is the
+        # three turns after it: that answer re-entered history and took the
+        # user turn from 69,148 bytes to 223,796, three times over, roughly
+        # 38,000 tokens of repetition displacing real code and heading for
+        # LTM and the index.
+        #
+        # Truncated to the first copy rather than dropped: the opening of a
+        # looped answer is usually sound and the reader saw it, so keeping
+        # it preserves the thread while the repetition stops here.
+        # ------------------------------------------------------------------
+        if self._f.valves.enable_degeneracy_retry and len(assistant_content) > 1500:
+            _degen = _output_is_degenerate(assistant_content)
+            if _degen:
+                _keep = len(assistant_content)
+                _cut = assistant_content[: max(1500, len(assistant_content) // 8)]
+                self._f._log_debug(
+                    f"⚠️ prev-assistant: previous answer is degenerate "
+                    f"({_degen}) — {_keep:,} chars truncated to {len(_cut):,} "
+                    f"before hashing, indexing and history re-injection"
+                )
+                assistant_content = _cut
+                last_assistant["content"] = _cut
 
         response_hash = hashlib.md5(assistant_content.encode()).hexdigest()[:12]
 
