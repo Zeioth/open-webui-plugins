@@ -24541,6 +24541,16 @@ class AgenticSynthesisComposer:
             "finds one. Put the finding in the paragraph underneath, "
             "where it belongs.",
             "",
+            "The lines of three hyphens between the headings below are part "
+            "of the answer, not punctuation in this instruction: reproduce "
+            "each one, on its own line, exactly where it appears. Measured: "
+            "the rule was shown in the list and written by nobody, because "
+            "a shape displayed reads as the instruction's own formatting "
+            "unless the instruction says to copy it. They mark the four "
+            "groups the reader scans by — what they came for, what is still "
+            "open, the detail and its limits — and a group boundary nobody "
+            "draws is a grouping nobody sees.",
+            "",
             "This list is CLOSED and each heading appears exactly ONCE. Do "
             "not add sections of your own, and do not repeat one you "
             "already wrote. Next steps in particular belong where they are "
@@ -54660,9 +54670,14 @@ class Filter:
             # "").rstrip()`, which raises on a list. The guard swallowed it
             # and the turn degraded before the normalisation was reached.
             _flat_n = self._inlet_orch.flatten_part_lists(body.get("messages") or [])
-            # A backstop for the turn mark: asked of the model in
-            # the trailing injection, added here when it did not.
-            self._inlet_orch.mark_previous_answer(body.get("messages") or [])
+            # No turn-mark backstop any more. It existed because the model
+            # was asked to open with [Tn] and sometimes did not; the turn
+            # number now lives in the Stats block instead, so the model
+            # never writes an opening mark and this fired on every single
+            # turn — stamping a [Tn] above the first paragraph of every
+            # answer, which is exactly what moving it into Stats was meant
+            # to stop. inlet edits persist and reach the reader, so unlike
+            # the outlet's own mark this one was visible.
             if _flat_n:
                 self._log_debug(
                     f"⌨️ Content shape: {_flat_n} message(s) arrived as part "
