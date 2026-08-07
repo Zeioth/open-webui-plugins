@@ -477,14 +477,129 @@ _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 # it, and these two are as turn-specific as the number. Left in the pattern's
 # blind spot they would ride into the next turn's history attached to the
 # wrong evidence — the exact failure that function was written to prevent.
+# A boundary the sections are grouped by, resolved to a horizontal rule
+# only where a group actually exists on both sides. Emitted as a sentinel
+# rather than as the rule itself because five of the eight sections are
+# gated: a rule written inline would land next to another rule whenever a
+# whole group was skipped, and a run of rules separating nothing is worse
+# than no rules at all.
+_GROUP_BREAK = "\x00GROUP\x00"
+
+
+def _resolve_group_breaks(lines: List[str]) -> List[str]:
+    """Turn group sentinels into rules, dropping the ones with nothing to separate.
+
+    A sentinel survives only when real content sits on both sides, so
+    consecutive sentinels collapse to one and leading or trailing ones
+    vanish. The four groups are what the reader scans by — what they came
+    for, what is still open, the detail, and its limits — so a rule has to
+    mark a real edge or it stops meaning anything.
+    """
+    _out: List[str] = []
+    _pending = False
+    for _l in lines:
+        if _l == _GROUP_BREAK:
+            _pending = bool([x for x in _out if x.strip()])
+            continue
+        if _pending and _l.strip():
+            _out += ["", "---"]
+            _pending = False
+        _out.append(_l)
+    return _out
+
+
 _ANSWER_FOOTER_RE = re.compile(
     r"^[ \t]*(?:\*\*Stats\*\*|"
-    r"\[(?:Confidence|Use case|Question type|Code action|Reinforcement):"
-    r"[^\]\n]*\])"
-    r"[ \t]*$",
-    re.M,
+    r"\[(?:Turn|Confidence|Use case|Question type|Code action"
+    r"|Reinforcement):[^\]\n]*\])[ \t]*$",
+    # The horizontal rule ahead of the block goes with it. The rule exists
+    # to separate Stats from the section above; strip the block and leave
+    # the rule and the answer ends on a divider dividing nothing, in the
+    # history as well as in what the outlet re-emits.
+    #
+    # Case-insensitive because the labels are handed to a model to copy and
+    # a copy is not a guarantee. A footer this misses is not merely left in
+    # place: _strip_answer_scaffolding uses the same pattern to clear the
+    # PREVIOUS answer before indexing it, so one stray capital carries a
+    # measured line into the next turn attached to the wrong evidence.
+    re.M | re.I,
+)
+# Only the confidence line, for the one caller that REWRITES rather than
+# removes. It shares nothing with _ANSWER_FOOTER_RE on purpose: that one
+# grew from a single label to six as the Stats block did, and each widening
+# silently gave this caller more lines to rewrite — the label landed on
+# **Stats**, on [Turn:] and on [Use case:] too, leaving a stray bracket on
+# the first. A pattern with two jobs acquires the union of their scopes.
+_CONFIDENCE_LINE_RE = re.compile(
+    r"^[ \t]*\[Confidence:[^\]\n]*\][ \t]*$", re.M | re.I
 )
 _ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
+
+
+def _strip_answer_footer(text: str) -> Tuple[str, int]:
+    """Remove the measured footer, leaving anything inside a code fence alone.
+
+    The pattern is blind to fences, and an answer that SHOWS the block —
+    "the Stats section looks like this" inside a python block — had its own
+    example gutted, leaving an empty fence above a real footer. Same for a
+    quoted docstring whose line happens to read like a label.
+
+    Scanned by line with a fence toggle rather than by making the pattern
+    fence-aware: the pattern has three jobs already, and the one thing a
+    regex cannot see is whether it is inside a block someone opened four
+    lines up.
+    """
+    _out: List[str] = []
+    _n = 0
+    _in_fence = False
+    _pending_rule = ""
+    # Blank lines after a held rule travel with it: dropped, the rule glues
+    # to the heading below and the paragraph break the reader scans by is
+    # gone; kept unconditionally, they pile up where the rule was removed.
+    _held_blanks: List[str] = []
+    for _line in (text or "").split("\n"):
+        if _line.lstrip().startswith("```"):
+            _in_fence = not _in_fence
+            if _pending_rule:
+                _out.append(_pending_rule)
+                _out.extend(_held_blanks)
+                _pending_rule = ""
+                _held_blanks = []
+            _out.append(_line)
+            continue
+        if _in_fence:
+            if _pending_rule:
+                _out.append(_pending_rule)
+                _out.extend(_held_blanks)
+                _pending_rule = ""
+                _held_blanks = []
+            _out.append(_line)
+            continue
+        if _ANSWER_FOOTER_RE.fullmatch(_line.rstrip()):
+            _n += 1
+            _pending_rule = ""
+            _held_blanks = []
+            continue
+        # A rule is held back one line: it leaves with the block it
+        # introduces and stays when the next line is ordinary content.
+        if re.fullmatch(r"[ \t]*-{3,}[ \t]*", _line):
+            if _pending_rule:
+                _out.append(_pending_rule)
+            _pending_rule = _line
+            continue
+        if _pending_rule and not _line.strip():
+            _held_blanks.append(_line)
+            continue
+        if _pending_rule:
+            _out.append(_pending_rule)
+            _out.extend(_held_blanks)
+            _pending_rule = ""
+            _held_blanks = []
+        _out.append(_line)
+    if _pending_rule:
+        _out.append(_pending_rule)
+        _out.extend(_held_blanks)
+    return "\n".join(_out), _n
 
 # Handed to the model on any path that answers without measuring. A footer
 # is a claim about evidence, and on these paths there is none: one turn
@@ -1086,7 +1201,7 @@ def _strip_answer_scaffolding(text: str) -> str:
     try:
         if not isinstance(text, str) or not text:
             return text
-        _out = _ANSWER_FOOTER_RE.sub('', text)
+        _out, _ = _strip_answer_footer(text)
         _out = _ANSWER_MARK_RE.sub('', _out)
         return _out.strip() or text
     except Exception:
@@ -24293,7 +24408,10 @@ class AgenticSynthesisComposer:
         conditionals, so it lives here:
 
         In the order they are emitted, which is the order the reader
-        meets them:
+        meets them. A horizontal rule separates the four groups — what the
+        reader came for, what is still open, the detail and its limits,
+        and the measured block — and _resolve_group_breaks drops the rules
+        whose group turned out empty, so two never land together:
 
           Conclusion                always — fixed heading, body by
                                     use_case; everything below develops it
@@ -24487,6 +24605,8 @@ class AgenticSynthesisComposer:
                 "the same words the hypotheses section below uses for it, "
                 "so the reader can ask for that one by name.",
             ]
+        out.append(_GROUP_BREAK)
+
         # ── Step 4: code, with an explicit fencing contract ──
         # has_code means a step pulled code into the workspace, which on an
         # architecture or planning turn is satisfied merely by having quoted
@@ -24545,6 +24665,8 @@ class AgenticSynthesisComposer:
                 "outside the sandbox that made them, and their verdict is "
                 "already reported without them.",
             ]
+
+        out.append(_GROUP_BREAK)
 
         # ── Step 3: explanations the evidence did not eliminate ──
         # "hypothesis", not "account". Two reasons, and the second is the
@@ -24638,6 +24760,8 @@ class AgenticSynthesisComposer:
                     "",
                     f"- Ruled out: {_d.get('hypothesis', '')} — {_how}.",
                 ]
+        out.append(_GROUP_BREAK)
+
         # ── the audit trail: what was checked, and how ──
         out += [
             "",
@@ -24647,6 +24771,7 @@ class AgenticSynthesisComposer:
             "so the reader can go and confirm it. Never give an "
             "unverified claim the same voice as a verified one.",
         ]
+
         # ── Step 2: the honest gap, only when there is one ──
         # A winner sealed having walked under two rungs of the
         # investigation ladder is a scope gap even when every claim
@@ -24809,7 +24934,7 @@ class AgenticSynthesisComposer:
                 "was not established this turn.",
             ]
 
-        return out
+        return _resolve_group_breaks(out)
 
 class AgenticOrchestrator:
     """
@@ -28169,6 +28294,19 @@ class AgenticOrchestrator:
                 except Exception:
                     _axes = []
 
+                # The turn number goes on FRONT, and outside the try that
+                # builds the axes. It comes from a different source — the
+                # turn counter, not the classification — so a pstate that
+                # fails takes the three axes with it and must not take this
+                # too. Inside the block rather than alone at the top of the
+                # answer: it belongs with the rest of what was measured,
+                # and a bare "[T4]" above the first paragraph is a label
+                # with no section to belong to. Written by the model like
+                # the other lines, because the outlet's own mark never
+                # reaches the reader.
+                if _turn_no > 0:
+                    _axes.insert(0, f"[Turn: {_turn_no}]")
+
                 # Stashed for the outlet, which rebuilds the whole footer
                 # rather than trusting the copy the model made of it.
                 # A heading of its own, like every other section. The four
@@ -28179,9 +28317,13 @@ class AgenticOrchestrator:
                 # the rest and the footer pattern strips the old one; a
                 # heading left outside would be orphaned above a freshly
                 # appended block.
-                _reading = (
-                    ("**Stats**\n" + "\n".join(_axes) + "\n") if _axes else ""
-                )
+                # The heading goes on whenever a footer is emitted at all,
+                # not only when an axis survived. The confidence figure is
+                # as measured as the three axes, and with the axes gone it
+                # was handed over bare while the instruction still asked for
+                # a rule and a "Stats section" — a section the reader was
+                # told to expect and given nothing to head it with.
+                _reading = ("**Stats**\n" + "\n".join(_axes) + "\n") if _axes else "**Stats**\n"
                 self._f._measured_reading_lines = _reading
 
                 _t_line = (
@@ -28191,29 +28333,24 @@ class AgenticOrchestrator:
                     + ("; " + ", ".join(_t_open) if _t_open else "")
                     + "]"
                 )
-                if _turn_no > 0:
-                    _workspace += (
-                        f"\n\n## Your turn mark\n"
-                        f"Open your answer with exactly `[T{_turn_no}]` "
-                        f"on its own line, then a blank line, then the "
-                        f"answer. The person refers back to turns by "
-                        f"that mark."
-                    )
-                # Plural: what follows may be one line or three. The two
-                # extra ones say how the turn was read and what it actually
-                # did, and they are as measured as the confidence figure —
-                # asking for "this line" while handing over three would
-                # leave the model to guess which of them to keep.
-                _n_lines = _t_line.count("\n") + 1
+                # No opening mark any more: the turn number is the first
+                # line of the Stats block instead. A bare "[T4]" above the
+                # first paragraph was a label with nothing to belong to,
+                # and everything else measured about the turn already lives
+                # in one place. The outlet still prepends its own mark for
+                # the stored history, which the reader never sees.
+                # Always plural now. The block carries its **Stats** heading
+                # even when every axis was dropped, so what is handed over is
+                # never a single line, and the singular wording that used to
+                # sit here could no longer be reached. A branch that cannot
+                # run is a claim about the data that stopped being true.
                 _workspace += (
                     "\n\n## Your Stats section\n"
                     "This turn's evidence was counted. Close your answer "
-                    "with a **Stats** section containing "
-                    + (
-                        "exactly these lines, all of them, in this order, "
-                        if _n_lines > 1
-                        else "exactly this line, "
-                    )
+                    "with a horizontal rule on its own line — three "
+                    "hyphens, like the ones separating the groups above — "
+                    "and then a **Stats** section containing "
+                    "exactly these lines, all of them, in this order, "
                     + "copied character for character. Do NOT translate this "
                     "block, unlike the section headings above: the outlet "
                     "matches these labels literally to replace them with the "
@@ -55335,9 +55472,26 @@ class Filter:
             # made about how long it will take.
             try:
                 _ho = int(getattr(self, "_inlet_handoff_tokens", 0) or 0)
+                # The same count the Stats block closes with, read from the
+                # same pstate key rather than recounted here — two counts of
+                # one thing is how two numbers drift apart. Showing it in
+                # both places means the reader can name the turn from the
+                # top of a long answer as well as from its foot, without
+                # scrolling to find out which one they are looking at.
+                _tn = 0
+                try:
+                    _tn = int(
+                        self._project_state_manager.get_pstate(
+                            project_id
+                        ).get("napmem_turn_number", 0)
+                        or 0
+                    )
+                except Exception:
+                    _tn = 0
                 await self._emit_status(
                     "✍️ Writing the answer"
                     + (f" (~{_ho} tokens of context)" if _ho else "")
+                    + (f" · [Turn: {_tn}]" if _tn > 0 else "")
                 )
             except Exception:
                 pass
@@ -55501,7 +55655,7 @@ class Filter:
                 # Same whole-line shape as the measured branch, so a
                 # footer already carrying a breakdown is labelled too
                 # rather than skipped for not being the short form.
-                _t0, _n0 = _ANSWER_FOOTER_RE.subn(
+                _t0, _n0 = _CONFIDENCE_LINE_RE.subn(
                     lambda m: (
                         m.group(0).rstrip().rstrip("]")
                         + " — the model's own estimate; this turn "
@@ -55596,8 +55750,18 @@ class Filter:
             # result independent of how many footers there are and of
             # which form each takes.
             _text = _last["content"]
-            _stripped, _n_gone = _ANSWER_FOOTER_RE.subn("", _text)
-            _last["content"] = _stripped.rstrip() + "\n\n" + _line
+            _stripped, _n_gone = _strip_answer_footer(_text)
+            # The rule comes back with the block. _strip_answer_footer took
+            # it away deliberately — a divider dividing nothing is worse
+            # than none — but the directive asks the model to put one there,
+            # so rebuilding without it makes the stored history a different
+            # shape from the answer on screen. Two forms of one thing is how
+            # the next turn learns the wrong one by example.
+            _last["content"] = (
+                _stripped.rstrip() + "\n\n---\n\n" + _line
+                if _stripped.strip()
+                else _line
+            )
             self._log_debug(
                 f"outlet: confidence footer set to the measured tally "
                 f"({_settled}/{_total}); {_n_gone} pre-existing footer(s) "
