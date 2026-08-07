@@ -553,6 +553,11 @@ def _strip_answer_footer(text: str) -> Tuple[str, int]:
     _n = 0
     _in_fence = False
     _pending_rule = ""
+    # Set once a footer line has been seen, so the rule CLOSING the block
+    # leaves with it. The block is fenced above and below; strip it and
+    # keep the lower fence and the answer ends on a divider dividing
+    # nothing, which is the same failure the upper one already had.
+    _seen_footer = False
     # Blank lines after a held rule travel with it: dropped, the rule glues
     # to the heading below and the paragraph break the reader scans by is
     # gone; kept unconditionally, they pile up where the rule was removed.
@@ -579,17 +584,24 @@ def _strip_answer_footer(text: str) -> Tuple[str, int]:
             _n += 1
             _pending_rule = ""
             _held_blanks = []
+            _seen_footer = True
             continue
         # A rule is held back one line: it leaves with the block it
         # introduces and stays when the next line is ordinary content.
         if re.fullmatch(r"[ \t]*-{3,}[ \t]*", _line):
+            if _seen_footer:
+                _seen_footer = False
+                continue
             if _pending_rule:
                 _out.append(_pending_rule)
             _pending_rule = _line
             continue
+        if _seen_footer and not _line.strip():
+            continue
         if _pending_rule and not _line.strip():
             _held_blanks.append(_line)
             continue
+        _seen_footer = False
         if _pending_rule:
             _out.append(_pending_rule)
             _out.extend(_held_blanks)
@@ -24503,8 +24515,13 @@ class AgenticSynthesisComposer:
                 "say that instead of implying it does."
             ),
         }
+        # H2 for the two sections the reader came for, bold for the rest.
+        # The hierarchy is the point: Conclusion and How to proceed answer
+        # the question and say what to do next, and everything under them
+        # develops that — a flat run of eight equal headings gives the eye
+        # nothing to land on first.
         _opening = (
-            "**Conclusion** — "
+            "## **Conclusion** — "
             + _bodies.get(
                 use_case,
                 "the single mechanism you hold responsible, named "
@@ -24517,39 +24534,29 @@ class AgenticSynthesisComposer:
         out: List[str] = [
             "",
             "Structure your reply with these headed sections, in this "
-            "order, EVERY heading translated into the language you are "
-            "answering in. Write each in your own prose — this is a shape "
-            "to fill, never a template to copy:",
+            "order. Write each in your own prose — this is a shape to "
+            "fill, never a template to copy:",
             "",
-            "TRANSLATE the headings below into the language you are "
-            "answering in — ALL of them, including the last ones. Measured: "
-            "one answer carried English headings over Spanish prose all the "
-            "way down, which is what happens when this instruction is read "
-            "once at the top and the list runs long. Translate them; do not "
-            "reword them. 'Most likely explanation' came back as 'La "
-            "afirmación es correcta', and a heading the reader cannot find "
-            "twice in the same place stops being a landmark. The one "
-            "exception is the Stats block at the very end — copied "
-            "character for character, in English, for the reason given "
-            "where it is handed to you.",
-            "",
-            "The FIRST heading is the word Conclusion, translated and "
-            "nothing else. It is not a slot for what you concluded: two "
-            "runs in a row it came back as 'La afirmación es correcta', "
-            "which is the finding and not the label, and a reader "
-            "scanning for the same landmark in every answer no longer "
-            "finds one. Put the finding in the paragraph underneath, "
-            "where it belongs.",
-            "",
-            "The lines of three hyphens between the headings below are part "
-            "of the answer, not punctuation in this instruction: reproduce "
-            "each one, on its own line, exactly where it appears. Measured: "
-            "the rule was shown in the list and written by nobody, because "
-            "a shape displayed reads as the instruction's own formatting "
-            "unless the instruction says to copy it. They mark the four "
-            "groups the reader scans by — what they came for, what is still "
-            "open, the detail and its limits — and a group boundary nobody "
-            "draws is a grouping nobody sees.",
+            # One instruction where four used to stack. They overlapped, and
+            # the last one to arrive won: adding "reproduce each one exactly
+            # where it appears" for the rules put COPY nearest the list, and
+            # the next run came back with every heading in English over
+            # Spanish prose — a model resolving two mandates by taking the
+            # closer one. Translated headings and verbatim rules are not in
+            # tension, but only if one sentence says which is which.
+            "Two rules for that list, and they do not conflict. The "
+            "HEADINGS are labels: translate every one into the language you "
+            "are answering in — all of them, including the last — and "
+            "translate only, never reword. 'Most likely explanation' came "
+            "back once as 'La afirmación es correcta', which is the finding "
+            "and not the label, and a heading the reader cannot find in the "
+            "same place twice stops being a landmark; put the finding in "
+            "the paragraph underneath. The LINES OF THREE HYPHENS are "
+            "content: copy each one verbatim, on its own line, exactly "
+            "where it appears. They mark the four groups the reader scans "
+            "by — what they came for, what is still open, the detail and "
+            "its limits — and a group boundary nobody draws is a grouping "
+            "nobody sees.",
             "",
             "This list is CLOSED and each heading appears exactly ONCE. Do "
             "not add sections of your own, and do not repeat one you "
@@ -24559,6 +24566,12 @@ class AgenticSynthesisComposer:
             "two answers to the same question and no way to tell which one "
             "you meant. Omit any section whose content this turn does not "
             "have; an empty heading is worse than a missing one.",
+            "",
+            # A literal rule, not a group sentinel. The sentinels resolve to
+            # rules only BETWEEN groups and a leading one is dropped by
+            # design; this one opens the answer, so it is written straight
+            # into the list where nothing can collapse it.
+            "---",
             "",
             _opening,
             "",
@@ -24581,7 +24594,7 @@ class AgenticSynthesisComposer:
         # ── Step 5: where the reader goes next ──
         out += [
             "",
-            "**How to proceed** — the next concrete step, ordered so "
+            "## **How to proceed** — the next concrete step, ordered so "
             "the one that settles the most uncertainty comes first: "
             "the symbol to read, the check to run, the thing to "
             "instrument. Actionable, not generic advice.",
@@ -28359,7 +28372,12 @@ class AgenticOrchestrator:
                     "This turn's evidence was counted. Close your answer "
                     "with a horizontal rule on its own line — three "
                     "hyphens, like the ones separating the groups above — "
-                    "and then a **Stats** section containing "
+                    "and then a **Stats** section. Start both at the LEFT "
+                    "MARGIN, with no indentation: when the section above "
+                    "ends in a bulleted list, continuing at that list's "
+                    "indent makes the whole block a continuation of the "
+                    "last bullet, and it renders inside it. Two answers in "
+                    "one run came back that way. The section contains "
                     "exactly these lines, all of them, in this order, "
                     + "copied character for character. Do NOT translate this "
                     "block, unlike the section headings above: the outlet "
@@ -28367,7 +28385,11 @@ class AgenticOrchestrator:
                     "measured values, and a translated label is not replaced "
                     "and rides into the next turn's history. And do NOT write "
                     "a confidence line of your own — your own estimate is not "
-                    "measured and predicts nothing:\n\n" + _t_line
+                    "measured and predicts nothing. Close with one more "
+                    "horizontal rule underneath the block, so the measured "
+                    "lines are fenced off from whatever follows them the "
+                    "way they are fenced off from the answer above:\n\n"
+                    + _t_line
                 )
                 # Logged whole. The cut used to be [:60], which landed
                 # exactly on the boundary where the reason a rival survived
@@ -55772,10 +55794,14 @@ class Filter:
             # so rebuilding without it makes the stored history a different
             # shape from the answer on screen. Two forms of one thing is how
             # the next turn learns the wrong one by example.
+            # Fenced above and below, the same shape the directive asks
+            # for. _strip_answer_footer took both rules away with the block;
+            # putting only the upper one back would leave the stored history
+            # a different shape from the answer on screen.
             _last["content"] = (
-                _stripped.rstrip() + "\n\n---\n\n" + _line
+                _stripped.rstrip() + "\n\n---\n\n" + _line + "\n\n---"
                 if _stripped.strip()
-                else _line
+                else _line + "\n\n---"
             )
             self._log_debug(
                 f"outlet: confidence footer set to the measured tally "
