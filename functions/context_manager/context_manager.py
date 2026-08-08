@@ -485,6 +485,14 @@ _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 # than no rules at all.
 _GROUP_BREAK = "\x00GROUP\x00"
 
+# Written into a design_tests step's output when the repair pass ran, and
+# read back to decide whether the conclusion should tell the story. A
+# sentinel and not a phrase: the first version looked for "The blocks above
+# are", which a step describing what it had read would produce on its own,
+# and a turn that never repaired anything would have been told to explain
+# the bug it fixed.
+_REPAIR_MARK = "\x00REPAIRED\x00"
+
 
 def _resolve_group_breaks(lines: List[str]) -> List[str]:
     """Turn group sentinels into rules, dropping the ones with nothing to separate.
@@ -19604,6 +19612,11 @@ if __name__ == "__main__":
         self._broker = broker
         self._classifier = AgenticTestabilityClassifier()
         self._runner = AgenticSandboxRunner(filter_ref)
+        # design_tests pairs whose tests went red, waiting for the repair
+        # pass. Per instance, not per class: a mutable default on the class
+        # is shared by every instance and outlives the turn, so one turn's
+        # failures would queue up behind the next one's.
+        self._pending_repairs: List[Tuple[Any, str, str, Dict[str, Any], str]] = []
 
     # ── Step entry point ─────────────────────────────────────────────────
 
@@ -19687,39 +19700,18 @@ if __name__ == "__main__":
         # PASSED and FAILED — so a run that passed 5/5 and a run that failed
         # 4/5 both came out "inconclusive", and the Stats line said so for a
         # whole session.
+        # Counted from the recorded verdicts rather than from the target
+        # list: a symbol the classifier refused, or a harness that never
+        # ran, is not an execution that happened. Fed into the turn-wide
+        # tally so a design_tests run earlier in the same turn survives —
+        # _step_verdicts is cleared at the top of every dynamic step, and
+        # design_tests sorts before this one.
         _v = list(getattr(self, "_step_verdicts", []) or [])
-        _passed = _v.count("pass")
+        for _sv in _v:
+            self._note_execution("symbol", _sv)
         _failed = _v.count("fail")
         _skipped = _v.count("io_bound") + _v.count("skipped")
-        _other = len(_v) - _passed - _failed - _skipped
-
-        # Stashed for the Stats block, where the Code action line reports
-        # the effect of the axis that opened this gate. Counted from the
-        # rendered verdicts rather than from the target list, so a symbol
-        # the classifier refused or a harness that never ran is not
-        # reported as an execution that happened.
-        # A symbol the classifier refused was never executed, so it is
-        # reported apart from one whose harness ran and said nothing
-        # conclusive. Collapsing the two would let "io_bound, left to
-        # static" read as a failed experiment.
-        _ran = _passed + _failed + _other
-        _bits = []
-        if _passed:
-            _bits.append(f"{_passed} passed")
-        if _failed:
-            _bits.append(f"{_failed} refuted")
-        if _other:
-            _bits.append(f"{_other} inconclusive")
-        _parts = []
-        if _ran:
-            _parts.append(
-                f"{_ran} symbol{'' if _ran == 1 else 's'} executed, "
-                + ", ".join(_bits)
-            )
-        if _skipped:
-            _parts.append(f"{_skipped} not executable")
-        if _parts:
-            self._f._measured_execution = " · ".join(_parts)
+        _ran = len(_v) - _skipped
         # The step's own summary, on every path including the empty one. A
         # step that picks targets, spends thirty seconds and records no
         # verdicts leaves the Stats line without its execution clause, and
@@ -20283,6 +20275,71 @@ if __name__ == "__main__":
         )
         ledger.claims.append(claim)
 
+    def _note_execution(self, kind: str, status: str) -> None:
+        """Add one executed unit to the turn's Stats clause.
+
+        Separate from _step_verdicts, which run_dynamic_step clears at the
+        top of every dynamic step: design_tests sorts BEFORE verify_dynamic,
+        so its verdicts were wiped by the next step that ran, and in a turn
+        with no dynamic step at all nobody read them. Either way the reader
+        watched tests execute in the status stream and then met a Stats
+        block that did not mention them.
+        """
+        _acc = getattr(self._f, "_execution_tally", None)
+        if not isinstance(_acc, list):
+            _acc = []
+        _acc.append((kind, status))
+        self._f._execution_tally = _acc
+        # Recomposed here, not by whoever happens to run last. The clause
+        # used to be built only inside run_dynamic_step, so a turn with a
+        # design_tests run and no dynamic step filled the tally and left
+        # the clause empty — the reader watched tests execute and met a
+        # Stats block that did not mention them. One writer for the tally
+        # and the same writer for the line it produces: they cannot drift.
+        self._f._measured_execution = self._render_execution_clause()
+
+    def _render_execution_clause(self) -> str:
+        """The Stats clause for everything this turn actually ran.
+
+        Composed from the turn-wide tally rather than from one step's
+        verdicts, so a design_tests run and a verify_dynamic run in the
+        same turn are both counted instead of the second overwriting the
+        first. Named by kind because they are not the same thing: a symbol
+        was pulled from the reader's module, a test pair was written by the
+        turn, and a repair was the turn's second attempt at its own work.
+        """
+        _acc = list(getattr(self._f, "_execution_tally", None) or [])
+        if not _acc:
+            return ""
+        _skipped = sum(1 for _k, _s in _acc if _s in ("io_bound", "skipped"))
+        _ran = [(k, v) for k, v in _acc if v not in ("io_bound", "skipped")]
+        _parts = []
+        for _label, _kind in (
+            ("symbol", "symbol"),
+            ("test run", "tests"),
+            ("repair", "repair"),
+        ):
+            _g = [v for k, v in _ran if k == _kind]
+            if not _g:
+                continue
+            _p = _g.count("pass")
+            _f = _g.count("fail")
+            _o = len(_g) - _p - _f
+            _bits = []
+            if _p:
+                _bits.append(f"{_p} passed")
+            if _f:
+                _bits.append(f"{_f} refuted")
+            if _o:
+                _bits.append(f"{_o} inconclusive")
+            _parts.append(
+                f"{len(_g)} {_label}{'' if len(_g) == 1 else 's'}, "
+                + ", ".join(_bits)
+            )
+        if _skipped:
+            _parts.append(f"{_skipped} not executable")
+        return " · ".join(_parts)
+
     def _note_verdict(self, status: str) -> None:
         """Record one target's outcome for the step to count.
 
@@ -20324,7 +20381,8 @@ if __name__ == "__main__":
             f"({result.get('passed', 0)}/{result.get('total', 0)})"
         )
         if result.get("failures"):
-            base += f" — first failure: {result['failures'][0][:160]}"
+            _fl = [str(x) for x in result["failures"]]
+            base += f" — first of {len(_fl)} failure(s): {_fl[0][:160]}"
         if status in ("rejected", "error", "timeout") and result.get("detail"):
             base += f" — {result['detail'][:160]}"
         return base
@@ -20598,6 +20656,225 @@ if __name__ == "__main__":
         )
         await self._cache_put(project_id, pseudo, "", tests, {"status": "pending"})
         self._f._log_debug(f"🤖 DynamicVerifier: design tests persisted as {pseudo}")
+        return tests, pseudo
+
+    _REPAIR_CONTRACT = (
+        "A test this turn wrote failed against code this turn wrote. Both "
+        "halves are shown below; exactly one of them is wrong.\n\n"
+        "## The code under test\n```python\n{code}\n```\n\n"
+        "## The tests\n```python\n{tests}\n```\n\n"
+        "## What happened\n{detail}\n\n"
+        "Decide which half is at fault and repair THAT one. A test that "
+        "asserts something the code was never asked to do is the wrong "
+        "half; so is a test that encodes a misreading of the spec. Do not "
+        "change both, and do not weaken a test merely to make it pass — a "
+        "green suite bought that way is worse than a red one.\n\n"
+        "Return ONLY a fenced python block containing BOTH halves in full, "
+        "the repaired one repaired and the other byte-identical, in the "
+        "order shown. No prose."
+    )
+
+    async def repair_and_rerun(
+        self,
+        step: "AgenticStep",
+        code: str,
+        tests: str,
+        result: Dict[str, Any],
+        pseudo: str,
+        ledger: "AgenticEvidenceLedger",
+        project_id: str,
+        aligned_prefix: str = "",
+    ) -> bool:
+        """Repair a failing design_tests pair and run it again, once.
+
+        A red assert reported and left alone is a turn that found a bug and
+        shipped it. The reader asked for tests and for the code to work; the
+        evidence needed to fix it — which assert, on which body, with what
+        message — exists here and nowhere else, and by the next turn it has
+        become a summary.
+
+        Bounded to a single attempt on purpose. A repair loop that keeps
+        going trades a red suite for a green one obtained by attrition, and
+        the one thing worse than a failing test is a test weakened until it
+        passes. One pass, re-run, and whatever comes out is reported as it
+        is.
+
+        Only for code the turn itself wrote. Both halves come from the same
+        step, so repairing either is legitimate; the same move against the
+        reader's own module would be rewriting code on the word of a
+        harness built with stand-in valves.
+
+        Returns:
+            True when a repaired pair ran and the run was recorded.
+        """
+        # ── Step 1: one attempt, and only when there is budget for the rerun ──
+        _spent = int(getattr(self._f, "_dynamic_targets_this_turn", 0) or 0)
+        if _spent >= max(1, self._f.valves.agentic_dynamic_max_per_turn):
+            self._f._log_debug(
+                f"🤖 design_tests {pseudo}: failure left unrepaired — the "
+                f"per-turn execution cap ({_spent}) leaves no budget to "
+                f"verify a repair, and an unverified repair is a guess"
+            )
+            return False
+
+        # Every failure the runner collected, not just the first. It keeps
+        # up to five and only the first ever reached anything; with all of
+        # them in view the repair can see that four asserts fail for one
+        # reason instead of fixing a symptom and re-running into the next.
+        _fails = [str(x) for x in (result.get("failures") or [])][:5]
+        _detail = (
+            f"{result.get('passed', 0)}/{result.get('total', 0)} asserts passed"
+            + (
+                "; failures:\n" + "\n".join(f"  - {x[:300]}" for x in _fails)
+                if _fails
+                else ""
+            )
+            + (f"\ndetail: {str(result.get('detail'))[:300]}" if result.get("detail") else "")
+        )
+        await self._f._emit_status(
+            "🤖 Agentic: a test failed — repairing and re-running once"
+        )
+
+        # ── Step 2: ask which half is wrong, and get both back ──
+        _resp = await self._f._llm.call_llm(
+            system_prompt=aligned_prefix,
+            user_prompt=self._REPAIR_CONTRACT.format(
+                code=code[:6000], tests=tests[:4000], detail=_detail
+            ),
+            max_tokens=self._f.valves.agentic_harness_max_tokens,
+            label="agentic_repair",
+            enable_thinking=False,
+        )
+        _m = re.search(r"```(?:python)?\s*(.*?)```", _resp or "", re.S)
+        _fixed = (_m.group(1) if _m else "").strip()
+        if not _fixed or "def test_" not in _fixed:
+            self._f._log_debug(
+                f"🤖 design_tests {pseudo}: repair produced nothing usable — "
+                f"the original failure stands and is reported as it was"
+            )
+            return False
+
+        # ── Step 3: run the repaired pair, and report whatever comes out ──
+        self._f._dynamic_targets_this_turn = _spent + 1
+        _result2 = await self._runner.run(self._compose(_fixed, ""))
+        await self._cache_put(project_id, pseudo, "", _fixed, _result2)
+        self._note_verdict(str(_result2.get("status", "error")))
+        self._note_execution("repair", str(_result2.get("status", "error")))
+        # The verdict has to say which block to hand over. Appending the
+        # repaired pair leaves THREE code blocks in the workspace and the
+        # first of them is the broken one; the synthesis reads all three
+        # and nothing marks the difference, so the answer can carry the
+        # version that fails. The heading below is the marker.
+        _verdict = (
+            "SUPERSEDED — do not reproduce the earlier blocks; the pair "
+            "below is the one to give the reader"
+            if str(_result2.get("status")) == "pass"
+            else "REPAIR ATTEMPTED AND STILL RED — give the reader the pair "
+            "below and say plainly that it does not pass"
+        )
+        step.output = (
+            (step.output or "")
+            + f"\n\n{_REPAIR_MARK}\n### The blocks above are {_verdict}.\n\n"
+            + "```python\n"
+            + _fixed
+            + "\n```\n\n"
+            + self._format_line(pseudo, "design", _result2, "repaired")
+        )
+        self._f._log_debug(
+            f"🤖 design_tests {pseudo}: repaired and re-ran · "
+            f"was {result.get('passed', 0)}/{result.get('total', 0)} → "
+            f"now {_result2.get('status')} "
+            f"{_result2.get('passed', 0)}/{_result2.get('total', 0)}"
+            + (
+                f" first_failure={str(_result2.get('failures', [''])[0])[:200]}"
+                if _result2.get("failures")
+                else ""
+            )
+        )
+        self._append_evidence(ledger, step.id, pseudo, _result2, cached=False)
+        await self._f._emit_status(
+            f"🤖 Agentic: repaired · {_result2.get('status')} "
+            f"({_result2.get('passed', 0)}/{_result2.get('total', 0)})"
+        )
+        return True
+
+    async def run_design_tests_now(
+        self,
+        step: "AgenticStep",
+        tests: str,
+        pseudo: str,
+        ledger: "AgenticEvidenceLedger",
+        project_id: str,
+    ) -> None:
+        """Run a design_tests step's own tests against its own code, this turn.
+
+        design_tests wrote both halves — the code under test and the tests
+        for it — and until now it persisted them and ran nothing, so the
+        turn that asked "generate tests and check everything works" checked
+        nothing. The inter-turn loop picks the tests up on the NEXT turn,
+        which answers a question the reader asked on this one.
+
+        Both halves come from the same step, which is what makes acting on
+        a failure safe here and not elsewhere: a verify_dynamic harness
+        tests a symbol torn out of the reader's module against stand-in
+        valves, so a red assert may be an artefact of the scaffold. Here
+        nobody else owns either side. A failure is the turn's own, and so
+        is the fix.
+        """
+        # ── Step 1: the code under test, from the step's own output ──
+        _blocks = re.findall(r"```(?:python)?\s*(.*?)```", step.output or "", re.S)
+        _code = ""
+        for _b in _blocks:
+            if "def test_" in _b:
+                continue
+            if re.search(r"(?m)^\s*(def|class)\s", _b):
+                _code = _b.strip()
+                break
+        if not _code:
+            self._f._log_debug(
+                f"🤖 design_tests {pseudo}: tests written but no code block to "
+                f"run them against — left for the inter-turn check"
+            )
+            return
+
+        # ── Step 2: compose and run, under the same caps as everything else ──
+        _spent = int(getattr(self._f, "_dynamic_targets_this_turn", 0) or 0)
+        if _spent >= max(1, self._f.valves.agentic_dynamic_max_per_turn):
+            self._f._log_debug(
+                f"🤖 design_tests {pseudo}: per-turn execution cap reached "
+                f"({_spent}) — left for the inter-turn check"
+            )
+            return
+        self._f._dynamic_targets_this_turn = _spent + 1
+        _harness = self._compose(_code, tests)
+        _result = await self._runner.run(_harness)
+        await self._cache_put(project_id, pseudo, "", tests, _result)
+
+        # ── Step 3: record it where every other verdict is recorded ──
+        self._note_verdict(str(_result.get("status", "error")))
+        self._note_execution("tests", str(_result.get("status", "error")))
+        _line = self._format_line(pseudo, "design", _result, "design_tests")
+        step.output = (step.output or "") + "\n\n" + _line
+        self._f._log_debug(
+            f"🤖 design_tests {pseudo}: ran its own tests · "
+            f"status={_result.get('status')} "
+            f"{_result.get('passed', 0)}/{_result.get('total', 0)}"
+            + (
+                f" first_failure={str(_result.get('failures', [''])[0])[:200]}"
+                if _result.get("failures")
+                else ""
+            )
+        )
+        self._append_evidence(ledger, step.id, pseudo, _result, cached=False)
+        # Parked for the repair pass, which runs after every step is done —
+        # the point where the turn knows the most and has not yet written
+        # anything. Only genuine reds: a harness that never ran says
+        # nothing about the code and repairing on that evidence would be
+        # editing working code to satisfy a broken scaffold.
+        if str(_result.get("status")) == "fail" and not self._suspect_reason_of(
+            _result
+        ):
+            self._pending_repairs.append((step, _code, tests, _result, pseudo))
 
 
 # ==========================================================================
@@ -24339,6 +24616,22 @@ class AgenticSynthesisComposer:
             and (s.output or "").strip()
             for s in plan.steps
         )
+        # A repair happened when the step carries the marker the repair pass
+        # writes. Read from the output rather than from a flag on the
+        # verifier: the step is what the synthesis will actually see, so if
+        # the marker is not there the reader would not have had the repaired
+        # block either, and asking for a story about it would be asking for
+        # one that is not in front of them.
+        _had_repair = False
+        for _s in plan.steps:
+            if _REPAIR_MARK in (_s.output or ""):
+                _had_repair = True
+                # Stripped once read. The sentinel exists to survive from
+                # the repair pass to here; past this point step.output is
+                # workspace material the model reads, and a NUL-wrapped
+                # token in the middle of it is noise it has to step over.
+                _s.output = (_s.output or "").replace(_REPAIR_MARK + "\n", "")
+                _s.output = _s.output.replace(_REPAIR_MARK, "")
         _vc = ledger.verification_counts() if ledger is not None else {}
         lines += self._answer_format_directive(
             ok,
@@ -24376,6 +24669,7 @@ class AgenticSynthesisComposer:
             _use_case,
             _asked_for_artifact,
             _has_tests,
+            _had_repair,
         )
         return "\n".join(lines).rstrip()
 
@@ -24401,6 +24695,7 @@ class AgenticSynthesisComposer:
         use_case: str = "",
         asked_for_artifact: bool = False,
         has_tests: bool = False,
+        had_repair: bool = False,
     ) -> List[str]:
         """
         Instruct the final model on the SHAPE of its answer.
@@ -24537,6 +24832,18 @@ class AgenticSynthesisComposer:
                 "that instead of promoting the least bad candidate.",
             )
             + " One short paragraph. Everything below is its development."
+            + (
+                " This turn wrote code, ran tests against it, and one of "
+                "them went red — say so HERE: what the test expected, why "
+                "the first version did not give it, and what changed. The "
+                "block further down is the repaired one and it arrives "
+                "without a history; a reader who meets working code with "
+                "no account of the bug it used to have learns nothing from "
+                "the turn that found it. If the repair did not go green, "
+                "that is the conclusion: say what still fails."
+                if had_repair
+                else ""
+            )
         )
         out: List[str] = [
             "",
@@ -24681,7 +24988,12 @@ class AgenticSynthesisComposer:
                 # — and taught by example the exact habit the sentence
                 # forbids: a fence inside a line of prose.
                 "## **Code** — only if a concrete change or snippet is "
-                "warranted. Fence every block: open with a line holding "
+                "warranted AND it is not already going into Tests below. "
+                "When this turn wrote a tested pair, the code lives with "
+                "its tests in one runnable block and belongs there alone; "
+                "repeating it here gives the reader two copies and no way "
+                "to tell which one was the one that ran. "
+                "Fence every block: open with a line holding "
                 "three backticks followed by the language (python, and so "
                 "on), and close with a line holding three backticks and "
                 "nothing else. Never leave a block unterminated, never "
@@ -26611,6 +26923,14 @@ class AgenticOrchestrator:
         Runs only behind run_pipeline's slot gate and fail-open boundary, so
         it may assume a free slot and raise freely on internal errors.
         """
+        # Cleared at the START of the turn, not only after the repair pass
+        # reads it. The pass sits near the tail and the pipeline can crash
+        # before reaching it — it has a handler that degrades the turn and
+        # carries on — and anything left in the queue would then be
+        # repaired on the NEXT turn: a step object from a conversation that
+        # has moved on, against tests nobody is waiting for.
+        self._dyn._pending_repairs = []
+
         # EC-6 anchors need the USER'S question, not the planner's
         # paraphrase: stored per turn (same pattern as the
         # preplanner's question type) so the forge and the judge
@@ -27405,8 +27725,23 @@ class AgenticOrchestrator:
 
                 step.digest = self._digest(step.output)
                 if step.kind == "design_tests":
-                    await self._dyn.persist_design_tests(step, project_id)
+                    _dt = await self._dyn.persist_design_tests(step, project_id)
                     self._dyn.arm_tdd_verification(step, project_id)
+                    # Run them now as well as arming the inter-turn check.
+                    # The two are not alternatives: this answers the reader's
+                    # question on the turn they asked it, and the armed check
+                    # still catches the implementation they write afterwards.
+                    if _dt and self._f.valves.agentic_exec_mode == "subprocess":
+                        try:
+                            await self._dyn.run_design_tests_now(
+                                step, _dt[0], _dt[1], self._ledger, project_id
+                            )
+                        except Exception as _e_dt:
+                            self._f._log_debug(
+                                f"🤖 design_tests: in-turn run failed "
+                                f"({type(_e_dt).__name__}: {_e_dt}) — the "
+                                f"inter-turn check still stands"
+                            )
                 if use_cache:
                     await self._cache.put(
                         project_id,
@@ -27979,6 +28314,44 @@ class AgenticOrchestrator:
                 "🤖 Agentic: generative evaluation skipped (early-exit fired)"
             )
             _ge_mode = "off"
+        # ── The repair pass, before the probe for a better angle ──
+        #
+        # Here and not earlier: every step has run, so the ledger holds the
+        # hypotheses, the evidence and the verdicts, and the turn knows the
+        # most it will ever know. Here and not later: nothing has been
+        # written yet, so a repair still reaches the answer instead of
+        # correcting one already given.
+        #
+        # And here rather than next turn, which was the alternative. The
+        # assert, the body it ran against and the message it printed live
+        # in THIS ledger; by the next turn they are a summary, and a
+        # summary is not enough to fix anything with.
+        #
+        # No confirmation is asked for. A reader who says "generate tests
+        # and check it works" is asking for it to work, and stopping to ask
+        # whether they meant it would be answering a question they did not
+        # pose.
+        try:
+            _repairs = list(getattr(self._dyn, "_pending_repairs", []) or [])
+            self._dyn._pending_repairs = []
+            for _st, _code, _tests, _res, _pseudo in _repairs:
+                await self._dyn.repair_and_rerun(
+                    _st,
+                    _code,
+                    _tests,
+                    _res,
+                    _pseudo,
+                    self._ledger,
+                    project_id,
+                    aligned_prefix,
+                )
+        except Exception as _e_rp:
+            self._f._log_debug(
+                f"🤖 Agentic: repair pass failed "
+                f"({type(_e_rp).__name__}: {_e_rp}) — the original verdicts "
+                f"stand and the turn proceeds"
+            )
+
         # The probe for a better angle, and the waves it may propose,
         # are optional; the steps already run and the claims already in
         # the ledger are not. Unguarded, a failure here reached the
@@ -53972,6 +54345,10 @@ class Filter:
         # them as executions is the failure this whole subsystem's
         # _suspect_reason_of guard exists to prevent one level down.
         self._measured_execution: str = ""
+        # Everything the sandbox ran this turn, as (kind, status) pairs.
+        # Turn-wide because two different steps feed it and one of them
+        # clears its own per-step list.
+        self._execution_tally: List[Tuple[str, str]] = []
         # Symbols the sandbox has executed so far THIS turn, across every
         # verify_dynamic step the plan carries. Cleared per turn beside the
         # rest of the per-turn state.
@@ -54658,6 +55035,7 @@ class Filter:
             self._measured_reading_lines = ""
             self._measured_reinforcement = ""
             self._measured_execution = ""
+            self._execution_tally = []
             self._dynamic_targets_this_turn = 0
             self._answer_is_verbatim_echo = False
             self._prelim_stable_this_turn = ""
