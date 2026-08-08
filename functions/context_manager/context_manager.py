@@ -20939,9 +20939,14 @@ if __name__ == "__main__":
         # real repair and on every outline call, and both were caught by
         # their own guards — so the turn carried on, reported the failing
         # test unrepaired, and the only trace was one line in the log.
+        # `prompt`, not `user_prompt`. Two names were invented for this one
+        # call in two consecutive patches — first the orchestrator's, then
+        # its parameter's — and both times the guard around it swallowed the
+        # error and the turn carried on. A name is worth one grep before it
+        # is worth a run.
         _resp = await self._f._llm_orchestrator.call_llm(
             system_prompt=aligned_prefix,
-            user_prompt=self._REPAIR_CONTRACT.format(
+            prompt=self._REPAIR_CONTRACT.format(
                 code=code[:6000], tests=tests[:4000], detail=_detail
             ),
             max_tokens=self._f.valves.agentic_harness_max_tokens,
@@ -24454,7 +24459,7 @@ class AgenticSynthesisComposer:
         try:
             _resp = await self._f._llm_orchestrator.call_llm(
                 system_prompt=aligned_prefix,
-                user_prompt=self._OUTLINE_CONTRACT.format(
+                prompt=self._OUTLINE_CONTRACT.format(
                     sections="\n".join(f"- {x}" for x in sections),
                     langname=_names,
                 ),
@@ -25610,143 +25615,52 @@ class AgenticSynthesisComposer:
                 "graph could not confirm. State it plainly. An "
                 "acknowledged gap is worth more to the reader than a "
                 "confident sentence papering over it.\n\n"
-                "ONE RULE COVERS EVERY LIST BELOW: name it in this "
-                "section, and give it the voice of a verified finding "
-                "nowhere else in the reply. Each list adds only what is "
-                "particular to it.",
+                "The items this turn could not settle are listed below, "
+                "each under the kind of gap it is. They are DATA for this "
+                "section, not text to reproduce: write them into your prose "
+                "in your own words, and give none of them the voice of a "
+                "verified finding anywhere else in the reply.",
             ]
-            if n_unchecked or n_unsupported:
-                _parts = []
-                if n_unchecked:
-                    _parts.append(
-                        f"{n_unchecked} claim(s) marked NOT CHECKED in the "
-                        f"workspace, against which no verification ran at all"
-                    )
-                if n_unsupported:
-                    _parts.append(
-                        f"{n_unsupported} claim(s) whose check ran and came "
-                        f"back unsupported by the indexed graph"
-                    )
-                out += [
-                    "",
-                    # The gap lists each restated one rule in their own
-                    # words — five paragraphs for one principle. Stated
-                    # once above, each list now carries only its own
-                    # nuance, and a shorter instruction is one the model
-                    # still has in view at the end of a long answer.
-                    "Carried " + " and ".join(_parts) + ". An unchecked "
-                    "claim may well be true; what is certain is that "
-                    "nothing here establishes it.",
-                ]
+            # Labelled data, not five paragraphs of prose. Each gap type
+            # used to wrap its own list in a sentence of guidance — "These
+            # symbols are asserted about and the index holds no body for
+            # them: X, Y. Anything resting on them rests on their name
+            # alone. Do not tell the reader to read them…" — and an answer
+            # reproduced the whole block VERBATIM under the heading, all
+            # five parts, instruction and list alike. Read in sequence under
+            # a section title, that is exactly what section content looks
+            # like. A labelled list cannot be mistaken for prose.
+            _rows: List[Tuple[str, str]] = []
+            if n_unchecked:
+                _rows.append(("never checked", f"{n_unchecked} claim(s)"))
+            if n_unsupported:
+                _rows.append(
+                    ("checked, unsupported by the graph", f"{n_unsupported} claim(s)")
+                )
             if dropped_gaps:
-                # Named as a decision, not as a suggestion. The reader who
-                # knows the pipeline stopped for budget asks again; the
-                # reader who reads it as advice does the work by hand.
-                out += [
-                    "",
-                    "This investigation identified what it still needed "
-                    "and ran out of room to fetch it: "
-                    + "; ".join(dropped_gaps)
-                    + ". Say so in that section, as a limit this run hit "
-                    "rather than as something the reader ought to look "
-                    "into — it is the difference between a gap that "
-                    "another pass would close and one that needs them.",
-                ]
+                _rows.append(("wanted but out of room", "; ".join(dropped_gaps)))
             if unreadable_subjects:
-                # These are not budget. The index could not produce a body
-                # for them at all, so no further pass helps and telling the
-                # reader to go and read them is telling them to look for
-                # something that is not there.
+                _rows.append(
+                    ("no body in the index", ", ".join(unreadable_subjects))
+                )
+            if unsettled_claims:
+                _rows.append(
+                    ("tested, came back unsettled", "; ".join(unsettled_claims))
+                )
+            if unsettled_subjects:
+                _rows.append(
+                    ("behaviour never established", ", ".join(unsettled_subjects))
+                )
+            if _rows:
+                out += [""] + [f"- {_k}: {_v}" for _k, _v in _rows]
+            if unsettled_claims or unsettled_subjects:
                 out += [
                     "",
-                    "These symbols are asserted about and the index holds "
-                    "no body for them: "
-                    + ", ".join(unreadable_subjects)
-                    + ". Anything resting on them rests on their name "
-                    "alone. Do not tell the reader to read them — there "
-                    "is nothing to read; say the symbol could not be "
-                    "found, which is a different and more useful fact.",
+                    "Two of those bear on the opening paragraph: a claim "
+                    "that came back unsettled may not be asserted there, "
+                    "nor its opposite; a symbol whose behaviour was never "
+                    "established may be named but not described.",
                 ]
-            if _scope_gap:
-                out += [
-                    "",
-                    "The investigation sealed its verdict having "
-                    "examined only part of the call tree; these "
-                    "lines of enquiry were never read: "
-                    + ", ".join(_unw)
-                    + ". State this plainly in that section — the "
-                    "conclusion's evidence stops where the "
-                    "investigation stopped.",
-                ]
-        # ── Step 2.5: the sentences this turn did NOT establish ──
-        # Handed as a list rather than as a rule. The rule was already
-        # there — `may not assert what you are about to list below as
-        # unverified` — and an answer opened by stating a set is cleared
-        # at end of turn, then admitted four paragraphs later that nobody
-        # had read the function that would clear it. Asking the model to
-        # find the relevant verdicts, filter them and apply them is a join
-        # performed while generating, at the point in the answer where it
-        # has done least work and is under most pressure to sound
-        # definite.
-        #
-        # The measured-confidence line settled this question once already:
-        # the same model ignored `do not write an estimate of your own`
-        # for runs and then copied a supplied line character for character
-        # the turn it was given one. Copying beats applying, so the
-        # propositions are computed here and printed.
-        _unsettled = [_u for _u in (unsettled_claims or []) if _u]
-        if _unsettled:
-            out += [
-                "",
-                "These statements were put to the test this turn and did "
-                "NOT come back settled. Your opening paragraph may not "
-                "assert any of them, and may not assert their opposite "
-                "either — nothing here establishes the negative:",
-            ]
-            for _u in _unsettled[:6]:
-                # Hyphen, not an en dash: markdown only accepts -, * or +
-                # as a list marker, so "  – x" renders as indented prose
-                # that runs into the paragraph above it instead of as an
-                # item. The two sibling lists in this method already use a
-                # hyphen; these two did not, and they are the two the
-                # reader was seeing malformed.
-                out.append(f"- {_u}")
-            out += [
-                "",
-                "If your opening rests on one of them, say so in that "
-                "paragraph, in the same breath as the claim, not four "
-                "paragraphs later. A reader who stops after the opening — "
-                "which is what putting it first invites — must not be left "
-                "holding a sentence this investigation failed to "
-                "establish.",
-            ]
-
-        # The symbols, beside the propositions. The list above names
-        # statements, and the answers that broke it did not restate them —
-        # they asserted something NEW about the same symbols. Four openings
-        # of one run named an unsettled symbol, and two of them gave
-        # Filter._audit_opening_against_ledger a causal role it does not
-        # have, saying it lowers the confidence figure when all it does is
-        # write a log line. A rule against restating a sentence does not
-        # reach that; a rule about the symbol does.
-        #
-        # Same set the outlet's audit uses, so the instruction and the
-        # check that reports on it are measuring one thing. They were
-        # measuring two, which is why one stayed quiet while the other
-        # fired on four turns in five.
-        _unsub = [_s for _s in (unsettled_subjects or []) if _s]
-        if _unsub:
-            out += [
-                "",
-                "Nothing this turn settled what these symbols DO:\n"
-                + "\n".join(f"- {_s}" for _s in _unsub[:8]),
-                "",
-                "Your opening paragraph may name them — an explanation often "
-                "has to — but it may not state what they do, what they "
-                "return, or what they cause. If one of them carries your "
-                "opening, say in that same sentence that its behaviour "
-                "was not established this turn.",
-            ]
 
         return _split_heading_lines(_resolve_group_breaks(out))
 
@@ -29095,9 +29009,24 @@ class AgenticOrchestrator:
                             "pass is unlikely to help"
                         )
                     _t_open.append(
-                        f"{_t_ind} rival account"
-                        + ("s" if _t_ind > 1 else "")
-                        + " the evidence did not rule out"
+                        # The arithmetic has to show. The figure divides by
+                        # (1 + surviving rivals), so a reader who sees "31%"
+                        # beside "20 of 32 settled" cannot reconcile the two
+                        # — 20 of 32 is 62, and nothing on the line said a
+                        # rival took the other half. Confidence is an alarm;
+                        # an alarm whose cause is invisible is one the
+                        # reader learns to discount.
+                        #
+                        # "hypothesis", not "account": the sections were
+                        # renamed and this line was missed.
+                        f"{_t_ind} rival hypothes"
+                        + ("es" if _t_ind > 1 else "is")
+                        + " the evidence did not rule out, "
+                        + (
+                            f"dividing the figure by {1 + _t_ind}"
+                            if _t_ind > 1
+                            else "halving the figure"
+                        )
                         + _why
                     )
                 # ── How the turn was read, and what it actually did ──
@@ -29325,7 +29254,11 @@ class AgenticOrchestrator:
                     "were going to write is written: do NOT add another one "
                     "here, and in particular do not write next steps again "
                     "because the answer feels like it should end with them. "
-                    "It ends with the block below and nothing else.\n"
+                    "It ends with the block below and nothing else — the "
+                    "last character of your answer is the closing rule "
+                    "under it. Do not start another heading after it: one "
+                    "answer ended with a bare '##' and nothing to follow, "
+                    "which is the shape of a habit finishing itself.\n"
                     "This turn's evidence was counted. Close your answer "
                     "with a horizontal rule on its own line — three "
                     "hyphens, like the ones separating the groups above — "
@@ -37590,7 +37523,8 @@ class HypothesisForge:
                 except Exception:
                     _rv.relation_to_winner = ""
             _note += (
-                f" | {len(_rivals)} rival account(s) also survived "
+                f" | {len(_rivals)} rival hypothes"
+                f"{'es' if len(_rivals) != 1 else 'is'} also survived "
                 f"(corroboration "
                 + ", ".join(f"{d.corroboration:.2f}" for d in _rivals[:3])
                 + ")"
@@ -56734,9 +56668,18 @@ class Filter:
             _conf = (_settled / _total) / (1 + _indep)
             if _indep:
                 _open.append(
-                    f"{_indep} rival account"
-                    + ("s" if _indep > 1 else "")
-                    + " the evidence did not rule out"
+                    # Same wording and same arithmetic as the pipeline's
+                    # version: two composers writing one line, and a reader
+                    # who saw them differ would have no way to know which
+                    # was the real one.
+                    f"{_indep} rival hypothes"
+                    + ("es" if _indep > 1 else "is")
+                    + " the evidence did not rule out, "
+                    + (
+                        f"dividing the figure by {1 + _indep}"
+                        if _indep > 1
+                        else "halving the figure"
+                    )
                 )
             if _compl:
                 _open.append(
