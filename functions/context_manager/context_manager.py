@@ -9463,13 +9463,22 @@ class ContextBuilder:
         workspace, which is where "last" actually is. See
         MessageAssembler._build_code_preferences_restatement.
         """
+        # Labelled like every other note to the model, not wrapped in
+        # italic brackets. The bracketed form reads as an editorial aside
+        # belonging to the document, and the sibling that used it — the
+        # code-preferences restatement — was reproduced verbatim in an
+        # answer. These three sit in the same position and would go the
+        # same way. The bracketed style is right in ONE place: the
+        # ingestion acknowledgement, which the READER sees and the model
+        # does not.
+        _NOTE = "[WORKSPACE NOTE — not part of your answer]\n"
         tails = {
-            "A": "_[Architecture mode: focus on contracts, interfaces, and invariants. "
-            "Reasoning guidelines from system above apply.]_",
-            "D": "_[Refactor mode: identify all callers before proposing changes. "
-            "Code review checklist from system above applies.]_",
-            "E": "_[Scaffold mode: signatures only, no implementation. "
-            "Guidelines from system above apply.]_",
+            "A": _NOTE + "ARCHITECTURE MODE: focus on contracts, interfaces "
+            "and invariants; the reasoning guidelines above apply.",
+            "D": _NOTE + "REFACTOR MODE: identify all callers before "
+            "proposing changes; the code review checklist above applies.",
+            "E": _NOTE + "SCAFFOLD MODE: signatures only, no "
+            "implementation; the guidelines above apply.",
         }
         # The former default tail ("_[Reasoning mode: code review checklist
         # + critical reasoning guidelines from system above apply to this
@@ -25594,10 +25603,10 @@ class AgenticSynthesisComposer:
                 "copy of the function under test — bare, no commentary, "
                 "there only so the tests have something to call — then the "
                 "tests, then the runner.\n\n"
-                "COPY IT EVEN WHEN IT IS THE READER'S OWN CODE and appears "
-                "under Code above: this block sees nothing outside itself, "
-                "so without the copy every test dies on NameError. If it is "
-                "long, copy only the part the tests exercise.\n\n"
+                "COPY IT EVEN WHEN IT IS THE READER'S OWN CODE shown under "
+                "Code: this block sees nothing outside itself, so without "
+                "the copy every test dies on NameError. If it is long, copy "
+                "only the part the tests exercise.\n\n"
                 # The runner is GIVEN, not described. Four patches described
                 # it and the model found a new door each time: unittest,
                 # then unittest.main() calling sys.exit, then `if __name__
@@ -25686,7 +25695,17 @@ class AgenticSynthesisComposer:
                 "dataclasses, typing — each one you use — and never os, "
                 "sys, pathlib, subprocess, socket, open(), or anything "
                 "this project defines.\n\n"
-                "For a method, put a small stand-in class here.\n\n"
+                # "No test class" is the rule that was implied and not
+                # stated. An answer wrote its tests as methods of a
+                # TestQualifySymbolName class — the unittest habit — and the
+                # runner called them unbound: seven TypeErrors for a missing
+                # `self`. The runner takes bare callables, so the tests have
+                # to be bare functions; a class may appear only as a
+                # stand-in for the subject.
+                "NEVER put the test functions inside a test class — the "
+                "runner calls them unbound and each fails on a missing "
+                "`self`. A class here is only a stand-in for the "
+                "subject.\n\n"
                 "Do NOT reproduce a harness from a dynamic verification "
                 "step: throwaway probes against stand-in objects, already "
                 "reported.",
@@ -45671,7 +45690,20 @@ class MessageAssembler:
         if not _rules:
             return ""
         # ── Step 2: render as one bracketed line ───────────────────────────
-        return "_[When you write code in this reply: " + "; ".join(_rules) + ".]_"
+        # Labelled, not bracketed. The old form — italic square brackets —
+        # reads as an editorial note belonging to the document, and this
+        # string sits LAST, immediately before generation, which is the
+        # position most likely to be copied. An answer reproduced the whole
+        # thing verbatim, brackets and all, as a paragraph of its reply.
+        #
+        # Same fix as the workspace labels: a marker the answer never uses
+        # cannot be mistaken for part of the answer.
+        return (
+            "[WORKSPACE NOTE — not part of your answer]\n"
+            "WHEN YOU WRITE CODE IN THIS REPLY: "
+            + "; ".join(_rules)
+            + "."
+        )
 
     def _assemble_final_system_and_log(
         self,
