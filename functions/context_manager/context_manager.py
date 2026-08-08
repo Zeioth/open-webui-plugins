@@ -19676,7 +19676,18 @@ class AgenticSandboxRunner:
                             data = json.loads(line)
                             passed = int(data.get("passed", 0))
                             total = int(data.get("total", 0))
-                            status = "pass" if total > 0 and passed == total else "fail"
+                            # Zero tests is not a failure, it is an empty
+                            # harness. Folding it into "fail" sent a 0/0
+                            # result into the repair queue, where the model
+                            # was asked which half of a pair was wrong when
+                            # neither half had been exercised. It also read
+                            # as a refuted claim in the Stats clause.
+                            if total <= 0:
+                                status = "empty"
+                            elif passed == total:
+                                status = "pass"
+                            else:
+                                status = "fail"
                             return {
                                 "status": status,
                                 "passed": passed,
@@ -20382,6 +20393,8 @@ if __name__ == "__main__":
         status = result.get("status", "error")
         if status in ("error", "timeout", "rejected"):
             return f"harness did not run (status={status})"
+        if status == "empty":
+            return "harness ran but defined no tests"
         if (
             status == "fail"
             and int(result.get("passed", 0)) == 0
@@ -20504,8 +20517,12 @@ if __name__ == "__main__":
         _acc = list(getattr(self._f, "_execution_tally", None) or [])
         if not _acc:
             return ""
-        _skipped = sum(1 for _k, _s in _acc if _s in ("io_bound", "skipped"))
-        _ran = [(k, v) for k, v in _acc if v not in ("io_bound", "skipped")]
+        _skipped = sum(
+            1 for _k, _s in _acc if _s in ("io_bound", "skipped", "empty")
+        )
+        _ran = [
+            (k, v) for k, v in _acc if v not in ("io_bound", "skipped", "empty")
+        ]
         _parts = []
         for _label, _kind in (
             ("symbol", "symbol"),
