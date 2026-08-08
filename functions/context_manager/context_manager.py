@@ -512,6 +512,76 @@ def _clip_words(text: str, limit: int) -> str:
     return _cut.rstrip(" ,;:") + "…"
 
 
+# The eight section headings, already written in each language the emitter
+# can produce. Asking the model to translate them was tried and measured:
+# the instruction was stated once, then three times, then anchored to the
+# reader's own question, and answers still came back with English headings
+# over Spanish prose. Obedience is not something a longer sentence buys.
+# Handing over the words already translated takes the model out of the
+# decision entirely — the rule it kept breaking no longer exists.
+#
+# Stats is absent on purpose: it is the one heading the outlet matches
+# literally, so it stays English in every language.
+_SECTION_HEADINGS: Dict[str, Dict[str, str]] = {
+    "en": {
+        "conclusion": "Conclusion",
+        "proceed": "How to proceed",
+        "code": "Code",
+        "tests": "Tests",
+        "rivals": "Other plausible hypotheses",
+        "buried": "Hypotheses ruled out",
+        "evidence": "What the evidence shows",
+        "gaps": "What was not verified",
+    },
+    "es": {
+        "conclusion": "Conclusión",
+        "proceed": "Cómo proceder",
+        "code": "Código",
+        "tests": "Tests",
+        "rivals": "Otras hipótesis plausibles",
+        "buried": "Hipótesis descartadas",
+        "evidence": "Lo que muestra la evidencia",
+        "gaps": "Lo que no se verificó",
+    },
+}
+
+# Function words, which appear in ordinary prose and almost never inside an
+# identifier. Counting them beats looking for accents: "¿Qué hace
+# SymbolIndex.compute_structure_hash?" has one accented word and six English
+# identifiers, and an accent-based guess calls it English.
+_LANG_MARKERS: Dict[str, Tuple[str, ...]] = {
+    "es": (
+        "que", "para", "con", "los", "las", "una", "del", "por", "este",
+        "esta", "cuando", "porque", "sobre", "desde", "entre", "qué",
+        "cómo", "hace", "está", "son", "hay", "más", "pero", "si", "el",
+        "la", "de", "en", "y", "o", "no", "se", "un", "es", "al", "lo",
+    ),
+    "en": (
+        "the", "that", "with", "for", "this", "when", "because", "from",
+        "between", "which", "does", "into", "what", "how", "is", "are",
+        "and", "or", "not", "a", "an", "of", "to", "in", "it", "on",
+    ),
+}
+
+
+def _question_language(question: str) -> str:
+    """Which language's headings to emit, from the reader's own question.
+
+    A function-word count, not a model call: it runs on every turn, it must
+    not fail, and a wrong guess costs a heading in the wrong language rather
+    than anything structural. Ties and empty questions fall back to English,
+    which is what the emitter produced before this existed.
+    """
+    _w = re.findall(r"[a-záéíóúñü]+", (question or "").lower())
+    if not _w:
+        return "en"
+    _score = {
+        _k: sum(1 for _x in _w if _x in _v) for _k, _v in _LANG_MARKERS.items()
+    }
+    _best = max(_score, key=lambda k: _score[k])
+    return _best if _score[_best] > _score.get("en", 0) else "en"
+
+
 def _split_heading_lines(lines: List[str]) -> List[str]:
     """Put every heading on a line of its own, its brief on the next.
 
@@ -8267,6 +8337,65 @@ class ContextBuilder:
                 "section and the conversation history over this map."
             )
 
+        # ══════════════════════════════════════════════════════════════
+        # WHAT THE ANSWERING MODEL IS TOLD — the whole map, in one place
+        # ══════════════════════════════════════════════════════════════
+        #
+        # Five separate places write instructions that all land in front of
+        # the same model, and none of them could see the others. That is how
+        # a valve came to ask for a confidence line while the answer
+        # directive forbade one, and how a paragraph about the [Tn] mark
+        # outlived the mark itself. The map lives here, beside the first of
+        # them, and any sixth writer belongs on this list.
+        #
+        #   WHERE                              WHAT                  CACHED
+        #   ---------------------------------- --------------------- ------
+        #   1 valves.confidence_prompt          a confidence line     yes
+        #     (this method, just below)         the directive forbids
+        #
+        #   2 this method                       code-review checklist yes
+        #                                       reasoning guidelines
+        #
+        #   3 _answer_format_directive          the eight sections,   no
+        #     (AgenticSynthesisComposer)        three rules, ~1.9k
+        #                                       tokens
+        #
+        #   4 _run_pipeline_inner               the Stats block to    no
+        #     ([WORKSPACE NOTE] labels)         copy, and the closing
+        #                                       "add nothing" note
+        #
+        #   5 dynamic_injections                per-turn notes from
+        #     (trailing)                        gates and commands
+        #
+        # CACHED matters more than length. 1 and 2 sit inside Block A, the
+        # KV prefix: changing a character there costs a full re-prefill of
+        # ~70,000 tokens, measured at 517 tok/s — about 135 seconds, once,
+        # on the next turn. 3, 4 and 5 ride in the user turn and are free to
+        # change. Batch any edit to 1 or 2 rather than paying that twice.
+        #
+        # PROPORTION, measured on a real turn: the system prompt is 299,422
+        # characters and 88% of it is the call graph and the skeleton, which
+        # are reference and not instruction. Everything on this list is
+        # about 2% of what the model reads. Trimming instructions is worth
+        # doing for the DECISIONS it removes, not for the tokens.
+        #
+        # ROADMAP, in order of return over risk:
+        #   a. Delete anything here that contradicts the directive, and
+        #      anything describing a mechanism that no longer exists. Free,
+        #      and a contradiction costs more attention than its length.
+        #   b. Give the model words instead of rules wherever it has to
+        #      choose: headings now arrive translated from a table because
+        #      three wordings of "translate them" all failed. The same move
+        #      is available anywhere a rule keeps being broken.
+        #   c. An agentic step that writes the section OUTLINE — one line
+        #      per section — leaving prose to the final model, which is the
+        #      only caller that sees conversation history (2-8 user turns,
+        #      against 1-4 for a step). That would let 3 shrink from ~1.9k
+        #      tokens to a few hundred. Costs one extra generation, ~20s.
+        #   d. NOT the whole answer as a step: it would lose the history the
+        #      final model has, and giving a step that history would break
+        #      the aligned prefix the auxiliary calls depend on.
+        #
         # 5.1 Base instructions (completely static)
         if is_code_session and self._f.valves.enable_confidence_scoring:
             parts.append(self._f.valves.confidence_prompt.strip())
@@ -20805,7 +20934,12 @@ if __name__ == "__main__":
         )
 
         # ── Step 2: ask which half is wrong, and get both back ──
-        _resp = await self._f._llm.call_llm(
+        # _llm_orchestrator, which is what the other forty-five call sites
+        # use. Writing self._f._llm here raised AttributeError on the first
+        # real repair and on every outline call, and both were caught by
+        # their own guards — so the turn carried on, reported the failing
+        # test unrepaired, and the only trace was one line in the log.
+        _resp = await self._f._llm_orchestrator.call_llm(
             system_prompt=aligned_prefix,
             user_prompt=self._REPAIR_CONTRACT.format(
                 code=code[:6000], tests=tests[:4000], detail=_detail
@@ -21600,7 +21734,15 @@ class AgenticPlanner:
         "acceptance tests for it, then run them against each other — use it "
         "whenever the request is to build or implement something, so what "
         "the reader gets has been checked instead of merely read; a failing "
-        "test is repaired once and re-run before the answer is written), "
+        "test is repaired once and re-run before the answer is written. "
+        "A REQUEST FOR TESTS IS A REQUEST TO BUILD THEM: 'generate "
+        "acceptance tests for X and check it works' needs this step, and "
+        "needs it EVEN WHEN X IS ALREADY IN THE INDEX — the reader is "
+        "asking for tests that do not exist yet, not for a reading of a "
+        "symbol that does. Measured: that exact request was planned as "
+        "three investigate steps because the symbol resolved, so no step "
+        "ever wrote the tests and the answer improvised them under a "
+        "heading of its own), "
         "analyze (reason and conclude).\n"
         "- The LAST step must be analyze.\n"
         "- Each goal must be self-contained (understandable without the "
@@ -24267,6 +24409,90 @@ class AgenticSynthesisComposer:
     # 1. Workspace rendering
     # ──────────────────────────────────────────────────────────────────────
 
+    _OUTLINE_CONTRACT = (
+        "The investigation is finished. Below is its workspace. Say, in ONE "
+        "line each, what belongs in each of these sections of the answer "
+        "about to be written:\n\n{sections}\n\n"
+        "Write each line in {langname}. Name the finding, not the topic: "
+        '"the empty-string guard returns before the loop" and not "how the '
+        'guard works". A section this turn has nothing for gets the single '
+        "word SKIP.\n\n"
+        "Return ONLY the section names and their lines, one per line, in "
+        "the order given. No prose, no preamble, no code."
+    )
+
+    async def compose_outline(
+        self,
+        plan: "AgenticPlan",
+        question: str,
+        ledger: "AgenticEvidenceLedger",
+        aligned_prefix: str,
+        lang: str,
+        sections: List[str],
+    ) -> str:
+        """One line per section, written while the workspace is still in view.
+
+        The answer directive spends three quarters of its length explaining
+        what each section is FOR — 5,535 characters of rationale against
+        1,015 of instruction. That rationale exists because the final model
+        has to decide what belongs where, from a workspace it reads once.
+        Decided here instead, the directive can hand it the decision and
+        keep only the shape: measured, 1,863 tokens down to about 467.
+
+        Prose stays with the final model on purpose. That model is the only
+        caller carrying conversation history — two to eight user turns
+        against one to four for a step — so it is the only one that can
+        write "as you saw last turn" and have it mean anything.
+
+        Returns:
+            The outline, or "" on any failure, in which case the caller
+            keeps the full directive. A thin outline is worse than none:
+            the fallback is not a degraded mode, it is the mode that
+            already works.
+        """
+        _names = {"es": "Spanish", "en": "English"}.get(lang, "English")
+        try:
+            _resp = await self._f._llm_orchestrator.call_llm(
+                system_prompt=aligned_prefix,
+                user_prompt=self._OUTLINE_CONTRACT.format(
+                    sections="\n".join(f"- {x}" for x in sections),
+                    langname=_names,
+                ),
+                max_tokens=1200,
+                label="agentic_outline",
+                enable_thinking=False,
+            )
+        except Exception as _e:
+            self._f._log_debug(
+                f"🤖 Outline: call failed ({type(_e).__name__}: {_e}) — the "
+                f"full directive stands"
+            )
+            return ""
+        # Fences are dropped and "#" is NOT: the section names are "##
+        # **Conclusión**" and so on, so filtering lines that start with a
+        # hash threw away every heading the next check then looked for.
+        # The outline came back complete and was discarded as empty.
+        _lines = [
+            _l.strip()
+            for _l in (_resp or "").splitlines()
+            if _l.strip() and not _l.strip().startswith("```")
+        ]
+        # Every section named, or none: a partial outline would leave the
+        # final model with instructions for some sections and silence for
+        # the rest, which is worse than the uniform version of either.
+        _named = sum(1 for _l in _lines if any(_s in _l for _s in sections))
+        if _named < len(sections):
+            self._f._log_debug(
+                f"🤖 Outline: {_named} of {len(sections)} section(s) named — "
+                f"discarded, the full directive stands"
+            )
+            return ""
+        self._f._log_debug(
+            f"🤖 Outline: {_named} section(s) planned in {_names} "
+            f"({len(_resp or '')} chars)"
+        )
+        return "\n".join(_lines)
+
     def render(
         self,
         plan: AgenticPlan,
@@ -24692,10 +24918,36 @@ class AgenticSynthesisComposer:
         # section is offered only when a step actually pulled code
         # into the workspace — asking for it otherwise invites a
         # fabricated snippet.
-        _has_code = any(
-            ("```" in (s.output or "")) or ("```" in (s.digest or ""))
-            for s in plan.steps
-        )
+        # A fence is not enough. Any fence anywhere opened this section, and
+        # design_tests ALWAYS carries fences — its tests live in them — so
+        # Code opened on every turn that planned one, with nothing of its
+        # own to hold. The model found an open section and filled it with
+        # what it had: one answer shipped the same seven test functions
+        # under Code and again under Tests, and Code held no implementation
+        # at all. A block that defines only test_* functions is the Tests
+        # section's content, not this one's.
+        _has_code = False
+        for _s in plan.steps:
+            for _blk in re.findall(
+                r"```(?:python)?\s*(.*?)```", (_s.output or ""), re.S
+            ):
+                _defs = re.findall(
+                    r"(?m)^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)", _blk
+                )
+                _cls = re.findall(r"(?m)^\s*class\s+[A-Za-z_]", _blk)
+                # The runner counts as test material too. Naming it
+                # run_all_tests rather than test_* is the convention, and
+                # taking it for implementation reopened the section this
+                # check exists to keep shut.
+                if _cls or any(
+                    not _d.startswith("test_")
+                    and _d not in ("run_all_tests", "run_tests", "main")
+                    for _d in _defs
+                ):
+                    _has_code = True
+                    break
+            if _has_code:
+                break
         # A design_tests step that completed wrote acceptance tests meant to
         # be kept; that is the only thing the Tests section is for. Read
         # from the plan's own steps rather than from the presence of a fence
@@ -24760,6 +25012,8 @@ class AgenticSynthesisComposer:
             _asked_for_artifact,
             _has_tests,
             _had_repair,
+            _question_language(question),
+            getattr(self._f, "_answer_outline", "") or "",
         )
         return "\n".join(lines).rstrip()
 
@@ -24786,6 +25040,8 @@ class AgenticSynthesisComposer:
         asked_for_artifact: bool = False,
         has_tests: bool = False,
         had_repair: bool = False,
+        lang: str = "en",
+        outline: str = "",
     ) -> List[str]:
         """
         Instruct the final model on the SHAPE of its answer.
@@ -24916,13 +25172,50 @@ class AgenticSynthesisComposer:
                 "say that instead of implying it does."
             ),
         }
+        _H = _SECTION_HEADINGS.get(lang) or _SECTION_HEADINGS["en"]
+
+        # With an outline in hand the long form is redundant: a step that
+        # read the whole workspace has already decided what belongs where,
+        # so what remains is the shape and the content, not the reasoning
+        # behind either. Without one — the call failed, or came back naming
+        # only some sections — the long form is what still works, and it is
+        # returned untouched rather than in some thinner variant nobody has
+        # run.
+        if outline.strip():
+            return _resolve_group_breaks(
+                [
+                    "",
+                    "Structure your reply with these headed sections, in "
+                    "this order, and write each one in your own prose:",
+                    "",
+                    "1. COPY every line of three hyphens exactly where it "
+                    "appears, including the FIRST, which is the first line "
+                    "of your answer and not the end of this instruction.",
+                    "",
+                    "2. WRITE EACH HEADING EXACTLY AS IT APPEARS, letter "
+                    "for letter. They are already in the right language; do "
+                    "not translate them and do not reword them.",
+                    "",
+                    "3. Omit any section marked SKIP. Do not add sections "
+                    "of your own and do not repeat one you already wrote.",
+                    "",
+                    "The line under each heading says what this turn "
+                    "established for it. Develop it into prose against the "
+                    "workspace above; do not simply restate it.",
+                    "",
+                    "---",
+                    "",
+                    outline.strip(),
+                ]
+            )
+
         # H2 for the two sections the reader came for, bold for the rest.
         # The hierarchy is the point: Conclusion and How to proceed answer
         # the question and say what to do next, and everything under them
         # develops that — a flat run of eight equal headings gives the eye
         # nothing to land on first.
         _opening = (
-            "## **Conclusion** — "
+            f"## **{_H['conclusion']}** — "
             + _bodies.get(
                 use_case,
                 "the single mechanism you hold responsible, named "
@@ -24994,24 +25287,37 @@ class AgenticSynthesisComposer:
             # came back with Spanish prose under English headings — the body
             # translated, the titles copied — which is the shape of a model
             # obeying both readings at once.
-            "2. TRANSLATE every heading into THE LANGUAGE THE READER WROTE "
-            "THEIR QUESTION IN, whatever language this instruction happens "
-            "to be in. Every heading, including the last on the page, and "
-            "in the same language as the prose beneath it. Translate the "
-            "words; never reword them, and never replace a heading with "
-            "what you found.",
+            # No translation rule any more. The headings below arrive in
+            # the reader's language already, chosen from a table, so there
+            # is nothing left to translate and nothing left to get wrong.
+            # Three wordings were tried and measured — stated once, stated
+            # three times, anchored to the reader's own question — and
+            # answers still came back with English headings over Spanish
+            # prose. The rule was replaced rather than rewritten a fourth
+            # time: the reliable way to have a model use a word is to give
+            # it the word.
+            "2. WRITE EACH HEADING EXACTLY AS IT APPEARS, letter for "
+            "letter. They are already in the right language; do not "
+            "translate them, do not reword them, and never replace one "
+            "with what you found.",
             "",
-            "3. Start with Conclusion. It is the only section that is "
-            "always required, and three answers in one run left it out.",
+            # "three answers in one run left it out" was in the text the
+            # model reads. It does not need the history, it needs the rule;
+            # the history belongs here, where whoever weakens this rule can
+            # see what it cost.
+            "3. Start with Conclusion. It is the only section always "
+            "required.",
             "",
+            # The next-steps clause ran three sentences on why repeating
+            # them is bad, and a turn repeated How to proceed anyway. What
+            # catches it is the "Before you close" note, which arrives at
+            # the moment of the mistake; the reasoning here only added
+            # length to a rule already stated.
             "This list is CLOSED and each heading appears exactly ONCE. Do "
             "not add sections of your own, and do not repeat one you "
-            "already wrote. Next steps in particular belong where they are "
-            "listed here and nowhere else: writing them again at the end "
-            "because that is where they usually go leaves the reader with "
-            "two answers to the same question and no way to tell which one "
-            "you meant. Omit any section whose content this turn does not "
-            "have; an empty heading is worse than a missing one.",
+            "already wrote — next steps included. Omit any section whose "
+            "content this turn does not have; an empty heading is worse "
+            "than a missing one.",
             "",
             # A literal rule, not a group sentinel. The sentinels resolve to
             # rules only BETWEEN groups and a leading one is dropped by
@@ -25042,7 +25348,7 @@ class AgenticSynthesisComposer:
             "",
             _GROUP_BREAK,
             "",
-            "## **How to proceed** — the next concrete step, ordered so "
+            f"## **{_H['proceed']}** — the next concrete step, ordered so "
             "the one that settles the most uncertainty comes first: "
             "the symbol to read, the check to run, the thing to "
             "instrument. Actionable, not generic advice.",
@@ -25100,14 +25406,17 @@ class AgenticSynthesisComposer:
                 # instruction rendered with its own middle as a code block
                 # — and taught by example the exact habit the sentence
                 # forbids: a fence inside a line of prose.
-                "## **Code** — only if a concrete change or snippet is "
+                f"## **{_H['code']}** — only if a concrete change or snippet is "
                 "warranted. THE CODE GOES HERE AND THE TESTS DO NOT: tests "
                 "belong in their own section, and even when there is no "
                 "Tests section they belong in a separate fenced block after "
                 "the code. Never fuse the two into one block — a reader who "
                 "wants to run the code has to hand-strip the tests out of "
                 "it, and one who wants the tests has the same problem in "
-                "reverse. Measured: one answer shipped both fused together. "
+                # "Measured: one answer shipped both fused together" was in
+                # the model's copy. The reason is already stated above; the
+                # anecdote only added length.
+                "reverse. "
                 "Fence every block: open with a line holding "
                 "three backticks followed by the language (python, and so "
                 "on), and close with a line holding three backticks and "
@@ -25131,7 +25440,7 @@ class AgenticSynthesisComposer:
                 "",
                 _GROUP_BREAK,
                 "",
-                "## **Tests** — the acceptance tests this turn wrote and ran, "
+                f"## **{_H['tests']}** — the acceptance tests this turn wrote and ran, "
                 "in full, in ONE fenced block. The TESTS only: the code they "
                 "exercise is in the Code section above and does not belong "
                 "here twice.\n\n"
@@ -25139,13 +25448,20 @@ class AgenticSynthesisComposer:
                 "at the end: a loop that calls each one, catches the "
                 "exception, and prints what passed. NOT unittest and NOT "
                 "pytest. Import every module you use, including the ones "
-                "that feel automatic. Measured, in one run: two blocks died "
-                "on `NameError: name 'unittest' is not defined` and a third "
-                "on `SystemExit: 0`, because unittest.main() calls sys.exit "
-                "and the browser runner reports that as a crash even when "
-                "every test passed. A block the reader cannot press run on "
-                "is a block that has to be rewritten before it is worth "
-                "anything.\n\n"
+                # The measured version named both failures and explained
+                # sys.exit. The model needs the two prohibitions, not the
+                # diagnosis: in one run two blocks died on "NameError:
+                # unittest is not defined" and a third on "SystemExit: 0",
+                # because unittest.main() calls sys.exit and the browser
+                # runner reports that as a crash even when all tests pass.
+                "that feel automatic. Put the runner at the TOP LEVEL: no "
+                "`if __name__ == \"__main__\"` guard, which is False in the "
+                "browser runner and turns the whole block into a definition "
+                "that runs nothing and prints nothing — output that is "
+                "neither a pass nor a failure, which is worse than either. "
+                "The sandbox harness in this codebase uses that guard and "
+                "you may be reading it; it is correct there and wrong "
+                "here.\n\n"
                 "Do NOT reproduce any harness a "
                 "dynamic verification step generated: those are throwaway "
                 "probes built against stand-in objects, they will not run "
@@ -25178,7 +25494,7 @@ class AgenticSynthesisComposer:
         if _rivals:
             out += [
                 "",
-                "## **Other plausible hypotheses** — the competition did not "
+                f"## **{_H['rivals']}** — the competition did not "
                 "eliminate these, and the confidence figure is divided by "
                 "them."
                 + (
@@ -25227,7 +25543,7 @@ class AgenticSynthesisComposer:
                 "",
                 _GROUP_BREAK,
             "",
-            "## **Hypotheses ruled out** — this turn built these "
+            f"## **{_H['buried']}** — this turn built these "
                 "explanations and the index eliminated them. State each in "
                 "a sentence and say what killed it. This is a result, not "
                 "an apology: an explanation removed is work the reader "
@@ -25254,7 +25570,7 @@ class AgenticSynthesisComposer:
         # ── the audit trail: what was checked, and how ──
         out += [
             "",
-            "## **What the evidence shows** — the facts that carry the "
+            f"## **{_H['evidence']}** — the facts that carry the "
             "conclusion: the symbols, call relations and code paths "
             "that were checked against the indexed graph, each stated "
             "so the reader can go and confirm it. Never give an "
@@ -25288,12 +25604,16 @@ class AgenticSynthesisComposer:
                 "",
                 _GROUP_BREAK,
                 "",
-                "## **What was not verified** — what this investigation "
+                f"## **{_H['gaps']}** — what this investigation "
                 "could NOT settle, and why: a symbol absent from the "
                 "index, a step that ran out of room, a relation the "
                 "graph could not confirm. State it plainly. An "
                 "acknowledged gap is worth more to the reader than a "
-                "confident sentence papering over it.",
+                "confident sentence papering over it.\n\n"
+                "ONE RULE COVERS EVERY LIST BELOW: name it in this "
+                "section, and give it the voice of a verified finding "
+                "nowhere else in the reply. Each list adds only what is "
+                "particular to it.",
             ]
             if n_unchecked or n_unsupported:
                 _parts = []
@@ -25309,11 +25629,14 @@ class AgenticSynthesisComposer:
                     )
                 out += [
                     "",
-                    "This investigation carried " + " and ".join(_parts) + ". "
-                    "Name them in that section and do not give them the voice "
-                    "of a verified finding anywhere else in the reply. An "
-                    "unchecked claim may well be true; what is certain is "
-                    "that nothing here establishes it.",
+                    # The gap lists each restated one rule in their own
+                    # words — five paragraphs for one principle. Stated
+                    # once above, each list now carries only its own
+                    # nuance, and a shorter instruction is one the model
+                    # still has in view at the end of a long answer.
+                    "Carried " + " and ".join(_parts) + ". An unchecked "
+                    "claim may well be true; what is certain is that "
+                    "nothing here establishes it.",
                 ]
             if dropped_gaps:
                 # Named as a decision, not as a suggestion. The reader who
@@ -27271,7 +27594,6 @@ class AgenticOrchestrator:
         # plan finalization: mid-loop insertions (NEEDS gap-fill, the
         # hypothesis-refutation retry below) place themselves by position
         # deliberately and are not re-sorted.
-        self._f._plan_step_total = len(plan.steps)
         if self._f.valves.agentic_enforce_step_order:
             # verify BEFORE verify_dynamic, which is the opposite of the
             # order these ranks first carried. _pick_targets chooses what
@@ -27355,6 +27677,13 @@ class AgenticOrchestrator:
         idx = 0
         # Region: budget policy — skip-before-start, essentials always run
         while idx < len(plan.steps):
+            # Refreshed per step, not captured once when the plan was
+            # ready. The plan GROWS — gap-fill and the re-plan wave insert
+            # steps mid-run — and a total taken at the start went stale:
+            # the dynamic verifier's status read "step 2/4" on a run whose
+            # other lines all read "step 2/5". Every other caller reads
+            # len(plan.steps) live; this makes the one that could not.
+            self._f._plan_step_total = len(plan.steps)
             step = plan.steps[idx]
             if step.status != "pending":
                 # Region: surface skipped steps so the trace reads as a
@@ -28392,8 +28721,40 @@ class AgenticOrchestrator:
                         f"re-judged, {len(_still)} not in the index"
                     )
                     # What the index could not produce is a real gap and
-                    # belongs in the answer, not in a log line.
-                    self._f._serial_unreadable_subjects = _still[:5]
+                    # belongs in the answer, not in a log line — EXCEPT for
+                    # code this turn wrote. A design_tests step names its
+                    # own test functions, the index has never seen them,
+                    # and the sweep reported all seven as "asserted about
+                    # but never read": confidence fell from ~100% to 22%
+                    # over functions the turn had just written AND RUN,
+                    # which is the best-established thing in it. An unknown
+                    # symbol is a gap when it should have been in the
+                    # index; one the turn authored was never going to be.
+                    _authored = set()
+                    for _st in plan.steps:
+                        if getattr(_st, "kind", "") != "design_tests":
+                            continue
+                        for _blk in re.findall(
+                            r"```(?:python)?\s*(.*?)```", _st.output or "", re.S
+                        ):
+                            _authored.update(
+                                re.findall(
+                                    r"(?m)^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)",
+                                    _blk,
+                                )
+                            )
+                    _gaps = [
+                        _s
+                        for _s in _still
+                        if _s.rsplit(".", 1)[-1] not in _authored
+                    ]
+                    if len(_gaps) != len(_still):
+                        self._f._log_debug(
+                            f"🤖 Agentic: {len(_still) - len(_gaps)} of "
+                            f"{len(_still)} unknown symbol(s) were written by "
+                            f"this turn — not counted as gaps"
+                        )
+                    self._f._serial_unreadable_subjects = _gaps[:5]
             except Exception as _e_lm:
                 self._f._log_debug(
                     f"🤖 Agentic: last-mile sweep failed ({_e_lm!r}) — the "
@@ -28480,6 +28841,34 @@ class AgenticOrchestrator:
                 f"({type(_e_rp).__name__}: {_e_rp}) — the original verdicts "
                 f"stand and the turn proceeds"
             )
+
+        # ── The outline, after the repair pass and before the probe ──
+        #
+        # Same reasoning as the repair pass and the same moment: every step
+        # has run, the ledger is complete, and nothing has been written. A
+        # step that plans the answer here has the whole workspace in view;
+        # the final model reads it once and has to decide what belongs
+        # where while also writing prose, in the reader's language, to a
+        # shape it is being told about in the same breath.
+        self._f._answer_outline = ""
+        if self._f.valves.agentic_outline_step:
+            try:
+                _lang = _question_language(question)
+                _HH = _SECTION_HEADINGS.get(_lang) or _SECTION_HEADINGS["en"]
+                _secs = [f"## **{_HH[_k]}**" for _k in (
+                    "conclusion", "proceed", "code", "tests",
+                    "rivals", "buried", "evidence", "gaps",
+                )]
+                self._f._answer_outline = await self._composer.compose_outline(
+                    plan, question, self._ledger, aligned_prefix, _lang, _secs
+                )
+            except Exception as _e_ol:
+                self._f._log_debug(
+                    f"🤖 Outline: step failed "
+                    f"({type(_e_ol).__name__}: {_e_ol}) — the full directive "
+                    f"stands"
+                )
+                self._f._answer_outline = ""
 
         # The probe for a better angle, and the waves it may propose,
         # are optional; the steps already run and the claims already in
@@ -28913,7 +29302,15 @@ class AgenticOrchestrator:
                 # sit here could no longer be reached. A branch that cannot
                 # run is a claim about the data that stopped being true.
                 _workspace += (
-                    "\n\n## Your Stats section\n"
+                    # Not an "##" heading. Every section of the answer is
+                    # "##" now, and a workspace label wearing the same
+                    # marker is one the model copies: an answer came back
+                    # with "Your Stats section" written out as a heading of
+                    # its own, directly above the real block. The marker
+                    # used to distinguish instruction from answer; once the
+                    # answer adopted it, it stopped distinguishing anything.
+                    "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                    "YOUR STATS SECTION\n"
                     # The no-repeat rule, restated where it is broken. It
                     # already sits in the header, and an answer broke it
                     # anyway: How to proceed appeared once in its place and
@@ -28922,7 +29319,8 @@ class AgenticOrchestrator:
                     # model reaches the end of a long answer the header is
                     # thousands of tokens behind it; the instruction that
                     # governs a moment has to be readable at that moment.
-                    "\n\n## Before you close\n"
+                    "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                    "BEFORE YOU CLOSE\n"
                     "You are at the end of the answer. Every section you "
                     "were going to write is written: do NOT add another one "
                     "here, and in particular do not write next steps again "
@@ -53251,9 +53649,42 @@ class Valves(BaseModel):
         description="Request a confidence score at the end of each response.",
     )
 
+    agentic_outline_step: bool = Field(
+        default=True,
+        description=(
+            "Plan the answer's sections in an agentic step, while the "
+            "workspace is still in view, and hand the final model one line "
+            "per section instead of the reasoning behind each. Measured: "
+            "the directive drops from ~1,500 tokens to ~210, and the final "
+            "model stops deciding what belongs where — a decision it was "
+            "making from a workspace it reads once.\n\n"
+            "Costs one extra generation, roughly 20s. Fails safe: any error "
+            "or a partial outline discards it and the full directive "
+            "stands. Turn OFF to compare answer quality with and without."
+        ),
+    )
+
     confidence_prompt: str = Field(
-        default="\n\nAfter your response, on a new line, output '[Confidence: XX%]'...",
-        description="Suffix appended to system prompt to request confidence score.",
+        default="",
+        description=(
+            "Suffix appended to Block A asking the model for a confidence "
+            "line. EMPTY by default, and the empty default is the point: "
+            "the answer directive already forbids the model writing a "
+            "confidence line of its own, because the outlet supplies a "
+            "MEASURED one from the ledger. Asking for both put two "
+            "instructions about the same line in front of one model, and "
+            "the model obeyed the prefix — answers came back carrying a "
+            "self-assessed '[Confidence: 95%]' next to a measured tally.\n\n"
+            "It also leaked into every auxiliary call: Block A is the "
+            "aligned prefix, so a JSON-contract call inherited 'output "
+            "[Confidence: XX%]' and appended it after the object, which is "
+            "what broke classify_turn and contradiction detection. "
+            "call_llm still appends a countermand for JSON calls; with this "
+            "empty there is nothing left to countermand.\n\n"
+            "Setting it back is a Block A edit: one full re-prefill of "
+            "~70,000 tokens, about 135s at the measured 517 tok/s, and the "
+            "contradiction returns with it."
+        ),
     )
 
     enable_user_profile: bool = Field(
@@ -54500,6 +54931,8 @@ class Filter:
         # How many steps the plan holds, so the dynamic verifier's status
         # lines can carry the same "N/M (kind)" shape as every other step's.
         self._plan_step_total: int = 0
+        # The per-section outline, when the outline step produced one.
+        self._answer_outline: str = ""
         # Everything the sandbox ran this turn, as (kind, status) pairs.
         # Turn-wide because two different steps feed it and one of them
         # clears its own per-step list.
@@ -55191,6 +55624,7 @@ class Filter:
             self._measured_reinforcement = ""
             self._measured_execution = ""
             self._plan_step_total = 0
+            self._answer_outline = ""
             self._execution_tally = []
             self._dynamic_targets_this_turn = 0
             self._answer_is_verbatim_echo = False
