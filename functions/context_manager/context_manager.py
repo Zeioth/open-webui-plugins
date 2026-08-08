@@ -25610,21 +25610,36 @@ class AgenticSynthesisComposer:
                 # to it, so one habit broke both executions at once. The
                 # tests are pure logic; the list costs one sentence and the
                 # rejection costs the whole turn's evidence.
-                "NO imports from this project and no package name you have "
-                "not seen in the file you were shown: the Code block above "
-                "defines what these tests call, and the reader runs it "
-                "first. Standard library only — and NOT os, sys, pathlib, "
-                "subprocess, socket or open(), which the sandbox refuses to "
-                "run at all. Import everything you use including what feels "
-                "automatic. Test plain functions; "
+                # The allowed list, not the forbidden one, and the
+                # precondition said out loud. Two failures, both mine:
+                #
+                # Naming what is banned left every other module implicitly
+                # fine, and a block imported `code_aware.filter`, a package
+                # that exists nowhere. The allowed list has no such gap —
+                # the same reason the headings come from a table.
+                #
+                # And "the reader runs it first" was an assumption THE
+                # READER COULD NOT KNOW. They press run on the Tests block
+                # and get NameError, because nothing in the answer told them
+                # the Code block has to go first. An instruction to the
+                # model cannot carry a precondition for the person reading;
+                # that has to be written where they will see it.
+                "Import ONLY from this list and nothing else: re, json, "
+                "math, hashlib, itertools, functools, collections, "
+                "textwrap, difflib, string, enum, dataclasses, typing. "
+                "Nothing from this project and none of os, sys, pathlib, "
+                "subprocess, socket or open(), which the sandbox refuses "
+                "outright. Import every one you use.\n\n"
+                "Open the section with one line telling the reader to run "
+                "the Code block above first: the run button executes one "
+                "block at a time. Test plain functions; "
                 "if the subject is a method, give the Code block a small "
                 "stand-in class so there is something to construct here "
                 "rather than testing `self`.\n\n"
-                "Do NOT reproduce any harness a "
-                "dynamic verification step generated: those are throwaway "
-                "probes built against stand-in objects, they will not run "
-                "outside the sandbox that made them, and their verdict is "
-                "already reported without them.",
+                "Do NOT reproduce a harness from a dynamic verification "
+                "step: those are throwaway probes built against stand-in "
+                "objects, they do not run outside the sandbox that made "
+                "them, and their verdict is already reported.",
             ]
 
         out.append(_GROUP_BREAK)
