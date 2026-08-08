@@ -25578,8 +25578,18 @@ class AgenticSynthesisComposer:
                 # Copied, it cannot be got wrong, and there is nothing left
                 # to prohibit — the same move that fixed the headings, which
                 # three wordings of "translate them" could not.
-                "Plain functions named test_1, test_2, … and then EXACTLY "
-                "this runner at the top level, changed only in the names it "
+                # THE RUNNER IS THE POINT, said as a requirement rather
+                # than as part of a sentence about naming. An answer came
+                # back with five test functions, no runner, and nothing
+                # calling them: it defined and ended, so the reader pressed
+                # run and saw no output at all — neither a pass nor a
+                # failure, which reads as a broken block. Tests with nothing
+                # to run them are the most common way this section fails,
+                # and the least visible: everything looks right.
+                "IT MUST END WITH A RUNNER THAT CALLS THE TESTS AND PRINTS "
+                "THE RESULT — test functions alone define and exit, and the "
+                "reader sees nothing. Plain functions named test_1, test_2, "
+                "… then EXACTLY this, changed only in the names it "
                 "lists:\n\n"
                 "```python\n"
                 "_tests = [test_1, test_2]  # every test function, in order\n"
@@ -25638,13 +25648,13 @@ class AgenticSynthesisComposer:
                 # model does not write for, so its restrictions arrived
                 # unexplained.
                 "THIS BLOCK RUNS IN PYODIDE — CPython on WebAssembly, in a "
-                "browser tab, one block at a time. There is no file system, "
-                "no network, no process to exit from, and nothing this "
-                "project defines is reachable. Write for that.\n\n"
-                "So: import ONLY from re, json, math, hashlib, itertools, "
+                "browser tab, one block at a time: no file system, no "
+                "network, no process to exit from.\n\n"
+                "Import ONLY from re, json, math, hashlib, itertools, "
                 "functools, collections, textwrap, difflib, string, enum, "
-                "dataclasses, typing — import each one you use — and never "
-                "os, sys, pathlib, subprocess, socket or open().\n\n"
+                "dataclasses, typing — each one you use — and never os, "
+                "sys, pathlib, subprocess, socket, open(), or anything "
+                "this project defines.\n\n"
                 "Open the section with one line telling the reader to run "
                 "the Code block above first, since each block runs alone. "
                 "Test plain functions; "
@@ -25652,9 +25662,8 @@ class AgenticSynthesisComposer:
                 "stand-in class so there is something to construct here "
                 "rather than testing `self`.\n\n"
                 "Do NOT reproduce a harness from a dynamic verification "
-                "step: those are throwaway probes built against stand-in "
-                "objects, they do not run outside the sandbox that made "
-                "them, and their verdict is already reported.",
+                "step: throwaway probes against stand-in objects, already "
+                "reported.",
             ]
 
         out.append(_GROUP_BREAK)
