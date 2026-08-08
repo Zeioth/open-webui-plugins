@@ -25294,9 +25294,14 @@ class AgenticSynthesisComposer:
                     "Structure your reply with these headed sections, in "
                     "this order, and write each one in your own prose:",
                     "",
+                    # Both halves are measured. One answer dropped the
+                    # opening rule and kept the internal ones; another kept
+                    # the opening one and dropped all six internal.
                     "1. COPY every line of three hyphens exactly where it "
-                    "appears, including the FIRST, which is the first line "
-                    "of your answer and not the end of this instruction.",
+                    "appears — the FIRST one, which is the first line of "
+                    "your answer and not the end of this instruction, AND "
+                    "the one before every heading that follows. A section "
+                    "without its rule above it is a section written wrong.",
                     "",
                     "2. WRITE EACH HEADING EXACTLY AS IT APPEARS, letter "
                     "for letter. They are already in the right language; do "
@@ -25398,9 +25403,15 @@ class AgenticSynthesisComposer:
             # longer carry a dash, so there is nothing left to get wrong.
             "Three rules, all of them:",
             "",
-            "1. COPY every line of three hyphens exactly where it appears, "
-            "including the FIRST, which is the first line of your answer "
-            "and not the end of this instruction.",
+            # Same wording as the outline mode's copy. Two modes stating one
+            # rule differently is how the weaker of them stops being kept
+            # up to date — this one is the fallback, and a fallback that
+            # produces a worse-formed answer is not much of one.
+            "1. COPY every line of three hyphens exactly where it appears — "
+            "the FIRST one, which is the first line of your answer and not "
+            "the end of this instruction, AND the one before every heading "
+            "that follows. A section without its rule above it is a section "
+            "written wrong.",
             "",
             # Anchored to the QUESTION, not to "the language you are
             # answering in". That phrasing was circular: it told the model
@@ -25529,16 +25540,12 @@ class AgenticSynthesisComposer:
                 # — and taught by example the exact habit the sentence
                 # forbids: a fence inside a line of prose.
                 f"## **{_H['code']}** — only if a concrete change or snippet is "
-                "warranted. THE CODE GOES HERE AND THE TESTS DO NOT: tests "
-                "belong in their own section, and even when there is no "
-                "Tests section they belong in a separate fenced block after "
-                "the code. Never fuse the two into one block — a reader who "
-                "wants to run the code has to hand-strip the tests out of "
-                "it, and one who wants the tests has the same problem in "
-                # "Measured: one answer shipped both fused together" was in
-                # the model's copy. The reason is already stated above; the
-                # anecdote only added length.
-                "reverse. "
+                # The defence went out: Tests is self-contained now, so the
+                # two sections no longer compete for the same block and the
+                # rule needs no argument. What remains is the instruction.
+                "warranted. THE CODE GOES HERE AND THE TESTS DO NOT — they "
+                "have their own section, or their own fenced block after "
+                "this one when there is none. "
                 "Fence every block: open with a line holding "
                 "three backticks followed by the language (python, and so "
                 "on), and close with a line holding three backticks and "
@@ -25575,10 +25582,22 @@ class AgenticSynthesisComposer:
                 # Code keeps the implementation with its explanation; this
                 # repeats it bare, as the preamble the tests need. Two
                 # copies with different jobs beat one that cannot run.
+                # "Even when it is the reader's own code" is the case that
+                # keeps failing. A turn that WROTE the function copies it
+                # without prompting; a turn that EXPLAINS one the reader
+                # already has does not — it reasons that the reader has the
+                # code, which is true and beside the point, because the
+                # block cannot see it either way. Measured: a !test turn
+                # about _repair_truncated_json shipped three tests and no
+                # copy, and all three failed with NameError.
                 "in ONE fenced block that RUNS ON ITS OWN. Open it with a "
                 "copy of the function under test — bare, no commentary, "
                 "there only so the tests have something to call — then the "
                 "tests, then the runner.\n\n"
+                "COPY IT EVEN WHEN IT IS THE READER'S OWN CODE and appears "
+                "under Code above: this block sees nothing outside itself, "
+                "so without the copy every test dies on NameError. If it is "
+                "long, copy only the part the tests exercise.\n\n"
                 # The runner is GIVEN, not described. Four patches described
                 # it and the model found a new door each time: unittest,
                 # then unittest.main() calling sys.exit, then `if __name__
@@ -25660,16 +25679,14 @@ class AgenticSynthesisComposer:
                 # that is the SERVER's runner, a different environment the
                 # model does not write for, so its restrictions arrived
                 # unexplained.
-                "THIS BLOCK RUNS IN PYODIDE — CPython on WebAssembly, in a "
-                "browser tab, one block at a time: no file system, no "
-                "network, no process to exit from.\n\n"
+                "IT RUNS IN PYODIDE — CPython on WebAssembly, in a browser "
+                "tab: no files, no network, no process to exit from.\n\n"
                 "Import ONLY from re, json, math, hashlib, itertools, "
                 "functools, collections, textwrap, difflib, string, enum, "
                 "dataclasses, typing — each one you use — and never os, "
                 "sys, pathlib, subprocess, socket, open(), or anything "
                 "this project defines.\n\n"
-                "Test plain functions; for a method, put a small stand-in "
-                "class in this same block and construct it here.\n\n"
+                "For a method, put a small stand-in class here.\n\n"
                 "Do NOT reproduce a harness from a dynamic verification "
                 "step: throwaway probes against stand-in objects, already "
                 "reported.",
@@ -29417,7 +29434,7 @@ class AgenticOrchestrator:
                 # was handed over bare while the instruction still asked for
                 # a rule and a "Stats section" — a section the reader was
                 # told to expect and given nothing to head it with.
-                _reading = ("**Stats**\n" + "\n".join(_axes) + "\n") if _axes else "**Stats**\n"
+                _reading = ("## **Stats**\n" + "\n".join(_axes) + "\n") if _axes else "## **Stats**\n"
                 self._f._measured_reading_lines = _reading
 
                 # "of the N this turn checked", not a bare "N/N claims".
@@ -29479,7 +29496,9 @@ class AgenticOrchestrator:
                     "This turn's evidence was counted. Close your answer "
                     "with a horizontal rule on its own line — three "
                     "hyphens, like the ones separating the groups above — "
-                    "and then a **Stats** section. Start both at the LEFT "
+                    "and then the ## **Stats** section — the same heading "
+                    "shape as every other section, since it is one. Start "
+                    "both at the LEFT "
                     "MARGIN, with no indentation: when the section above "
                     "ends in a bulleted list, continuing at that list's "
                     "indent makes the whole block a continuation of the "
