@@ -509,7 +509,12 @@ def _resolve_group_breaks(lines: List[str]) -> List[str]:
 
 
 _ANSWER_FOOTER_RE = re.compile(
-    r"^[ \t]*(?:\*\*Stats\*\*|"
+    # An optional heading marker before the label: the model was seen
+    # promoting every bold heading to ## in one run, and a "## **Stats**"
+    # the pattern does not recognise is a block nobody strips — it rides
+    # into the next turn's history carrying a measurement of the wrong one.
+    # Tolerating the marker costs nothing; missing it costs a turn.
+    r"^[ \t]*#{0,4}[ \t]*(?:\*{0,2}Stats\*{0,2}[ \t]*$|"
     r"\[(?:Turn|Confidence|Use case|Question type|Code action"
     r"|Reinforcement):[^\]\n]*\])[ \t]*$",
     # The horizontal rule ahead of the block goes with it. The rule exists
@@ -24420,10 +24425,12 @@ class AgenticSynthesisComposer:
         conditionals, so it lives here:
 
         In the order they are emitted, which is the order the reader
-        meets them. A horizontal rule separates the four groups — what the
-        reader came for, what is still open, the detail and its limits,
-        and the measured block — and _resolve_group_breaks drops the rules
-        whose group turned out empty, so two never land together:
+        meets them. Every heading is an `##` and every one carries a
+        horizontal rule above it; _resolve_group_breaks drops the rule of
+        any section this turn omits, so two never land together. Uniform
+        by choice: the earlier shape gave two sections `##` and six bold,
+        and grouped the rules four ways, and the model held neither — a
+        distinction it will not keep is one better not drawn:
 
           Conclusion                always — fixed heading, body by
                                     use_case; everything below develops it
@@ -24544,19 +24551,38 @@ class AgenticSynthesisComposer:
             # Spanish prose — a model resolving two mandates by taking the
             # closer one. Translated headings and verbatim rules are not in
             # tension, but only if one sentence says which is which.
-            "Two rules for that list, and they do not conflict. The "
-            "HEADINGS are labels: translate every one into the language you "
-            "are answering in — all of them, including the last — and "
-            "translate only, never reword. 'Most likely explanation' came "
-            "back once as 'La afirmación es correcta', which is the finding "
-            "and not the label, and a heading the reader cannot find in the "
-            "same place twice stops being a landmark; put the finding in "
-            "the paragraph underneath. The LINES OF THREE HYPHENS are "
-            "content: copy each one verbatim, on its own line, exactly "
-            "where it appears. They mark the four groups the reader scans "
-            "by — what they came for, what is still open, the detail and "
-            "its limits — and a group boundary nobody draws is a grouping "
-            "nobody sees.",
+            # Two rules where there were three. The third said "keep each
+            # heading's level as written" and existed because two sections
+            # were `##` and six were bold; the model promoted all eight and
+            # erased the distinction. Every heading is `##` now, so there is
+            # no level to preserve and no rule needed to preserve it — a
+            # distinction the model will not hold is a distinction better
+            # not drawn.
+            #
+            # ORDER MATTERS. Copying comes first and translating last,
+            # because the instruction nearest the list is the one applied to
+            # it: with "copy verbatim" sitting closest, a run came back with
+            # every heading left in English over Spanish prose.
+            "Two rules for that list, and they do not conflict.",
+            "",
+            "1. COPY EVERY LINE OF THREE HYPHENS verbatim, on its own line, "
+            "exactly where it appears — one above every heading, including "
+            "the FIRST, which sits above the opening heading and is the "
+            "easiest to mistake for the end of this instruction. It is not: "
+            "it is the first line of your answer. A section without its rule "
+            "above it is a section the eye runs straight past. This rule is "
+            "about the hyphens and NOTHING else.",
+            "",
+            "2. TRANSLATE THE TEXT OF EVERY HEADING into the language you "
+            "are answering in — all of them, including the last one on the "
+            "page — and translate only, never reword. This is the rule that "
+            "governs the list you are about to read: the hyphens are copied "
+            "letter for letter and the `##` stays, but the heading WORDS are "
+            "not copied, they are translated. A Spanish answer with English "
+            "headings reads as though the shape came from somewhere else. "
+            "'Most likely explanation' came back once as 'La afirmación es "
+            "correcta', which is the finding and not the label; put the "
+            "finding in the paragraph underneath.",
             "",
             "This list is CLOSED and each heading appears exactly ONCE. Do "
             "not add sections of your own, and do not repeat one you "
@@ -24593,6 +24619,8 @@ class AgenticSynthesisComposer:
         ]
         # ── Step 5: where the reader goes next ──
         out += [
+            "",
+            _GROUP_BREAK,
             "",
             "## **How to proceed** — the next concrete step, ordered so "
             "the one that settles the most uncertainty comes first: "
@@ -24652,7 +24680,7 @@ class AgenticSynthesisComposer:
                 # instruction rendered with its own middle as a code block
                 # — and taught by example the exact habit the sentence
                 # forbids: a fence inside a line of prose.
-                "**Code** — only if a concrete change or snippet is "
+                "## **Code** — only if a concrete change or snippet is "
                 "warranted. Fence every block: open with a line holding "
                 "three backticks followed by the language (python, and so "
                 "on), and close with a line holding three backticks and "
@@ -24674,7 +24702,9 @@ class AgenticSynthesisComposer:
         if has_tests:
             out += [
                 "",
-                "**Tests** — the acceptance tests this turn wrote, in full, "
+                _GROUP_BREAK,
+                "",
+                "## **Tests** — the acceptance tests this turn wrote, in full, "
                 "in ONE fenced block that runs as it stands. Import only "
                 "the standard library, include the code under test in the "
                 "block rather than importing it from the project, and end "
@@ -24714,7 +24744,7 @@ class AgenticSynthesisComposer:
         if _rivals:
             out += [
                 "",
-                "**Other plausible hypotheses** — the competition did not "
+                "## **Other plausible hypotheses** — the competition did not "
                 "eliminate these, and the confidence figure is divided by "
                 "them."
                 + (
@@ -24761,7 +24791,9 @@ class AgenticSynthesisComposer:
         if _dead:
             out += [
                 "",
-                "**Hypotheses ruled out** — this turn built these "
+                _GROUP_BREAK,
+            "",
+            "## **Hypotheses ruled out** — this turn built these "
                 "explanations and the index eliminated them. State each in "
                 "a sentence and say what killed it. This is a result, not "
                 "an apology: an explanation removed is work the reader "
@@ -24788,7 +24820,7 @@ class AgenticSynthesisComposer:
         # ── the audit trail: what was checked, and how ──
         out += [
             "",
-            "**What the evidence shows** — the facts that carry the "
+            "## **What the evidence shows** — the facts that carry the "
             "conclusion: the symbols, call relations and code paths "
             "that were checked against the indexed graph, each stated "
             "so the reader can go and confirm it. Never give an "
@@ -24820,7 +24852,9 @@ class AgenticSynthesisComposer:
         ):
             out += [
                 "",
-                "**What was not verified** — what this investigation "
+                _GROUP_BREAK,
+                "",
+                "## **What was not verified** — what this investigation "
                 "could NOT settle, and why: a symbol absent from the "
                 "index, a step that ran out of room, a relation the "
                 "graph could not confirm. State it plainly. An "
