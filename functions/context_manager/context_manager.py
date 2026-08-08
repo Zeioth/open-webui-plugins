@@ -24539,7 +24539,24 @@ class AgenticSynthesisComposer:
         # Every section named, or none: a partial outline would leave the
         # final model with instructions for some sections and silence for
         # the rest, which is worse than the uniform version of either.
-        _named = sum(1 for _l in _lines if any(_s in _l for _s in sections))
+        # Match on the NAME, not on the exact "## **Name**" wrapper. The
+        # strict version counted a heading only when the model reproduced
+        # the hashes and the asterisks; "**Conclusión**", "## Conclusión"
+        # and a bare "Conclusión" all scored zero, and one outline was
+        # discarded as "0 of 8 named" when it had named every one. The
+        # emitter re-wraps them anyway, so the wrapper the model chose is
+        # not information worth being strict about.
+        _bare = [_s.strip("# *") for _s in sections]
+
+        def _heads(_line: str) -> str:
+            # Bullets and numbering come off too: a model asked for a list
+            # of sections often gives a list, and "- Conclusión" is the
+            # same heading as "## **Conclusión**" for this purpose.
+            _t = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s*", "", _line.strip())
+            _t = _t.strip("# *").strip().rstrip(":").strip()
+            return next((_b for _b in _bare if _t == _b), "")
+
+        _named = sum(1 for _l in _lines if _heads(_l))
         if _named < len(sections):
             self._f._log_debug(
                 f"🤖 Outline: {_named} of {len(sections)} section(s) named — "
@@ -24558,21 +24575,23 @@ class AgenticSynthesisComposer:
         _idx = 0
         while _idx < len(_lines):
             _l = _lines[_idx]
-            _is_head = any(_s in _l for _s in sections)
+            _is_head = bool(_heads(_l))
             if _is_head:
                 _body = _lines[_idx + 1] if _idx + 1 < len(_lines) else ""
                 if _body.strip().upper().startswith("SKIP"):
                     _skip += 1
                     _idx += 2
                     continue
-                _kept.append(_l)
+                # Re-wrapped in the canonical form, so a heading the model
+                # wrote bare still reaches the answer as "## **Name**".
+                _kept.append(f"## **{_heads(_l)}**")
                 if _body:
                     _kept.append(_body)
                 _idx += 2
                 continue
             _kept.append(_l)
             _idx += 1
-        if not [_l for _l in _kept if any(_s in _l for _s in sections)]:
+        if not [_l for _l in _kept if _heads(_l)]:
             self._f._log_debug(
                 "🤖 Outline: every section came back SKIP — discarded, the "
                 "full directive stands"
@@ -52082,6 +52101,24 @@ class Valves(BaseModel):
         description="Inject full bodies of top‑N hubs as a cacheable tier between Block A and Block B.",
     )
 
+    # THE HUB TIER IS INSIDE THE INVARIANT PREFIX AND THE FREEZE DOES NOT
+    # COVER IT. Measured on one run: the tier went from ~6,256 to ~6,595
+    # tokens between turn 2 and turn 3, the invariant moved by 1,679 chars,
+    # and llama.cpp re-prefilled 88,273 tokens in 122 seconds — while the
+    # Block A freeze sat there logging "holding frozen map", because it
+    # protects the architecture map and not these bodies.
+    #
+    # The churn is ordinary: the model writes code in an answer, it gets
+    # indexed, centrality shifts, and one symbol enters or leaves the top
+    # N. Nothing is broken; the damper simply stops short of the part that
+    # moves most often.
+    #
+    # Not changed here because both directions cost something. Freezing the
+    # tier with the map keeps the prefix stable and lets the model read a
+    # body the project no longer has. Leaving it as is pays ~122s whenever
+    # centrality reorders. The valve to reach for first is
+    # block_a_freeze_count_all_changes, which would make a tier change
+    # count against the freeze budget rather than pass through it.
     hub_bodies_tier_top_n: int = Field(
         default=16,
         ge=1,
