@@ -25624,15 +25624,30 @@ class AgenticSynthesisComposer:
                 # the Code block has to go first. An instruction to the
                 # model cannot carry a precondition for the person reading;
                 # that has to be written where they will see it.
-                "Import ONLY from this list and nothing else: re, json, "
-                "math, hashlib, itertools, functools, collections, "
-                "textwrap, difflib, string, enum, dataclasses, typing. "
-                "Nothing from this project and none of os, sys, pathlib, "
-                "subprocess, socket or open(), which the sandbox refuses "
-                "outright. Import every one you use.\n\n"
+                # The environment, named. Every rule below was a
+                # prohibition inferred from a run that failed, and the model
+                # was never told the one fact they all follow from: this
+                # block goes to Pyodide, CPython compiled to WebAssembly,
+                # inside the reader's browser tab. A model told that can
+                # reason about what is reachable there; a model given a list
+                # can only avoid the doors already found — and it found a
+                # new one each time.
+                #
+                # The two earlier mentions of "the sandbox" made it worse:
+                # that is the SERVER's runner, a different environment the
+                # model does not write for, so its restrictions arrived
+                # unexplained.
+                "THIS BLOCK RUNS IN PYODIDE — CPython on WebAssembly, in a "
+                "browser tab, one block at a time. There is no file system, "
+                "no network, no process to exit from, and nothing this "
+                "project defines is reachable. Write for that.\n\n"
+                "So: import ONLY from re, json, math, hashlib, itertools, "
+                "functools, collections, textwrap, difflib, string, enum, "
+                "dataclasses, typing — import each one you use — and never "
+                "os, sys, pathlib, subprocess, socket or open().\n\n"
                 "Open the section with one line telling the reader to run "
-                "the Code block above first: the run button executes one "
-                "block at a time. Test plain functions; "
+                "the Code block above first, since each block runs alone. "
+                "Test plain functions; "
                 "if the subject is a method, give the Code block a small "
                 "stand-in class so there is something to construct here "
                 "rather than testing `self`.\n\n"
