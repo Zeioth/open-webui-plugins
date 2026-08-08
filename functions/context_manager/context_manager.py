@@ -494,6 +494,49 @@ _GROUP_BREAK = "\x00GROUP\x00"
 _REPAIR_MARK = "\x00REPAIRED\x00"
 
 
+def _clip_words(text: str, limit: int) -> str:
+    """Cut a status line at a word boundary, with an ellipsis when it cut.
+
+    A hard slice ends mid-word, and the status stream is read at a glance
+    while the turn runs: "falsifying 'The acceptance tests for _normalize_qid
+    pass aga'" makes the reader stop and reconstruct the word instead of
+    taking in the claim.
+    """
+    _t = " ".join((text or "").split())
+    if len(_t) <= limit:
+        return _t
+    _cut = _t[:limit]
+    _sp = _cut.rfind(" ")
+    if _sp > limit // 2:
+        _cut = _cut[:_sp]
+    return _cut.rstrip(" ,;:") + "…"
+
+
+def _split_heading_lines(lines: List[str]) -> List[str]:
+    """Put every heading on a line of its own, its brief on the next.
+
+    The sections were emitted as "## **Name** — what to put in it", and the
+    model copied the whole line: five answers in one run were headed
+    "Conclusión** — el mecanismo concreto que controlo", the closing bold
+    marker torn in half. Only the first section did it, the one whose brief
+    changes from turn to turn and so reads like part of the name.
+
+    Splitting is better than forbidding. A rule saying "the heading is the
+    words before the dash" asks the model to parse a line correctly on
+    every turn; a heading with no dash in it cannot be got wrong.
+    """
+    _out: List[str] = []
+    for _l in lines:
+        _s = _l.strip()
+        if _s.startswith("## **") and " — " in _s:
+            _h, _brief = _s.split(" — ", 1)
+            _out.append(_h)
+            _out.append(_brief)
+            continue
+        _out.append(_l)
+    return _out
+
+
 def _resolve_group_breaks(lines: List[str]) -> List[str]:
     """Turn group sentinels into rules, dropping the ones with nothing to separate.
 
@@ -606,7 +649,14 @@ def _strip_answer_footer(text: str) -> Tuple[str, int]:
                 _seen_footer = False
                 continue
             if _pending_rule:
+                # Its blanks travel with it. Dropping them here made the
+                # function non-idempotent — a second pass over its own
+                # output moved a blank line — and the footer goes through
+                # this path twice, once for the reader and once for the
+                # stored history, which then disagree by a line.
                 _out.append(_pending_rule)
+                _out.extend(_held_blanks)
+                _held_blanks = []
             _pending_rule = _line
             continue
         if _seen_footer and not _line.strip():
@@ -19680,7 +19730,12 @@ if __name__ == "__main__":
         # bodies a step asked for. Announce BEFORE, because the wait is
         # the part that needs explaining, and once per target after, since
         # a verdict per symbol is the unit the reader can act on.
-        _pfx = f"🤖 Agentic: step {step.display_no}"
+        _tot = int(getattr(self._f, "_plan_step_total", 0) or 0)
+        _pfx = (
+            f"🤖 Agentic step {step.display_no}/{_tot} (verify_dynamic)"
+            if _tot
+            else f"🤖 Agentic step {step.display_no} (verify_dynamic)"
+        )
         await self._f._emit_status(
             f"{_pfx} · executing {len(targets)} symbol(s) in the sandbox…"
         )
@@ -20646,9 +20701,23 @@ if __name__ == "__main__":
         """Persist a design_tests step's harness under a goal-keyed pseudo
         qid so the Fase 6 inter-turn loop can pick it up after the main
         call generates the implementation."""
-        m = re.search(r"```(?:python)?\s*(.*?)```", step.output, re.S)
-        tests = (m.group(1) if m else step.output).strip()
+        # The block with the tests in it, not the first block there is. The
+        # step now writes the candidate implementation FIRST and the tests
+        # second, so taking match number one got the implementation, failed
+        # the "def test_" check, and returned without a word — a step that
+        # spent sixty seconds and left no line in the log at all. Searching
+        # every block for the one that holds tests survives either order.
+        _blocks = re.findall(r"```(?:python)?\s*(.*?)```", step.output or "", re.S)
+        tests = next(
+            (b.strip() for b in _blocks if "def test_" in b),
+            (step.output or "").strip() if not _blocks else "",
+        )
         if "def test_" not in tests:
+            self._f._log_debug(
+                f"🤖 DynamicVerifier: design_tests step produced no test "
+                f"functions in {len(_blocks)} fenced block(s) — nothing to "
+                f"persist and nothing to run"
+            )
             return
         pseudo = (
             "__design__"
@@ -24828,9 +24897,18 @@ class AgenticSynthesisComposer:
                 "instead of promoting the least bad one."
             ),
             UseCase.PLANNING: (
-                "what you would do and what it costs. If the evidence does "
-                "not favour one option, say so and name what would settle "
-                "it, rather than promoting the least bad."
+                "what you would do and what it costs. When the reader put "
+                "options on the table, weigh them HERE — what each one buys "
+                "and what each one gives up — rather than opening a section "
+                "of your own for it further down. Measured: an answer asked "
+                "for 'the decision and what is lost with each option' got a "
+                "one-paragraph decision and a section called 'Qué se pierde "
+                "en cada opción' invented to hold the rest, because a "
+                "comparison does not fit in a short paragraph and the list "
+                "of sections had nowhere else to put it. This section is "
+                "where it goes, and it may run past one paragraph to do it. "
+                "If the evidence does not favour one option, say so and name "
+                "what would settle it, rather than promoting the least bad."
             ),
             UseCase.REFACTORING: (
                 "the edit and the callers it reaches, named concretely. If "
@@ -24852,7 +24930,11 @@ class AgenticSynthesisComposer:
                 "them). If the evidence supports no single mechanism, say "
                 "that instead of promoting the least bad candidate.",
             )
-            + " One short paragraph. Everything below is its development."
+            + (
+                " Everything below is its development."
+                if use_case == UseCase.PLANNING
+                else " One short paragraph. Everything below is its development."
+            )
             + (
                 " This turn wrote code, ran tests against it, and one of "
                 "them went red — say so HERE: what the test expected, why "
@@ -24891,26 +24973,36 @@ class AgenticSynthesisComposer:
             # because the instruction nearest the list is the one applied to
             # it: with "copy verbatim" sitting closest, a run came back with
             # every heading left in English over Spanish prose.
-            "Two rules for that list, and they do not conflict.",
+            # Short on purpose. The long form carried a measured anecdote
+            # per rule and ran to four paragraphs; across one run the model
+            # kept the early rules and dropped the late ones — two answers
+            # came back with English headings over Spanish prose, one
+            # repeated How to proceed, and three omitted Conclusion. The
+            # rules did not need better arguments, they needed to fit in
+            # view. The heading/dash rule is gone entirely: headings no
+            # longer carry a dash, so there is nothing left to get wrong.
+            "Three rules, all of them:",
             "",
-            "1. COPY EVERY LINE OF THREE HYPHENS verbatim, on its own line, "
-            "exactly where it appears — one above every heading, including "
-            "the FIRST, which sits above the opening heading and is the "
-            "easiest to mistake for the end of this instruction. It is not: "
-            "it is the first line of your answer. A section without its rule "
-            "above it is a section the eye runs straight past. This rule is "
-            "about the hyphens and NOTHING else.",
+            "1. COPY every line of three hyphens exactly where it appears, "
+            "including the FIRST, which is the first line of your answer "
+            "and not the end of this instruction.",
             "",
-            "2. TRANSLATE THE TEXT OF EVERY HEADING into the language you "
-            "are answering in — all of them, including the last one on the "
-            "page — and translate only, never reword. This is the rule that "
-            "governs the list you are about to read: the hyphens are copied "
-            "letter for letter and the `##` stays, but the heading WORDS are "
-            "not copied, they are translated. A Spanish answer with English "
-            "headings reads as though the shape came from somewhere else. "
-            "'Most likely explanation' came back once as 'La afirmación es "
-            "correcta', which is the finding and not the label; put the "
-            "finding in the paragraph underneath.",
+            # Anchored to the QUESTION, not to "the language you are
+            # answering in". That phrasing was circular: it told the model
+            # to translate into whatever language it had already decided on,
+            # and the instruction it was reading is in English. Two answers
+            # came back with Spanish prose under English headings — the body
+            # translated, the titles copied — which is the shape of a model
+            # obeying both readings at once.
+            "2. TRANSLATE every heading into THE LANGUAGE THE READER WROTE "
+            "THEIR QUESTION IN, whatever language this instruction happens "
+            "to be in. Every heading, including the last on the page, and "
+            "in the same language as the prose beneath it. Translate the "
+            "words; never reword them, and never replace a heading with "
+            "what you found.",
+            "",
+            "3. Start with Conclusion. It is the only section that is "
+            "always required, and three answers in one run left it out.",
             "",
             "This list is CLOSED and each heading appears exactly ONCE. Do "
             "not add sections of your own, and do not repeat one you "
@@ -25039,12 +25131,22 @@ class AgenticSynthesisComposer:
                 "",
                 _GROUP_BREAK,
                 "",
-                "## **Tests** — the acceptance tests this turn wrote and ran, in "
-                "full, in ONE fenced block. The TESTS only: the code they "
+                "## **Tests** — the acceptance tests this turn wrote and ran, "
+                "in full, in ONE fenced block. The TESTS only: the code they "
                 "exercise is in the Code section above and does not belong "
-                "here twice. Import only the standard library beyond the "
-                "code under test, and end with the lines that run them and "
-                "report what passed. Do NOT reproduce any harness a "
+                "here twice.\n\n"
+                "Plain functions named test_1, test_2, … and a plain runner "
+                "at the end: a loop that calls each one, catches the "
+                "exception, and prints what passed. NOT unittest and NOT "
+                "pytest. Import every module you use, including the ones "
+                "that feel automatic. Measured, in one run: two blocks died "
+                "on `NameError: name 'unittest' is not defined` and a third "
+                "on `SystemExit: 0`, because unittest.main() calls sys.exit "
+                "and the browser runner reports that as a crash even when "
+                "every test passed. A block the reader cannot press run on "
+                "is a block that has to be rewritten before it is worth "
+                "anything.\n\n"
+                "Do NOT reproduce any harness a "
                 "dynamic verification step generated: those are throwaway "
                 "probes built against stand-in objects, they will not run "
                 "outside the sandbox that made them, and their verdict is "
@@ -25323,7 +25425,7 @@ class AgenticSynthesisComposer:
                 "was not established this turn.",
             ]
 
-        return _resolve_group_breaks(out)
+        return _split_heading_lines(_resolve_group_breaks(out))
 
 class AgenticOrchestrator:
     """
@@ -26198,7 +26300,7 @@ class AgenticOrchestrator:
         for _ci, claim in enumerate(claims, start=1):
             await self._f._emit_status(
                 f"{_prefix} · metacog {_ci}/{len(claims)}: falsifying "
-                f"“{claim.text[:48]}”"
+                f"“{_clip_words(claim.text, 56)}”"
             )
             try:
                 # Evidence first (free), so the design is bounded by what
@@ -26950,6 +27052,12 @@ class AgenticOrchestrator:
         # repaired on the NEXT turn: a step object from a conversation that
         # has moved on, against tests nobody is waiting for.
         self._dyn._pending_repairs = []
+        # The plan size, for the status lines the dynamic verifier emits.
+        # It never sees the plan, so its statuses read "Agentic: step 3 ·"
+        # while every other line reads "Agentic step 3/5 (verify):" — the
+        # same run, two shapes, and the reader loses both the total and the
+        # kind on exactly the steps that take longest.
+        self._f._plan_step_total = 0
 
         # EC-6 anchors need the USER'S question, not the planner's
         # paraphrase: stored per turn (same pattern as the
@@ -27163,6 +27271,7 @@ class AgenticOrchestrator:
         # plan finalization: mid-loop insertions (NEEDS gap-fill, the
         # hypothesis-refutation retry below) place themselves by position
         # deliberately and are not re-sorted.
+        self._f._plan_step_total = len(plan.steps)
         if self._f.valves.agentic_enforce_step_order:
             # verify BEFORE verify_dynamic, which is the opposite of the
             # order these ranks first carried. _pick_targets chooses what
@@ -28776,10 +28885,19 @@ class AgenticOrchestrator:
                 _reading = ("**Stats**\n" + "\n".join(_axes) + "\n") if _axes else "**Stats**\n"
                 self._f._measured_reading_lines = _reading
 
+                # "of the N this turn checked", not a bare "N/N claims".
+                # The denominator is the ledger, which holds what the STEPS
+                # asserted; the answer is written afterwards and asserts
+                # more. Measured: a turn reported 100% on 3 of 3 while its
+                # answer made eighteen assertions, and 100% next to a
+                # three-claim denominator reads as "this answer is fully
+                # verified" rather than "three things were checked and all
+                # three held". The figure was always the latter; only the
+                # wording let it be read as the former.
                 _t_line = (
                     _reading
-                    + f"[Confidence: {_t_pct}% — {_t_ok}/{_t_all} claims "
-                    f"settled against code"
+                    + f"[Confidence: {_t_pct}% — {_t_ok} of the {_t_all} "
+                    f"claim(s) this turn checked, settled against code"
                     + ("; " + ", ".join(_t_open) if _t_open else "")
                     + "]"
                 )
@@ -28796,6 +28914,20 @@ class AgenticOrchestrator:
                 # run is a claim about the data that stopped being true.
                 _workspace += (
                     "\n\n## Your Stats section\n"
+                    # The no-repeat rule, restated where it is broken. It
+                    # already sits in the header, and an answer broke it
+                    # anyway: How to proceed appeared once in its place and
+                    # again just above this block, the second one proposing
+                    # exactly what its own section forbids. By the time the
+                    # model reaches the end of a long answer the header is
+                    # thousands of tokens behind it; the instruction that
+                    # governs a moment has to be readable at that moment.
+                    "\n\n## Before you close\n"
+                    "You are at the end of the answer. Every section you "
+                    "were going to write is written: do NOT add another one "
+                    "here, and in particular do not write next steps again "
+                    "because the answer feels like it should end with them. "
+                    "It ends with the block below and nothing else.\n"
                     "This turn's evidence was counted. Close your answer "
                     "with a horizontal rule on its own line — three "
                     "hyphens, like the ones separating the groups above — "
@@ -54365,6 +54497,9 @@ class Filter:
         # them as executions is the failure this whole subsystem's
         # _suspect_reason_of guard exists to prevent one level down.
         self._measured_execution: str = ""
+        # How many steps the plan holds, so the dynamic verifier's status
+        # lines can carry the same "N/M (kind)" shape as every other step's.
+        self._plan_step_total: int = 0
         # Everything the sandbox ran this turn, as (kind, status) pairs.
         # Turn-wide because two different steps feed it and one of them
         # clears its own per-step list.
@@ -55055,6 +55190,7 @@ class Filter:
             self._measured_reading_lines = ""
             self._measured_reinforcement = ""
             self._measured_execution = ""
+            self._plan_step_total = 0
             self._execution_tally = []
             self._dynamic_targets_this_turn = 0
             self._answer_is_verbatim_echo = False
@@ -56176,7 +56312,8 @@ class Filter:
                 )
             _line = (
                 f"[Confidence: {int(round(100 * _conf))}% — "
-                f"{_settled}/{_total} claims settled against code"
+                f"{_settled} of the {_total} claim(s) this turn checked, "
+                f"settled against code"
                 + ("; " + ", ".join(_open) if _open else "")
                 + "]"
             )
