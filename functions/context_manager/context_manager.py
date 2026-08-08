@@ -21527,10 +21527,11 @@ class AgenticPlanner:
         "callers of an edited function — use it after any step that changes "
         "behaviour, to find out which callers the change broke before the "
         "reader does), "
-        "design_tests (write executable acceptance tests BEFORE the "
-        "implementation — use it whenever the request is to build or "
-        "implement something, so what follows can be checked against them "
-        "instead of merely read), "
+        "design_tests (write a candidate implementation AND executable "
+        "acceptance tests for it, then run them against each other — use it "
+        "whenever the request is to build or implement something, so what "
+        "the reader gets has been checked instead of merely read; a failing "
+        "test is repaired once and re-run before the answer is written), "
         "analyze (reason and conclude).\n"
         "- The LAST step must be analyze.\n"
         "- Each goal must be self-contained (understandable without the "
@@ -23311,18 +23312,38 @@ class AgenticStepExecutor:
             "code region comments as your answer; they are raw evidence, "
             "and your job is the synthesis, in your own words."
         ),
+        # Both halves, in that order. This step used to write the tests
+        # alone — "before the implementation exists, expected to fail now" —
+        # and leave the implementation to the final model, which put the two
+        # halves a turn apart: the only place they ever met was the
+        # inter-turn check, so a reader who asked "write tests and check it
+        # works" got tests, unverified code, and an answer on the next turn.
+        #
+        # Writing tests first is a discipline for humans, where time passes
+        # between the two. Here one call produces both, and the ordering
+        # inside a single generation does not carry the meaning it carries
+        # across days. Asking for the candidate too costs one paragraph and
+        # gives the turn something to run.
+        #
+        # A candidate, not the final word: the synthesis may refine it, and
+        # arm_tdd_verification still checks whatever actually ships against
+        # these same tests on the following turn.
         "design_tests": (
             "You are executing step {sid} (design_tests) of an agentic "
             "pipeline.\nGoal: {goal}\n\n"
-            "Write executable acceptance tests for the requested "
-            "implementation BEFORE it exists: 3-5 plain functions named "
-            "test_1, test_2, ... containing asserts that a correct "
-            "implementation must satisfy (they are expected to fail now). "
-            "Only stdlib logic modules (re, json, math, hashlib, "
-            "itertools, functools, collections); no file, network or os "
-            "access. Return the tests in a single fenced python block, "
-            "followed by one short paragraph explaining the acceptance "
-            "criteria."
+            "Write TWO fenced python blocks, in this order.\n\n"
+            "FIRST, a candidate implementation of what was asked for: the "
+            "functions or classes themselves, complete and runnable, with "
+            "no tests in the block.\n\n"
+            "SECOND, executable acceptance tests for it: 3-5 plain "
+            "functions named test_1, test_2, ... containing asserts a "
+            "correct implementation must satisfy. Write the asserts against "
+            "the SPEC, not against what your candidate happens to do — a "
+            "test written to agree with the code it is testing proves "
+            "nothing, and this pair is about to be run against each other.\n\n"
+            "Only stdlib logic modules (re, json, math, hashlib, itertools, "
+            "functools, collections); no file, network or os access. After "
+            "the two blocks, one short paragraph on the acceptance criteria."
         ),
         "hypothesize": (
             "You are executing step {sid} (hypothesize) of an agentic "
@@ -24988,11 +25009,13 @@ class AgenticSynthesisComposer:
                 # — and taught by example the exact habit the sentence
                 # forbids: a fence inside a line of prose.
                 "## **Code** — only if a concrete change or snippet is "
-                "warranted AND it is not already going into Tests below. "
-                "When this turn wrote a tested pair, the code lives with "
-                "its tests in one runnable block and belongs there alone; "
-                "repeating it here gives the reader two copies and no way "
-                "to tell which one was the one that ran. "
+                "warranted. THE CODE GOES HERE AND THE TESTS DO NOT: tests "
+                "belong in their own section, and even when there is no "
+                "Tests section they belong in a separate fenced block after "
+                "the code. Never fuse the two into one block — a reader who "
+                "wants to run the code has to hand-strip the tests out of "
+                "it, and one who wants the tests has the same problem in "
+                "reverse. Measured: one answer shipped both fused together. "
                 "Fence every block: open with a line holding "
                 "three backticks followed by the language (python, and so "
                 "on), and close with a line holding three backticks and "
@@ -25016,15 +25039,12 @@ class AgenticSynthesisComposer:
                 "",
                 _GROUP_BREAK,
                 "",
-                "## **Tests** — the acceptance tests this turn wrote, in full, "
-                "in ONE fenced block that runs as it stands. Import only "
-                "the standard library, include the code under test in the "
-                "block rather than importing it from the project, and end "
-                "with the lines that execute the tests and report what "
-                "passed. The reader has a run button under every code "
-                "block: a block that needs a checkout, a path or a missing "
-                "import is a block that button cannot help with, and these "
-                "tests exist to be run. Do NOT reproduce any harness a "
+                "## **Tests** — the acceptance tests this turn wrote and ran, in "
+                "full, in ONE fenced block. The TESTS only: the code they "
+                "exercise is in the Code section above and does not belong "
+                "here twice. Import only the standard library beyond the "
+                "code under test, and end with the lines that run them and "
+                "report what passed. Do NOT reproduce any harness a "
                 "dynamic verification step generated: those are throwaway "
                 "probes built against stand-in objects, they will not run "
                 "outside the sandbox that made them, and their verdict is "
