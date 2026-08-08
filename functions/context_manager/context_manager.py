@@ -25563,9 +25563,22 @@ class AgenticSynthesisComposer:
                 _GROUP_BREAK,
                 "",
                 f"## **{_H['tests']}** — the acceptance tests this turn wrote and ran, "
-                "in full, in ONE fenced block. The TESTS only: the code they "
-                "exercise is in the Code section above and does not belong "
-                "here twice.\n\n"
+                # SELF-CONTAINED, and the duplication is the price of the
+                # button. Separation was tried and measured: an answer put
+                # the implementation under Code and the tests here, the
+                # reader pressed run, and all six failed with "NameError:
+                # name '_normalize_qid' is not defined". Each block runs in
+                # its own namespace — running Code first does not carry the
+                # name across — so a Tests block calling what another block
+                # defines cannot work, whatever the reader does.
+                #
+                # Code keeps the implementation with its explanation; this
+                # repeats it bare, as the preamble the tests need. Two
+                # copies with different jobs beat one that cannot run.
+                "in ONE fenced block that RUNS ON ITS OWN. Open it with a "
+                "copy of the function under test — bare, no commentary, "
+                "there only so the tests have something to call — then the "
+                "tests, then the runner.\n\n"
                 # The runner is GIVEN, not described. Four patches described
                 # it and the model found a new door each time: unittest,
                 # then unittest.main() calling sys.exit, then `if __name__
@@ -25655,12 +25668,8 @@ class AgenticSynthesisComposer:
                 "dataclasses, typing — each one you use — and never os, "
                 "sys, pathlib, subprocess, socket, open(), or anything "
                 "this project defines.\n\n"
-                "Open the section with one line telling the reader to run "
-                "the Code block above first, since each block runs alone. "
-                "Test plain functions; "
-                "if the subject is a method, give the Code block a small "
-                "stand-in class so there is something to construct here "
-                "rather than testing `self`.\n\n"
+                "Test plain functions; for a method, put a small stand-in "
+                "class in this same block and construct it here.\n\n"
                 "Do NOT reproduce a harness from a dynamic verification "
                 "step: throwaway probes against stand-in objects, already "
                 "reported.",
