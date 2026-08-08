@@ -21077,10 +21077,19 @@ if __name__ == "__main__":
         self._note_execution("tests", str(_result.get("status", "error")))
         _line = self._format_line(pseudo, "design", _result, "design_tests")
         step.output = (step.output or "") + "\n\n" + _line
+        # The detail matters most on the paths with no test counts. A
+        # "status=rejected 0/0" line cost an investigation to trace back to
+        # "denylist token: import os": the sandbox had said exactly that and
+        # nobody wrote it down.
         self._f._log_debug(
             f"🤖 design_tests {pseudo}: ran its own tests · "
             f"status={_result.get('status')} "
             f"{_result.get('passed', 0)}/{_result.get('total', 0)}"
+            + (
+                f" · {str(_result.get('detail'))[:200]}"
+                if _result.get("detail")
+                else ""
+            )
             + (
                 f" first_failure={str(_result.get('failures', [''])[0])[:200]}"
                 if _result.get("failures")
@@ -25557,33 +25566,60 @@ class AgenticSynthesisComposer:
                 "in full, in ONE fenced block. The TESTS only: the code they "
                 "exercise is in the Code section above and does not belong "
                 "here twice.\n\n"
-                "Plain functions named test_1, test_2, … and a plain runner "
-                "at the end: a loop that calls each one, catches the "
-                "exception, and prints what passed. NOT unittest and NOT "
-                "pytest. Import every module you use, including the ones "
-                # The measured version named both failures and explained
-                # sys.exit. The model needs the two prohibitions, not the
-                # diagnosis: in one run two blocks died on "NameError:
-                # unittest is not defined" and a third on "SystemExit: 0",
-                # because unittest.main() calls sys.exit and the browser
-                # runner reports that as a crash even when all tests pass.
-                # Two prohibitions, one cause. The block runs in a browser,
-                # not a shell: __main__ is not the module name there, and
-                # exiting is a crash rather than a status. Both were
-                # measured — a block that printed nothing at all, and a
-                # block that printed a clean report and then died on
-                # SystemExit so the reader saw the traceback instead.
-                # Forbidding unittest was not enough: the model wrote
-                # sys.exit(1) by hand once unittest was gone, which is the
-                # same idea reaching for a different door.
-                "that feel automatic. Two things the browser runner cannot "
-                "take: put the runner at the TOP LEVEL with no "
-                "`if __name__ == \"__main__\"` guard, which is False there "
-                "and leaves a block that runs nothing and prints nothing; "
-                "and NEVER exit — no sys.exit, no raise at the end, no "
-                "SystemExit by any route, because a non-zero exit is "
-                "reported as a crash and buries the report you just "
-                "printed. Report failures by printing them and stop.\n\n"
+                # The runner is GIVEN, not described. Four patches described
+                # it and the model found a new door each time: unittest,
+                # then unittest.main() calling sys.exit, then `if __name__
+                # == "__main__"` never firing in a browser, then a
+                # hand-written sys.exit(1) once unittest was gone. Each
+                # prohibition closed one door in a building with more doors.
+                #
+                # This is the shape the sandbox's own harness uses, minus
+                # the __main__ guard that is right there and wrong here.
+                # Copied, it cannot be got wrong, and there is nothing left
+                # to prohibit — the same move that fixed the headings, which
+                # three wordings of "translate them" could not.
+                "Plain functions named test_1, test_2, … and then EXACTLY "
+                "this runner at the top level, changed only in the names it "
+                "lists:\n\n"
+                "```python\n"
+                "_tests = [test_1, test_2]  # every test function, in order\n"
+                "_passed, _failures = 0, []\n"
+                "for _fn in _tests:\n"
+                "    try:\n"
+                "        _fn()\n"
+                "        _passed += 1\n"
+                "    except Exception as _e:\n"
+                "        _failures.append("
+                "f\"{_fn.__name__}: {type(_e).__name__}: {_e}\")\n"
+                "print(f\"{_passed}/{len(_tests)} passed\")\n"
+                "for _f in _failures:\n"
+                "    print(\"FAIL\", _f)\n"
+                "```\n\n"
+                # Where the function comes from, said plainly. "The code is
+                # in the Code section above" reads as "so import it", and a
+                # block came back with `from code_aware.filter import
+                # qualify_symbol` — a package that exists nowhere. Another
+                # called methods on `self` with no instance to bind. The
+                # answer is NOT to paste the implementation here, which is
+                # the duplication the section above forbids: it is that the
+                # reader runs the Code block first and the name is then
+                # defined. Saying so removes the reason to invent an import.
+                # The sandbox denylist, named up front. A block that opens
+                # with "import os" is rejected before it ever runs — and the
+                # same block dies in the browser on the invented import next
+                # to it, so one habit broke both executions at once. The
+                # tests are pure logic; the list costs one sentence and the
+                # rejection costs the whole turn's evidence.
+                "NO imports from this project and no package name you have "
+                "not seen in the file you were shown: the Code block above "
+                "defines what these tests call, and the reader runs it "
+                "first. Standard library only — and NOT os, sys, pathlib, "
+                "subprocess, socket or open(), which the sandbox refuses to "
+                "run at all. Import everything you use including what feels "
+                "automatic. Test plain functions; "
+                "if the subject is a method, give the Code block a small "
+                "stand-in class so there is something to construct here "
+                "rather than testing `self`.\n\n"
                 "Do NOT reproduce any harness a "
                 "dynamic verification step generated: those are throwaway "
                 "probes built against stand-in objects, they will not run "
@@ -28242,6 +28278,22 @@ class AgenticOrchestrator:
                 f"🤖 Agentic step {step.display_no} ({step.kind}): {step.status} "
                 f"in {step.seconds:.1f}s"
             )
+            # A step that finishes in no time and was not served from the
+            # step cache did something other than run. One analyze — the
+            # terminal step, the one that writes the pipeline's conclusion —
+            # came back "done" in 0.0s with cached=False, skip='' and
+            # trunc=False, and three readings of this function could not
+            # say which path produced it. The next occurrence will say so
+            # itself rather than costing another investigation.
+            if step.seconds < 0.1 and not getattr(step, "cached", False):
+                self._f._log_debug(
+                    f"⚠️ Agentic step {step.display_no} ({step.kind}) "
+                    f"finished in {step.seconds:.3f}s without a cache hit — "
+                    f"status={step.status} skip={step.skip_reason!r} "
+                    f"trunc={getattr(step, 'truncated', False)} "
+                    f"output={len(step.output or '')} chars "
+                    f"digest={len(step.digest or '')} chars"
+                )
 
             # -- ASK TRIAGE: an ask naming project code is evidence -------
             # Demoted before the NEEDS region below so the existing
@@ -51618,6 +51670,18 @@ class Valves(BaseModel):
         ),
     )
 
+    # STILL ZERO, AND MEASURED COSTING SOMETHING. A planner call came back
+    # with 10,345 tokens of repetition from a 1,427-token prompt, took 138
+    # seconds, hit the ceiling, produced unparseable JSON, and the turn fell
+    # back to a fixed plan — one turn's whole plan lost to the exact failure
+    # this valve exists to prevent. The degeneracy detector caught it and
+    # said so: "the prompt is what needs fixing, not this call".
+    #
+    # Left at zero because turning it on changes sampling for every long
+    # generation in the pipeline, and that is a quality decision rather than
+    # a bug fix: DRY suppresses repetition, and some repetition is correct
+    # (a list of similar claims, a table). Try 0.8 with the existing
+    # allowed_length of 18 and compare answers before adopting it.
     llm_long_dry_multiplier: float = Field(
         default=0.0,
         ge=0.0,
