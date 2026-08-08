@@ -20944,15 +20944,29 @@ if __name__ == "__main__":
         # its parameter's — and both times the guard around it swallowed the
         # error and the turn carried on. A name is worth one grep before it
         # is worth a run.
-        _resp = await self._f._llm_orchestrator.call_llm(
-            system_prompt=aligned_prefix,
-            prompt=self._REPAIR_CONTRACT.format(
-                code=code[:6000], tests=tests[:4000], detail=_detail
-            ),
-            max_tokens=self._f.valves.agentic_harness_max_tokens,
-            label="agentic_repair",
-            enable_thinking=False,
-        )
+        # Guarded here, not only by the pass that calls this. The pass wraps
+        # the whole loop, so an exception on the first pair aborted the
+        # second as well — a turn with two design_tests steps lost the
+        # repair of one because the other's call failed. compose_outline
+        # has carried its own guard since it was written; this did not, and
+        # the asymmetry was invisible until both were exercised.
+        try:
+            _resp = await self._f._llm_orchestrator.call_llm(
+                system_prompt=aligned_prefix,
+                prompt=self._REPAIR_CONTRACT.format(
+                    code=code[:6000], tests=tests[:4000], detail=_detail
+                ),
+                max_tokens=self._f.valves.agentic_harness_max_tokens,
+                label="agentic_repair",
+                enable_thinking=False,
+            )
+        except Exception as _e_rr:
+            self._f._log_debug(
+                f"🤖 design_tests {pseudo}: repair call failed "
+                f"({type(_e_rr).__name__}: {_e_rr}) — the original failure "
+                f"stands and is reported as it was"
+            )
+            return False
         _m = re.search(r"```(?:python)?\s*(.*?)```", _resp or "", re.S)
         _fixed = (_m.group(1) if _m else "").strip()
         if not _fixed or "def test_" not in _fixed:
@@ -24422,6 +24436,11 @@ class AgenticSynthesisComposer:
         '"the empty-string guard returns before the loop" and not "how the '
         'guard works". A section this turn has nothing for gets the single '
         "word SKIP.\n\n"
+        "Code and Tests hold different things and never the same thing "
+        "twice: the implementation goes to Code, the test functions go to "
+        "Tests. If this turn wrote only tests, Code is SKIP — an answer put "
+        "the tests under BOTH headings, and another put them under Code "
+        "while marking Tests skipped.\n\n"
         "Return ONLY the section names and their lines, one per line, in "
         "the order given. No prose, no preamble, no code."
     )
@@ -24492,11 +24511,43 @@ class AgenticSynthesisComposer:
                 f"discarded, the full directive stands"
             )
             return ""
+        # SKIP sections are DROPPED, not handed over marked. The first
+        # version passed them through and told the model to omit anything
+        # marked SKIP; an answer came back with the Tests heading written
+        # out and the word SKIP underneath it. A heading with content below
+        # it is a section, whatever the content says — the model was being
+        # asked to un-see something already in front of it. Removed here,
+        # there is nothing to omit and no rule needed to omit it.
+        _kept: List[str] = []
+        _skip = 0
+        _idx = 0
+        while _idx < len(_lines):
+            _l = _lines[_idx]
+            _is_head = any(_s in _l for _s in sections)
+            if _is_head:
+                _body = _lines[_idx + 1] if _idx + 1 < len(_lines) else ""
+                if _body.strip().upper().startswith("SKIP"):
+                    _skip += 1
+                    _idx += 2
+                    continue
+                _kept.append(_l)
+                if _body:
+                    _kept.append(_body)
+                _idx += 2
+                continue
+            _kept.append(_l)
+            _idx += 1
+        if not [_l for _l in _kept if any(_s in _l for _s in sections)]:
+            self._f._log_debug(
+                "🤖 Outline: every section came back SKIP — discarded, the "
+                "full directive stands"
+            )
+            return ""
         self._f._log_debug(
-            f"🤖 Outline: {_named} section(s) planned in {_names} "
-            f"({len(_resp or '')} chars)"
+            f"🤖 Outline: {_named - _skip} section(s) planned in {_names}, "
+            f"{_skip} skipped and dropped ({len(_resp or '')} chars)"
         )
-        return "\n".join(_lines)
+        return "\n".join(_kept)
 
     def render(
         self,
@@ -25026,6 +25077,47 @@ class AgenticSynthesisComposer:
     # 2. Answer format directive
     # ──────────────────────────────────────────────────────────────────────
 
+    # ══════════════════════════════════════════════════════════════════
+    # FIVE RULES FOR WRITING ANYTHING THE ANSWERING MODEL READS
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # Each was paid for. They are here rather than in a document because
+    # the next person to add a paragraph to this method will be reading
+    # this method.
+    #
+    # 1. ANECDOTES GO IN COMMENTS. "Measured: two blocks died on NameError"
+    #    is for whoever weakens the rule later, not for the model, which
+    #    needs the rule and not its history. Ten per cent of this directive
+    #    was anecdote before they were moved out.
+    #
+    # 2. GIVE WORDS, NOT RULES, WHEREVER THE MODEL WOULD CHOOSE. "Translate
+    #    the headings" failed in three wordings across three runs; a table
+    #    of translated headings has not failed. Sections marked SKIP were
+    #    handed over with "omit anything marked SKIP" and an answer wrote
+    #    the heading and the word; dropped before emission, there is
+    #    nothing to omit. A rule the model must apply is a rule it can
+    #    misapply.
+    #
+    # 3. DATA AS LABELLED LISTS, PROSE AS PROSE, NEVER INTERLEAVED. Five
+    #    gap types each wrapped their own list in a sentence of guidance,
+    #    and an answer reproduced the whole block verbatim under the
+    #    heading — read in sequence under a section title, that is what
+    #    section content looks like.
+    #
+    # 4. THE INSTRUCTION NEAREST THE POINT OF ACTION WINS. "Copy verbatim"
+    #    sitting closest to the list beat "translate" three paragraphs
+    #    above it. The no-repeat rule lives in the header AND again in the
+    #    closing note, because that is where it gets broken.
+    #
+    # 5. A RULE THAT FAILS TWICE IS REPLACED, NOT REWORDED. Rewording is
+    #    what produced the four-paragraph header that the model stopped
+    #    reading halfway through. Ask what would remove the decision.
+    #
+    # BUDGET: the outline mode runs about 190 tokens and the long mode
+    # about 1,300. The long mode is the fallback, so it may be thorough;
+    # the outline mode is the one that runs, and anything added there is
+    # added to every turn. test_directive_budget guards both.
+    #
     @staticmethod
     def _answer_format_directive(
         n_valid: int,
@@ -25201,16 +25293,32 @@ class AgenticSynthesisComposer:
                     "for letter. They are already in the right language; do "
                     "not translate them and do not reword them.",
                     "",
-                    "3. Omit any section marked SKIP. Do not add sections "
-                    "of your own and do not repeat one you already wrote.",
+                    "3. Write every section listed and no others. Do not "
+                    "add sections of your own and do not repeat one you "
+                    "already wrote.",
                     "",
                     "The line under each heading says what this turn "
                     "established for it. Develop it into prose against the "
                     "workspace above; do not simply restate it.",
                     "",
-                    "---",
-                    "",
-                    outline.strip(),
+                ]
+                # Split into lines, with a rule ahead of every heading. The
+                # outline arrived as ONE list element with newlines inside
+                # it, so _resolve_group_breaks never saw its headings and
+                # emitted no rules between them: an answer came back with
+                # eight sections and a single rule at the top, while rule 1
+                # was telling it to copy hyphens that were not there. The
+                # long mode builds its rules the same way — one before each
+                # section — and this now matches it instead of asking the
+                # model to supply what the emitter left out.
+                + [
+                    _l
+                    for _line in outline.strip().split("\n")
+                    for _l in (
+                        ["", "---", "", _line]
+                        if _line.strip().startswith("## **")
+                        else [_line]
+                    )
                 ]
             )
 
@@ -25459,14 +25567,23 @@ class AgenticSynthesisComposer:
                 # unittest is not defined" and a third on "SystemExit: 0",
                 # because unittest.main() calls sys.exit and the browser
                 # runner reports that as a crash even when all tests pass.
-                "that feel automatic. Put the runner at the TOP LEVEL: no "
-                "`if __name__ == \"__main__\"` guard, which is False in the "
-                "browser runner and turns the whole block into a definition "
-                "that runs nothing and prints nothing — output that is "
-                "neither a pass nor a failure, which is worse than either. "
-                "The sandbox harness in this codebase uses that guard and "
-                "you may be reading it; it is correct there and wrong "
-                "here.\n\n"
+                # Two prohibitions, one cause. The block runs in a browser,
+                # not a shell: __main__ is not the module name there, and
+                # exiting is a crash rather than a status. Both were
+                # measured — a block that printed nothing at all, and a
+                # block that printed a clean report and then died on
+                # SystemExit so the reader saw the traceback instead.
+                # Forbidding unittest was not enough: the model wrote
+                # sys.exit(1) by hand once unittest was gone, which is the
+                # same idea reaching for a different door.
+                "that feel automatic. Two things the browser runner cannot "
+                "take: put the runner at the TOP LEVEL with no "
+                "`if __name__ == \"__main__\"` guard, which is False there "
+                "and leaves a block that runs nothing and prints nothing; "
+                "and NEVER exit — no sys.exit, no raise at the end, no "
+                "SystemExit by any route, because a non-zero exit is "
+                "reported as a crash and buries the report you just "
+                "printed. Report failures by printing them and stop.\n\n"
                 "Do NOT reproduce any harness a "
                 "dynamic verification step generated: those are throwaway "
                 "probes built against stand-in objects, they will not run "
