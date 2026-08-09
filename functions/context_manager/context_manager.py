@@ -6003,6 +6003,18 @@ class HubSymbolIndex:
             cls, _, _bare = qid.rpartition(".")
             chunk_lines = []
             if cls != current_class:
+                # 66 of these say "(module-level)" in one graph, about 313
+                # tokens of repeated label. Not redundant — the heading
+                # separates a class AS a symbol, with its own call edges,
+                # from its methods — but the repetition is free to remove
+                # by emitting the label once per run of module-level
+                # entries rather than once per class.
+                #
+                # NOT changed: this renders into Block A, the cached
+                # prefix, so the edit costs one full re-prefill of ~122s
+                # to save 0.45% of it. Worth doing only alongside another
+                # Block A change, and the hub-tier freeze note on
+                # hub_bodies_tier_top_n is the one to pair it with.
                 chunk_lines.append(f"### {cls}" if cls else "### (module-level)")
             chunk_lines.append(
                 self._format_symbol_line_no_score(
@@ -19802,6 +19814,10 @@ if __name__ == "__main__":
         "- Only use these modules (already imported): asyncio, json, math, "
         "re, time, hashlib, itertools, functools, collections.\n"
         "- No file, network, os, sys or subprocess access. No prints.\n"
+        "- Define the test functions at the TOP LEVEL, never inside a "
+        "class. The runner collects them from globals(); a method of a "
+        "test class is not there, so a class-wrapped suite runs zero "
+        "tests and reports 0/0 with its tests plainly present.\n"
         "- Return ONLY a fenced python block with the VALVES assignment "
         "(when needed) and the test functions. No prose."
     )
@@ -20867,7 +20883,14 @@ if __name__ == "__main__":
             (b.strip() for b in _blocks if "def test_" in b),
             (step.output or "").strip() if not _blocks else "",
         )
-        if "def test_" not in tests:
+        # Top-level, not merely present. "def test_" matched an indented
+        # method too, so a class-wrapped suite was persisted and armed and
+        # then ran zero tests: the runner collects from globals() and a
+        # method is not there. The step reported 0/0 with its tests intact
+        # a few lines above, which reads as a runner fault rather than as a
+        # shape the harness cannot execute. The same mistake fails in the
+        # reader's browser too, as unbound calls missing `self`.
+        if not re.search(r"(?m)^(?:async\s+)?def\s+test_", tests):
             self._f._log_debug(
                 f"🤖 DynamicVerifier: design_tests step produced no test "
                 f"functions in {len(_blocks)} fenced block(s) — nothing to "
@@ -25062,12 +25085,27 @@ class AgenticSynthesisComposer:
         # be kept; that is the only thing the Tests section is for. Read
         # from the plan's own steps rather than from the presence of a fence
         # somewhere, so a dynamic verification harness cannot open it.
-        _has_tests = any(
-            getattr(s, "kind", "") == "design_tests"
-            and getattr(s, "status", "") == "done"
-            and (s.output or "").strip()
-            for s in plan.steps
-        )
+        # The step having RUN is not the step having produced tests. One
+        # design_tests came back with an empty harness — 0/0, no test
+        # function in it at all — and this opened the section anyway; the
+        # model found a heading with nothing to fill it and wrote a
+        # paragraph describing tests instead of writing any. The same turn
+        # did it to Code. _has_code already looks inside the fences; this
+        # now does too.
+        _has_tests = False
+        for _s in plan.steps:
+            if getattr(_s, "kind", "") != "design_tests":
+                continue
+            if getattr(_s, "status", "") != "done":
+                continue
+            for _blk in re.findall(
+                r"```(?:python)?\s*(.*?)```", (_s.output or ""), re.S
+            ):
+                if re.search(r"(?m)^\s*(?:async\s+)?def\s+test_", _blk):
+                    _has_tests = True
+                    break
+            if _has_tests:
+                break
         # A repair happened when the step carries the marker the repair pass
         # writes. Read from the output rather than from a flag on the
         # verifier: the step is what the synthesis will actually see, so if
@@ -25527,9 +25565,13 @@ class AgenticSynthesisComposer:
             _GROUP_BREAK,
             "",
             f"## **{_H['proceed']}** — the next concrete step, ordered so "
-            "the one that settles the most uncertainty comes first: "
-            "the symbol to read, the check to run, the thing to "
-            "instrument. Actionable, not generic advice.",
+            "the one that settles the most uncertainty comes first: the "
+            "symbol to read, the check to run, the thing to instrument. "
+            # "five of fourteen said no further step was necessary" is the
+            # measurement, and it belongs here rather than in the model's
+            # copy: a heading and a paragraph spent to say nothing.
+            "Actionable, not generic advice. OMIT IT ENTIRELY when the "
+            "turn settled what was asked and nothing is left to do.",
         ]
         # Only truthful because the last-mile pass ran first. Before it,
         # this would be asking the model to hide a gap; after it, every
@@ -25537,13 +25579,13 @@ class AgenticSynthesisComposer:
         # X" is either work already done or work nobody can do.
         out += [
             "",
-            "Do not propose reading a symbol in this codebase as a next "
-            "step. Every body the index holds for a symbol this answer "
-            "asserts about has already been read; one that has not is "
-            "named in the sections below as not found, and reading it "
-            "is not available "
-            "to anyone. A step this pipeline should have taken itself, "
-            "or one the reader cannot act on, is not a next step.",
+            # The three sentences of reasoning went out; the rule stands.
+            # Every body the index holds has already been read, and one it
+            # does not hold is named below as not found — so "read X" is
+            # either work this pipeline owed or work nobody can do.
+            "Never propose reading a symbol in this codebase as a next "
+            "step: the bodies are already read, and one that is missing "
+            "is named below as not found.",
         ]
         if _rivals:
             # Ordering, not an extra instruction. A surviving account is
@@ -25639,10 +25681,10 @@ class AgenticSynthesisComposer:
                 "copy of the function under test — bare, no commentary, "
                 "there only so the tests have something to call — then the "
                 "tests, then the runner.\n\n"
-                "COPY IT EVEN WHEN IT IS THE READER'S OWN CODE shown under "
+                "COPY IT EVEN WHEN IT IS THE READER'S OWN CODE under "
                 "Code: this block sees nothing outside itself, so without "
-                "the copy every test dies on NameError. If it is long, copy "
-                "only the part the tests exercise.\n\n"
+                "it every test dies on NameError. If long, copy only the "
+                "part the tests exercise.\n\n"
                 # The runner is GIVEN, not described. Four patches described
                 # it and the model found a new door each time: unittest,
                 # then unittest.main() calling sys.exit, then `if __name__
@@ -25738,7 +25780,7 @@ class AgenticSynthesisComposer:
                 # `self`. The runner takes bare callables, so the tests have
                 # to be bare functions; a class may appear only as a
                 # stand-in for the subject.
-                "NEVER put the test functions inside a test class — the "
+                "NEVER put the test functions inside a class — the "
                 "runner calls them unbound and each fails on a missing "
                 "`self`. A class here is only a stand-in for the "
                 "subject.\n\n"
@@ -25852,7 +25894,10 @@ class AgenticSynthesisComposer:
             "conclusion: the symbols, call relations and code paths "
             "that were checked against the indexed graph, each stated "
             "so the reader can go and confirm it. Never give an "
-            "unverified claim the same voice as a verified one.",
+            "unverified claim the same voice as a verified one. When "
+            "this turn verified NOTHING, say so in one line and stop: "
+            "an empty check reported honestly beats a paragraph "
+            "written to fill the heading.",
         ]
 
         # ── Step 2: the honest gap, only when there is one ──
@@ -25877,6 +25922,16 @@ class AgenticSynthesisComposer:
             or n_unsupported > 0
             or dropped_gaps
             or unreadable_subjects
+            # A claim whose body WAS read and still did not settle. It sits
+            # in the `read` bucket, which none of the terms above look at,
+            # so a turn could report "1 read but unresolved" in its
+            # confidence line and open no section to name it — and a
+            # dropped gap arrived the same turn with nowhere to be
+            # written. The confidence line and this section are two views
+            # of one thing; they should not be able to disagree about
+            # whether there is anything to say.
+            or unsettled_claims
+            or unsettled_subjects
         ):
             out += [
                 "",
@@ -29058,10 +29113,29 @@ class AgenticOrchestrator:
             try:
                 _lang = _question_language(question)
                 _HH = _SECTION_HEADINGS.get(_lang) or _SECTION_HEADINGS["en"]
-                _secs = [f"## **{_HH[_k]}**" for _k in (
-                    "conclusion", "proceed", "code", "tests",
-                    "rivals", "buried", "evidence", "gaps",
-                )]
+                # Only the sections this turn HAS something for. All eight
+                # were offered unconditionally, and the outline named one
+                # the pipeline had no data for: an answer carried a
+                # "Hipótesis descartadas" section holding a rival the model
+                # made up on the spot, because nothing was buried this turn
+                # and the outline was free to plan the section anyway.
+                #
+                # The long mode gates each of these on its own evidence.
+                # The outline mode replaced those gates wholesale, which is
+                # exactly the kind of thing a second path quietly loses.
+                _rivals_now = bool(
+                    getattr(self._f, "_serial_rival_accounts", None)
+                )
+                _buried_now = bool(
+                    getattr(self._f, "_serial_eliminated_accounts", None)
+                )
+                _keys = ["conclusion", "proceed", "code", "tests"]
+                if _rivals_now:
+                    _keys.append("rivals")
+                if _buried_now:
+                    _keys.append("buried")
+                _keys += ["evidence", "gaps"]
+                _secs = [f"## **{_HH[_k]}**" for _k in _keys]
                 self._f._answer_outline = await self._composer.compose_outline(
                     plan, question, self._ledger, aligned_prefix, _lang, _secs
                 )
@@ -29559,14 +29633,36 @@ class AgenticOrchestrator:
                     "indent makes the whole block a continuation of the "
                     "last bullet, and it renders inside it. Two answers in "
                     "one run came back that way. The section contains "
+                    # The old justification was FALSE, and the model could
+                    # act on it: it said the outlet replaces these labels
+                    # with measured values. The outlet computes them and
+                    # OpenWebUI discards its edits to body["messages"] —
+                    # measured on this project long ago. Nothing downstream
+                    # corrects this block, so an answer that rewrites it is
+                    # the only version the reader ever sees.
+                    #
+                    # Two turns in one run did exactly that: one carried the
+                    # PREVIOUS block copied out of history, and a measured
+                    # "92% — 23 of 25; 2 unchecked" reached the reader as
+                    # "100% — 4 of 4". The alarm reported the opposite of
+                    # what was measured.
                     "exactly these lines, all of them, in this order, "
-                    + "copied character for character. Do NOT translate this "
-                    "block, unlike the section headings above: the outlet "
-                    "matches these labels literally to replace them with the "
-                    "measured values, and a translated label is not replaced "
-                    "and rides into the next turn's history. And do NOT write "
-                    "a confidence line of your own — your own estimate is not "
-                    "measured and predicts nothing. Close with one more "
+                    + "copied character for character. NOTHING downstream "
+                    "corrects this block: what you write is what the reader "
+                    "sees, so a number you adjust, or a line carried over "
+                    "from an earlier turn, BECOMES the measurement. Every "
+                    "line below is THIS turn's, and the Stats blocks in "
+                    "earlier answers above are NOT yours to reuse: one "
+                    "answer updated its "
+                    "[Turn:] line and carried the other five from the "
+                    "turn before. Every deviation measured so far moved "
+                    "the same way: refuted became passed, 86% became 95%, "
+                    "92% became 100%. The block is an alarm, and an alarm "
+                    "adjusted upward is worse than none. "
+                    "Do NOT translate it, unlike the headings above, and "
+                    "do NOT write a confidence line of your own: your own "
+                    "estimate is not measured and predicts nothing. Close "
+                    "with one more "
                     "horizontal rule underneath the block, so the measured "
                     "lines are fenced off from whatever follows them the "
                     "way they are fenced off from the answer above:\n\n"
@@ -42095,6 +42191,39 @@ class ActiveCodeUpdater:
                 _indexed = set(
                     self._f._symbol_index.get_all_qualified_names(project_id)
                 )
+                # "Source" means a PASTED FILE, not the index at large.
+                # get_all_qualified_names returns everything, including
+                # what the assistant wrote on earlier turns, so a symbol
+                # the model invented two turns ago made its own newer
+                # version look like a restatement of a file that never
+                # held it. Measured: "_normalize_qid" — a function this
+                # project does not contain — was dropped as already held
+                # from source, and a later block lost six test functions
+                # the same way, the ones a repair had just fixed among
+                # them.
+                #
+                # This prevents new cases; it does not clean old ones.
+                # An index that ran with the bug holds whatever the
+                # assistant wrote — measured on one project: three
+                # references to "_normalize_qid", a function it does not
+                # contain, sitting in the call graph and counting toward
+                # centrality like any other symbol. "/forget last" drops
+                # the block that introduced them, and "/clean" lists the
+                # inactive ones.
+                #
+                # get_file_for_symbol is the distinction: a symbol that
+                # came from a pasted file has a path, one the assistant
+                # wrote does not.
+                _indexed = {
+                    _q
+                    for _q in _indexed
+                    if (
+                        self._f._symbol_index.get_file_for_symbol(
+                            _q, project_id
+                        )
+                        or ""
+                    ).strip()
+                }
                 _indexed_bare = {_q.rsplit(".", 1)[-1] for _q in _indexed}
                 _kept2 = []
                 for blk, syms, raw in zip(
@@ -45764,9 +45893,61 @@ class MessageAssembler:
         # Appended here, after the agentic pipeline has already appended its
         # workspace, so the stable trailing sort puts this last of all: the
         # final thing the model reads before it starts generating.
+        # ── The question, restated at the very end ──────────────────────
+        #
+        # Measured on one prompt: the user turn ran 29,954 characters —
+        # profile, then the question, then the workspace and the answer
+        # shape — and the question sat with 19,514 characters after it.
+        # The last thing the model read before generating was formatting
+        # instruction, not what it had been asked. That turn answered the
+        # PREVIOUS question, workspace and Stats block and all, while the
+        # pipeline had framed and measured the right one.
+        #
+        # This is the same principle every rule in the answer directive
+        # was reordered around — the instruction nearest the point of
+        # action wins — pointing back at us. Repeating the question costs
+        # one line and puts it where that principle helps instead.
+        _q = str(
+            getattr(getattr(self._f, "_agentic", None), "_turn_question", "") or ""
+        ).strip()
+        if _q:
+            dynamic_injections.append((
+                "trailing",
+                "[WORKSPACE NOTE — not part of your answer]\n"
+                "THE QUESTION YOU ARE ANSWERING, restated because the "
+                "material above is long:\n"
+                + " ".join(_q.split())[:600],
+            ))
+
         _prefs = self._build_code_preferences_restatement()
         if _prefs:
             dynamic_injections.append(("trailing", _prefs))
+
+        # ── The Stats block goes LAST, after everything appended here ────
+        #
+        # The workspace ends with the block the model must copy, and its
+        # instruction says to end the answer with it and nothing else. But
+        # the workspace is appended by the pipeline and these are appended
+        # afterwards, so the stable trailing sort put a paragraph about
+        # PEP 8 line lengths BELOW the block. Measured: the correct "92% —
+        # 23 of 25" sat at 97% of the user turn with the style restatement
+        # after it, and the answer carried the previous turn's figures.
+        #
+        # The same misplaced paragraph was reproduced verbatim in another
+        # answer. One string in the wrong position, two failures.
+        _ws = [
+            _k
+            for _k, _v in enumerate(dynamic_injections)
+            if isinstance(_v, tuple)
+            and len(_v) == 2
+            and isinstance(_v[1], str)
+            and "[Turn:" in _v[1]
+            and "[Confidence:" in _v[1]
+        ]
+        for _k in _ws:
+            dynamic_injections.append(dynamic_injections[_k])
+        for _k in reversed(_ws):
+            del dynamic_injections[_k]
 
         psm = self._f._project_state_manager
         pstate = psm.get_pstate(project_id)
