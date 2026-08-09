@@ -10791,6 +10791,11 @@ class ContextBuilder:
         # these (and only if they reached LOD-3 by merit) refresh the sticky TTL.
         _lod3_emitted: Set[str] = set()
 
+        # The seed rescued from the skeleton tier this iteration, so the
+        # budget check below can name the symbol it dropped. Declared
+        # here rather than probed with locals(): that call would run for
+        # every symbol of ~950 and hide the dependency from the reader.
+        _rescued_qid = None
         for qid in sorted_nodes:
             if total_tokens >= budget:
                 break
@@ -10822,7 +10827,31 @@ class ContextBuilder:
                     # same trade the hub override already makes.
                     _is_seed = False
                     try:
-                        _is_seed = qid in set(ag.get_seed_nodes())
+                        # NAMED IN THE QUESTION, not merely seeded.
+                        # get_seed_nodes() also returns the history boosts,
+                        # registered with source="seed" — which in the turn
+                        # that exposed this were _normalize_qid,
+                        # qualify_symbol and four more from earlier turns.
+                        # Re-admitting those at full LOD would serve the
+                        # carry-over this exception exists to displace.
+                        # Whole word, not substring. "get" is a real symbol
+                        # here and it is inside "target"; "run" is inside
+                        # "runner"; "plan" inside "el plan agéntico". A
+                        # substring test re-admits a body on the strength of
+                        # a syllable, which is how a rescue turns into
+                        # noise.
+                        _bare = qid.rsplit(".", 1)[-1]
+                        _cls = qid.split(".", 1)[0]
+                        _is_seed = bool(_bare) and bool(
+                            re.search(
+                                r"(?<![\w.])(?:"
+                                + re.escape(_bare)
+                                + r"|"
+                                + re.escape(_cls)
+                                + r")(?![\w])",
+                                query or "",
+                            )
+                        )
                     except Exception:
                         _is_seed = False
                     if not _is_seed:
@@ -10835,6 +10864,13 @@ class ContextBuilder:
                         f"Block B: exact-seed override re-admits skeleton "
                         f"symbol {qid} at full LOD"
                     )
+                    # Sized, because the rescue is not free: this class is
+                    # 16,312 tokens against a 30,000 budget. It fits with
+                    # room in the turn that exposed the problem, and the
+                    # LOD-2 emit below checks the budget anyway — but a
+                    # rescue silently dropped for size would put us back
+                    # where we started with no line saying so.
+                    _rescued_qid = qid
                 if _lod_tier(qid) == 3:
                     body_only = self._render_symbol_body_only(qid, project_id)
                     if body_only:
@@ -10927,6 +10963,13 @@ class ContextBuilder:
 
                 tok = self._f._tokens.estimate_code_tokens(text)
                 if total_tokens + tok > budget:
+                    if qid == _rescued_qid:
+                        self._f._log_debug(
+                            f"WARNING Block B: the rescued seed {qid} does "
+                            f"not fit the budget ({tok} tokens, "
+                            f"{budget - total_tokens} left) — the question's "
+                            f"own symbol is not served"
+                        )
                     continue
                 loc = f" ({block.file_path})" if block.file_path else ""
                 _lod2_parts.append(f"{text}{loc} _(score: {score:.2f})_")
