@@ -10807,10 +10807,34 @@ class ContextBuilder:
                     # adding it again to _lod1_parts would duplicate it.
                     continue
                 if _lod_tier(qid) == 2:
+                    # …unless the question NAMED it. The exact-seed
+                    # override above rescues hub symbols from the same
+                    # starvation, and the skeleton needs the identical
+                    # exception: it holds ~950 signatures, so a question
+                    # about almost any symbol of the project lands here.
+                    #
+                    # Measured: a turn asking whether to split
+                    # AgenticDynamicVerifier had the class AND all eight of
+                    # its methods skipped here, leaving Block B filled with
+                    # the previous turn's activation. The answer addressed
+                    # the previous question and never named the class. One
+                    # duplicated body is cheaper than an invented one — the
+                    # same trade the hub override already makes.
+                    _is_seed = False
+                    try:
+                        _is_seed = qid in set(ag.get_seed_nodes())
+                    except Exception:
+                        _is_seed = False
+                    if not _is_seed:
+                        self._f._log_debug(
+                            f"Block B: skipping LOD-2 for {qid} "
+                            f"(in skeleton tier)"
+                        )
+                        continue
                     self._f._log_debug(
-                        f"Block B: skipping LOD-2 for {qid} (in skeleton tier)"
+                        f"Block B: exact-seed override re-admits skeleton "
+                        f"symbol {qid} at full LOD"
                     )
-                    continue
                 if _lod_tier(qid) == 3:
                     body_only = self._render_symbol_body_only(qid, project_id)
                     if body_only:
@@ -43351,6 +43375,40 @@ class SystemPromptBuilder:
             self._f, "_last_activation_scores", {}
         ).get(project_id, {})
 
+        # Does Block B hold a body for what was ASKED? When none of the
+        # served bodies is named in the question, what fills the section is
+        # whatever the previous turn activated, and nothing says so.
+        #
+        # Measured: a turn asking whether to split AgenticDynamicVerifier
+        # was served six bodies of _repair_truncated_json — the previous
+        # turn's subject — because the class sits in the skeleton tier and
+        # its LOD-2 render was skipped. The answer addressed the previous
+        # question and never named the class once. The pipeline had the
+        # right bodies and measured correctly; only the final model was
+        # shown the wrong ones. Three other turns in the same run served
+        # their own subject, so this is the skeleton-tier case, not the
+        # rule.
+        try:
+            _q = (user_question or "").lower()
+            _served = [
+                _m.group(1)
+                for _m in re.finditer(r"(?m)^# `([^`]+)`", prelim_system or "")
+            ]
+            if _q and _served and not any(
+                _n.rsplit(".", 1)[-1].lower() in _q or _n.split(".", 1)[0].lower() in _q
+                for _n in _served
+            ):
+                self._f._log_debug(
+                    f"WARNING Block B serves no body named in this question "
+                    f"({len(_served)} served, first={_served[0][:48]!r}) — "
+                    f"the section is carry-over activation and the answer "
+                    f"will be written from it"
+                )
+        except Exception as _e_bb:
+            self._f._log_debug(
+                f"Block B question check failed "
+                f"({type(_e_bb).__name__}: {_e_bb})"
+            )
         self._f._log_debug("🔄 Block B: complete")
         return static_block, dynamic_injections, None, prelim_system
 
