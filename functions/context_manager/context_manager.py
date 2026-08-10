@@ -25479,6 +25479,15 @@ class AgenticSynthesisComposer:
                     "appears (the first one included, and one before every heading), "
                     "Your answer STARTS with that first rule and then the first "
                     "section listed; nothing comes before it. "
+                    # "Nothing before it" has to name CODE, because code is what came
+                    # before it. An answer opened with the design_tests block sitting
+                    # above the first rule, outside every section, and then repeated
+                    # the same block under Code. The step output is in the workspace
+                    # and reads as the thing to show; without a line saying where it
+                    # goes, it goes first.
+                    "Nothing at all comes before that rule — no code block, no "
+                    "preamble, no summary. Code from a step belongs inside a "
+                    "section, once. "
                     "and every heading letter for letter WITH its asterisks. Write "
                     "the sections listed and no others, none twice.\n\n"
                     "Then write: each section EXCEPT Conclusion as a list, one "
@@ -25592,6 +25601,15 @@ class AgenticSynthesisComposer:
             "This list is CLOSED: write the sections listed and no others, "
             "none twice, and omit any whose content this turn does not have. "
             "Start with Conclusion, the only one always required.",
+            # "Nothing before it" has to name CODE, because code is what came
+            # before it. An answer opened with the design_tests block sitting
+            # above the first rule, outside every section, and then repeated
+            # the same block under Code. The step output is in the workspace
+            # and reads as the thing to show; without a line saying where it
+            # goes, it goes first.
+            "Nothing at all comes before that first rule — no code block, "
+            "no preamble, no summary. Code from a step belongs inside a "
+            "section, once.",
             "",
             "Then write: each section EXCEPT Conclusion as a list, one "
             "finding per item, numbered where the items have an order or a "
