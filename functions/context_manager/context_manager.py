@@ -24561,7 +24561,6 @@ class AgenticSynthesisComposer:
         '"the empty-string guard returns before the loop" and not "how the '
         'guard works". A section this turn has nothing for gets the single '
         "word SKIP.\n\n"
-        "{never}"
         # No Tests section any more: the sandbox verifies against the real
         # body and Stats reports it, so nothing runnable belongs in the
         # answer. Code carries whatever code the turn has, tests included
@@ -24605,26 +24604,11 @@ class AgenticSynthesisComposer:
         """
         _names = {"es": "Spanish", "en": "English"}.get(lang, "English")
         try:
-            # The sections the outline may NOT skip, named in its own contract.
-            # Offered 3 and 4 sections on turns with ten findings each, it
-            # skipped the two that absorb the most and the model invented
-            # eight headings to hold what was left over.
-            _never_text = (
-                ""
-                if not never_skip
-                else (
-                    "These sections are NEVER SKIP, whatever this turn found: "
-                    + ", ".join(never_skip)
-                    + ". A turn that settled little still has something true to "
-                    "say in each.\n\n"
-                )
-            )
             _resp = await self._f._llm_orchestrator.call_llm(
                 system_prompt=aligned_prefix,
                 prompt=self._OUTLINE_CONTRACT.format(
                     sections="\n".join(f"- {x}" for x in sections),
                     langname=_names,
-                    never=_never_text,
                 ),
                 max_tokens=1200,
                 label="agentic_outline",
@@ -24687,13 +24671,11 @@ class AgenticSynthesisComposer:
             _is_head = bool(_heads(_l))
             if _is_head:
                 _body = _lines[_idx + 1] if _idx + 1 < len(_lines) else ""
-                if _body.strip().upper().startswith("SKIP") and (
-                        # _heads returns the BARE name; never_skip arrives wrapped as
-                        # "## **Name**". Comparing the two forms silently matched
-                        # nothing and the guard did not guard.
-                        _heads(_l)
-                        not in {_x.strip("# *") for _x in (never_skip or [])}
-                ):
+                # _heads returns the BARE name; never_skip arrives wrapped as
+                # "## **Name**", so both are compared bare.
+                if _body.strip().upper().startswith("SKIP") and _heads(
+                    _l
+                ) not in {_x.strip("# *") for _x in (never_skip or [])}:
                     _skip += 1
                     _idx += 2
                     continue
@@ -24701,7 +24683,15 @@ class AgenticSynthesisComposer:
                 # wrote bare still reaches the answer as "## **Name**".
                 _kept.append(f"## **{_heads(_l)}**")
                 if _body:
-                    _kept.append(_body)
+                    # A protected section keeps its heading, but its body must not
+                    # be the word SKIP: the guard would hand the model
+                    # "## **Código**" with SKIP under it, which is the shape
+                    # that gets copied into the answer.
+                    _kept.append(
+                        "what this turn has for it"
+                        if _body.strip().upper().startswith("SKIP")
+                        else _body
+                    )
                 _idx += 2
                 continue
             _kept.append(_l)
@@ -25469,31 +25459,57 @@ class AgenticSynthesisComposer:
                     # Both halves are measured. One answer dropped the
                     # opening rule and kept the internal ones; another kept
                     # the opening one and dropped all six internal.
-                    # SHORT, and mechanical first. Six numbered rules put the two that
-                    # are COPIED — the rules and the headings — behind four about how
-                    # to write, and the model stopped copying: every heading in one run
-                    # came back without its asterisks, 32 of them, where the two runs
-                    # before had 42 with. Same failure as the four-paragraph header
-                    # this replaced months ago: a rule read late is a rule not read.
-                    "COPY, do not compose: every line of three hyphens where it "
-                    "appears (the first one included, and one before every heading), "
-                    "and every heading letter for letter WITH its asterisks. Write "
-                    "the sections listed and no others, none twice.\n\n"
-                    "Your answer STARTS with that first rule and then the first "
-                    "section listed. Nothing at all comes before it — no code "
-                    "block, no preamble, no summary. Code from a step belongs "
-                    "inside Código, once: the implementation and the tests both "
-                    "go there, in SEPARATE fenced blocks, and neither earns a "
-                    "section of its own.\n\n"
-                    "Then write: each section EXCEPT Conclusion as a list, one "
-                    "finding per item, numbered where there is an order and bulleted "
-                    "where there is not; Conclusion as prose, since an argument cut "
-                    "into bullets stops being one. Fence code with three backticks "
-                    "and never leave one open.\n\n"
-                    "Write the way a good friend explains something they know well: "
-                    "plainly, in the second person, ordinary words before technical "
-                    "ones, real uncertainty said as a person would. The goal is that "
-                    "the reader UNDERSTANDS, not that they are impressed.",
+                    "1. COPY every line of three hyphens exactly where it "
+                    "appears — the FIRST one, which is the first line of "
+                    "your answer and not the end of this instruction, AND "
+                    "the one before every heading that follows. A section "
+                    "without its rule above it is a section written wrong.",
+                    "",
+                    "2. WRITE EACH HEADING EXACTLY AS IT APPEARS, letter "
+                    "for letter. They are already in the right language; do "
+                    "not translate them and do not reword them.",
+                    "",
+                    "3. Write every section listed and no others. Do not "
+                    "add sections of your own and do not repeat one you "
+                    "already wrote.",
+                    "",
+                    # Same rule 4 as the long mode. The outline mode is the
+                    # one that actually runs, and it was missing every test
+                    # rule this project has: a turn here would get the
+                    # sections and none of what makes their code runnable.
+                    # Rule 4 was born to make the Tests section runnable in the
+                    # browser: Pyodide named, a literal runner, the class ban, an
+                    # import whitelist. That section is gone — verification runs in
+                    # the sandbox against the real body — so what is left is the one
+                    # rule that governs any code block at all.
+                    "4. FENCE EVERY CODE BLOCK: open with a line holding three "
+                    "backticks and the language, close with a line holding three "
+                    "and nothing else. Never nest fences and never leave one "
+                    "open — an unclosed block swallows the rest of your answer.",
+                    "",
+                    # Form and voice. Sections that carry several findings read as a
+                    # wall when they are written as one paragraph: the reader cannot
+                    # tell where one point ends and the next begins, and cannot come
+                    # back to the third one later. Conclusion is the exception because
+                    # it argues a single mechanism, and an argument split into bullets
+                    # stops being an argument.
+                    "5. Every section EXCEPT Conclusion is a list: numbered when the "
+                    "items have an order or a rank, bulleted when they do not. One "
+                    "finding per item, so the reader can take them one at a time and "
+                    "come back to the third one later. Conclusion stays prose — it "
+                    "argues one mechanism, and an argument cut into bullets stops "
+                    "being one.",
+                    "",
+                    # The register, said as a relationship rather than a style. "Be
+                    # clear" produces the same hedged prose it always did; "a friend
+                    # who wants you to understand" changes what the sentence is FOR.
+                    "6. Write the way a good friend explains something they know "
+                    "well: plainly, in the second person, checking as they go that "
+                    "you are still with them. Say the hard part in ordinary words "
+                    "before reaching for the technical one, and when something is "
+                    "genuinely uncertain say so like a person would rather than "
+                    "hedging it into fog. Warm, never chummy; the goal is that the "
+                    "reader UNDERSTANDS, not that they are impressed.",
                     "The line under each heading says what this turn "
                     "established for it. Develop it into prose against the "
                     "workspace above; do not simply restate it.",
@@ -25584,49 +25600,95 @@ class AgenticSynthesisComposer:
             # rules did not need better arguments, they needed to fit in
             # view. The heading/dash rule is gone entirely: headings no
             # longer carry a dash, so there is nothing left to get wrong.
-            # Same order as the outline mode: what is COPIED comes first. Six
-            # numbered rules buried the two mechanical ones behind four about
-            # voice, and a whole run came back with headings stripped of their
-            # asterisks — 32 of them, against 42 correct in the two runs
-            # before. A rule read late is a rule not read.
-            "COPY, do not compose: every line of three hyphens where it "
-            "appears (the first one included, and one before every heading), "
-            "and every heading letter for letter WITH its asterisks. They are "
-            "already in the right language; do not translate or reword them. "
-            "This list is CLOSED: write the sections listed and no others, "
-            "none twice, and omit any whose content this turn does not have. "
-            "Start with Conclusion, the only one always required.",
-            # "Nothing before it" has to name CODE, because code is what came
-            # before it. An answer opened with the design_tests block sitting
-            # above the first rule, outside every section, and then repeated
-            # the same block under Code. The step output is in the workspace
-            # and reads as the thing to show; without a line saying where it
-            # goes, it goes first.
-            "Nothing at all comes before that first rule — no code block, "
-            "no preamble, no summary. Code from a step belongs inside "
-            "Código, once — the implementation and the tests both go "
-            "there, in SEPARATE fenced blocks, and neither earns a "
-            "section of its own. ",
+            "Four rules, all of them:",
             "",
-            "Then write: each section EXCEPT Conclusion as a list, one "
-            "finding per item, numbered where the items have an order or a "
-            "rank and bulleted where they do not; Conclusion as prose, since "
-            "an argument cut into bullets stops being one. Fence every code "
-            "block with three backticks and the language, close it with three "
-            "and nothing else, and never leave one open — an unclosed block "
-            "swallows the rest of your answer.",
+            # Same wording as the outline mode's copy. Two modes stating one
+            # rule differently is how the weaker of them stops being kept
+            # up to date — this one is the fallback, and a fallback that
+            # produces a worse-formed answer is not much of one.
+            "1. COPY every line of three hyphens exactly where it appears — "
+            "the FIRST one, which is the first line of your answer and not "
+            "the end of this instruction, AND the one before every heading "
+            "that follows. A section without its rule above it is a section "
+            "written wrong.",
             "",
-            "Write the way a good friend explains something they know well: "
-            "plainly, in the second person, checking as they go that you are "
-            "still with them. Ordinary words before technical ones, and real "
-            "uncertainty said the way a person would rather than hedged into "
-            "fog. Warm, never chummy; the goal is that the reader "
-            "UNDERSTANDS, not that they are impressed.",
+            # Anchored to the QUESTION, not to "the language you are
+            # answering in". That phrasing was circular: it told the model
+            # to translate into whatever language it had already decided on,
+            # and the instruction it was reading is in English. Two answers
+            # came back with Spanish prose under English headings — the body
+            # translated, the titles copied — which is the shape of a model
+            # obeying both readings at once.
+            # No translation rule any more. The headings below arrive in
+            # the reader's language already, chosen from a table, so there
+            # is nothing left to translate and nothing left to get wrong.
+            # Three wordings were tried and measured — stated once, stated
+            # three times, anchored to the reader's own question — and
+            # answers still came back with English headings over Spanish
+            # prose. The rule was replaced rather than rewritten a fourth
+            # time: the reliable way to have a model use a word is to give
+            # it the word.
+            "2. WRITE EACH HEADING EXACTLY AS IT APPEARS, letter for "
+            "letter. They are already in the right language; do not "
+            "translate them, do not reword them, and never replace one "
+            "with what you found.",
+            "",
+            # "three answers in one run left it out" was in the text the
+            # model reads. It does not need the history, it needs the rule;
+            # the history belongs here, where whoever weakens this rule can
+            # see what it cost.
+            "3. Start with Conclusion. It is the only section always "
+            "required.",
+            "",
+            # ANY fenced test code, wherever it lands. Everything this
+            # project learned about runnable tests used to live inside the
+            # Tests section brief — the literal runner, Pyodide named, the
+            # class prohibition, the import list — and a turn whose Tests
+            # section was not emitted received NONE of it. Measured: two
+            # answers shipped class-wrapped suites with no runner, which is
+            # exactly where this started four days ago.
+            #
+            # The section decides WHERE tests go. This decides what they
+            # must look like, and it holds even when there is no section.
+            # Rule 4 was born to make the Tests section runnable in the
+            # browser: Pyodide named, a literal runner, the class ban, an
+            # import whitelist. That section is gone — verification runs in
+            # the sandbox against the real body — so what is left is the one
+            # rule that governs any code block at all.
+            "4. FENCE EVERY CODE BLOCK: open with a line holding three "
+            "backticks and the language, close with a line holding three "
+            "and nothing else. Never nest fences and never leave one "
+            "open — an unclosed block swallows the rest of your answer.",
+            "",
+            # Form and voice. A section carrying several findings reads as a
+            # wall when written as one paragraph: the reader cannot tell where
+            # one point ends, and cannot come back to the third one later.
+            "5. Every section EXCEPT Conclusion is a list: numbered when the "
+            "items have an order or a rank, bulleted when they do not. One "
+            "finding per item, so the reader can take them one at a time and "
+            "come back to the third one later. Conclusion stays prose — it "
+            "argues one mechanism, and an argument cut into bullets stops "
+            "being one.",
+            "",
+            # The register said as a relationship rather than a style. "Be
+            # clear" produces the same hedged prose it always did; "a friend
+            # who wants you to understand" changes what the sentence is FOR.
+            "6. Write the way a good friend explains something they know "
+            "well: plainly, in the second person, checking as they go that "
+            "you are still with them. Ordinary words before technical ones, "
+            "and real uncertainty said the way a person would rather than "
+            "hedged into fog. Warm, never chummy; the goal is that the "
+            "reader UNDERSTANDS, not that they are impressed.",
             # The next-steps clause ran three sentences on why repeating
             # them is bad, and a turn repeated How to proceed anyway. What
             # catches it is the "Before you close" note, which arrives at
             # the moment of the mistake; the reasoning here only added
             # length to a rule already stated.
+            "This list is CLOSED and each heading appears exactly ONCE. Do "
+            "not add sections of your own, and do not repeat one you "
+            "already wrote — next steps included. Omit any section whose "
+            "content this turn does not have; an empty heading is worse "
+            "than a missing one.",
             "",
             # A literal rule, not a group sentinel. The sentinels resolve to
             # rules only BETWEEN groups and a leading one is dropped by
@@ -29109,13 +29171,16 @@ class AgenticOrchestrator:
                 if _buried_now:
                     _keys.append("buried")
                 _keys += ["evidence", "gaps"]
-                # Evidence and Gaps are not skippable. Measured: the outline planned
-                # 3 and 4 sections on turns whose answers carried ten findings, and
-                # the model invented "Hallazgos", "Resumen", "Referencias" and five
-                # more to hold the overflow. The one turn offered fifteen sections
-                # wrote nine — given room, it stays inside it.
                 _secs = [f"## **{_HH[_k]}**" for _k in _keys]
-                _never = [f"## **{_HH['evidence']}**", f"## **{_HH['gaps']}**"]
+                # Código, Evidence and Gaps are NOT skippable. Measured: an answer
+                # came back with no Código section at all — the outline had marked
+                # it SKIP — and the code landed above the first rule, outside every
+                # section, because there was nowhere else for it to go.
+                _never = [
+                    f"## **{_HH['code']}**",
+                    f"## **{_HH['evidence']}**",
+                    f"## **{_HH['gaps']}**",
+                ]
                 self._f._answer_outline = await self._composer.compose_outline(
                     plan, question, self._ledger, aligned_prefix, _lang, _secs, _never
                 )
@@ -29562,6 +29627,9 @@ class AgenticOrchestrator:
                     + ("; " + ", ".join(_t_open) if _t_open else "")
                     + "]"
                 )
+                # Kept on the Filter so the outlet can append it verbatim when
+                # append_stats_block is on: one string, two possible paths.
+                self._f._measured_stats_block = _t_line
                 # No opening mark any more: the turn number is the first
                 # line of the Stats block instead. A bare "[T4]" above the
                 # first paragraph was a label with nothing to belong to,
@@ -29573,59 +29641,94 @@ class AgenticOrchestrator:
                 # never a single line, and the singular wording that used to
                 # sit here could no longer be reached. A branch that cannot
                 # run is a claim about the data that stopped being true.
-                _workspace += (
-                    # Not an "##" heading. Every section of the answer is
-                    # "##" now, and a workspace label wearing the same
-                    # marker is one the model copies: an answer came back
-                    # with "Your Stats section" written out as a heading of
-                    # its own, directly above the real block. The marker
-                    # used to distinguish instruction from answer; once the
-                    # answer adopted it, it stopped distinguishing anything.
-                    "\n\n[WORKSPACE NOTE — not part of your answer]\n"
-                    "YOUR STATS SECTION\n"
-                    # The no-repeat rule, restated where it is broken. It
-                    # already sits in the header, and an answer broke it
-                    # anyway: How to proceed appeared once in its place and
-                    # again just above this block, the second one proposing
-                    # exactly what its own section forbids. By the time the
-                    # model reaches the end of a long answer the header is
-                    # thousands of tokens behind it; the instruction that
-                    # governs a moment has to be readable at that moment.
-                    "\n\n[WORKSPACE NOTE — not part of your answer]\n"
-                    # THE BLOCK FIRST, the reasoning after. It used to sit at the end of
-                    # ~200 words about not adding sections, the closing rule and
-                    # indentation, and the numbers came back rewritten while the long,
-                    # odd [Code action:] line was copied perfectly. That is not
-                    # carelessness: it is a model that reached the block late and
-                    # recomputed what it could recompute.
-                    #
-                    # Measured: "40% - 27 of 34" reached the reader as "100% - 5 of 5",
-                    # and "4 of 4" as "6 of 6". Both upward. Same fix as the header:
-                    # what is copied comes before what is explained.
-                    # NOTHING FOLLOWS THE BLOCK. Two orderings have now failed for
-                    # opposite reasons: with the block last, after ~200 words, the
-                    # numbers came back recomputed; with the block first and the
-                    # reasoning after it, an answer copied the reasoning too and the
-                    # reader saw "NOTHING downstream corrects them..." printed under
-                    # its Stats.
-                    #
-                    # Both are the same rule: whatever sits next to the thing being
-                    # copied gets copied. So the lead-in is two sentences, the block
-                    # is last, and there is nothing after it to sweep up.
-                    "BEFORE YOU CLOSE\n"
-                    "Every section you meant to write is written; add no more, and "
-                    "no heading after this. These figures were measured this turn "
-                    "and nothing downstream corrects them, so one you adjust "
-                    "BECOMES the measurement — every deviation so far moved the "
-                    "same way, 4 of 4 to 6 of 6, 40% to 100%. Do not translate "
-                    "them, do not write a confidence line of your own, and do not "
-                    "reuse the Stats block of an earlier answer above.\n"
-                    "End your answer with a horizontal rule, then EXACTLY the lines "
-                    "below copied character for character, then one closing rule "
-                    "under them. All at the LEFT MARGIN: continuing at a bullet's "
-                    "indent renders the whole block inside that bullet.\n\n"
-                    + _t_line
-                )
+                # With the outlet appending the measured block, asking the model
+                # for one as well gets it written twice — one of the ways
+                # transcription already failed.
+                if self._f.valves.append_stats_block:
+                    _workspace += (
+                        "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                        "BEFORE YOU CLOSE\n"
+                        "Every section you meant to write is written; add no more, "
+                        "and no heading after this. Do NOT write a Stats block or a "
+                        "confidence line of your own — the measured one is appended "
+                        "after your answer. End on your last section."
+                    )
+                else:
+                    _workspace += (
+                        # Not an "##" heading. Every section of the answer is
+                        # "##" now, and a workspace label wearing the same
+                        # marker is one the model copies: an answer came back
+                        # with "Your Stats section" written out as a heading of
+                        # its own, directly above the real block. The marker
+                        # used to distinguish instruction from answer; once the
+                        # answer adopted it, it stopped distinguishing anything.
+                        "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                        "YOUR STATS SECTION\n"
+                        # The no-repeat rule, restated where it is broken. It
+                        # already sits in the header, and an answer broke it
+                        # anyway: How to proceed appeared once in its place and
+                        # again just above this block, the second one proposing
+                        # exactly what its own section forbids. By the time the
+                        # model reaches the end of a long answer the header is
+                        # thousands of tokens behind it; the instruction that
+                        # governs a moment has to be readable at that moment.
+                        "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                        "BEFORE YOU CLOSE\n"
+                        "You are at the end of the answer. Every section you "
+                        "were going to write is written: do NOT add another one "
+                        "here, and in particular do not write next steps again "
+                        "because the answer feels like it should end with them. "
+                        "It ends with the block below and nothing else — the "
+                        "last character of your answer is the closing rule "
+                        "under it. Do not start another heading after it: one "
+                        "answer ended with a bare '##' and nothing to follow, "
+                        "which is the shape of a habit finishing itself.\n"
+                        "This turn's evidence was counted. Close your answer "
+                        "with a horizontal rule on its own line — three "
+                        "hyphens, like the ones separating the groups above — "
+                        "and then the ## **Stats** section — the same heading "
+                        "shape as every other section, since it is one. Start "
+                        "both at the LEFT "
+                        "MARGIN, with no indentation: when the section above "
+                        "ends in a bulleted list, continuing at that list's "
+                        "indent makes the whole block a continuation of the "
+                        "last bullet, and it renders inside it. Two answers in "
+                        "one run came back that way. The section contains "
+                        # The old justification was FALSE, and the model could
+                        # act on it: it said the outlet replaces these labels
+                        # with measured values. The outlet computes them and
+                        # OpenWebUI discards its edits to body["messages"] —
+                        # measured on this project long ago. Nothing downstream
+                        # corrects this block, so an answer that rewrites it is
+                        # the only version the reader ever sees.
+                        #
+                        # Two turns in one run did exactly that: one carried the
+                        # PREVIOUS block copied out of history, and a measured
+                        # "92% — 23 of 25; 2 unchecked" reached the reader as
+                        # "100% — 4 of 4". The alarm reported the opposite of
+                        # what was measured.
+                        "exactly these lines, all of them, in this order, "
+                        + "copied character for character. NOTHING downstream "
+                        "corrects this block: what you write is what the reader "
+                        "sees, so a number you adjust, or a line carried over "
+                        "from an earlier turn, BECOMES the measurement. Every "
+                        "line below is THIS turn's, and the Stats blocks in "
+                        "earlier answers above are NOT yours to reuse: one "
+                        "answer updated its "
+                        "[Turn:] line and carried the other five from the "
+                        "turn before. Every deviation measured so far moved "
+                        "the same way: refuted became passed, 86% became 95%, "
+                        "92% became 100%. The block is an alarm, and an alarm "
+                        "adjusted upward is worse than none. "
+                        "Do NOT translate it, unlike the headings above, and "
+                        "do NOT write a confidence line of your own: your own "
+                        "estimate is not measured and predicts nothing. Close "
+                        "with one more "
+                        "horizontal rule underneath the block, so the measured "
+                        "lines are fenced off from whatever follows them the "
+                        "way they are fenced off from the answer above:\n\n"
+                        + _t_line
+                    )
                 # Logged whole. The cut used to be [:60], which landed
                 # exactly on the boundary where the reason a rival survived
                 # begins, so the one field worth reading was the one field
@@ -47351,17 +47454,16 @@ class ContextDumper:
         # user role in this OpenWebUI), which is why a turn-3 dump was labelled
         # 5. Disabling Builtin Tools in the model Capabilities restores strict
         # user/assistant alternation; this count is correct either way.
+        # The SAME number the Stats block and the status line show. All
+        # three used to count user messages, each at its own moment and
+        # this one with a max(1, ...) floor, so a turn-3 dump was labelled
+        # 5 while the answer said 4. The old count stays as a fallback.
         turn = (
             turn_override
             if turn_override is not None
-            # The SAME number the Stats block and the status line show.
-            # All three used to count user messages, each at its own
-            # moment and this one with a max(1, …) floor, so a turn-3
-            # dump was labelled 5 while the answer said 4. One counter,
-            # read three times.
-                else int(
-                    pstate.get("napmem_turn_number", 0)
-                    or max(1, sum(1 for m in messages if m.get("role") == "user"))
+            else int(
+                pstate.get("napmem_turn_number", 0)
+                or max(1, sum(1 for m in messages if m.get("role") == "user"))
             )
         )
 
@@ -54785,6 +54887,23 @@ class Valves(BaseModel):
     # 16. INTERACTION & COMMANDS
     # ══════════════════════════════════════════════════════════════════════
 
+    # THE STATS BLOCK, APPENDED INSTEAD OF TRANSCRIBED. Off by default.
+    #
+    # Four arrangements of "copy these lines exactly" failed, each
+    # differently: numbers recomputed (40% of 27-of-34 became 100% of
+    # 5-of-5), the explanation beside the block copied into the answer,
+    # and the block written twice. A literal block in a prompt can be
+    # copied wrongly, and asking more firmly does not change that.
+    #
+    # With this on the model is not asked for it: the outlet appends it
+    # through the event channel the status lines already use.
+    append_stats_block: bool = Field(
+        default=False,
+        description=(
+            "Append the measured Stats block via the event emitter "
+            "instead of asking the answering model to copy it."
+        ),
+    )
     enable_status_updates: bool = Field(
         default=True,
         description=(
@@ -55380,6 +55499,7 @@ class Filter:
         # not the model's recollection of it. Cleared per turn beside the
         # other per-turn state.
         self._measured_reading_lines: str = ""
+        self._measured_stats_block: str = ""
         # What the metacognitive escalation re-tested this turn, if it ran.
         # "re-tested" rather than "falsified": four claims went through a
         # second, independent falsification attempt and ONE fell — the other
@@ -55620,6 +55740,42 @@ class Filter:
         line = f"{'=' * left}{title_text}{'=' * right}"
         print(f"[CodeAware] {line}")
 
+    async def _emit_message(self, content: str) -> None:
+        """
+        Append content to the assistant message via __event_emitter__.
+    
+        The channel the status lines already use accepts {"type":
+        "message"}, which APPENDS to what the model streamed. It is the
+        one way this plugin can put text in front of the reader without
+        asking the model to write it: outlet edits to body["messages"]
+        are discarded by OpenWebUI, which is why the Stats block was
+        handed over to be copied in the first place.
+    
+        Confirmed working against a live OpenWebUI: the appended block
+        arrived intact, fenced by the rules this caller wraps it in.
+    
+        Never raises: a UI error must not take the turn down.
+    
+        Args:
+            content: Markdown appended to the end of the answer.
+        """
+        # Nothing to append is not an append: an empty string still fires
+        # the event, and the caller wraps it in two horizontal rules — a
+        # fenced-off nothing at the end of the answer.
+        if not (content or "").strip():
+            return
+        if not self._event_emitter:
+            return
+        try:
+            await self._event_emitter(
+                {"type": "message", "data": {"content": content}}
+            )
+        except Exception as _e_em:
+            self._log_debug(
+                f"emit_message failed ({type(_e_em).__name__}: {_e_em}) — "
+                f"the answer stands without the appended block"
+            )
+    
     async def _emit_status(self, description: str, done: bool = False) -> None:
         """
         Emit a real-time status update to the UI via __event_emitter__.
@@ -56086,6 +56242,7 @@ class Filter:
             self._serial_rival_causes = []
             self._serial_rival_accounts = []
             self._measured_reading_lines = ""
+            self._measured_stats_block = ""
             self._measured_reinforcement = ""
             self._measured_execution = ""
             self._plan_step_total = 0
@@ -56175,17 +56332,13 @@ class Filter:
 
             # A MONOTONIC counter, not a count of user messages. Counting the
             # messages OpenWebUI happens to send makes the turn number a
-            # function of the history it kept: a compacted window, a pruned
-            # message or a deleted one all move it. Measured on one run: four
-            # consecutive answers came back numbered 1, 2, 4, 5.
+            # function of the history it kept: a compacted window or a pruned
+            # message moves it. Measured on one run: four consecutive answers
+            # came back numbered 1, 2, 4, 5 while the dumps said 2, 3, 4, 5 —
+            # three views of one turn disagreeing about which turn it is.
             #
-            # The dumps counted the same way at a different moment and with a
-            # max(1, …) floor, so a turn-3 dump was labelled 5. Three views of
-            # one turn disagreeing about which turn it is.
-            #
-            # Now: increment once per inlet and store it. The count of user
-            # messages stays as the seed for a session that starts mid-history,
-            # so an existing conversation does not restart at 1.
+            # The user-message count stays as the SEED, so a session starting
+            # mid-history does not restart at 1.
             _prev_turn = int(pstate.get("napmem_turn_number", 0) or 0)
             _seen_users = sum(
                 1
@@ -57765,6 +57918,24 @@ class Filter:
                 else:
                     await self._bg_manager.start(task.name, task.bg_func, project_id)
 
+        # The measured block, appended rather than transcribed. Gated off by
+        # default. Labelled, because the emitter APPENDS and cannot remove a
+        # block the model wrote itself: two blocks that look alike is worse
+        # than one wrong block, since the reader cannot tell which was
+        # measured. One line the model has no reason to invent settles it.
+        if self.valves.append_stats_block:
+            _stats = getattr(self, "_measured_stats_block", "") or ""
+            if _stats.strip():
+                await self._emit_message(
+                    "\n\n---\n\n"
+                    + _stats.rstrip()
+                    + "\n\n_Measured by the pipeline._\n\n---\n"
+                )
+                self._log_debug(
+                    f"outlet: appended the measured Stats block "
+                    f"({len(_stats)} chars)"
+                )
+        
         self._log_section(
             "CONTEXT MANAGER - OUTLET END",
             duration=time.monotonic() - start_time,
