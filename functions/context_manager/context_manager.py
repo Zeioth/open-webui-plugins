@@ -24561,11 +24561,14 @@ class AgenticSynthesisComposer:
         '"the empty-string guard returns before the loop" and not "how the '
         'guard works". A section this turn has nothing for gets the single '
         "word SKIP.\n\n"
+        # Tests is only offered when the turn HAS them, so it is never a
+        # candidate for SKIP; the old text invited skipping Code instead,
+        # and turns came back with neither. Both hold something whenever
+        # they are on the list at all.
         "Code and Tests hold different things and never the same thing "
-        "twice: the implementation goes to Code, the test functions go to "
-        "Tests. If this turn wrote only tests, Code is SKIP — an answer put "
-        "the tests under BOTH headings, and another put them under Code "
-        "while marking Tests skipped.\n\n"
+        "twice: the implementation goes to Code, the test functions and "
+        "their runner go to Tests. Both are on the list only when this "
+        "turn has content for them, so neither is a candidate for SKIP.\n\n"
         "Return ONLY the section names and their lines, one per line, in "
         "the order given. No prose, no preamble, no code."
     )
@@ -25461,6 +25464,40 @@ class AgenticSynthesisComposer:
                     "add sections of your own and do not repeat one you "
                     "already wrote.",
                     "",
+                    # Same rule 4 as the long mode. The outline mode is the
+                    # one that actually runs, and it was missing every test
+                    # rule this project has: a turn here would get the
+                    # sections and none of what makes their code runnable.
+                    "4. ANY test code you write, in any section, runs in "
+                    "PYODIDE — CPython on WebAssembly in a browser tab. So: "
+                    "plain functions test_1, test_2, … NEVER inside a test "
+                    "class; a copy of what they call in the same block; a "
+                    "runner at the end that calls each and PRINTS the "
+                    "result; no unittest, no pytest, no `if __name__`, no "
+                    "sys.exit; imports only from re, json, math, hashlib, "
+                    "itertools, functools, collections, textwrap, difflib, "
+                    "typing.\n\n"
+                    "The runner, EXACTLY this, changed only in the names it "
+                    "lists:\n\n"
+                    "```python\n"
+                    "_tests = [test_1, test_2]  # every test function, in order\n"
+                    "_passed, _failures = 0, []\n"
+                    "for _fn in _tests:\n"
+                    "    try:\n"
+                    "        _fn()\n"
+                    "        _passed += 1\n"
+                    "    except Exception as _e:\n"
+                    "        _failures.append("
+                    "f\"{_fn.__name__}: {type(_e).__name__}: {_e}\")\n"
+                    "print(f\"{_passed}/{len(_tests)} passed\")\n"
+                    "for _f in _failures:\n"
+                    "    print(\"FAIL\", _f)\n"
+                    "```\n\n"
+                    "FENCE EVERY CODE BLOCK: open with a line holding three "
+                    "backticks and the language, close with a line holding three "
+                    "and nothing else. Never nest fences and never leave one "
+                    "open — an unclosed block swallows the rest of your answer.",
+                    "",
                     "The line under each heading says what this turn "
                     "established for it. Develop it into prose against the "
                     "workspace above; do not simply restate it.",
@@ -25591,6 +25628,46 @@ class AgenticSynthesisComposer:
             "3. Start with Conclusion. It is the only section always "
             "required.",
             "",
+            # ANY fenced test code, wherever it lands. Everything this
+            # project learned about runnable tests used to live inside the
+            # Tests section brief — the literal runner, Pyodide named, the
+            # class prohibition, the import list — and a turn whose Tests
+            # section was not emitted received NONE of it. Measured: two
+            # answers shipped class-wrapped suites with no runner, which is
+            # exactly where this started four days ago.
+            #
+            # The section decides WHERE tests go. This decides what they
+            # must look like, and it holds even when there is no section.
+            "4. ANY test code you write, in any section, runs in PYODIDE — "
+            "CPython on WebAssembly in a browser tab, one block at a time. "
+            "So: plain functions named test_1, test_2, … NEVER inside a "
+            "test class; a copy of what they call, in the same block; a "
+            "runner at the end that calls each one and PRINTS the result; "
+            "no unittest, no pytest, no `if __name__`, no sys.exit, and "
+            "imports only from re, json, math, hashlib, itertools, "
+            "functools, collections, textwrap, difflib, string, enum, "
+            "dataclasses, typing.\n\n"
+            "The runner, EXACTLY this, changed only in the names it "
+            "lists:\n\n"
+            "```python\n"
+            "_tests = [test_1, test_2]  # every test function, in order\n"
+            "_passed, _failures = 0, []\n"
+            "for _fn in _tests:\n"
+            "    try:\n"
+            "        _fn()\n"
+            "        _passed += 1\n"
+            "    except Exception as _e:\n"
+            "        _failures.append("
+            "f\"{_fn.__name__}: {type(_e).__name__}: {_e}\")\n"
+            "print(f\"{_passed}/{len(_tests)} passed\")\n"
+            "for _f in _failures:\n"
+            "    print(\"FAIL\", _f)\n"
+            "```\n\n"
+            "FENCE EVERY CODE BLOCK: open with a line holding three "
+            "backticks and the language, close with a line holding three "
+            "and nothing else. Never nest fences and never leave one "
+            "open — an unclosed block swallows the rest of your answer.",
+            "",
             # The next-steps clause ran three sentences on why repeating
             # them is bad, and a turn repeated How to proceed anyway. What
             # catches it is the "Before you close" note, which arrives at
@@ -25699,13 +25776,7 @@ class AgenticSynthesisComposer:
                 # rule needs no argument. What remains is the instruction.
                 "warranted. THE CODE GOES HERE AND THE TESTS DO NOT — they "
                 "have their own section, or their own fenced block after "
-                "this one when there is none. "
-                "Fence every block: open with a line holding "
-                "three backticks followed by the language (python, and so "
-                "on), and close with a line holding three backticks and "
-                "nothing else. Never leave a block unterminated, never "
-                "nest fences, and keep prose outside them — an unclosed "
-                "block swallows the rest of the answer.",
+                "this one when there is none.",
             ]
         # ── Step 4.5: the tests, when a design_tests step wrote some ──
         # Only for design_tests. Its output is written to be KEPT and run
@@ -25772,25 +25843,6 @@ class AgenticSynthesisComposer:
                 # failure, which reads as a broken block. Tests with nothing
                 # to run them are the most common way this section fails,
                 # and the least visible: everything looks right.
-                "IT MUST END WITH A RUNNER THAT CALLS THE TESTS AND PRINTS "
-                "THE RESULT — test functions alone define and exit, and the "
-                "reader sees nothing. Plain functions named test_1, test_2, "
-                "… then EXACTLY this, changed only in the names it "
-                "lists:\n\n"
-                "```python\n"
-                "_tests = [test_1, test_2]  # every test function, in order\n"
-                "_passed, _failures = 0, []\n"
-                "for _fn in _tests:\n"
-                "    try:\n"
-                "        _fn()\n"
-                "        _passed += 1\n"
-                "    except Exception as _e:\n"
-                "        _failures.append("
-                "f\"{_fn.__name__}: {type(_e).__name__}: {_e}\")\n"
-                "print(f\"{_passed}/{len(_tests)} passed\")\n"
-                "for _f in _failures:\n"
-                "    print(\"FAIL\", _f)\n"
-                "```\n\n"
                 # Where the function comes from, said plainly. "The code is
                 # in the Code section above" reads as "so import it", and a
                 # block came back with `from code_aware.filter import
@@ -25833,13 +25885,6 @@ class AgenticSynthesisComposer:
                 # that is the SERVER's runner, a different environment the
                 # model does not write for, so its restrictions arrived
                 # unexplained.
-                "IT RUNS IN PYODIDE — CPython on WebAssembly, in a browser "
-                "tab: no files, no network, no process to exit from.\n\n"
-                "Import ONLY from re, json, math, hashlib, itertools, "
-                "functools, collections, textwrap, difflib, string, enum, "
-                "dataclasses, typing — each one you use — and never os, "
-                "sys, pathlib, subprocess, socket, open(), or anything "
-                "this project defines.\n\n"
                 # "No test class" is the rule that was implied and not
                 # stated. An answer wrote its tests as methods of a
                 # TestQualifySymbolName class — the unittest habit — and the
@@ -25847,10 +25892,8 @@ class AgenticSynthesisComposer:
                 # `self`. The runner takes bare callables, so the tests have
                 # to be bare functions; a class may appear only as a
                 # stand-in for the subject.
-                "NEVER put the test functions inside a class — the "
-                "runner calls them unbound and each fails on a missing "
-                "`self`. A class here is only a stand-in for the "
-                "subject.\n\n"
+                # The class prohibition is rule 4 of the header now: it
+                # applies to any test code, in any section.
                 "Do NOT reproduce a harness from a dynamic verification "
                 "step: throwaway probes against stand-in objects, already "
                 "reported.",
@@ -29196,7 +29239,34 @@ class AgenticOrchestrator:
                 _buried_now = bool(
                     getattr(self._f, "_serial_eliminated_accounts", None)
                 )
-                _keys = ["conclusion", "proceed", "code", "tests"]
+                # tests is CONDITIONAL like the other two, and the reason
+                # is measured: offered unconditionally, the outline marked
+                # it SKIP on three turns that HAD tests, the SKIP filter
+                # dropped the section, and the model — holding a test suite
+                # with nowhere to put it — invented "Tests existentes",
+                # "Código de tests" and "Ejecución y resultados". Two other
+                # turns lost their Code section the same way.
+                #
+                # A section the turn has content for must not be offered as
+                # skippable; a section it has nothing for must not be
+                # offered at all.
+                _tests_now = False
+                for _st in plan.steps:
+                    if getattr(_st, "kind", "") != "design_tests":
+                        continue
+                    if getattr(_st, "status", "") != "done":
+                        continue
+                    for _b2 in re.findall(
+                        r"```(?:python)?\s*(.*?)```", (_st.output or ""), re.S
+                    ):
+                        if re.search(r"(?m)^\s*(?:async\s+)?def\s+test_", _b2):
+                            _tests_now = True
+                            break
+                    if _tests_now:
+                        break
+                _keys = ["conclusion", "proceed", "code"]
+                if _tests_now:
+                    _keys.append("tests")
                 if _rivals_now:
                     _keys.append("rivals")
                 if _buried_now:
@@ -42278,18 +42348,34 @@ class ActiveCodeUpdater:
                 # the block that introduced them, and "/clean" lists the
                 # inactive ones.
                 #
-                # get_file_for_symbol is the distinction: a symbol that
-                # came from a pasted file has a path, one the assistant
-                # wrote does not.
+                # generated_by_assistant on the OWNING BLOCK is the
+                # distinction, not the presence of a file path. The first
+                # attempt used get_file_for_symbol, on the theory that only
+                # pasted code carries a path — but an assistant block gets
+                # one too: extract_file_path_for_block infers it from the
+                # surrounding prose, and a reply that mentions
+                # context_manager.py hands its own blocks that name.
+                #
+                # Measured after that fix shipped: nine symbols still
+                # dropped as "already held from source", all of them test
+                # classes the model had just written.
+                _from_file = set()
+                try:
+                    _st = self._f._conversation_state_manager.get(project_id)
+                    for _h, _b in (getattr(_st, "active_blocks", None) or {}).items():
+                        if getattr(_b, "generated_by_assistant", False):
+                            continue
+                        for _sy in (getattr(_b, "symbols", None) or []):
+                            _nm = getattr(_sy, "name", "")
+                            if _nm:
+                                _from_file.add(_nm)
+                                _from_file.add(_nm.rsplit(".", 1)[-1])
+                except Exception:
+                    _from_file = set()
                 _indexed = {
                     _q
                     for _q in _indexed
-                    if (
-                        self._f._symbol_index.get_file_for_symbol(
-                            _q, project_id
-                        )
-                        or ""
-                    ).strip()
+                    if _q in _from_file or _q.rsplit(".", 1)[-1] in _from_file
                 }
                 _indexed_bare = {_q.rsplit(".", 1)[-1] for _q in _indexed}
                 _kept2 = []
