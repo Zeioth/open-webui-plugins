@@ -25477,19 +25477,14 @@ class AgenticSynthesisComposer:
                     # this replaced months ago: a rule read late is a rule not read.
                     "COPY, do not compose: every line of three hyphens where it "
                     "appears (the first one included, and one before every heading), "
-                    "Your answer STARTS with that first rule and then the first "
-                    "section listed; nothing comes before it. "
-                    # "Nothing before it" has to name CODE, because code is what came
-                    # before it. An answer opened with the design_tests block sitting
-                    # above the first rule, outside every section, and then repeated
-                    # the same block under Code. The step output is in the workspace
-                    # and reads as the thing to show; without a line saying where it
-                    # goes, it goes first.
-                    "Nothing at all comes before that rule — no code block, no "
-                    "preamble, no summary. Code from a step belongs inside a "
-                    "section, once. "
                     "and every heading letter for letter WITH its asterisks. Write "
                     "the sections listed and no others, none twice.\n\n"
+                    "Your answer STARTS with that first rule and then the first "
+                    "section listed. Nothing at all comes before it — no code "
+                    "block, no preamble, no summary. Code from a step belongs "
+                    "inside Código, once: the implementation and the tests both "
+                    "go there, in SEPARATE fenced blocks, and neither earns a "
+                    "section of its own.\n\n"
                     "Then write: each section EXCEPT Conclusion as a list, one "
                     "finding per item, numbered where there is an order and bulleted "
                     "where there is not; Conclusion as prose, since an argument cut "
@@ -25608,8 +25603,10 @@ class AgenticSynthesisComposer:
             # and reads as the thing to show; without a line saying where it
             # goes, it goes first.
             "Nothing at all comes before that first rule — no code block, "
-            "no preamble, no summary. Code from a step belongs inside a "
-            "section, once.",
+            "no preamble, no summary. Code from a step belongs inside "
+            "Código, once — the implementation and the tests both go "
+            "there, in SEPARATE fenced blocks, and neither earns a "
+            "section of its own. ",
             "",
             "Then write: each section EXCEPT Conclusion as a list, one "
             "finding per item, numbered where the items have an order or a "
