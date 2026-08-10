@@ -24561,14 +24561,13 @@ class AgenticSynthesisComposer:
         '"the empty-string guard returns before the loop" and not "how the '
         'guard works". A section this turn has nothing for gets the single '
         "word SKIP.\n\n"
-        # Tests is only offered when the turn HAS them, so it is never a
-        # candidate for SKIP; the old text invited skipping Code instead,
-        # and turns came back with neither. Both hold something whenever
-        # they are on the list at all.
-        "Code and Tests hold different things and never the same thing "
-        "twice: the implementation goes to Code, the test functions and "
-        "their runner go to Tests. Both are on the list only when this "
-        "turn has content for them, so neither is a candidate for SKIP.\n\n"
+        # No Tests section any more: the sandbox verifies against the real
+        # body and Stats reports it, so nothing runnable belongs in the
+        # answer. Code carries whatever code the turn has, tests included
+        # if they are worth showing.
+        "Code carries any code this turn has to show, tests included when "
+        "they are worth showing. It is on the list only when the turn has "
+        "content for it, so it is not a candidate for SKIP.\n\n"
         "Return ONLY the section names and their lines, one per line, in "
         "the order given. No prose, no preamble, no code."
     )
@@ -25129,24 +25128,21 @@ class AgenticSynthesisComposer:
         # under Code and again under Tests, and Code held no implementation
         # at all. A block that defines only test_* functions is the Tests
         # section's content, not this one's.
+        # ANY fenced code opens the section, tests included. The exclusion
+        # of test_* functions existed to keep them out of Code while a
+        # Tests section held them; that section is gone, so a turn whose
+        # only code IS tests — "design tests for X", where the tests are
+        # exactly what was asked for — had nowhere to put them and would
+        # have described them in prose instead.
+        #
+        # Measured on the old rule: a block of five test_* functions and a
+        # run_all_tests left Code closed.
         _has_code = False
         for _s in plan.steps:
             for _blk in re.findall(
                 r"```(?:python)?\s*(.*?)```", (_s.output or ""), re.S
             ):
-                _defs = re.findall(
-                    r"(?m)^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)", _blk
-                )
-                _cls = re.findall(r"(?m)^\s*class\s+[A-Za-z_]", _blk)
-                # The runner counts as test material too. Naming it
-                # run_all_tests rather than test_* is the convention, and
-                # taking it for implementation reopened the section this
-                # check exists to keep shut.
-                if _cls or any(
-                    not _d.startswith("test_")
-                    and _d not in ("run_all_tests", "run_tests", "main")
-                    for _d in _defs
-                ):
+                if _blk.strip():
                     _has_code = True
                     break
             if _has_code:
@@ -25468,36 +25464,39 @@ class AgenticSynthesisComposer:
                     # one that actually runs, and it was missing every test
                     # rule this project has: a turn here would get the
                     # sections and none of what makes their code runnable.
-                    "4. ANY test code you write, in any section, runs in "
-                    "PYODIDE — CPython on WebAssembly in a browser tab. So: "
-                    "plain functions test_1, test_2, … NEVER inside a test "
-                    "class; a copy of what they call in the same block; a "
-                    "runner at the end that calls each and PRINTS the "
-                    "result; no unittest, no pytest, no `if __name__`, no "
-                    "sys.exit; imports only from re, json, math, hashlib, "
-                    "itertools, functools, collections, textwrap, difflib, "
-                    "typing.\n\n"
-                    "The runner, EXACTLY this, changed only in the names it "
-                    "lists:\n\n"
-                    "```python\n"
-                    "_tests = [test_1, test_2]  # every test function, in order\n"
-                    "_passed, _failures = 0, []\n"
-                    "for _fn in _tests:\n"
-                    "    try:\n"
-                    "        _fn()\n"
-                    "        _passed += 1\n"
-                    "    except Exception as _e:\n"
-                    "        _failures.append("
-                    "f\"{_fn.__name__}: {type(_e).__name__}: {_e}\")\n"
-                    "print(f\"{_passed}/{len(_tests)} passed\")\n"
-                    "for _f in _failures:\n"
-                    "    print(\"FAIL\", _f)\n"
-                    "```\n\n"
-                    "FENCE EVERY CODE BLOCK: open with a line holding three "
+                    # Rule 4 was born to make the Tests section runnable in the
+                    # browser: Pyodide named, a literal runner, the class ban, an
+                    # import whitelist. That section is gone — verification runs in
+                    # the sandbox against the real body — so what is left is the one
+                    # rule that governs any code block at all.
+                    "4. FENCE EVERY CODE BLOCK: open with a line holding three "
                     "backticks and the language, close with a line holding three "
                     "and nothing else. Never nest fences and never leave one "
                     "open — an unclosed block swallows the rest of your answer.",
                     "",
+                    # Form and voice. Sections that carry several findings read as a
+                    # wall when they are written as one paragraph: the reader cannot
+                    # tell where one point ends and the next begins, and cannot come
+                    # back to the third one later. Conclusion is the exception because
+                    # it argues a single mechanism, and an argument split into bullets
+                    # stops being an argument.
+                    "5. Every section EXCEPT Conclusion is a list: numbered when the "
+                    "items have an order or a rank, bulleted when they do not. One "
+                    "finding per item, so the reader can take them one at a time and "
+                    "come back to the third one later. Conclusion stays prose — it "
+                    "argues one mechanism, and an argument cut into bullets stops "
+                    "being one.",
+                    "",
+                    # The register, said as a relationship rather than a style. "Be
+                    # clear" produces the same hedged prose it always did; "a friend
+                    # who wants you to understand" changes what the sentence is FOR.
+                    "6. Write the way a good friend explains something they know "
+                    "well: plainly, in the second person, checking as they go that "
+                    "you are still with them. Say the hard part in ordinary words "
+                    "before reaching for the technical one, and when something is "
+                    "genuinely uncertain say so like a person would rather than "
+                    "hedging it into fog. Warm, never chummy; the goal is that the "
+                    "reader UNDERSTANDS, not that they are impressed.",
                     "The line under each heading says what this turn "
                     "established for it. Develop it into prose against the "
                     "workspace above; do not simply restate it.",
@@ -25588,7 +25587,7 @@ class AgenticSynthesisComposer:
             # rules did not need better arguments, they needed to fit in
             # view. The heading/dash rule is gone entirely: headings no
             # longer carry a dash, so there is nothing left to get wrong.
-            "Three rules, all of them:",
+            "Four rules, all of them:",
             "",
             # Same wording as the outline mode's copy. Two modes stating one
             # rule differently is how the weaker of them stops being kept
@@ -25638,36 +25637,35 @@ class AgenticSynthesisComposer:
             #
             # The section decides WHERE tests go. This decides what they
             # must look like, and it holds even when there is no section.
-            "4. ANY test code you write, in any section, runs in PYODIDE — "
-            "CPython on WebAssembly in a browser tab, one block at a time. "
-            "So: plain functions named test_1, test_2, … NEVER inside a "
-            "test class; a copy of what they call, in the same block; a "
-            "runner at the end that calls each one and PRINTS the result; "
-            "no unittest, no pytest, no `if __name__`, no sys.exit, and "
-            "imports only from re, json, math, hashlib, itertools, "
-            "functools, collections, textwrap, difflib, string, enum, "
-            "dataclasses, typing.\n\n"
-            "The runner, EXACTLY this, changed only in the names it "
-            "lists:\n\n"
-            "```python\n"
-            "_tests = [test_1, test_2]  # every test function, in order\n"
-            "_passed, _failures = 0, []\n"
-            "for _fn in _tests:\n"
-            "    try:\n"
-            "        _fn()\n"
-            "        _passed += 1\n"
-            "    except Exception as _e:\n"
-            "        _failures.append("
-            "f\"{_fn.__name__}: {type(_e).__name__}: {_e}\")\n"
-            "print(f\"{_passed}/{len(_tests)} passed\")\n"
-            "for _f in _failures:\n"
-            "    print(\"FAIL\", _f)\n"
-            "```\n\n"
-            "FENCE EVERY CODE BLOCK: open with a line holding three "
+            # Rule 4 was born to make the Tests section runnable in the
+            # browser: Pyodide named, a literal runner, the class ban, an
+            # import whitelist. That section is gone — verification runs in
+            # the sandbox against the real body — so what is left is the one
+            # rule that governs any code block at all.
+            "4. FENCE EVERY CODE BLOCK: open with a line holding three "
             "backticks and the language, close with a line holding three "
             "and nothing else. Never nest fences and never leave one "
             "open — an unclosed block swallows the rest of your answer.",
             "",
+            # Form and voice. A section carrying several findings reads as a
+            # wall when written as one paragraph: the reader cannot tell where
+            # one point ends, and cannot come back to the third one later.
+            "5. Every section EXCEPT Conclusion is a list: numbered when the "
+            "items have an order or a rank, bulleted when they do not. One "
+            "finding per item, so the reader can take them one at a time and "
+            "come back to the third one later. Conclusion stays prose — it "
+            "argues one mechanism, and an argument cut into bullets stops "
+            "being one.",
+            "",
+            # The register said as a relationship rather than a style. "Be
+            # clear" produces the same hedged prose it always did; "a friend
+            # who wants you to understand" changes what the sentence is FOR.
+            "6. Write the way a good friend explains something they know "
+            "well: plainly, in the second person, checking as they go that "
+            "you are still with them. Ordinary words before technical ones, "
+            "and real uncertainty said the way a person would rather than "
+            "hedged into fog. Warm, never chummy; the goal is that the "
+            "reader UNDERSTANDS, not that they are impressed.",
             # The next-steps clause ran three sentences on why repeating
             # them is bad, and a turn repeated How to proceed anyway. What
             # catches it is the "Before you close" note, which arrives at
@@ -25771,12 +25769,14 @@ class AgenticSynthesisComposer:
                 # — and taught by example the exact habit the sentence
                 # forbids: a fence inside a line of prose.
                 f"## **{_H['code']}** — only if a concrete change or snippet is "
-                # The defence went out: Tests is self-contained now, so the
-                # two sections no longer compete for the same block and the
-                # rule needs no argument. What remains is the instruction.
-                "warranted. THE CODE GOES HERE AND THE TESTS DO NOT — they "
-                "have their own section, or their own fenced block after "
-                "this one when there is none.",
+                # Tests belong HERE now. The old text sent them to their own
+                # section, which no longer exists, and a turn asked to
+                # "design tests for X" would have had nowhere to put the
+                # very thing it was asked for.
+                "warranted. Tests belong here too when this turn wrote "
+                "them — they are code. Keep the implementation and the "
+                "tests in SEPARATE fenced blocks so either can be copied "
+                "without the other.",
             ]
         # ── Step 4.5: the tests, when a design_tests step wrote some ──
         # Only for design_tests. Its output is written to be KEPT and run
@@ -25789,115 +25789,24 @@ class AgenticSynthesisComposer:
         # that looks committable and is not. Measured, the harnesses in one
         # run ran 417, 1189 and 1822 tokens; four of them would outweigh
         # the answer they belong to.
-        if has_tests:
-            out += [
-                "",
-                _GROUP_BREAK,
-                "",
-                f"## **{_H['tests']}** — the acceptance tests this turn wrote and ran, "
-                # SELF-CONTAINED, and the duplication is the price of the
-                # button. Separation was tried and measured: an answer put
-                # the implementation under Code and the tests here, the
-                # reader pressed run, and all six failed with "NameError:
-                # name '_normalize_qid' is not defined". Each block runs in
-                # its own namespace — running Code first does not carry the
-                # name across — so a Tests block calling what another block
-                # defines cannot work, whatever the reader does.
-                #
-                # Code keeps the implementation with its explanation; this
-                # repeats it bare, as the preamble the tests need. Two
-                # copies with different jobs beat one that cannot run.
-                # "Even when it is the reader's own code" is the case that
-                # keeps failing. A turn that WROTE the function copies it
-                # without prompting; a turn that EXPLAINS one the reader
-                # already has does not — it reasons that the reader has the
-                # code, which is true and beside the point, because the
-                # block cannot see it either way. Measured: a !test turn
-                # about _repair_truncated_json shipped three tests and no
-                # copy, and all three failed with NameError.
-                "in ONE fenced block that RUNS ON ITS OWN. Open it with a "
-                "copy of the function under test — bare, no commentary, "
-                "there only so the tests have something to call — then the "
-                "tests, then the runner.\n\n"
-                "COPY IT EVEN WHEN IT IS THE READER'S OWN CODE under "
-                "Code: this block sees nothing outside itself, so without "
-                "it every test dies on NameError. If long, copy only the "
-                "part the tests exercise.\n\n"
-                # The runner is GIVEN, not described. Four patches described
-                # it and the model found a new door each time: unittest,
-                # then unittest.main() calling sys.exit, then `if __name__
-                # == "__main__"` never firing in a browser, then a
-                # hand-written sys.exit(1) once unittest was gone. Each
-                # prohibition closed one door in a building with more doors.
-                #
-                # This is the shape the sandbox's own harness uses, minus
-                # the __main__ guard that is right there and wrong here.
-                # Copied, it cannot be got wrong, and there is nothing left
-                # to prohibit — the same move that fixed the headings, which
-                # three wordings of "translate them" could not.
-                # THE RUNNER IS THE POINT, said as a requirement rather
-                # than as part of a sentence about naming. An answer came
-                # back with five test functions, no runner, and nothing
-                # calling them: it defined and ended, so the reader pressed
-                # run and saw no output at all — neither a pass nor a
-                # failure, which reads as a broken block. Tests with nothing
-                # to run them are the most common way this section fails,
-                # and the least visible: everything looks right.
-                # Where the function comes from, said plainly. "The code is
-                # in the Code section above" reads as "so import it", and a
-                # block came back with `from code_aware.filter import
-                # qualify_symbol` — a package that exists nowhere. Another
-                # called methods on `self` with no instance to bind. The
-                # answer is NOT to paste the implementation here, which is
-                # the duplication the section above forbids: it is that the
-                # reader runs the Code block first and the name is then
-                # defined. Saying so removes the reason to invent an import.
-                # The sandbox denylist, named up front. A block that opens
-                # with "import os" is rejected before it ever runs — and the
-                # same block dies in the browser on the invented import next
-                # to it, so one habit broke both executions at once. The
-                # tests are pure logic; the list costs one sentence and the
-                # rejection costs the whole turn's evidence.
-                # The allowed list, not the forbidden one, and the
-                # precondition said out loud. Two failures, both mine:
-                #
-                # Naming what is banned left every other module implicitly
-                # fine, and a block imported `code_aware.filter`, a package
-                # that exists nowhere. The allowed list has no such gap —
-                # the same reason the headings come from a table.
-                #
-                # And "the reader runs it first" was an assumption THE
-                # READER COULD NOT KNOW. They press run on the Tests block
-                # and get NameError, because nothing in the answer told them
-                # the Code block has to go first. An instruction to the
-                # model cannot carry a precondition for the person reading;
-                # that has to be written where they will see it.
-                # The environment, named. Every rule below was a
-                # prohibition inferred from a run that failed, and the model
-                # was never told the one fact they all follow from: this
-                # block goes to Pyodide, CPython compiled to WebAssembly,
-                # inside the reader's browser tab. A model told that can
-                # reason about what is reachable there; a model given a list
-                # can only avoid the doors already found — and it found a
-                # new one each time.
-                #
-                # The two earlier mentions of "the sandbox" made it worse:
-                # that is the SERVER's runner, a different environment the
-                # model does not write for, so its restrictions arrived
-                # unexplained.
-                # "No test class" is the rule that was implied and not
-                # stated. An answer wrote its tests as methods of a
-                # TestQualifySymbolName class — the unittest habit — and the
-                # runner called them unbound: seven TypeErrors for a missing
-                # `self`. The runner takes bare callables, so the tests have
-                # to be bare functions; a class may appear only as a
-                # stand-in for the subject.
-                # The class prohibition is rule 4 of the header now: it
-                # applies to any test code, in any section.
-                "Do NOT reproduce a harness from a dynamic verification "
-                "step: throwaway probes against stand-in objects, already "
-                "reported.",
-            ]
+        # THE TESTS SECTION IS GONE, and it is not a formatting decision.
+        # A block in the reader's browser runs in Pyodide with nothing but
+        # itself, so to execute at all it needs a COPY of the subject —
+        # which means a green result says the copy passes, not the project.
+        # And if the model transcribes the function as it believes it
+        # should be, the tests go green on code that does not exist.
+        #
+        # Measured across four answers: every block died on NameError
+        # because the copy was omitted (0/6, 0/6, 0/5, 0/5), while the same
+        # turns verified fine in the sandbox — which composes the REAL
+        # symbol body from the index and repairs what fails. One went 5/6,
+        # was repaired, and came back 6/6 against actual code.
+        #
+        # Verification stays where it is real and is reported in Stats as
+        # "N test run, N passed". A green tick that means nothing is the
+        # same failure as a confidence figure adjusted upward: it buys
+        # trust it cannot pay for. has_tests is kept in the signature and
+        # ignored here, since callers still compute it.
 
         out.append(_GROUP_BREAK)
 
@@ -29239,34 +29148,11 @@ class AgenticOrchestrator:
                 _buried_now = bool(
                     getattr(self._f, "_serial_eliminated_accounts", None)
                 )
-                # tests is CONDITIONAL like the other two, and the reason
-                # is measured: offered unconditionally, the outline marked
-                # it SKIP on three turns that HAD tests, the SKIP filter
-                # dropped the section, and the model — holding a test suite
-                # with nowhere to put it — invented "Tests existentes",
-                # "Código de tests" and "Ejecución y resultados". Two other
-                # turns lost their Code section the same way.
-                #
-                # A section the turn has content for must not be offered as
-                # skippable; a section it has nothing for must not be
-                # offered at all.
-                _tests_now = False
-                for _st in plan.steps:
-                    if getattr(_st, "kind", "") != "design_tests":
-                        continue
-                    if getattr(_st, "status", "") != "done":
-                        continue
-                    for _b2 in re.findall(
-                        r"```(?:python)?\s*(.*?)```", (_st.output or ""), re.S
-                    ):
-                        if re.search(r"(?m)^\s*(?:async\s+)?def\s+test_", _b2):
-                            _tests_now = True
-                            break
-                    if _tests_now:
-                        break
+                # No "tests" key: the section no longer exists. It was
+                # conditioned on the turn having tests, then removed
+                # entirely once a browser-run block was shown to verify a
+                # copy rather than the project.
                 _keys = ["conclusion", "proceed", "code"]
-                if _tests_now:
-                    _keys.append("tests")
                 if _rivals_now:
                     _keys.append("rivals")
                 if _buried_now:
