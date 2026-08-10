@@ -25477,6 +25477,8 @@ class AgenticSynthesisComposer:
                     # this replaced months ago: a rule read late is a rule not read.
                     "COPY, do not compose: every line of three hyphens where it "
                     "appears (the first one included, and one before every heading), "
+                    "Your answer STARTS with that first rule and then the first "
+                    "section listed; nothing comes before it. "
                     "and every heading letter for letter WITH its asterisks. Write "
                     "the sections listed and no others, none twice.\n\n"
                     "Then write: each section EXCEPT Conclusion as a list, one "
@@ -29585,25 +29587,29 @@ class AgenticOrchestrator:
                     # Measured: "40% - 27 of 34" reached the reader as "100% - 5 of 5",
                     # and "4 of 4" as "6 of 6". Both upward. Same fix as the header:
                     # what is copied comes before what is explained.
+                    # NOTHING FOLLOWS THE BLOCK. Two orderings have now failed for
+                    # opposite reasons: with the block last, after ~200 words, the
+                    # numbers came back recomputed; with the block first and the
+                    # reasoning after it, an answer copied the reasoning too and the
+                    # reader saw "NOTHING downstream corrects them..." printed under
+                    # its Stats.
+                    #
+                    # Both are the same rule: whatever sits next to the thing being
+                    # copied gets copied. So the lead-in is two sentences, the block
+                    # is last, and there is nothing after it to sweep up.
                     "BEFORE YOU CLOSE\n"
-                    "Your answer ends with a horizontal rule and then EXACTLY "
-                    "these lines, at the LEFT MARGIN, copied character for "
-                    "character:\n\n"
+                    "Every section you meant to write is written; add no more, and "
+                    "no heading after this. These figures were measured this turn "
+                    "and nothing downstream corrects them, so one you adjust "
+                    "BECOMES the measurement — every deviation so far moved the "
+                    "same way, 4 of 4 to 6 of 6, 40% to 100%. Do not translate "
+                    "them, do not write a confidence line of your own, and do not "
+                    "reuse the Stats block of an earlier answer above.\n"
+                    "End your answer with a horizontal rule, then EXACTLY the lines "
+                    "below copied character for character, then one closing rule "
+                    "under them. All at the LEFT MARGIN: continuing at a bullet's "
+                    "indent renders the whole block inside that bullet.\n\n"
                     + _t_line
-                    + "\nThose numbers were measured this turn. NOTHING "
-                    "downstream corrects them: a figure you adjust BECOMES the "
-                    "measurement, and every deviation so far moved the same way "
-                    "- 4 of 4 became 6 of 6, 40% became 100%. An alarm adjusted "
-                    "upward is worse than none. Do not translate the block, do "
-                    "not write a confidence line of your own, and do not reuse "
-                    "the Stats block of an earlier answer above: one reply "
-                    "updated its [Turn:] line and carried the other five.\n"
-                    "Close with one more horizontal rule under the block. Add no "
-                    "section here and no heading after it - every section you "
-                    "meant to write is already written, and one answer ended on "
-                    "a bare '##' with nothing to follow. Start the rule and the "
-                    "block at the left margin: continuing at a bullet's indent "
-                    "renders the whole block inside that bullet."
                 )
                 # Logged whole. The cut used to be [:60], which landed
                 # exactly on the boundary where the reason a rival survived
