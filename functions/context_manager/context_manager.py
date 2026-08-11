@@ -8,6 +8,7 @@ version: 10.0.0
 license: GPL3
 requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter==0.25.2, tree-sitter-language-pack==1.8.1, llmlingua>=0.2.2, scikit-learn==1.9.0
 """
+
 import os
 import time
 import re
@@ -101,7 +102,6 @@ from shared_resources import (
     get_model_backend,
     LLMResult,
 )
-
 
 # ==========================================================================
 # FILE INDEX
@@ -210,12 +210,11 @@ _CROSS_ENCODER_LOCK = threading.Lock()
 _db_global_lock = threading.Lock()
 
 
-
-
 # ==========================================================================
 # MODELS AND ENUMS
 # Dataclasses, pydantic models and enums shared across the whole pipeline.
 # ==========================================================================
+
 
 @dataclass
 class ExperimentDesign:
@@ -248,6 +247,7 @@ class ExperimentDesign:
     unknown_claims: List[str]
     hypothesis_hash: str = ""
 
+
 @dataclass
 class PeerReviewResult:
     """
@@ -268,6 +268,7 @@ class PeerReviewResult:
     critiques: List[str]
     reviewer_model: str
     is_external: bool = False
+
 
 @dataclass
 class HypothesisDossier:
@@ -326,6 +327,7 @@ class HypothesisDossier:
     # Reporting metadata only — it never touches the ranking.
     relation_to_winner: str = ""
 
+
 @dataclass
 class CompetitionRecord:
     """
@@ -366,6 +368,7 @@ class CompetitionRecord:
     # gate by (project, question_type). Same safe defaulted
     # widening as external_validation; old rows hydrate to "".
     question_type: str = ""
+
 
 # Compression ratio below which a generation is degenerate. Measured:
 # the most repetitive legitimate output of 25 samples compressed to
@@ -551,15 +554,70 @@ _SECTION_HEADINGS: Dict[str, Dict[str, str]] = {
 # identifiers, and an accent-based guess calls it English.
 _LANG_MARKERS: Dict[str, Tuple[str, ...]] = {
     "es": (
-        "que", "para", "con", "los", "las", "una", "del", "por", "este",
-        "esta", "cuando", "porque", "sobre", "desde", "entre", "qué",
-        "cómo", "hace", "está", "son", "hay", "más", "pero", "si", "el",
-        "la", "de", "en", "y", "o", "no", "se", "un", "es", "al", "lo",
+        "que",
+        "para",
+        "con",
+        "los",
+        "las",
+        "una",
+        "del",
+        "por",
+        "este",
+        "esta",
+        "cuando",
+        "porque",
+        "sobre",
+        "desde",
+        "entre",
+        "qué",
+        "cómo",
+        "hace",
+        "está",
+        "son",
+        "hay",
+        "más",
+        "pero",
+        "si",
+        "el",
+        "la",
+        "de",
+        "en",
+        "y",
+        "o",
+        "no",
+        "se",
+        "un",
+        "es",
+        "al",
+        "lo",
     ),
     "en": (
-        "the", "that", "with", "for", "this", "when", "because", "from",
-        "between", "which", "does", "into", "what", "how", "is", "are",
-        "and", "or", "not", "a", "an", "of", "to", "in", "it", "on",
+        "the",
+        "that",
+        "with",
+        "for",
+        "this",
+        "when",
+        "because",
+        "from",
+        "between",
+        "which",
+        "does",
+        "into",
+        "what",
+        "how",
+        "is",
+        "are",
+        "and",
+        "or",
+        "not",
+        "a",
+        "an",
+        "of",
+        "to",
+        "in",
+        "it",
+        "on",
     ),
 }
 
@@ -575,9 +633,7 @@ def _question_language(question: str) -> str:
     _w = re.findall(r"[a-záéíóúñü]+", (question or "").lower())
     if not _w:
         return "en"
-    _score = {
-        _k: sum(1 for _x in _w if _x in _v) for _k, _v in _LANG_MARKERS.items()
-    }
+    _score = {_k: sum(1 for _x in _w if _x in _v) for _k, _v in _LANG_MARKERS.items()}
     _best = max(_score, key=lambda k: _score[k])
     return _best if _score[_best] > _score.get("en", 0) else "en"
 
@@ -656,9 +712,7 @@ _ANSWER_FOOTER_RE = re.compile(
 # silently gave this caller more lines to rewrite — the label landed on
 # **Stats**, on [Turn:] and on [Use case:] too, leaving a stray bracket on
 # the first. A pattern with two jobs acquires the union of their scopes.
-_CONFIDENCE_LINE_RE = re.compile(
-    r"^[ \t]*\[Confidence:[^\]\n]*\][ \t]*$", re.M | re.I
-)
+_CONFIDENCE_LINE_RE = re.compile(r"^[ \t]*\[Confidence:[^\]\n]*\][ \t]*$", re.M | re.I)
 _ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
 
 
@@ -746,6 +800,7 @@ def _strip_answer_footer(text: str) -> Tuple[str, int]:
         _out.extend(_held_blanks)
     return "\n".join(_out), _n
 
+
 # Handed to the model on any path that answers without measuring. A footer
 # is a claim about evidence, and on these paths there is none: one turn
 # served a stored artifact in ten seconds and still published `98% — 7/7
@@ -809,6 +864,7 @@ _FOCUS_MIN_PARTIAL_CHARS = 4000
 _MAX_CLAIMS_PER_STEP = 20
 
 _DEGENERACY_COMPRESSION_MAX = 0.13
+
 
 class DetectionCatalog:
     """
@@ -1064,6 +1120,7 @@ class DetectionCatalog:
         )
         return "\n".join(_out)
 
+
 # The two sides of an experimentum crucis round. The model answers
 # "if_true_supports": "A" or "B", meaning the FIRST or the SECOND of the
 # two rival dossiers being compared — nothing to do with UseCase, whose
@@ -1072,6 +1129,7 @@ class DetectionCatalog:
 # hypothesis slot.
 _CRUCIS_FIRST = "A"
 _CRUCIS_SECOND = "B"
+
 
 class UseCase(str, Enum):
     """
@@ -1140,10 +1198,12 @@ class UseCase(str, Enum):
             "E": "Scaffolding/Boilerplate",
         }[self.value]
 
+
 # R12: OpenWebUI names pasted-code uploads 'Pasted_Text_<epoch_ms>'. That
 # synthetic filename must never become a module prefix in a qualified id
 # (see qualify_symbol_name). Matches the stem, with or without extension.
 _PASTED_UPLOAD_RE = re.compile(r"^Pasted_Text_\d+$", re.IGNORECASE)
+
 
 class ContentType(str, Enum):
     """Classification of a code block's role in the conversation."""
@@ -1154,6 +1214,7 @@ class ContentType(str, Enum):
     GENERAL = "general"  # Plain conversation text
     TOOL_CALL = "tool_call"  # Structured tool / function call payload
     ERROR = "error"  # Traceback or error message
+
 
 class CodeSymbol(BaseModel):
     """A single function, method, or class extracted from source code."""
@@ -1188,6 +1249,7 @@ class CodeSymbol(BaseModel):
 
     calls: List[str] = Field(default_factory=list)  # Bare names called by this symbol
     docstring: str = ""
+
 
 class CodeBlock(BaseModel):
     """A chunk of code managed by the context system.
@@ -1283,6 +1345,7 @@ class CodeBlock(BaseModel):
             (base_score + keyword_boost) * mention_boost * recency_factor * penalty
         )
 
+
 class Edge(BaseModel):
     """A directed relationship between two symbols in the call graph.
 
@@ -1318,12 +1381,11 @@ class Edge(BaseModel):
         return self.weight * self.confidence
 
 
-
-
 # ==========================================================================
 # SHARED UTILITIES
 # Module-level helpers used from more than one region.
 # ==========================================================================
+
 
 def _strip_answer_scaffolding(text: str) -> str:
     """Remove the turn mark and confidence footer from an answer.
@@ -1347,10 +1409,11 @@ def _strip_answer_scaffolding(text: str) -> str:
         if not isinstance(text, str) or not text:
             return text
         _out, _ = _strip_answer_footer(text)
-        _out = _ANSWER_MARK_RE.sub('', _out)
+        _out = _ANSWER_MARK_RE.sub("", _out)
         return _out.strip() or text
     except Exception:
         return text
+
 
 def _note_body_shown(filt, qid: str) -> None:
     """
@@ -1378,6 +1441,7 @@ def _note_body_shown(filt, qid: str) -> None:
         _seen.add(qid.rsplit(".", 1)[-1])
     except Exception:
         pass
+
 
 def _resolve_symbol_name(sym: str, find_blocks, qualified_for, all_names):
     """
@@ -1446,6 +1510,7 @@ def _resolve_symbol_name(sym: str, find_blocks, qualified_for, all_names):
     except Exception:
         pass
     return ""
+
 
 def _output_is_degenerate(text: str) -> str:
     """
@@ -1520,6 +1585,7 @@ def _output_is_degenerate(text: str) -> str:
     except Exception:  # noqa: BLE001 - diagnostics never raise
         return ""
 
+
 def qualify_symbol_name(
     name: str, parent_symbol: str, file_path: Optional[str] = None
 ) -> str:
@@ -1553,6 +1619,7 @@ def qualify_symbol_name(
             return f"{module}.{name}"
     return name
 
+
 def qualify_symbol(sym: "CodeSymbol") -> str:
     """
     Convenience wrapper: qualify a CodeSymbol using ALL the identity
@@ -1563,6 +1630,7 @@ def qualify_symbol(sym: "CodeSymbol") -> str:
     inconsistency that caused them to go unmatched in several lookups.
     """
     return qualify_symbol_name(sym.name, sym.parent_symbol, sym.file_path)
+
 
 def _get_cross_encoder(
     model_name: str = "Qwen/Qwen3-Reranker-0.6B",
@@ -1580,10 +1648,12 @@ def _get_cross_encoder(
                     return None
     return _CROSS_ENCODER
 
+
 # ==========================================================================
 # SYMBOL INDEX AND ACTIVATION GRAPH
 # The code map: symbols, edges, cached path views and the state around them.
 # ==========================================================================
+
 
 class ActivationState(BaseModel):
     """Snapshot of a single node's activation during PPR propagation."""
@@ -1606,6 +1676,7 @@ class ActivationState(BaseModel):
 
     depth: int
     source: str
+
 
 class SymbolIndex:
     """Central index that stores every known symbol under a **qualified id**
@@ -2410,6 +2481,7 @@ class SymbolIndex:
 
     # ── Internal helpers (iteration) ─────────────────────────────────────
 
+
 class ConversationState(BaseModel):
     """
     Persistent conversation state for a single project.
@@ -2480,6 +2552,7 @@ class ConversationState(BaseModel):
         self.wm_batch_too_small = False
         self.wm_degradation_guard = False
         self.wm_tokens_freed = 0
+
 
 class ConversationStateManager:
     """
@@ -3014,6 +3087,7 @@ class ConversationStateManager:
                 f"ConversationStateManager: evicted LRU project '{oldest_pid}'"
             )
 
+
 class ActivationGraph:
     """Personalised PageRank (PPR) engine for the symbol call graph.
 
@@ -3159,6 +3233,7 @@ class ActivationGraph:
             return 0.0
         return sum(active) / len(active)
 
+
 class SubgraphExtractor:
     """Extract a connected subgraph induced by activated nodes.
 
@@ -3206,6 +3281,7 @@ class SubgraphExtractor:
                 if edge.dst in included_nodes:
                     included_edges.append(edge)
         return included_nodes, included_edges
+
 
 class CodePathView(BaseModel):
     """A cached snapshot of an activated subgraph, used for speculative
@@ -3256,6 +3332,7 @@ class CodePathView(BaseModel):
             or self.call_graph_hash != current_call_graph
         )
 
+
 class StaticEvidence(BaseModel):
     """Deterministic evidence gathered from the SymbolGraph to validate a
     hypothesis during scientific Chain‑of‑Thought reasoning.
@@ -3287,6 +3364,7 @@ class StaticEvidence(BaseModel):
     # ═══════════════════════════════════════════════════════════════════════════
 
     objective_score: float  # Fraction of verifiable claims that hold
+
 
 class PathIndex:
     """Lightweight in‑memory index of ``CodePathView`` objects, organised by
@@ -3371,6 +3449,7 @@ class PathIndex:
                 result.add(qid)
         return result
 
+
 class AppliedChangeFeedback(BaseModel):
     """Feedback record for a change that was applied (or rejected) by the user.
 
@@ -3399,6 +3478,7 @@ class AppliedChangeFeedback(BaseModel):
     success: bool = True
     user_comment: str = ""
     resolved: bool = False
+
 
 class ActivationEngine:
     """Builds activation graphs from query seeds and the symbol call graph,
@@ -5737,6 +5817,7 @@ Output only the symbol name.
         pstate = psm.get_pstate(project_id)
         pstate["cached_code_state_hash"] = None
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CLASSES — Module level, before class Filter
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5746,6 +5827,7 @@ Output only the symbol name.
 # CONTEXT CONSTRUCTION
 # Selecting and laying out the code that reaches the model.
 # ==========================================================================
+
 
 class HubSymbolIndex:
     """
@@ -6253,9 +6335,7 @@ class HubSymbolIndex:
         ]
 
         if len(by_file) == 1 and None in by_file:
-            file_ordered = sorted(
-                by_file[None], key=lambda q: -centrality.get(q, 0)
-            )
+            file_ordered = sorted(by_file[None], key=lambda q: -centrality.get(q, 0))
             for qid in file_ordered:
                 lines.append(
                     self._format_symbol_line(
@@ -6268,9 +6348,7 @@ class HubSymbolIndex:
                     continue
                 lines.append(f"### {file_path}")
                 file_qids = by_file[file_path]
-                file_ordered = sorted(
-                    file_qids, key=lambda q: -centrality.get(q, 0)
-                )
+                file_ordered = sorted(file_qids, key=lambda q: -centrality.get(q, 0))
                 for qid in file_ordered:
                     lines.append(
                         self._format_symbol_line(
@@ -6347,6 +6425,7 @@ class HubSymbolIndex:
                 parts.append(f"\n  → calls: {', '.join(sorted(callees))}")
 
         return "".join(parts)
+
 
 class ContextPager:
     """
@@ -7233,6 +7312,7 @@ class ContextPager:
 
         return block
 
+
 class RaptorCodeIndex:
     """
     Hierarchical clustering of code symbols (RAPTOR adapted for code).
@@ -7997,6 +8077,7 @@ class RaptorCodeIndex:
         except Exception:
             return default
 
+
 class ContextBuilder:
     """
     Builds Block A + Block B and provides skeleton
@@ -8279,20 +8360,22 @@ class ContextBuilder:
         # session shares. Which of the three key components moved is the
         # whole diagnosis, and until now a miss was silent: a rebuild in the
         # middle of a turn looked identical in the log to no rebuild at all.
-        _why = "no stored key" if not stored_key else (
-            "no cached text" if cached_text is None else "key changed"
+        _why = (
+            "no stored key"
+            if not stored_key
+            else ("no cached text" if cached_text is None else "key changed")
         )
         if stored_key and stored_key != cache_key:
             _old = stored_key.split("__")
             _new = cache_key.split("__")
             _parts = [
-                n for n, o, c in zip(("structure", "mode", "profile"), _old, _new)
+                n
+                for n, o, c in zip(("structure", "mode", "profile"), _old, _new)
                 if o != c
             ]
             _why = f"key changed in {'+'.join(_parts) or 'shape'}"
         self._f._log_debug(
-            f"🧱 Block A REBUILD ({_why}) · stored={stored_key!r} "
-            f"new={cache_key!r}"
+            f"🧱 Block A REBUILD ({_why}) · stored={stored_key!r} " f"new={cache_key!r}"
         )
 
         # --- 4b. Cache miss or continuation freeze ---
@@ -10856,8 +10939,7 @@ class ContextBuilder:
                         _is_seed = False
                     if not _is_seed:
                         self._f._log_debug(
-                            f"Block B: skipping LOD-2 for {qid} "
-                            f"(in skeleton tier)"
+                            f"Block B: skipping LOD-2 for {qid} " f"(in skeleton tier)"
                         )
                         continue
                     self._f._log_debug(
@@ -11367,6 +11449,7 @@ Output only "YES" or "NO".
 # STATIC EXTRACTION (tree-sitter)
 # Parsing source into symbols, signatures and control flow.
 # ==========================================================================
+
 
 class SignatureExtractor:
     """
@@ -12046,6 +12129,7 @@ class SignatureExtractor:
             if doc:
                 sym.docstring = doc
 
+
 class ControlFlowExtractor:
     """
     Extracts a compressed control-flow skeleton for a single function or
@@ -12658,6 +12742,7 @@ class ControlFlowExtractor:
 # Everything that survives a turn: on-disk state and the vector store.
 # ==========================================================================
 
+
 class ReentrantAsyncLock:
     """Reentrant asyncio lock with optional timeout to prevent deadlocks."""
 
@@ -12715,6 +12800,7 @@ class ReentrantAsyncLock:
     async def __aexit__(self, *args) -> None:
         """Async context manager exit."""
         self.release()
+
 
 class StateStore:
     """
@@ -13562,6 +13648,7 @@ class StateStore:
             if project_id not in self._f._project_locks:
                 self._f._project_locks[project_id] = ReentrantAsyncLock()
             return self._f._project_locks[project_id]
+
 
 class LongTermMemory:
     """Manages long‑term conversational and code memory using ChromaDB.
@@ -15656,6 +15743,7 @@ class LongTermMemory:
 # The single point every model call goes through, and its response contracts.
 # ==========================================================================
 
+
 class JsonContracts:
     """Tolerant parsing of JSON contracts produced by an LLM.
 
@@ -15833,6 +15921,7 @@ class JsonContracts:
             pass
         data = cls._repair_truncated_json(text)
         return (data, "salvaged") if data is not None else (None, "")
+
 
 class LLMOrchestrator:
     """Centralised LLM caller with built‑in response cache, retry logic,
@@ -16320,7 +16409,7 @@ class LLMOrchestrator:
                         _i = prompt.find(_lead)
                         if _i < 0:
                             continue
-                        _body = prompt[_i + len(_lead):]
+                        _body = prompt[_i + len(_lead) :]
                         if _fenced:
                             _o = _body.find("```")
                             _c = _body.find("```", _o + 3) if _o >= 0 else -1
@@ -16346,9 +16435,7 @@ class LLMOrchestrator:
                             f"(which carries it complete and untruncated)"
                         )
             except Exception as _exc:
-                self._f._log_debug(
-                    f"✂️ skeleton dedup skipped: {type(_exc).__name__}"
-                )
+                self._f._log_debug(f"✂️ skeleton dedup skipped: {type(_exc).__name__}")
 
         # ── One system for every aligned call ─────────────────────────────
         # The aligner produces `prelim + separator + role`, and the role is
@@ -16434,7 +16521,7 @@ class LLMOrchestrator:
                 and system_prompt.startswith(_cut)
                 and len(system_prompt) > len(_cut)
             ):
-                _moved = system_prompt[len(_cut):].strip()
+                _moved = system_prompt[len(_cut) :].strip()
                 if _moved:
                     system_prompt = _cut
                     prompt = _moved + "\n\n" + (prompt or "")
@@ -16473,9 +16560,7 @@ class LLMOrchestrator:
                     # that the cut happened, where it cut and whether it
                     # reached the invariant boundary all have to be
                     # visible from one line.
-                    if not getattr(
-                        self._f, "_cut_logged_this_turn", False
-                    ):
+                    if not getattr(self._f, "_cut_logged_this_turn", False):
                         self._f._cut_logged_this_turn = True
                         self._f._log_debug(
                             f"🔗 Aligned calls: system cut to "
@@ -16773,10 +16858,8 @@ class LLMOrchestrator:
                             _needs_rescue = True
                         if _needs_rescue:
                             try:
-                                _norm, _how = (
-                                    JsonContracts._parse_json_contract(
-                                        content
-                                    )
+                                _norm, _how = JsonContracts._parse_json_contract(
+                                    content
                                 )
                             except Exception as _norm_exc:
                                 # A crash here silently hands RAW text to a
@@ -16976,6 +17059,7 @@ class LLMOrchestrator:
     # 4. CrossEncoder helper (keep full code decision)
     # ═══════════════════════════════════════════════════════════════════════════
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 # GOVERNING PRINCIPLES OF THE AGENTIC PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════
@@ -17105,11 +17189,11 @@ class LLMOrchestrator:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-
 # ==========================================================================
 # AGENTIC PIPELINE · MODELS
 # The shapes a plan and its evidence take as they move through the loop.
 # ==========================================================================
+
 
 @dataclass
 class AgenticStep:
@@ -17136,6 +17220,7 @@ class AgenticStep:
         0  # 1-based execution position for user-facing labels; id stays the stable cache/ledger key
     )
 
+
 @dataclass
 class AgenticPlan:
     """Ordered steps plus provenance, for execution, logging and dry runs."""
@@ -17146,6 +17231,7 @@ class AgenticPlan:
     ask: str = (
         ""  # planner-level clarification question; honored only when steps is empty
     )
+
 
 @dataclass
 class LedgerClaim:
@@ -17190,6 +17276,7 @@ class LedgerClaim:
 # AGENTIC PIPELINE · VERIFICATION
 # Claims are recorded, then checked against the graph, the index and the sandbox.
 # ==========================================================================
+
 
 class AgenticEvidenceLedger:
     """
@@ -17994,9 +18081,7 @@ class AgenticEvidenceLedger:
                     f"assertion(s) remain of {_removed + len(self.claims)}"
                 )
         except Exception as _e:
-            self._f._log_debug(
-                f"🤖 Ledger: restatement collapse skipped ({_e!r})"
-            )
+            self._f._log_debug(f"🤖 Ledger: restatement collapse skipped ({_e!r})")
         return _removed
 
     def refresh_unread(self) -> int:
@@ -18043,9 +18128,7 @@ class AgenticEvidenceLedger:
                     f"{len(_seen)} body/bodies actually read"
                 )
         except Exception as _e:
-            self._f._log_debug(
-                f"🤖 Ledger: unread re-check skipped ({_e!r})"
-            )
+            self._f._log_debug(f"🤖 Ledger: unread re-check skipped ({_e!r})")
         return _changed
 
     def coverage(self) -> Dict[str, Any]:
@@ -18399,11 +18482,13 @@ class AgenticEvidenceLedger:
             return invalid
         return invalid
 
+
 # The one claim shape whose quote must mention something specific: a named
 # call target. Anything vaguer cannot be checked this way without guessing.
 _CALL_TARGET_RE = re.compile(
     r"\b(?:calls|invokes|delegates to|passes .{0,40}? to)\s+" r"([A-Za-z_][\w.]*)"
 )
+
 
 class AgenticEvidenceVerifier:
     """Settle behavioural claims by reading the code they describe.
@@ -18738,10 +18823,9 @@ class AgenticEvidenceVerifier:
                     # exactly what happened. Relational claims keep the
                     # cross-body reading they were given.
                     _cl = claims[n - 1]
-                    if (
-                        getattr(_cl, "claim_kind", "") == "behavioural"
-                        and not _CALL_TARGET_RE.search(_cl.text)
-                    ):
+                    if getattr(
+                        _cl, "claim_kind", ""
+                    ) == "behavioural" and not _CALL_TARGET_RE.search(_cl.text):
                         _own_only += 1
                         out[n] = (
                             "indeterminate",
@@ -18937,6 +19021,7 @@ class AgenticEvidenceVerifier:
             if verdict != "indeterminate":
                 settled += 1
         return settled
+
 
 class AgenticStaticVerifier:
     """
@@ -19413,6 +19498,7 @@ class AgenticStaticVerifier:
             lines.append(f"- [C{ch['claim']}] {ch['kind']}: {tag} — {detail}")
         return "\n".join(lines)
 
+
 class AgenticTestabilityClassifier:
     """
     AST-based, zero-LLM router deciding whether a symbol body can be
@@ -19609,6 +19695,7 @@ class AgenticTestabilityClassifier:
             parts.append(cur.id)
         return list(reversed(parts))
 
+
 class AgenticSandboxRunner:
     """
     Executes a composed harness in an isolated Python subprocess.
@@ -19787,6 +19874,7 @@ class AgenticSandboxRunner:
                 }
 
         return await anyio.to_thread.run_sync(_run_blocking)
+
 
 class AgenticDynamicVerifier:
     """
@@ -20207,9 +20295,7 @@ if __name__ == "__main__":
                     f"🤖 verify_dynamic {qid}: harness generation returned "
                     f"nothing usable — no dynamic evidence"
                 )
-                return (
-                    f"- {qid}: harness generation failed — no dynamic evidence"
-                )
+                return f"- {qid}: harness generation failed — no dynamic evidence"
 
         callee_src = self._resolve_callee_bodies(body, qid, project_id)
         harness = self._compose(body, tests, callee_src)
@@ -20600,12 +20686,8 @@ if __name__ == "__main__":
         _acc = list(getattr(self._f, "_execution_tally", None) or [])
         if not _acc:
             return ""
-        _skipped = sum(
-            1 for _k, _s in _acc if _s in ("io_bound", "skipped", "empty")
-        )
-        _ran = [
-            (k, v) for k, v in _acc if v not in ("io_bound", "skipped", "empty")
-        ]
+        _skipped = sum(1 for _k, _s in _acc if _s in ("io_bound", "skipped", "empty"))
+        _ran = [(k, v) for k, v in _acc if v not in ("io_bound", "skipped", "empty")]
         _parts = []
         for _label, _kind in (
             ("symbol", "symbol"),
@@ -20626,8 +20708,7 @@ if __name__ == "__main__":
             if _o:
                 _bits.append(f"{_o} inconclusive")
             _parts.append(
-                f"{len(_g)} {_label}{'' if len(_g) == 1 else 's'}, "
-                + ", ".join(_bits)
+                f"{len(_g)} {_label}{'' if len(_g) == 1 else 's'}, " + ", ".join(_bits)
             )
         if _skipped:
             _parts.append(f"{_skipped} not executable")
@@ -21043,7 +21124,11 @@ if __name__ == "__main__":
                 if _fails
                 else ""
             )
-            + (f"\ndetail: {str(result.get('detail'))[:300]}" if result.get("detail") else "")
+            + (
+                f"\ndetail: {str(result.get('detail'))[:300]}"
+                if result.get("detail")
+                else ""
+            )
         )
         await self._f._emit_status(
             "🤖 Agentic: a test failed — repairing and re-running once"
@@ -21228,6 +21313,7 @@ if __name__ == "__main__":
 # AGENTIC PIPELINE · PLANNING
 # Choose the framing, then decompose it into steps with a budget.
 # ==========================================================================
+
 
 class AgenticPreplanner:
     """
@@ -21796,6 +21882,7 @@ class AgenticPreplanner:
         else:
             self._f._log_debug("🧭 Preplanner: parsed but no usable framing — no brief")
         return brief, ""
+
 
 class AgenticPlanner:
     """
@@ -23008,6 +23095,7 @@ class AgenticPlanner:
             )
         return steps
 
+
 # R32: every scaffolding header the agentic machinery injects into
 # prompts. These exact strings are OURS — a model reply has no
 # legitimate reason to contain any of them, so their presence in an
@@ -23101,6 +23189,7 @@ _SKELETON_RULE_RE = re.compile(r"^[ \t]*\u2500{2,}", re.MULTILINE)
 # AGENTIC PIPELINE · EXECUTION
 # Run one step: fetch what it asks for, cache what it produced.
 # ==========================================================================
+
 
 class AgenticStepCache:
     """
@@ -23230,6 +23319,7 @@ class AgenticStepCache:
             await self._f._state_store._db_enqueue(_write)
         except Exception as e:
             self._f._log_debug(f"🤖 StepCache: write failed — {e}")
+
 
 class AgenticToolBroker:
     """
@@ -23563,6 +23653,7 @@ def _close_dangling_fence(text: str) -> str:
         return text
     return text.rstrip() + "\n```"
 
+
 def _find_context_echo(text: str, min_pos: int = 0) -> int:
     """
     Start index of a recited context skeleton, or -1.
@@ -23592,6 +23683,7 @@ def _find_context_echo(text: str, min_pos: int = 0) -> int:
             break
     return cut if cut >= min_pos else -1
 
+
 def _find_scaffold_echo(text: str, min_pos: int = 1) -> int:
     """
     Earliest LINE-START occurrence of a scaffolding marker, or -1.
@@ -23615,11 +23707,13 @@ def _find_scaffold_echo(text: str, min_pos: int = 1) -> int:
             p = text.find(m, p + 1)
     return best
 
+
 _ALREADY_IN_VIEW_NOTE = (
     "\n\nTheir bodies are already in the context above. Anything you assert "
     "about these symbols must come from that code; if it does not settle a "
     "point, say so rather than inferring it from the signature.\n"
 )
+
 
 class AgenticStepExecutor:
     """
@@ -24543,6 +24637,7 @@ class AgenticStepExecutor:
 # Compose the answer, and drive the whole loop from Filter.
 # ==========================================================================
 
+
 class AgenticSynthesisComposer:
     """Renders the agentic workspace block the main call synthesizes from."""
 
@@ -24673,9 +24768,9 @@ class AgenticSynthesisComposer:
                 _body = _lines[_idx + 1] if _idx + 1 < len(_lines) else ""
                 # _heads returns the BARE name; never_skip arrives wrapped as
                 # "## **Name**", so both are compared bare.
-                if _body.strip().upper().startswith("SKIP") and _heads(
-                    _l
-                ) not in {_x.strip("# *") for _x in (never_skip or [])}:
+                if _body.strip().upper().startswith("SKIP") and _heads(_l) not in {
+                    _x.strip("# *") for _x in (never_skip or [])
+                }:
                     _skip += 1
                     _idx += 2
                     continue
@@ -25637,8 +25732,7 @@ class AgenticSynthesisComposer:
             # model reads. It does not need the history, it needs the rule;
             # the history belongs here, where whoever weakens this rule can
             # see what it cost.
-            "3. Start with Conclusion. It is the only section always "
-            "required.",
+            "3. Start with Conclusion. It is the only section always " "required.",
             "",
             # ANY fenced test code, wherever it lands. Everything this
             # project learned about runnable tests used to live inside the
@@ -25840,9 +25934,7 @@ class AgenticSynthesisComposer:
         # uncertainty the reader still carries, the other is uncertainty
         # this turn removed, and a reader who cannot tell them apart
         # proposes back the account the evidence already killed.
-        _dead = [
-            _d for _d in (eliminated_accounts or []) if _d.get("hypothesis")
-        ]
+        _dead = [_d for _d in (eliminated_accounts or []) if _d.get("hypothesis")]
         if _rivals:
             out += [
                 "",
@@ -25894,8 +25986,8 @@ class AgenticSynthesisComposer:
             out += [
                 "",
                 _GROUP_BREAK,
-            "",
-            f"## **{_H['buried']}** — this turn built these "
+                "",
+                f"## **{_H['buried']}** — this turn built these "
                 "explanations and the index eliminated them. State each in "
                 "a sentence and say what killed it. This is a result, not "
                 "an apology: an explanation removed is work the reader "
@@ -26000,9 +26092,7 @@ class AgenticSynthesisComposer:
             if dropped_gaps:
                 _rows.append(("wanted but out of room", "; ".join(dropped_gaps)))
             if unreadable_subjects:
-                _rows.append(
-                    ("no body in the index", ", ".join(unreadable_subjects))
-                )
+                _rows.append(("no body in the index", ", ".join(unreadable_subjects)))
             if unsettled_claims:
                 _rows.append(
                     ("tested, came back unsettled", "; ".join(unsettled_claims))
@@ -26023,6 +26113,7 @@ class AgenticSynthesisComposer:
                 ]
 
         return _split_heading_lines(_resolve_group_breaks(out))
+
 
 class AgenticOrchestrator:
     """
@@ -27596,9 +27687,7 @@ class AgenticOrchestrator:
             _pstate = self._f._project_state_manager.get_pstate(project_id)
             _intent = (
                 str(
-                    (_pstate.get("turn_classification") or {}).get(
-                        "code_action", ""
-                    )
+                    (_pstate.get("turn_classification") or {}).get("code_action", "")
                     or ""
                 )
                 .strip()
@@ -28000,9 +28089,7 @@ class AgenticOrchestrator:
             if (
                 step.kind == "investigate"
                 and step.symbols
-                and getattr(
-                    self._f.valves, "agentic_skip_settled_focus", True
-                )
+                and getattr(self._f.valves, "agentic_skip_settled_focus", True)
             ):
                 try:
                     _settled = {
@@ -28013,9 +28100,7 @@ class AgenticOrchestrator:
                     }
                     _left = [_s for _s in step.symbols if _s not in _settled]
                     if _settled and len(_left) != len(step.symbols):
-                        _dropped = [
-                            _s for _s in step.symbols if _s in _settled
-                        ]
+                        _dropped = [_s for _s in step.symbols if _s in _settled]
                         self._f._log_debug(
                             f"🤖 Agentic: step {step.id} focus narrowed — "
                             f"{len(_dropped)} symbol(s) already carry a "
@@ -28031,9 +28116,7 @@ class AgenticOrchestrator:
                             )
                         step.symbols = _left
                 except Exception as _e_narrow:
-                    self._f._log_debug(
-                        f"focus narrowing skipped ({_e_narrow!r})"
-                    )
+                    self._f._log_debug(f"focus narrowing skipped ({_e_narrow!r})")
 
             # -- dynamic verification: extract + stub + execute ------------
             # Never step-cached (harness/result caching lives inside the
@@ -28617,9 +28700,7 @@ class AgenticOrchestrator:
                 # as a suggestion rather than as a budget that ran out. The
                 # difference decides whether asking again is worth it.
                 try:
-                    _prev = (
-                        getattr(self._f, "_serial_dropped_gaps", None) or []
-                    )
+                    _prev = getattr(self._f, "_serial_dropped_gaps", None) or []
                     self._f._serial_dropped_gaps = (_prev + _lost_gaps)[:5]
                 except Exception:
                     pass
@@ -28960,16 +29041,13 @@ class AgenticOrchestrator:
                     _s = _c.subject or ""
                     if not _s or _s in _seen or _s in _orphans:
                         continue
-                    if _s.rsplit(".", 1)[-1] in {
-                        _q.rsplit(".", 1)[-1] for _q in _seen
-                    }:
+                    if _s.rsplit(".", 1)[-1] in {_q.rsplit(".", 1)[-1] for _q in _seen}:
                         continue
                     _orphans.append(_s)
                 if _orphans:
                     self._f._log_debug(
                         f"🤖 Agentic: last-mile — {len(_orphans)} claim "
-                        f"subject(s) were never opened: "
-                        + ", ".join(_orphans[:5])
+                        f"subject(s) were never opened: " + ", ".join(_orphans[:5])
                     )
                     _lm = AgenticStep(
                         id=max((s.id for s in plan.steps), default=0) + 1,
@@ -29003,7 +29081,9 @@ class AgenticOrchestrator:
                         _s
                         for _s in _orphans
                         if _s
-                        not in (getattr(self._f, "_bodies_seen_this_turn", None) or set())
+                        not in (
+                            getattr(self._f, "_bodies_seen_this_turn", None) or set()
+                        )
                     ]
                     self._f._log_debug(
                         f"🤖 Agentic: last-mile done — "
@@ -29034,9 +29114,7 @@ class AgenticOrchestrator:
                                 )
                             )
                     _gaps = [
-                        _s
-                        for _s in _still
-                        if _s.rsplit(".", 1)[-1] not in _authored
+                        _s for _s in _still if _s.rsplit(".", 1)[-1] not in _authored
                     ]
                     if len(_gaps) != len(_still):
                         self._f._log_debug(
@@ -29155,9 +29233,7 @@ class AgenticOrchestrator:
                 # The long mode gates each of these on its own evidence.
                 # The outline mode replaced those gates wholesale, which is
                 # exactly the kind of thing a second path quietly loses.
-                _rivals_now = bool(
-                    getattr(self._f, "_serial_rival_accounts", None)
-                )
+                _rivals_now = bool(getattr(self._f, "_serial_rival_accounts", None))
                 _buried_now = bool(
                     getattr(self._f, "_serial_eliminated_accounts", None)
                 )
@@ -29608,7 +29684,11 @@ class AgenticOrchestrator:
                 # was handed over bare while the instruction still asked for
                 # a rule and a "Stats section" — a section the reader was
                 # told to expect and given nothing to head it with.
-                _reading = ("## **Stats**\n" + "\n".join(_axes) + "\n") if _axes else "## **Stats**\n"
+                _reading = (
+                    ("## **Stats**\n" + "\n".join(_axes) + "\n")
+                    if _axes
+                    else "## **Stats**\n"
+                )
                 self._f._measured_reading_lines = _reading
 
                 # "of the N this turn checked", not a bare "N/N claims".
@@ -29621,8 +29701,7 @@ class AgenticOrchestrator:
                 # three held". The figure was always the latter; only the
                 # wording let it be read as the former.
                 _t_line = (
-                    _reading
-                    + f"[Confidence: {_t_pct}% — {_t_ok} of the {_t_all} "
+                    _reading + f"[Confidence: {_t_pct}% — {_t_ok} of the {_t_all} "
                     f"claim(s) this turn checked, settled against code"
                     + ("; " + ", ".join(_t_open) if _t_open else "")
                     + "]"
@@ -29726,8 +29805,21 @@ class AgenticOrchestrator:
                         "with one more "
                         "horizontal rule underneath the block, so the measured "
                         "lines are fenced off from whatever follows them the "
-                        "way they are fenced off from the answer above:\n\n"
-                        + _t_line
+                        "way they are fenced off from the answer above:\n\n" + _t_line
+                        # ONCE, said after the block because that is where it is broken.
+                        # Measured: on three answers of ~1,000-2,000 characters the block
+                        # came back exactly once; on one of 7,338 it came back twice, and
+                        # the second copy had three of its four lines rewritten from
+                        # memory — "General Programming" for Architecture/Design, "modify"
+                        # for refactor, "0 tests run" on a turn that ran none. Only the
+                        # confidence line, the one hardest to reconstruct, was copied
+                        # character for character.
+                        #
+                        # The length is the variable: past a certain point the model has
+                        # lost sight of the block and finishes from habit.
+                        + "\n\nThat block goes in your answer ONCE. When you have "
+                        "written it, the answer is over — no second copy as a "
+                        "farewell, however long the answer was."
                     )
                 # Logged whole. The cut used to be [:60], which landed
                 # exactly on the boundary where the reason a rival survived
@@ -29839,6 +29931,7 @@ class AgenticOrchestrator:
 # COMMANDS AND CODE BLOCKS
 # User-facing commands, code block bookkeeping and query-driven activation.
 # ==========================================================================
+
 
 class MultiPhasePlanner:
     """Generates the multi‑phase protocol instructions injected into the
@@ -30087,6 +30180,7 @@ class MultiPhasePlanner:
             "content": messages[last_user_idx].get("content", "") + hint,
         }
         return messages
+
 
 class CommandRouter:
     """
@@ -30940,9 +31034,7 @@ class CommandRouter:
                 vector[_action] = 1.0
             else:
                 vector["explain"] = 1.0
-            self._f._log_debug(
-                f"classify_code_action [unified]: {_action} (one-hot)"
-            )
+            self._f._log_debug(f"classify_code_action [unified]: {_action} (one-hot)")
             return vector
 
         classifier_input = self._extract_text_for_classification(user_query)
@@ -31156,7 +31248,7 @@ class CommandRouter:
             system_prompt=(
                 "You are an intent classifier. "
                 "Output ONLY a valid JSON object with a single string field "
-            "'code_action' "
+                "'code_action' "
                 "whose value is one of: Explain, Modify, Debug, Refactor. "
                 "Your entire response must start with { and end with }."
             ),
@@ -31190,7 +31282,9 @@ class CommandRouter:
             if raw in _valid:
                 result = {"explain": 0.0, "modify": 0.0, "debug": 0.0, "refactor": 0.0}
                 result[raw] = 1.0
-                self._f._log_debug(f"_classify_code_action_with_llm: code_action={raw!r}")
+                self._f._log_debug(
+                    f"_classify_code_action_with_llm: code_action={raw!r}"
+                )
                 return result
             self._f._log_debug(
                 f"_classify_code_action_with_llm: unknown code action {raw!r}, "
@@ -31943,6 +32037,7 @@ class CommandRouter:
 
         # ── Step 2: delete through the same queue every writer uses ──
         try:
+
             def _wipe(pid=project_id):
                 self._f._db_conn.execute(
                     "DELETE FROM hypothesis_graveyard WHERE project_id = ?",
@@ -33005,6 +33100,7 @@ class CommandRouter:
             return True
         return False
 
+
 class CodeBlockManager:
     """
     Extract, classify, and manage code blocks throughout the conversation lifecycle.
@@ -33259,8 +33355,7 @@ class CodeBlockManager:
                 if _rblocks:
                     _probe = _rblocks[0]
                     if not (
-                        hasattr(_probe, "start_byte")
-                        and hasattr(_probe, "end_byte")
+                        hasattr(_probe, "start_byte") and hasattr(_probe, "end_byte")
                     ):
                         self._f._log_debug(
                             f"extract_code_blocks: process() returned "
@@ -33268,11 +33363,9 @@ class CodeBlockManager:
                             f"byte offsets — falling through to regex. A "
                             f"chunk carries: {type(_probe).__name__}("
                             + ", ".join(
-                                sorted(
-                                    a
-                                    for a in dir(_probe)
-                                    if not a.startswith("_")
-                                )[:16]
+                                sorted(a for a in dir(_probe) if not a.startswith("_"))[
+                                    :16
+                                ]
                             )
                             + ")"
                         )
@@ -33304,11 +33397,9 @@ class CodeBlockManager:
                             else type(result).__name__
                             + "("
                             + ", ".join(
-                                sorted(
-                                    a
-                                    for a in dir(result)
-                                    if not a.startswith("_")
-                                )[:12]
+                                sorted(a for a in dir(result) if not a.startswith("_"))[
+                                    :12
+                                ]
                             )
                             + ")"
                         )
@@ -34490,6 +34581,7 @@ class CodeBlockManager:
 # Structural evidence, named epistemic strategies, and hypothesis competition.
 # ==========================================================================
 
+
 class MetacognitiveReasoningEngine:
     """
     Operates above ActivationEngine as the scientific-method engine.
@@ -35077,6 +35169,7 @@ class MetacognitiveReasoningEngine:
             lines.append("Critical claims: " + "; ".join(design.critical_claims[:5]))
         return "\n".join(lines)
 
+
 class EpistemicStrategies:
     """The named moves of the scientific method, as prompts with contracts.
 
@@ -35312,7 +35405,9 @@ class EpistemicStrategies:
             f"🔍 Peer review with {self._f.valves.peer_review_model}..."
         )
 
-        evidence_summary = self._f._meta_reasoning._format_raw_evidence_for_review(evidence, design)
+        evidence_summary = self._f._meta_reasoning._format_raw_evidence_for_review(
+            evidence, design
+        )
 
         prompt = (
             f"Hypothesis under review:\n{hypothesis}\n\n"
@@ -35845,8 +35940,23 @@ class HypothesisForge:
     # as Class.attribute to a regex. Left in, a filename can be the one
     # token that clears a bar the hypothesis should have failed.
     _HYP_FILE_TAILS = frozenset(
-        {"md", "py", "json", "txt", "yaml", "yml", "ini", "log", "csv",
-         "html", "cfg", "toml", "sh", "js", "ts"}
+        {
+            "md",
+            "py",
+            "json",
+            "txt",
+            "yaml",
+            "yml",
+            "ini",
+            "log",
+            "csv",
+            "html",
+            "cfg",
+            "toml",
+            "sh",
+            "js",
+            "ts",
+        }
     )
 
     # Dots only BETWEEN identifier parts, never trailing. The previous
@@ -35857,9 +35967,7 @@ class HypothesisForge:
     # stop. Worse, `_run_pipeline_inner` and `_run_pipeline_inner.` were
     # two members. With the cap at eight, prose filled the slots that
     # decide whether two dossiers describe one mechanism.
-    _DOSSIER_SYM_RE = re.compile(
-        r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
-    )
+    _DOSSIER_SYM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 
     # Tokens that pass the identifier shape without being identifiers.
     # `None` is a keyword and it appeared in all three dossiers of one
@@ -35871,8 +35979,19 @@ class HypothesisForge:
     # guesses at more would start discarding real symbols.
     _DOSSIER_SYM_STOP = frozenset(
         {
-            "None", "True", "False", "Optional", "List", "Dict", "Set",
-            "Tuple", "Any", "JSON", "TODO", "Confidence", "Step",
+            "None",
+            "True",
+            "False",
+            "Optional",
+            "List",
+            "Dict",
+            "Set",
+            "Tuple",
+            "Any",
+            "JSON",
+            "TODO",
+            "Confidence",
+            "Step",
         }
     )
 
@@ -36774,7 +36893,9 @@ class HypothesisForge:
                 # of the expanded bodies. Graph first, contract
                 # second, both tri-state.
                 if _v is None:
-                    _v = self._f._meta_reasoning._verify_contract_claim(_c, _expanded_parts)
+                    _v = self._f._meta_reasoning._verify_contract_claim(
+                        _c, _expanded_parts
+                    )
                     if _v is not None:
                         _by_contract += 1
                         # Tagged only on a real verdict: the contract
@@ -37048,7 +37169,8 @@ class HypothesisForge:
                 _decided = [
                     _c
                     for _c in _claims
-                    if self._f._meta_reasoning._claim_verified(_c, evidence, project_id) is not None
+                    if self._f._meta_reasoning._claim_verified(_c, evidence, project_id)
+                    is not None
                 ]
                 if _decided:
                     _on_topic = 0
@@ -37088,7 +37210,9 @@ class HypothesisForge:
             # routine skip for several runs before anyone noticed.
             _pred_call = None
             try:
-                _pred_call = self._f._epistemic.generate_predictions(hyp_text, project_id)
+                _pred_call = self._f._epistemic.generate_predictions(
+                    hyp_text, project_id
+                )
             except TypeError as _e_bind:
                 self._f._log_debug(
                     f"🔴 BUG: generate_predictions could not be called "
@@ -37271,8 +37395,7 @@ class HypothesisForge:
 
             # ── Step 3: one match anywhere is enough to clear the bar ──
             return not any(
-                _h in _opened or _h.rsplit(".", 1)[-1] in _opened_bare
-                for _h in _syms
+                _h in _opened or _h.rsplit(".", 1)[-1] in _opened_bare for _h in _syms
             )
         except Exception:
             return False
@@ -37566,11 +37689,7 @@ class HypothesisForge:
                         + "Guidance: the previous attempt was discarded "
                         "because it was built on names that do not exist "
                         "in this project"
-                        + (
-                            " (" + ", ".join(_ghosts) + ")"
-                            if _ghosts
-                            else ""
-                        )
+                        + (" (" + ", ".join(_ghosts) + ")" if _ghosts else "")
                         + ". Build the mechanism only out of symbols you "
                         "have actually been shown."
                     )
@@ -38008,9 +38127,7 @@ class HypothesisForge:
             # chosen account at 0.85 and one at 0.28 read exactly alike,
             # and the rivals' numbers below have nothing to be compared to.
             try:
-                self._f._serial_winner_corroboration = round(
-                    _winner.corroboration, 2
-                )
+                self._f._serial_winner_corroboration = round(_winner.corroboration, 2)
             except Exception:
                 self._f._serial_winner_corroboration = None
             try:
@@ -38068,7 +38185,9 @@ class HypothesisForge:
         # self-reporting reviewer does not get to overturn measured
         # corroboration. REJECT is surfaced loudly for the reader.
         try:
-            _pr_evidence = self._f._meta_reasoning.gather_evidence(_winner.hypothesis, project_id)
+            _pr_evidence = self._f._meta_reasoning.gather_evidence(
+                _winner.hypothesis, project_id
+            )
             _pr_design = ExperimentDesign(
                 critical_claims=list(_winner.confirmed_claims[:5]),
                 supportive_claims=[],
@@ -38197,9 +38316,7 @@ class HypothesisForge:
         _known: Set[str] = set()
         if project_id:
             try:
-                _all = set(
-                    self._f._symbol_index.get_all_qualified_names(project_id)
-                )
+                _all = set(self._f._symbol_index.get_all_qualified_names(project_id))
                 _known = _all | {_q.rsplit(".", 1)[-1] for _q in _all}
             except Exception:
                 _known = set()
@@ -38212,7 +38329,7 @@ class HypothesisForge:
                 # removed before `self.` can take half of it.
                 for _p in ("self._f.", "self._", "self.", "cls."):
                     if _s.startswith(_p):
-                        _s = ("_" if _p == "self._" else "") + _s[len(_p):]
+                        _s = ("_" if _p == "self._" else "") + _s[len(_p) :]
                         break
                 if not _s or _s in self._DOSSIER_SYM_STOP:
                     continue
@@ -38784,6 +38901,7 @@ class HypothesisForge:
 # CONTEXT PREPARATION
 # Material the assembler draws on: compressed history, enrichment, live code.
 # ==========================================================================
+
 
 class HistoryCompressor:
     """
@@ -39944,6 +40062,7 @@ Code context (recent symbols referenced):
                 f"({tok} tokens > {self._f.valves.max_code_block_tokens} limit)"
             )
 
+
 class TokenUtils:
     """Token‑level utilities for budget management and text truncation.
 
@@ -39999,6 +40118,7 @@ class TokenUtils:
                 truncated = truncated[: last + len(pattern)]
                 break
         return truncated.rstrip()
+
 
 class EnrichmentTasks:
     """Runs post‑processing enrichment after each user or assistant message,
@@ -41895,6 +42015,7 @@ class EnrichmentTasks:
         # Return filtered sets
         return (deleted_qids - migrated_old), (added_qids - migrated_new)
 
+
 class ActiveCodeUpdater:
     """Processes a new user or assistant message through the full code‑aware
     pipeline, keeping the active block set and SymbolIndex in sync.
@@ -42289,7 +42410,7 @@ class ActiveCodeUpdater:
                     for _h, _b in (getattr(_st, "active_blocks", None) or {}).items():
                         if getattr(_b, "generated_by_assistant", False):
                             continue
-                        for _sy in (getattr(_b, "symbols", None) or []):
+                        for _sy in getattr(_b, "symbols", None) or []:
                             _nm = getattr(_sy, "name", "")
                             if _nm:
                                 _from_file.add(_nm)
@@ -43183,6 +43304,7 @@ class ActiveCodeUpdater:
                     f"Soft-evicted {len(candidates)} block(s) via ContextPager"
                 )
 
+
 # ── System-prompt injection ordering contract ────────────────────────────
 # Two axes that a single priority tag used to conflate:
 #
@@ -43217,6 +43339,7 @@ _INJECTION_PRIORITY = {
 _INJECTION_KEEP_UNDER_PRESSURE = ("critical", "high", "trailing")
 _INJECTION_TRAILING = ("trailing",)
 
+
 def _order_injections_for_render(
     selected: List[Tuple[str, str]],
 ) -> List[Tuple[str, str]]:
@@ -43233,6 +43356,7 @@ def _order_injections_for_render(
 # PROMPT ASSEMBLY
 # Turning selected context into the bytes the model actually receives.
 # ==========================================================================
+
 
 class SystemPromptBuilder:
     """Assembles the complete system prompt from two layers: a stable,
@@ -43447,9 +43571,14 @@ class SystemPromptBuilder:
                 _m.group(1)
                 for _m in re.finditer(r"(?m)^# `([^`]+)`", prelim_system or "")
             ]
-            if _q and _served and not any(
-                _n.rsplit(".", 1)[-1].lower() in _q or _n.split(".", 1)[0].lower() in _q
-                for _n in _served
+            if (
+                _q
+                and _served
+                and not any(
+                    _n.rsplit(".", 1)[-1].lower() in _q
+                    or _n.split(".", 1)[0].lower() in _q
+                    for _n in _served
+                )
             ):
                 self._f._log_debug(
                     f"WARNING Block B serves no body named in this question "
@@ -43459,8 +43588,7 @@ class SystemPromptBuilder:
                 )
         except Exception as _e_bb:
             self._f._log_debug(
-                f"Block B question check failed "
-                f"({type(_e_bb).__name__}: {_e_bb})"
+                f"Block B question check failed " f"({type(_e_bb).__name__}: {_e_bb})"
             )
         self._f._log_debug("🔄 Block B: complete")
         return static_block, dynamic_injections, None, prelim_system
@@ -44244,9 +44372,7 @@ class SystemPromptBuilder:
         # present and names the section, so there is no next run to spend.
         try:
             _census = []
-            for _prio, _text in _order_injections_for_render(
-                list(dynamic_injections)
-            ):
+            for _prio, _text in _order_injections_for_render(list(dynamic_injections)):
                 if not _text:
                     continue
                 _head = next(
@@ -44297,8 +44423,8 @@ class SystemPromptBuilder:
         separator = "\n\n---\n\n"
         _prof = getattr(self._f, "_profile_block_this_turn", "") or ""
         if _prof:
-            dynamic_block = (
-                _prof + ("\n\n" + dynamic_block if dynamic_block.strip() else "")
+            dynamic_block = _prof + (
+                "\n\n" + dynamic_block if dynamic_block.strip() else ""
             )
         parts = [p for p in [static_block, hub_tier, dynamic_block] if p.strip()]
         prelim_system = separator.join(parts)
@@ -44340,6 +44466,7 @@ class SystemPromptBuilder:
             )
 
         return prelim_system
+
 
 class WindowManager:
     """
@@ -44998,6 +45125,7 @@ class WindowManager:
             return False
         return any(marker in last_assistant.get("content", "") for marker in _MARKERS)
 
+
 class MessageAssembler:
     """
     Final processing of the message list before it is sent to the LLM.
@@ -45279,7 +45407,7 @@ class MessageAssembler:
                     # which is the exact shape the deliverer exists to
                     # avoid.
                     messages[:] = self._f._commands._deliver_command_response(
-                        messages, _direct[len(_DIRECT_ABSENCE_MARK):]
+                        messages, _direct[len(_DIRECT_ABSENCE_MARK) :]
                     )
                     # Nothing downstream needs the codebase. The reply is
                     # already written and the only instruction left is
@@ -45976,9 +46104,7 @@ class MessageAssembler:
         # cannot be mistaken for part of the answer.
         return (
             "[WORKSPACE NOTE — not part of your answer]\n"
-            "WHEN YOU WRITE CODE IN THIS REPLY: "
-            + "; ".join(_rules)
-            + "."
+            "WHEN YOU WRITE CODE IN THIS REPLY: " + "; ".join(_rules) + "."
         )
 
     def _assemble_final_system_and_log(
@@ -46022,13 +46148,14 @@ class MessageAssembler:
             getattr(getattr(self._f, "_agentic", None), "_turn_question", "") or ""
         ).strip()
         if _q:
-            dynamic_injections.append((
-                "trailing",
-                "[WORKSPACE NOTE — not part of your answer]\n"
-                "THE QUESTION YOU ARE ANSWERING, restated because the "
-                "material above is long:\n"
-                + " ".join(_q.split())[:600],
-            ))
+            dynamic_injections.append(
+                (
+                    "trailing",
+                    "[WORKSPACE NOTE — not part of your answer]\n"
+                    "THE QUESTION YOU ARE ANSWERING, restated because the "
+                    "material above is long:\n" + " ".join(_q.split())[:600],
+                )
+            )
 
         _prefs = self._build_code_preferences_restatement()
         if _prefs:
@@ -46125,8 +46252,8 @@ class MessageAssembler:
         # depend on.
         _prof = getattr(self._f, "_profile_block_this_turn", "") or ""
         if _prof:
-            dynamic_block = (
-                _prof + ("\n\n" + dynamic_block if dynamic_block.strip() else "")
+            dynamic_block = _prof + (
+                "\n\n" + dynamic_block if dynamic_block.strip() else ""
             )
 
         # A verbatim echo carries no code context. Set by the direct
@@ -46204,7 +46331,7 @@ class MessageAssembler:
                 and len(final_system) > len(_pre)
                 and not final_system.startswith(_pre + _PREFIX_ROLE_SEPARATOR)
             ):
-                _tail = final_system[len(_pre):].lstrip("\n")
+                _tail = final_system[len(_pre) :].lstrip("\n")
                 if _tail:
                     final_system = _pre + _PREFIX_ROLE_SEPARATOR + _tail
                     self._f._log_debug(
@@ -46213,9 +46340,7 @@ class MessageAssembler:
                         "reachable from here"
                     )
         except Exception as _e_splice:
-            self._f._log_debug(
-                f"answer-prompt junction splice skipped ({_e_splice!r})"
-            )
+            self._f._log_debug(f"answer-prompt junction splice skipped ({_e_splice!r})")
 
         # ── The junction, counted in tokens ────────────────────────────────
         # Diagnosis, not behaviour. The splice above makes the answer
@@ -46249,9 +46374,7 @@ class MessageAssembler:
                 # encoding both and walking forward. Character identity does
                 # not imply token identity and this is the number that
                 # decides whether a checkpoint is reachable.
-                _a = self._f.tokenizer.encode(
-                    _pre + _PREFIX_ROLE_SEPARATOR + "You are"
-                )
+                _a = self._f.tokenizer.encode(_pre + _PREFIX_ROLE_SEPARATOR + "You are")
                 _b = self._f.tokenizer.encode(final_system)
                 _shared = 0
                 for _x, _y in zip(_a, _b):
@@ -46360,7 +46483,7 @@ class MessageAssembler:
             elif _stab and final_system.startswith(_stab):
                 _cut = _stab
             if _cut and len(final_system) > len(_cut):
-                _moved = final_system[len(_cut):]
+                _moved = final_system[len(_cut) :]
                 # Block B travels too, and it travels in FRONT of the
                 # question while the workspace travels behind it — the two
                 # positions they already occupied. The system keeps only
@@ -46375,7 +46498,7 @@ class MessageAssembler:
                 # occupied.
                 _head = ""
                 if _cut is _pre_full and _stab and _pre_full.startswith(_stab):
-                    _head = _pre_full[len(_stab):].strip()
+                    _head = _pre_full[len(_stab) :].strip()
                 _last_user = None
                 for _m in reversed(messages):
                     if isinstance(_m, dict) and _m.get("role") == "user":
@@ -46417,9 +46540,7 @@ class MessageAssembler:
                     f"prelim {_pre_full[_c:_c + 40]!r})"
                 )
         except Exception as _e_move:
-            self._f._log_debug(
-                f"answer-prompt tail move skipped ({_e_move!r})"
-            )
+            self._f._log_debug(f"answer-prompt tail move skipped ({_e_move!r})")
 
         if final_system.strip():
             messages = [m for m in messages if m.get("role") != "system"]
@@ -46527,6 +46648,7 @@ class MessageAssembler:
                 self._f._log_debug(f"Context dump scheduling failed: {_dump_err}")
 
         return messages
+
 
 class ContextAssembler:
     """
@@ -46696,6 +46818,7 @@ class ContextAssembler:
 # INSTRUMENTATION AND BACKGROUND WORK
 # Per-turn snapshots, learned preferences, and everything that runs off-turn.
 # ==========================================================================
+
 
 class UserProfileManager:
     """
@@ -46990,9 +47113,7 @@ class UserProfileManager:
         # same as the step that settles the turn.
         try:
             _auth = self.get_authoritative(project_id) or {}
-            _missing = [
-                _n for _n in self._INFERENCE_FIELDS if _n not in _auth
-            ]
+            _missing = [_n for _n in self._INFERENCE_FIELDS if _n not in _auth]
             if not _missing:
                 self._f._log_debug(
                     f"👤 User-profile inference skipped — all "
@@ -47002,9 +47123,7 @@ class UserProfileManager:
                 )
                 return []
         except Exception as _e_prof:
-            self._f._log_debug(
-                f"user-profile completeness check skipped ({_e_prof!r})"
-            )
+            self._f._log_debug(f"user-profile completeness check skipped ({_e_prof!r})")
         numbered = "\n".join(f"- {m[:400]}" for m in msgs)
         field_lines = "\n".join(
             f"- {name}: {desc}" for name, desc in self._INFERENCE_FIELDS.items()
@@ -47159,6 +47278,7 @@ class UserProfileManager:
             out.append("- _(empty)_")
         return out
 
+
 def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
     """Render the claim-coverage tally, or nothing when there is none.
 
@@ -47246,6 +47366,7 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
         lines.append("</details>")
     lines += ["", ""]
     return "\n".join(lines)
+
 
 class ContextDumper:
     """
@@ -48054,6 +48175,7 @@ class ContextDumper:
             except Exception:
                 pass
 
+
 class TaskRegistry:
     """
     Registry and orchestrator for all background/lazy tasks.
@@ -48776,6 +48898,7 @@ class TaskRegistry:
             project_id, last_response, stop_event=None
         )
 
+
 class ProjectStateManager:
     """
     Manages per‑project volatile state that lives in memory only.
@@ -49141,9 +49264,11 @@ class ProjectStateManager:
         """Set the one-shot flag to force multi-phase protocol this turn."""
         self.get_pstate(project_id)["force_multi_phase_this_turn"] = value
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 # BackgroundTask — Definition of task lazy + background
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 class BackgroundTask:
     """
@@ -49258,6 +49383,7 @@ class BackgroundTask:
         state["in_progress"] = False
         state["completed"] = False
         pstate[self.state_key] = state
+
 
 class BackgroundTaskManager:
     """
@@ -49618,6 +49744,7 @@ class BackgroundTaskManager:
                 if self._tasks.get(name) is _me:
                     self._tasks.pop(name, None)
                     self._stop_events.pop(name, None)
+
 
 class SemanticSeedInferencer:
     """
@@ -50154,7 +50281,9 @@ class SemanticSeedInferencer:
         self._f._log_debug(
             "DIAG infer: no literal seeds → _should_infer (CrossEncoder)…"
         )
-        if not await self._should_infer(query, project_id, code_action_vector, use_case):
+        if not await self._should_infer(
+            query, project_id, code_action_vector, use_case
+        ):
             self._f._log_debug("DIAG infer: _should_infer=False → return {}")
             return {}
         self._f._log_debug("DIAG infer: _should_infer=True → building skeleton…")
@@ -50228,10 +50357,13 @@ class SemanticSeedInferencer:
         seeds = self._parse_and_resolve(tokens, project_id)
         self._f._log_debug(f"DIAG infer: RETURN {len(seeds)} seed(s)")
         return seeds
+
+
 # ==========================================================================
 # CONFIGURATION AND ENTRY POINT
 # The valve schema and the OpenWebUI filter contract.
 # ==========================================================================
+
 
 class InletOrchestrator:
     """Handles the early stages of request processing: extracting user
@@ -51770,8 +51902,6 @@ class InletOrchestrator:
             f"attachment refs cleared"
         )
         return messages
-
-
 
 
 class Valves(BaseModel):
@@ -53342,7 +53472,9 @@ class Valves(BaseModel):
             "93 were prefix. 628s of that run — 47% of all call time "
             "— went to calls under 2000 tokens. Set to 0 to align "
             "everything, which is the behaviour before this valve.\n\n"
-            "What this valve trades is measurable and the trade is not the obvious one. Over one run, 44 prompts above 50k tokens reached the server and 27 of them reused the cached prefix outright — `cached n_tokens = 75024` and similar — while 17 re-processed from zero. Reuse is therefore normal, not exceptional, and it happens between consecutive calls that share this prefix.\n\n"                "The 17 that re-processed fall in two groups. Four came directly after a small unaligned prompt (158, 218, 260 tokens) which had replaced the slot contents, so the prefix was simply no longer there: the same contradiction_llm call cost 2.1s when it followed an aligned call and 86.7s when it followed a short one. Those four are the ones this valve causes. The other thirteen followed another large prompt and re-processed anyway, because the point where two aligned prompts diverge sits at the end of the preliminary prefix, right in the middle of where llama.cpp places its checkpoints (341 of them, p25 73155, p75 75629) — so whether a checkpoint lands before the divergence is close to a coin flip and nothing here controls it.\n\n"                "So lowering this recovers up to four re-processings per run by keeping the slot warm, at the cost of sending 74000 tokens for a 46-token call each time reuse misses. Neither direction is free and the run above is a single sample; measure before changing it."
+            "What this valve trades is measurable and the trade is not the obvious one. Over one run, 44 prompts above 50k tokens reached the server and 27 of them reused the cached prefix outright — `cached n_tokens = 75024` and similar — while 17 re-processed from zero. Reuse is therefore normal, not exceptional, and it happens between consecutive calls that share this prefix.\n\n"
+            "The 17 that re-processed fall in two groups. Four came directly after a small unaligned prompt (158, 218, 260 tokens) which had replaced the slot contents, so the prefix was simply no longer there: the same contradiction_llm call cost 2.1s when it followed an aligned call and 86.7s when it followed a short one. Those four are the ones this valve causes. The other thirteen followed another large prompt and re-processed anyway, because the point where two aligned prompts diverge sits at the end of the preliminary prefix, right in the middle of where llama.cpp places its checkpoints (341 of them, p25 73155, p75 75629) — so whether a checkpoint lands before the divergence is close to a coin flip and nothing here controls it.\n\n"
+            "So lowering this recovers up to four re-processings per run by keeping the slot warm, at the cost of sending 74000 tokens for a 46-token call each time reuse misses. Neither direction is free and the run above is a single sample; measure before changing it."
         ),
     )
     align_aux_calls_to_prefix: bool = Field(
@@ -55297,9 +55429,7 @@ class Valves(BaseModel):
         description="Maximum seconds to wait for background tasks to finish gracefully at inlet.",
     )
 
-    bg_task_cancel_timeout: float = Field(
-        default=5.0
-    )  # Bound on awaiting the cancel
+    bg_task_cancel_timeout: float = Field(default=5.0)  # Bound on awaiting the cancel
 
     bg_task_log_detailed: bool = Field(
         default=False,
@@ -55743,19 +55873,19 @@ class Filter:
     async def _emit_message(self, content: str) -> None:
         """
         Append content to the assistant message via __event_emitter__.
-    
+
         The channel the status lines already use accepts {"type":
         "message"}, which APPENDS to what the model streamed. It is the
         one way this plugin can put text in front of the reader without
         asking the model to write it: outlet edits to body["messages"]
         are discarded by OpenWebUI, which is why the Stats block was
         handed over to be copied in the first place.
-    
+
         Confirmed working against a live OpenWebUI: the appended block
         arrived intact, fenced by the rules this caller wraps it in.
-    
+
         Never raises: a UI error must not take the turn down.
-    
+
         Args:
             content: Markdown appended to the end of the answer.
         """
@@ -55767,15 +55897,13 @@ class Filter:
         if not self._event_emitter:
             return
         try:
-            await self._event_emitter(
-                {"type": "message", "data": {"content": content}}
-            )
+            await self._event_emitter({"type": "message", "data": {"content": content}})
         except Exception as _e_em:
             self._log_debug(
                 f"emit_message failed ({type(_e_em).__name__}: {_e_em}) — "
                 f"the answer stands without the appended block"
             )
-    
+
     async def _emit_status(self, description: str, done: bool = False) -> None:
         """
         Emit a real-time status update to the UI via __event_emitter__.
@@ -56911,9 +57039,7 @@ class Filter:
                     # there is no valid prefix to keep, and where this
                     # correctly does nothing.
                     _inv = getattr(self, "_prefix_invariant", "") or ""
-                    if _inv and not any(
-                        m.get("role") == "system" for m in messages
-                    ):
+                    if _inv and not any(m.get("role") == "system" for m in messages):
                         messages.insert(0, {"role": "system", "content": _inv})
 
                         # Countermand the confidence footer this call now
@@ -57038,7 +57164,9 @@ class Filter:
             # 🧠 ENRICHMENT
             #   Classify intent and use case; run lazy tasks; resolve call-graph mode
             # ----------------------------------------------------------------
-            code_action_vector = await self._commands.classify_code_action(user_query, project_id)
+            code_action_vector = await self._commands.classify_code_action(
+                user_query, project_id
+            )
 
             use_case_key, use_case_profile, use_case_label = (
                 await self._inlet_orch.classify_code_action_with_continuation(
@@ -57153,9 +57281,9 @@ class Filter:
                 _tn = 0
                 try:
                     _tn = int(
-                        self._project_state_manager.get_pstate(
-                            project_id
-                        ).get("napmem_turn_number", 0)
+                        self._project_state_manager.get_pstate(project_id).get(
+                            "napmem_turn_number", 0
+                        )
                         or 0
                     )
                 except Exception:
@@ -57935,7 +58063,7 @@ class Filter:
                     f"outlet: appended the measured Stats block "
                     f"({len(_stats)} chars)"
                 )
-        
+
         self._log_section(
             "CONTEXT MANAGER - OUTLET END",
             duration=time.monotonic() - start_time,
