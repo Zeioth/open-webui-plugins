@@ -20584,7 +20584,13 @@ if __name__ == "__main__":
         return "\n\n".join(_tw.dedent(p).strip() for p in parts)
 
     def _compose(self, body: str, tests: str, callee_src: str = "") -> str:
-        """Sandwich: fixed scaffold + dedented symbol + LLM tests + runner."""
+        """Sandwich: fixed scaffold + dedented symbol + LLM tests + runner.
+
+        Also records the test names being composed, which is what makes the
+        answer auditable: every path that runs a harness composes it here
+        first, so one hook covers all of them and it reads the exact text
+        that reaches the sandbox rather than an earlier draft of it.
+        """
         import textwrap as _tw
 
         dep_block = (
@@ -20592,7 +20598,7 @@ if __name__ == "__main__":
             if callee_src
             else ""
         )
-        return (
+        harness = (
             self._SCAFFOLD_HEAD
             + dep_block
             + _tw.dedent(body).strip()
@@ -20600,6 +20606,18 @@ if __name__ == "__main__":
             + tests
             + self._RUNNER_TAIL
         )
+        # ── Names for the outlet audit, never a reason to fail a run ──
+        try:
+            _seen = getattr(self._f, "_executed_test_names", None)
+            if not isinstance(_seen, list):
+                _seen = []
+            for _n in _TEST_DEF_RE.findall(harness):
+                if _n not in _seen:
+                    _seen.append(_n)
+            self._f._executed_test_names = _seen
+        except Exception:
+            pass
+        return harness
 
     # ── Evidence + persistence ───────────────────────────────────────────
 
@@ -23253,6 +23271,11 @@ _MD_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.*?)[ \t]*#*[ \t]*$")
 # the fence walk makes that safe anyway, but the narrower pattern means a
 # stray comment outside a fence cannot be counted as a section either.
 _ANSWER_HEADING_RE = re.compile(r"^[ \t]{0,3}#{2,3}[ \t]+(.*?)[ \t]*#*[ \t]*$")
+# A test definition, sync or async. Names rather than a count, because the
+# useful question is WHICH tests the reader was shown that nobody ran, and
+# a count cannot answer it: five shown against one run says the same thing
+# whether the one run is among the five or not.
+_TEST_DEF_RE = re.compile(r"(?m)^[ \t]*(?:async[ \t]+)?def[ \t]+(test_\w+)[ \t]*\(")
 
 
 # ==========================================================================
@@ -55868,6 +55891,11 @@ class Filter:
         self._plan_step_total: int = 0
         # The per-section outline, when the outline step produced one.
         self._answer_outline: str = ""
+        # Every test name composed into a harness this turn. Written by
+        # _compose, read once by the outlet audit: the tests the reader is
+        # shown are written by the final model and need not be the ones the
+        # sandbox ran.
+        self._executed_test_names: List[str] = []
         # Everything the sandbox ran this turn, as (kind, status) pairs.
         # Turn-wide because two different steps feed it and one of them
         # clears its own per-step list.
@@ -56594,6 +56622,7 @@ class Filter:
             self._measured_execution = ""
             self._plan_step_total = 0
             self._answer_outline = ""
+            self._executed_test_names = []
             self._execution_tally = []
             self._dynamic_targets_this_turn = 0
             self._answer_is_verbatim_echo = False
@@ -57819,6 +57848,7 @@ class Filter:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
         self._audit_opening_against_ledger(body)
         self._audit_section_order(body)
+        self._audit_tests_shown(body)
         self._report_answer_handoff()
 
     def _seal_answer_handoff(self) -> None:
@@ -58048,6 +58078,66 @@ class Filter:
             )
         except Exception as _e_ord:
             self._log_debug(f"[SECTION-ORDER] audit skipped ({_e_ord!r})")
+
+    def _audit_tests_shown(self, body: dict) -> None:
+        """Report which tests the answer shows that the sandbox never ran.
+
+        Detection, not correction, like its two siblings.
+
+        The verifier composes the REAL symbol body from the index and runs
+        the tests against it, which is what makes a green result mean
+        something. The answer's code block is written by the final model
+        from the workspace, and nothing binds one to the other. Measured on
+        one turn: Stats said "1 test run, 1 passed" and the answer showed
+        five tests, one of which asserted a contract the body two blocks
+        above it does not implement. The reader gets an artifact that was
+        not the one verified, carrying the seal of one that was.
+
+        Names, not counts. Five shown against one run says the same thing
+        whether or not the one that ran is among the five, and the useful
+        question is which of them nobody executed.
+
+        Only the shown-but-not-run direction is a finding. The reverse is
+        ordinary: a harness carries tests for symbols the answer never
+        quotes, and the background TDD check composes its own after this
+        audit has already run, so its names land in the next turn's list.
+        """
+        try:
+            # ── Step 1: the tests the reader was shown, from fences only ──
+            _msgs = body.get("messages") or []
+            _last = next(
+                (
+                    m
+                    for m in reversed(_msgs)
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None or not isinstance(_last.get("content"), str):
+                return
+            _fenced = re.findall(r"```(?:\w+)?\s*(.*?)```", _last["content"], re.S)
+            _shown: List[str] = []
+            for _b in _fenced:
+                for _n in _TEST_DEF_RE.findall(_b):
+                    if _n not in _shown:
+                        _shown.append(_n)
+            if not _shown:
+                return
+            # ── Step 2: against the names that reached the sandbox ──
+            _ran = list(getattr(self, "_executed_test_names", None) or [])
+            _unrun = [_n for _n in _shown if _n not in set(_ran)]
+            if not _unrun:
+                self._log_debug(
+                    f"[TESTS-SHOWN] ok — all {len(_shown)} test(s) shown were "
+                    f"executed against the real body"
+                )
+                return
+            self._log_debug(
+                f"[TESTS-SHOWN] {len(_unrun)} of {len(_shown)} shown test(s) "
+                f"never ran: {_unrun} — executed this turn: {_ran or '(none)'}"
+            )
+        except Exception as _e_ts:
+            self._log_debug(f"[TESTS-SHOWN] audit skipped ({_e_ts!r})")
 
     def _mark_answer_turn(self, body: dict) -> None:
         """Open the answer with the turn number it belongs to.
