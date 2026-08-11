@@ -29706,9 +29706,6 @@ class AgenticOrchestrator:
                     + ("; " + ", ".join(_t_open) if _t_open else "")
                     + "]"
                 )
-                # Kept on the Filter so the outlet can append it verbatim when
-                # append_stats_block is on: one string, two possible paths.
-                self._f._measured_stats_block = _t_line
                 # No opening mark any more: the turn number is the first
                 # line of the Stats block instead. A bare "[T4]" above the
                 # first paragraph was a label with nothing to belong to,
@@ -29720,107 +29717,94 @@ class AgenticOrchestrator:
                 # never a single line, and the singular wording that used to
                 # sit here could no longer be reached. A branch that cannot
                 # run is a claim about the data that stopped being true.
-                # With the outlet appending the measured block, asking the model
-                # for one as well gets it written twice — one of the ways
-                # transcription already failed.
-                if self._f.valves.append_stats_block:
-                    _workspace += (
-                        "\n\n[WORKSPACE NOTE — not part of your answer]\n"
-                        "BEFORE YOU CLOSE\n"
-                        "Every section you meant to write is written; add no more, "
-                        "and no heading after this. Do NOT write a Stats block or a "
-                        "confidence line of your own — the measured one is appended "
-                        "after your answer. End on your last section."
-                    )
-                else:
-                    _workspace += (
-                        # Not an "##" heading. Every section of the answer is
-                        # "##" now, and a workspace label wearing the same
-                        # marker is one the model copies: an answer came back
-                        # with "Your Stats section" written out as a heading of
-                        # its own, directly above the real block. The marker
-                        # used to distinguish instruction from answer; once the
-                        # answer adopted it, it stopped distinguishing anything.
-                        "\n\n[WORKSPACE NOTE — not part of your answer]\n"
-                        "YOUR STATS SECTION\n"
-                        # The no-repeat rule, restated where it is broken. It
-                        # already sits in the header, and an answer broke it
-                        # anyway: How to proceed appeared once in its place and
-                        # again just above this block, the second one proposing
-                        # exactly what its own section forbids. By the time the
-                        # model reaches the end of a long answer the header is
-                        # thousands of tokens behind it; the instruction that
-                        # governs a moment has to be readable at that moment.
-                        "\n\n[WORKSPACE NOTE — not part of your answer]\n"
-                        "BEFORE YOU CLOSE\n"
-                        "You are at the end of the answer. Every section you "
-                        "were going to write is written: do NOT add another one "
-                        "here, and in particular do not write next steps again "
-                        "because the answer feels like it should end with them. "
-                        "It ends with the block below and nothing else — the "
-                        "last character of your answer is the closing rule "
-                        "under it. Do not start another heading after it: one "
-                        "answer ended with a bare '##' and nothing to follow, "
-                        "which is the shape of a habit finishing itself.\n"
-                        "This turn's evidence was counted. Close your answer "
-                        "with a horizontal rule on its own line — three "
-                        "hyphens, like the ones separating the groups above — "
-                        "and then the ## **Stats** section — the same heading "
-                        "shape as every other section, since it is one. Start "
-                        "both at the LEFT "
-                        "MARGIN, with no indentation: when the section above "
-                        "ends in a bulleted list, continuing at that list's "
-                        "indent makes the whole block a continuation of the "
-                        "last bullet, and it renders inside it. Two answers in "
-                        "one run came back that way. The section contains "
-                        # The old justification was FALSE, and the model could
-                        # act on it: it said the outlet replaces these labels
-                        # with measured values. The outlet computes them and
-                        # OpenWebUI discards its edits to body["messages"] —
-                        # measured on this project long ago. Nothing downstream
-                        # corrects this block, so an answer that rewrites it is
-                        # the only version the reader ever sees.
-                        #
-                        # Two turns in one run did exactly that: one carried the
-                        # PREVIOUS block copied out of history, and a measured
-                        # "92% — 23 of 25; 2 unchecked" reached the reader as
-                        # "100% — 4 of 4". The alarm reported the opposite of
-                        # what was measured.
-                        "exactly these lines, all of them, in this order, "
-                        + "copied character for character. NOTHING downstream "
-                        "corrects this block: what you write is what the reader "
-                        "sees, so a number you adjust, or a line carried over "
-                        "from an earlier turn, BECOMES the measurement. Every "
-                        "line below is THIS turn's, and the Stats blocks in "
-                        "earlier answers above are NOT yours to reuse: one "
-                        "answer updated its "
-                        "[Turn:] line and carried the other five from the "
-                        "turn before. Every deviation measured so far moved "
-                        "the same way: refuted became passed, 86% became 95%, "
-                        "92% became 100%. The block is an alarm, and an alarm "
-                        "adjusted upward is worse than none. "
-                        "Do NOT translate it, unlike the headings above, and "
-                        "do NOT write a confidence line of your own: your own "
-                        "estimate is not measured and predicts nothing. Close "
-                        "with one more "
-                        "horizontal rule underneath the block, so the measured "
-                        "lines are fenced off from whatever follows them the "
-                        "way they are fenced off from the answer above:\n\n" + _t_line
-                        # ONCE, said after the block because that is where it is broken.
-                        # Measured: on three answers of ~1,000-2,000 characters the block
-                        # came back exactly once; on one of 7,338 it came back twice, and
-                        # the second copy had three of its four lines rewritten from
-                        # memory — "General Programming" for Architecture/Design, "modify"
-                        # for refactor, "0 tests run" on a turn that ran none. Only the
-                        # confidence line, the one hardest to reconstruct, was copied
-                        # character for character.
-                        #
-                        # The length is the variable: past a certain point the model has
-                        # lost sight of the block and finishes from habit.
-                        + "\n\nThat block goes in your answer ONCE. When you have "
-                        "written it, the answer is over — no second copy as a "
-                        "farewell, however long the answer was."
-                    )
+                _workspace += (
+                    # Not an "##" heading. Every section of the answer is
+                    # "##" now, and a workspace label wearing the same
+                    # marker is one the model copies: an answer came back
+                    # with "Your Stats section" written out as a heading of
+                    # its own, directly above the real block. The marker
+                    # used to distinguish instruction from answer; once the
+                    # answer adopted it, it stopped distinguishing anything.
+                    "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                    "YOUR STATS SECTION\n"
+                    # The no-repeat rule, restated where it is broken. It
+                    # already sits in the header, and an answer broke it
+                    # anyway: How to proceed appeared once in its place and
+                    # again just above this block, the second one proposing
+                    # exactly what its own section forbids. By the time the
+                    # model reaches the end of a long answer the header is
+                    # thousands of tokens behind it; the instruction that
+                    # governs a moment has to be readable at that moment.
+                    "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                    "BEFORE YOU CLOSE\n"
+                    "You are at the end of the answer. Every section you "
+                    "were going to write is written: do NOT add another one "
+                    "here, and in particular do not write next steps again "
+                    "because the answer feels like it should end with them. "
+                    "It ends with the block below and nothing else — the "
+                    "last character of your answer is the closing rule "
+                    "under it. Do not start another heading after it: one "
+                    "answer ended with a bare '##' and nothing to follow, "
+                    "which is the shape of a habit finishing itself.\n"
+                    "This turn's evidence was counted. Close your answer "
+                    "with a horizontal rule on its own line — three "
+                    "hyphens, like the ones separating the groups above — "
+                    "and then the ## **Stats** section — the same heading "
+                    "shape as every other section, since it is one. Start "
+                    "both at the LEFT "
+                    "MARGIN, with no indentation: when the section above "
+                    "ends in a bulleted list, continuing at that list's "
+                    "indent makes the whole block a continuation of the "
+                    "last bullet, and it renders inside it. Two answers in "
+                    "one run came back that way. The section contains "
+                    # The old justification was FALSE, and the model could
+                    # act on it: it said the outlet replaces these labels
+                    # with measured values. The outlet computes them and
+                    # OpenWebUI discards its edits to body["messages"] —
+                    # measured on this project long ago. Nothing downstream
+                    # corrects this block, so an answer that rewrites it is
+                    # the only version the reader ever sees.
+                    #
+                    # Two turns in one run did exactly that: one carried the
+                    # PREVIOUS block copied out of history, and a measured
+                    # "92% — 23 of 25; 2 unchecked" reached the reader as
+                    # "100% — 4 of 4". The alarm reported the opposite of
+                    # what was measured.
+                    "exactly these lines, all of them, in this order, "
+                    + "copied character for character. NOTHING downstream "
+                    "corrects this block: what you write is what the reader "
+                    "sees, so a number you adjust, or a line carried over "
+                    "from an earlier turn, BECOMES the measurement. Every "
+                    "line below is THIS turn's, and the Stats blocks in "
+                    "earlier answers above are NOT yours to reuse: one "
+                    "answer updated its "
+                    "[Turn:] line and carried the other five from the "
+                    "turn before. Every deviation measured so far moved "
+                    "the same way: refuted became passed, 86% became 95%, "
+                    "92% became 100%. The block is an alarm, and an alarm "
+                    "adjusted upward is worse than none. "
+                    "Do NOT translate it, unlike the headings above, and "
+                    "do NOT write a confidence line of your own: your own "
+                    "estimate is not measured and predicts nothing. Close "
+                    "with one more "
+                    "horizontal rule underneath the block, so the measured "
+                    "lines are fenced off from whatever follows them the "
+                    "way they are fenced off from the answer above:\n\n" + _t_line
+                    # ONCE, said after the block because that is where it is broken.
+                    # Measured: on three answers of ~1,000-2,000 characters the block
+                    # came back exactly once; on one of 7,338 it came back twice, and
+                    # the second copy had three of its four lines rewritten from
+                    # memory — "General Programming" for Architecture/Design, "modify"
+                    # for refactor, "0 tests run" on a turn that ran none. Only the
+                    # confidence line, the one hardest to reconstruct, was copied
+                    # character for character.
+                    #
+                    # The length is the variable: past a certain point the model has
+                    # lost sight of the block and finishes from habit.
+                    + "\n\nThat block goes in your answer ONCE. When you have "
+                    "written it, the answer is over — no second copy as a "
+                    "farewell, however long the answer was."
+                )
                 # Logged whole. The cut used to be [:60], which landed
                 # exactly on the boundary where the reason a rival survived
                 # begins, so the one field worth reading was the one field
@@ -55019,23 +55003,6 @@ class Valves(BaseModel):
     # 16. INTERACTION & COMMANDS
     # ══════════════════════════════════════════════════════════════════════
 
-    # THE STATS BLOCK, APPENDED INSTEAD OF TRANSCRIBED. Off by default.
-    #
-    # Four arrangements of "copy these lines exactly" failed, each
-    # differently: numbers recomputed (40% of 27-of-34 became 100% of
-    # 5-of-5), the explanation beside the block copied into the answer,
-    # and the block written twice. A literal block in a prompt can be
-    # copied wrongly, and asking more firmly does not change that.
-    #
-    # With this on the model is not asked for it: the outlet appends it
-    # through the event channel the status lines already use.
-    append_stats_block: bool = Field(
-        default=False,
-        description=(
-            "Append the measured Stats block via the event emitter "
-            "instead of asking the answering model to copy it."
-        ),
-    )
     enable_status_updates: bool = Field(
         default=True,
         description=(
@@ -55629,7 +55596,6 @@ class Filter:
         # not the model's recollection of it. Cleared per turn beside the
         # other per-turn state.
         self._measured_reading_lines: str = ""
-        self._measured_stats_block: str = ""
         # What the metacognitive escalation re-tested this turn, if it ran.
         # "re-tested" rather than "falsified": four claims went through a
         # second, independent falsification attempt and ONE fell — the other
@@ -56370,7 +56336,6 @@ class Filter:
             self._serial_rival_causes = []
             self._serial_rival_accounts = []
             self._measured_reading_lines = ""
-            self._measured_stats_block = ""
             self._measured_reinforcement = ""
             self._measured_execution = ""
             self._plan_step_total = 0
@@ -58045,24 +58010,6 @@ class Filter:
                     )
                 else:
                     await self._bg_manager.start(task.name, task.bg_func, project_id)
-
-        # The measured block, appended rather than transcribed. Gated off by
-        # default. Labelled, because the emitter APPENDS and cannot remove a
-        # block the model wrote itself: two blocks that look alike is worse
-        # than one wrong block, since the reader cannot tell which was
-        # measured. One line the model has no reason to invent settles it.
-        if self.valves.append_stats_block:
-            _stats = getattr(self, "_measured_stats_block", "") or ""
-            if _stats.strip():
-                await self._emit_message(
-                    "\n\n---\n\n"
-                    + _stats.rstrip()
-                    + "\n\n_Measured by the pipeline._\n\n---\n"
-                )
-                self._log_debug(
-                    f"outlet: appended the measured Stats block "
-                    f"({len(_stats)} chars)"
-                )
 
         self._log_section(
             "CONTEXT MANAGER - OUTLET END",
