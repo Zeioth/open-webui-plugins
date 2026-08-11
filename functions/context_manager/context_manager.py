@@ -606,6 +606,75 @@ _SECTION_FALLBACK_BODIES: Dict[str, Dict[str, str]] = {
     },
 }
 
+# How an account's fate reads in one line, per language and per cause.
+_ACCOUNT_FATES: Dict[str, Dict[str, str]] = {
+    "en": {
+        "buried_falsified": "the index contradicted it",
+        "buried_other": "no evidence could be brought to bear on it",
+        "rival_stalled": "the cycles ran out before it could be separated",
+        "rival_other": "it was weighed against the winner and not separated",
+        "buried_lead": "Ruled out",
+        "rival_lead": "Still standing",
+    },
+    "es": {
+        "buried_falsified": "la evidencia del índice la contradijo",
+        "buried_other": "no se pudo reunir evidencia sobre ella",
+        "rival_stalled": "se acabaron los ciclos antes de poder separarla",
+        "rival_other": "se sopesó frente a la ganadora y no quedó separada",
+        "buried_lead": "Descartada",
+        "rival_lead": "Sigue en pie",
+    },
+}
+
+
+def _account_outline_body(accounts: Optional[List[dict]], kind: str, lang: str) -> str:
+    """One outline line stating what the forge actually did with each account.
+
+    The hypotheses section and the ruled-out section are the only two whose
+    content the pipeline already knows exactly, and they were the two the
+    outline step had to invent: it is handed section NAMES and a workspace,
+    and the graveyard is in neither. Measured on one turn — the buried
+    account was "When the question is empty, the function ... returns 'en'",
+    the outline wrote a line about a regex being fence-sensitive instead,
+    and the final model, asked for a section about a hypothesis nowhere in
+    its context, omitted it and re-entered the section cycle three times.
+
+    The long directive never had this problem because it renders the
+    accounts itself. This is that same content, folded into the one line
+    per section the outline format allows.
+
+    Returns "" when there is nothing to state, which leaves whatever the
+    outline wrote in place rather than blanking a section.
+    """
+    # ── Step 1: keep only accounts with a hypothesis worth showing ──
+    _rows = [
+        _a
+        for _a in (accounts or [])
+        if isinstance(_a, dict) and (_a.get("hypothesis") or "").strip()
+    ][:3]
+    if not _rows:
+        return ""
+    _f = _ACCOUNT_FATES.get(lang) or _ACCOUNT_FATES["en"]
+    _lead = _f["buried_lead"] if kind == "buried" else _f["rival_lead"]
+    # ── Step 2: state each one, cause and all ──
+    _parts: List[str] = []
+    for _a in _rows:
+        _cause = str(_a.get("cause") or "")
+        if kind == "buried":
+            _how = _f["buried_falsified" if _cause == "falsified" else "buried_other"]
+        else:
+            _how = _f[
+                "rival_stalled"
+                if _cause in ("stalled", "budget")
+                else "rival_other"
+            ]
+        # The synthetic upload prefix comes off here rather than at the
+        # forge, because this is the only place the text is shown to a
+        # reader and the qualifier is correct everywhere else it is used.
+        _h = _PASTED_QUALIFIER_RE.sub("", str(_a.get("hypothesis") or "")).strip()
+        _parts.append(f"{_lead}: {_h} — {_how}")
+    return "; ".join(_parts) + "."
+
 # Function words, which appear in ordinary prose and almost never inside an
 # identifier. Counting them beats looking for accents: "¿Qué hace
 # SymbolIndex.compute_structure_hash?" has one accented word and six English
@@ -1261,6 +1330,16 @@ class UseCase(str, Enum):
 # synthetic filename must never become a module prefix in a qualified id
 # (see qualify_symbol_name). Matches the stem, with or without extension.
 _PASTED_UPLOAD_RE = re.compile(r"^Pasted_Text_\d+$", re.IGNORECASE)
+# The same synthetic name where it turns up INSIDE prose rather than as a
+# module stem, which is why it needs its own pattern: _PASTED_UPLOAD_RE is
+# anchored and matches a whole stem. A forged hypothesis came back reading
+# "the function Pasted_Text_1786480430024.txt._question_language returns
+# ..." — R12 leaking through the qualifier and into a sentence a reader was
+# meant to be shown. Stripping the prefix leaves the bare symbol, which is
+# what the sentence was about.
+_PASTED_QUALIFIER_RE = re.compile(
+    r"\bPasted_Text_\d+(?:\.[A-Za-z0-9_]+)?\.", re.IGNORECASE
+)
 
 
 class ContentType(str, Enum):
@@ -1468,6 +1547,11 @@ def _strip_answer_scaffolding(text: str) -> str:
             return text
         _out, _ = _strip_answer_footer(text)
         _out = _ANSWER_MARK_RE.sub("", _out)
+        # The write probe leaves with them, and for the same reason: it is
+        # a token this file appends, not something the model produced.
+        # Stored, it would enter the index and long term memory and come
+        # back next turn as part of what an answer looks like.
+        _out = _WRITE_PROBE_RE.sub("", _out)
         return _out.strip() or text
     except Exception:
         return text
@@ -13931,6 +14015,14 @@ class LongTermMemory:
         (code stripped past the size valve) before embedding so a pasted
         file cannot trigger a multi-minute, over-length encode.
 
+        Every exit says why, on a [RESPONSE-CACHE] line. Five different
+        reasons returned None here and all five looked identical from
+        outside — the subsystem logged nothing but its own startup. Two
+        runs asked the same question twice under the same code; one served
+        the second from cache and the other did not, and the logs could not
+        settle which of the five it was. A feature that fails silently
+        cannot be fixed, only guessed at.
+
         Args:
             query: The current user query.
             context_hash: Hash of the context (unused, kept for API compatibility).
@@ -13945,9 +14037,15 @@ class LongTermMemory:
         # Region: Early exit — cache disabled or prerequisites missing
         # ------------------------------------------------------------------
         if not self._f.valves.enable_response_cache or not HAS_SENTENCE:
+            # Silent on purpose: the valve being off is a decision, not a
+            # failure, and a line per turn saying so is noise.
             return None
         col = getattr(self._f, "_response_cache_collection", None)
         if col is None:
+            self._f._log_debug(
+                "[RESPONSE-CACHE] miss — no collection (never opened, or "
+                "dropped after a failed store)"
+            )
             return None
 
         # ------------------------------------------------------------------
@@ -13966,6 +14064,9 @@ class LongTermMemory:
             )
         )
         if not results or not results["ids"] or not results["ids"][0]:
+            self._f._log_debug(
+                "[RESPONSE-CACHE] miss — nothing stored yet for this project"
+            )
             return None
 
         # ------------------------------------------------------------------
@@ -13973,7 +14074,18 @@ class LongTermMemory:
         # ------------------------------------------------------------------
         dist = results["distances"][0][0]
         similarity = 1.0 - (dist / 2.0)
-        if similarity < self._f.valves.response_cache_similarity_threshold:
+        _threshold = self._f.valves.response_cache_similarity_threshold
+        # Read here so the near-miss line can name the question that ALMOST
+        # matched. "Below threshold" alone cannot be acted on; the stored
+        # question beside it says whether the threshold is wrong or the two
+        # questions really were different.
+        _meta = (results.get("metadatas") or [[{}]])[0][0] or {}
+        _stored_q = (_meta.get("query", "") or "")[:70]
+        if similarity < _threshold:
+            self._f._log_debug(
+                f"[RESPONSE-CACHE] miss — nearest at {similarity:.3f}, below "
+                f"the {_threshold:.2f} threshold: {_stored_q!r}"
+            )
             return None
 
         # ------------------------------------------------------------------
@@ -13989,6 +14101,15 @@ class LongTermMemory:
             await anyio.to_thread.run_sync(
                 lambda: col.delete(ids=[results["ids"][0][0]])
             )
+            # Worth its own line because this exit DELETES. Editing the file
+            # empties the cache of everything it is asked for, one entry per
+            # lookup, and a run that starts by invalidating yesterday's
+            # entries looks exactly like a run whose store never fired.
+            self._f._log_debug(
+                f"[RESPONSE-CACHE] miss — matched at {similarity:.3f} but the "
+                f"code moved (stored {stored_code_state[:12] or '(none)'} ≠ "
+                f"current {current_code_state[:12]}); entry deleted"
+            )
             return None
 
         # ------------------------------------------------------------------
@@ -14000,9 +14121,18 @@ class LongTermMemory:
             await anyio.to_thread.run_sync(
                 lambda: col.delete(ids=[results["ids"][0][0]])
             )
+            self._f._log_debug(
+                f"[RESPONSE-CACHE] miss — matched at {similarity:.3f} but the "
+                f"entry is {(time.time() - ts) / 3600:.1f}h old, past the "
+                f"{self._f.valves.response_cache_ttl_hours}h TTL; entry deleted"
+            )
             return None
 
         doc = results["documents"][0][0]
+        self._f._log_debug(
+            f"[RESPONSE-CACHE] hit — {similarity:.3f} against {_stored_q!r}, "
+            f"stored {(time.time() - ts) / 60:.0f} min ago, {len(doc)} chars"
+        )
         # Footer and similarity ride along so the delivering path can say
         # what this turn is: an echo of an answer measured earlier, and how
         # closely the question matched. Both are read only there — nothing
@@ -15520,8 +15650,14 @@ class LongTermMemory:
                     pstate["response_cache_count"] = max(
                         0, current_size - len(old_entries["ids"])
                     )
+                    self._f._log_debug(
+                        f"[RESPONSE-CACHE] evicted {len(old_entries['ids'])} "
+                        f"entry/entries at capacity ({max_entries})"
+                    )
             except Exception as e:
-                self._f._log_debug(f"Failed to evict old cache entries: {e}")
+                self._f._log_debug(
+                    f"[RESPONSE-CACHE] eviction failed ({e!r})"
+                )
 
         # ------------------------------------------------------------------
         # Region: Upsert the new entry
@@ -15545,8 +15681,21 @@ class LongTermMemory:
                 )
             )
             pstate["response_cache_count"] = pstate.get("response_cache_count", 0) + 1
+            # The other half of the race. The store runs fire-and-forget from
+            # the same inlet whose parallel checks are querying the cache, so
+            # whether a repeated question hits depends on which finishes
+            # first. Timestamped here, a hit or a miss can be read against
+            # this line instead of guessed at.
+            self._f._log_debug(
+                f"[RESPONSE-CACHE] stored — {len(response)} chars under code "
+                f"state {code_state_hash[:12]}"
+                + (f", footer kept ({len(footer)} chars)" if footer else "")
+            )
         except Exception as e:
-            self._f._log_debug(f"Failed to store response in cache: {e}")
+            self._f._log_debug(
+                f"[RESPONSE-CACHE] store failed ({e!r}) — collection dropped, "
+                f"so every lookup misses until it is reopened"
+            )
             self._f._response_cache_collection = None
 
     async def _store_response_in_cache_async(
@@ -23328,6 +23477,14 @@ _MD_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.*?)[ \t]*#*[ \t]*$")
 # the fence walk makes that safe anyway, but the narrower pattern means a
 # stray comment outside a fence cannot be counted as a section either.
 _ANSWER_HEADING_RE = re.compile(r"^[ \t]{0,3}#{2,3}[ \t]+(.*?)[ \t]*#*[ \t]*$")
+# The write probe's token, and the pattern that takes it back out. Named
+# once so the outlet that writes it, the inlet that looks for it, and the
+# scaffolding strip that must not let it into the index or long term
+# memory all agree on the same string. Nothing else in this project or in
+# any answer produces these brackets, which is the whole point: its
+# presence cannot be explained by the model having written it.
+_WRITE_PROBE_TOKEN = "\u27eaOUTLET-WRITE-PROBE\u27eb"
+_WRITE_PROBE_RE = re.compile(r"\n*[ \t]*\u27eaOUTLET-WRITE-PROBE\u27eb[ \t]*")
 # A test definition, sync or async. Names rather than a count, because the
 # useful question is WHICH tests the reader was shown that nobody ran, and
 # a count cannot answer it: five shown against one run says the same thing
@@ -24903,8 +25060,16 @@ class AgenticSynthesisComposer:
         lang: str,
         sections: List[str],
         never_skip: Optional[List[str]] = None,
+        fixed_bodies: Optional[Dict[str, str]] = None,
     ) -> str:
         """One line per section, written while the workspace is still in view.
+
+        `fixed_bodies` maps a section KEY to a line that overrides whatever
+        the model wrote for it. Two sections need it: the surviving rivals
+        and the ruled-out accounts. Their content is a fact the pipeline
+        holds and the workspace does not carry, so asking a model to write
+        their line is asking it to invent one — which it did, naming a
+        hypothesis that was never forged.
 
         The answer directive spends three quarters of its length explaining
         what each section is FOR — 5,535 characters of rationale against
@@ -25019,6 +25184,16 @@ class AgenticSynthesisComposer:
                 # Re-wrapped in the canonical form, so a heading the model
                 # wrote bare still reaches the answer as "## **Name**".
                 _kept.append(f"## **{_heads(_l)}**")
+                # A fixed body wins over both the model's line and the SKIP
+                # fallback, and it is emitted even when the model wrote no
+                # body at all: the point is that this section's content is
+                # known, so nothing the model did or failed to do with it
+                # can be better than the fact.
+                _fix = (fixed_bodies or {}).get(_key_of.get(_heads(_l), ""), "")
+                if _fix:
+                    _kept.append(_fix)
+                    _idx += 2
+                    continue
                 if _body:
                     # A protected section keeps its heading, but its body must not
                     # be the word SKIP: the guard would hand the model
@@ -26013,7 +26188,30 @@ class AgenticSynthesisComposer:
             # model reads. It does not need the history, it needs the rule;
             # the history belongs here, where whoever weakens this rule can
             # see what it cost.
-            "3. Start with Conclusion. It is the only section always " "required.",
+            #
+            # The ordering half was added later, from the outline mode,
+            # because the two modes had drifted apart and only one of them
+            # was defended. Measured over twenty turns of two runs: with
+            # the outline mode's anchor and seeded opening, one defect in
+            # eleven; on this path, four in seven — a 1,801-character code
+            # preamble ahead of the first section, a 51,756-character loop
+            # that had to be stopped by hand, one answer repeating two
+            # sections and one closing on Código. Same model, same run,
+            # same questions; the difference was which directive it got.
+            #
+            # Named from _H and not hardcoded: this path always opens on
+            # Conclusion — _opening below is built from _H["conclusion"] —
+            # so the rule and the list cannot disagree, and the reader's
+            # language is already resolved.
+            #
+            # No completeness clause here, unlike the outline mode's rule
+            # 3. This path already carries one in the closing paragraph
+            # ("This list is CLOSED and each heading appears exactly
+            # ONCE"), and a rule stated twice in one directive is a rule
+            # the model gets to choose between.
+            f"3. Start with {_H['conclusion']} — it is the FIRST section, "
+            "and the sections follow in the order listed. It is the only "
+            "section always required.",
             "",
             # ANY fenced test code, wherever it lands. Everything this
             # project learned about runnable tests used to live inside the
@@ -29556,7 +29754,30 @@ class AgenticOrchestrator:
                     f"## **{_HH['gaps']}**",
                 ]
                 self._f._answer_outline = await self._composer.compose_outline(
-                    plan, question, self._ledger, aligned_prefix, _lang, _secs, _never
+                    plan,
+                    question,
+                    self._ledger,
+                    aligned_prefix,
+                    _lang,
+                    _secs,
+                    _never,
+                    # The two sections whose content is a fact rather than a
+                    # judgement. The gate above opens them on the accounts
+                    # existing; this is what makes them writable, because
+                    # the accounts themselves are not in the workspace the
+                    # outline step reads.
+                    {
+                        "rivals": _account_outline_body(
+                            getattr(self._f, "_serial_rival_accounts", None),
+                            "rivals",
+                            _lang,
+                        ),
+                        "buried": _account_outline_body(
+                            getattr(self._f, "_serial_eliminated_accounts", None),
+                            "buried",
+                            _lang,
+                        ),
+                    },
                 )
             except Exception as _e_ol:
                 self._f._log_debug(
@@ -30145,7 +30366,28 @@ class AgenticOrchestrator:
         # answer has to open with, so copying it IS obeying it. The two
         # outcomes coincide, which is the only shape of instruction that
         # belongs in the position guaranteed to be read last.
+        #
+        # Emitted on BOTH directive paths. It used to be guarded on the
+        # outline alone, so the turns that fell back to the long directive
+        # — a third of them, whenever compose_outline names no section and
+        # its result is discarded — got neither this nor the order anchor,
+        # while the outline turns got both. The defect rate split with it:
+        # one in eleven where the two defences landed, four in seven where
+        # neither did. The fallback path is not a rarer path, it is the
+        # unprotected one.
+        #
+        # Derived from _H rather than from the directive's own opening
+        # line, because that line carries a trailing description — "##
+        # **Conclusión** — the single mechanism you hold responsible..." —
+        # and seeding it whole would ask the model to open by copying the
+        # brief. The language is resolved here rather than reused from the
+        # outline block above: those locals live inside that block's `if`
+        # and `try`, so reading them here would raise on any turn where the
+        # outline step is off or failed early — precisely the turns this
+        # is for.
+        # ── Step 1: the outline's own first heading, when there is one ──
         _open_line = ""
+        _seed_from = ""
         try:
             _open_line = next(
                 (
@@ -30155,14 +30397,42 @@ class AgenticOrchestrator:
                 ),
                 "",
             )
+            if _open_line:
+                _seed_from = "outline"
         except Exception:
             _open_line = ""
+        # ── Step 2: otherwise the long directive's, which always opens on
+        # Conclusion. Its own try: a failure resolving the language must not
+        # be able to discard a line Step 1 already found, and the two steps
+        # fail for unrelated reasons.
+        if not _open_line:
+            try:
+                _open_line = "## **%s**" % (
+                    _SECTION_HEADINGS[_question_language(question)]["conclusion"]
+                )
+                _seed_from = "long directive"
+            except Exception as _e_seed:
+                # Deliberately no English default. The directive's headings
+                # come from the same table, so a seed in a language the
+                # directive did not use would contradict the list it sits
+                # above — and this file has already established that a rule
+                # disagreeing with its own list teaches the model to read
+                # neither. Nothing is safer than something wrong here.
+                _open_line = ""
+                self._f._log_debug(
+                    f"[ANSWER-SEED] not emitted — language unresolved "
+                    f"({_e_seed!r})"
+                )
+        # ── Step 3: emit, and say which source it came from ──
         if _open_line:
             _workspace += (
                 "\n\n[WORKSPACE NOTE — not part of your answer]\n"
                 "HOW YOUR ANSWER OPENS\n"
                 "Your answer begins with these two lines, exactly:\n\n"
                 "---\n\n" + _open_line
+            )
+            self._f._log_debug(
+                f"[ANSWER-SEED] {_open_line!r} from the {_seed_from}"
             )
         dynamic_injections.append(("trailing", _workspace))
         # The note that used to sit here is gone, and where it sat is why.
@@ -42774,6 +43044,76 @@ class ActiveCodeUpdater:
                     f"assistant restatement check skipped ({_e_restate!r})"
                 )
 
+        # ── Step 3.7: assistant test scaffolding is not project code ──
+        # Step 3.6 drops a block only when EVERY symbol in it is already
+        # indexed, which is right for a restated body and wrong for a test
+        # suite: a `TestQualifySymbolName` with ten methods is all new
+        # names, so it passes and indexes in full.
+        #
+        # Measured on this project, whose source contains not one `def
+        # test_`: 89 test functions and 4 test classes among 900 indexed
+        # symbols, roughly a tenth of the map, all of them written by the
+        # model in earlier answers. They are not inert. They ride in Block
+        # A's class list, so the model reads its own past inventions as
+        # project structure and writes them again — which is why every
+        # [TESTS-SHOWN] line reports 0 of N: the names it shows come from
+        # the map, not from the harness the sandbox ran. They were seen
+        # arriving as PPR seeds. And a claim citing one of them passes
+        # citation validation, so a fabricated symbol can settle a
+        # fabricated claim against "code".
+        #
+        # Symbol level rather than block level: an answer commonly shows
+        # the real function and its tests in one block, and the function
+        # belongs in the index. A block left with nothing but tests is
+        # dropped whole.
+        #
+        # Like Step 3.6, this prevents new cases and cleans none: an index
+        # that already ran without it holds what the assistant wrote, and
+        # "/forget last" or "/clean" is how those go.
+        if role == "assistant" and new_blocks_pending:
+            try:
+                _kept3 = []
+                _dropped_syms = 0
+                _dropped_blocks = 0
+                for blk, syms, raw in zip(
+                    new_blocks_pending, symbols_list, extracted_blocks
+                ):
+                    if isinstance(syms, Exception) or not syms:
+                        _kept3.append((blk, syms, raw))
+                        continue
+                    _real = [
+                        _s
+                        for _s in syms
+                        if not self._is_test_scaffolding(
+                            getattr(_s, "name", ""),
+                            getattr(_s, "parent_symbol", "") or "",
+                        )
+                    ]
+                    _dropped_syms += len(syms) - len(_real)
+                    if not _real:
+                        _dropped_blocks += 1
+                        continue
+                    if len(_real) != len(syms):
+                        blk.symbols = _real
+                    _kept3.append((blk, _real, raw))
+                if _dropped_syms:
+                    new_blocks_pending = [_k[0] for _k in _kept3]
+                    symbols_list = [_k[1] for _k in _kept3]
+                    extracted_blocks = [_k[2] for _k in _kept3]
+                    self._f._log_debug(
+                        f"[TEST-SCAFFOLD] {_dropped_syms} assistant test "
+                        f"symbol(s) kept out of the index"
+                        + (
+                            f", {_dropped_blocks} block(s) dropped whole"
+                            if _dropped_blocks
+                            else ""
+                        )
+                    )
+            except Exception as _e_tests:
+                self._f._log_debug(
+                    f"[TEST-SCAFFOLD] gate skipped ({_e_tests!r})"
+                )
+
         # ── Step 4: map block content → symbols (skip failed extractions) ──
         content_to_syms: Dict[str, List[CodeSymbol]] = {
             blk.content: syms
@@ -42781,6 +43121,23 @@ class ActiveCodeUpdater:
             if not isinstance(syms, Exception)
         }
         return new_blocks_pending, symbols_list, content_to_syms, extracted_blocks
+
+    @staticmethod
+    def _is_test_scaffolding(name: str, parent: str = "") -> bool:
+        """Return True for a symbol that is a test the assistant just wrote.
+
+        Test names, not test CONTENT: `test_*` and `Test*` are the pytest and
+        unittest conventions, and a project's own tests arrive as a paste,
+        which is a user block this never sees.
+        """
+        _tail = (name or "").rsplit(".", 1)[-1]
+        _par = (parent or "").split(".", 1)[0]
+        return bool(
+            _tail.startswith("test_")
+            or re.match(r"^Test[A-Z_]", _tail)
+            or _par.startswith("test_")
+            or re.match(r"^Test[A-Z_]", _par)
+        )
 
     @staticmethod
     def _is_illustrative_stub_block(content: str) -> bool:
@@ -51563,7 +51920,7 @@ class InletOrchestrator:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def process_prev_assistant_turn(
-        self, messages: list, project_id: str, state
+        self, messages: list, project_id: str, state, uncompleted: bool = False
     ) -> None:
         """
         Process the previous turn's assistant response at the start of inlet.
@@ -51745,6 +52102,30 @@ class InletOrchestrator:
             f"{len(assistant_content.split())} words)"
         )
 
+        # ── The write probe's verdict, read where the round trip closes ──
+        # This is the answer as the host stored it, which is the answer the
+        # reader has. If the token the outlet appended is here, outlet edits
+        # reach them; if it is not, none of them do and every enforcement
+        # this file does at the outlet has to move into the prompt. Read
+        # before the scaffolding strip below, which takes the token out.
+        try:
+            if getattr(self._f, "_probe_written_last_turn", False):
+                self._f._probe_written_last_turn = False
+                if _WRITE_PROBE_TOKEN in assistant_content:
+                    self._f._log_debug(
+                        "[WRITE-PROBE] SURVIVED — outlet edits reach the "
+                        "reader; enforcement at the outlet is worth doing"
+                    )
+                else:
+                    self._f._log_debug(
+                        "[WRITE-PROBE] ABSENT — the outlet appended it and "
+                        "the stored answer does not carry it, so no outlet "
+                        "edit reaches the reader and every enforcement "
+                        "belongs in the prompt"
+                    )
+        except Exception as _e_pv:
+            self._f._log_debug(f"[WRITE-PROBE] verdict skipped ({_e_pv!r})")
+
         # ------------------------------------------------------------------
         # Region: classify session over the sliced history
         #
@@ -51828,7 +52209,20 @@ class InletOrchestrator:
         # code_state_hash is taken AFTER _update_active_code, so the entry is
         # keyed to the post-response code state — matching the outlet's order.
         # ------------------------------------------------------------------
-        if self._f.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
+        # An answer whose stream never reached the outlet is not cacheable.
+        # The cache replays an entry VERBATIM in place of running the
+        # pipeline, so a stopped answer stored here is a partial reply
+        # served whole to a future repeat of the question, with no signal
+        # that it was cut off. Indexing and LTM are left alone: a stopped
+        # answer can still carry a correct function worth holding, and the
+        # degenerate-content guard above already truncates the pathological
+        # case. Replaying one as if it were finished has no such upside.
+        if uncompleted:
+            self._f._log_debug(
+                "[NO-OUTLET] response cache store skipped — the answer this "
+                "would store never completed"
+            )
+        elif self._f.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
             prompt_user = next(
                 (
                     m
@@ -55957,6 +56351,19 @@ class Filter:
         self._plan_step_total: int = 0
         # The per-section outline, when the outline step produced one.
         self._answer_outline: str = ""
+        # Turn parity between the two entry points. The host does not call
+        # outlet when a stream is cancelled, so an answer the reader stopped
+        # reaches the next inlet looking exactly like one that finished:
+        # measured on one run, eleven inlets and ten outlets, the missing
+        # one belonging to a 51,756-character loop the reader killed by
+        # hand. That turn left no audit line of any kind, so the doubling
+        # it already showed went unseen until the next turn amplified it.
+        self._inlet_turns: int = 0
+        self._outlet_turns: int = 0
+        # Set when the outlet appends the write probe, cleared when the
+        # next inlet reports on it. One turn's memory, so a verdict is
+        # never printed for a turn that never carried the token.
+        self._probe_written_last_turn: bool = False
         # Every test name composed into a harness this turn. Written by
         # _compose, read once by the outlet audit: the tests the reader is
         # shown are written by the final model and need not be the ones the
@@ -56629,6 +57036,22 @@ class Filter:
         self._event_emitter = __event_emitter__
         try:
             self._log_debug("inlet called")
+            # ── Turn parity: did the PREVIOUS turn reach the outlet? ──
+            # Read before the counter moves, so the comparison is against
+            # the turn whose answer this inlet is about to process. A gap
+            # means the stream was cancelled, errored, or the host dropped
+            # it, and in every one of those the answer below is partial.
+            _prev_uncompleted = (
+                self._inlet_turns > 0 and self._outlet_turns != self._inlet_turns
+            )
+            self._inlet_turns += 1
+            if _prev_uncompleted:
+                self._log_debug(
+                    f"[NO-OUTLET] the previous turn never reached the outlet "
+                    f"({self._outlet_turns} outlet(s) for "
+                    f"{self._inlet_turns - 1} inlet(s)) — its answer is "
+                    f"treated as incomplete"
+                )
             inlet_start = time.monotonic()
             self._log_section("CONTEXT MANAGER - INLET START")
             # Record the model this turn is served by. Auxiliary calls only
@@ -56870,7 +57293,7 @@ class Filter:
                 self._log_debug("🤖 TDD: verdict queued for injection")
 
             await self._inlet_orch.process_prev_assistant_turn(
-                messages, project_id, state
+                messages, project_id, state, _prev_uncompleted
             )
             _inlet_timing("Step 0/6: Process previous assistant turn", step_start)
 
@@ -57939,21 +58362,6 @@ class Filter:
                 f"({_settled}/{_total}); {_n_gone} pre-existing footer(s) "
                 f"removed"
             )
-            # Whether any of this reaches the reader is unproven. Two
-            # turns of one run were measured against the word count the
-            # next inlet logged for the same answer, and both matched the
-            # text as displayed rather than the text as edited here — so
-            # the edit appears to be discarded, and the marks and footers
-            # that do appear come from the instructions in the workspace
-            # instead. A token nothing else could produce settles it: if
-            # it never shows up in an answer, no outlet edit ever does,
-            # and every enforcement has to move into the prompt.
-            if getattr(self.valves, "outlet_write_probe", False):
-                _last["content"] += "\n\n⟪OUTLET-WRITE-PROBE⟫"
-                self._log_debug(
-                    "outlet: write probe appended — if it is absent from "
-                    "the answer, outlet edits do not reach the reader"
-                )
         except Exception as _e_conf:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
         self._report_answer_handoff()
@@ -58246,6 +58654,52 @@ class Filter:
         except Exception as _e_ts:
             self._log_debug(f"[TESTS-SHOWN] audit skipped ({_e_ts!r})")
 
+    def _append_write_probe(self, body: dict) -> None:
+        """Append the write-probe token, when the valve asks for it.
+
+        A method of its own, called beside the audits, because of where it
+        used to live: the tail of _replace_asserted_confidence, behind
+        three early returns — no pipeline this turn, a pipeline that
+        settled nothing, no assistant content. On any of those the probe
+        never fired, and a token that did not run is absent from the answer
+        for the same reason a discarded edit is. The one experiment this
+        valve exists for would have come back unreadable.
+
+        Out here it fires on every turn that has an answer, so absence
+        means one thing only: the edit did not reach the reader.
+
+        The reading is done for you. The next inlet looks for the token in
+        the answer the host hands back and says whether it survived, so the
+        question is settled by a log line rather than by remembering to
+        scroll to the bottom of a reply.
+        """
+        try:
+            if not getattr(self.valves, "outlet_write_probe", False):
+                return
+            _msgs = body.get("messages") or []
+            _last = next(
+                (
+                    m
+                    for m in reversed(_msgs)
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None or not isinstance(_last.get("content"), str):
+                self._log_debug(
+                    "[WRITE-PROBE] not appended — no assistant content in "
+                    "the outlet body"
+                )
+                return
+            _last["content"] = _last["content"].rstrip() + "\n\n" + _WRITE_PROBE_TOKEN
+            self._probe_written_last_turn = True
+            self._log_debug(
+                "[WRITE-PROBE] appended — the next inlet reports whether it "
+                "survived the round trip"
+            )
+        except Exception as _e_pr:
+            self._log_debug(f"[WRITE-PROBE] append skipped ({_e_pr!r})")
+
     def _mark_answer_turn(self, body: dict) -> None:
         """Open the answer with the turn number it belongs to.
 
@@ -58323,6 +58777,11 @@ class Filter:
         _bg_pause_epoch = self._bg_manager.capture_pause_epoch()
 
         self._log_debug("outlet called")
+        # Parity is stamped before the prerequisite gate below, which can
+        # return early: an outlet that ran and declined is still an outlet
+        # that ran, and counting only the ones that finish would report a
+        # cancelled stream on every turn where code awareness is off.
+        self._outlet_turns = self._inlet_turns
         start_time = time.monotonic()
         self._log_section("CONTEXT MANAGER - OUTLET START")
 
@@ -58475,6 +58934,7 @@ class Filter:
         self._audit_opening_against_ledger(body)
         self._audit_section_order(body)
         self._audit_tests_shown(body)
+        self._append_write_probe(body)
 
         # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
