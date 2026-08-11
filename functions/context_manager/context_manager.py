@@ -548,6 +548,64 @@ _SECTION_HEADINGS: Dict[str, Dict[str, str]] = {
     },
 }
 
+# The body line handed to a protected section whose outline body came back
+# SKIP. It replaces "what this turn has for it", which was a fragment of the
+# directive one line above it ("the line under each heading says what this
+# turn established for it") and read in the prompt as a leak rather than as
+# anything to act on. Protecting Conclusion and How to proceed made that
+# text frequent, since those two are the ones the outline actually drops.
+#
+# Each says the same thing in the section's own terms: report what there
+# is, and if there is nothing, say so plainly. A section honestly declared
+# empty is worth more than one padded to look full, and both are worth more
+# than its content arriving under a heading that promised something else.
+# Imperative on purpose: the directive tells the model to develop the line
+# into prose, so a line that read as content would be developed into prose
+# about the placeholder.
+_SECTION_FALLBACK_BODIES: Dict[str, Dict[str, str]] = {
+    "en": {
+        "conclusion": (
+            "Say in one or two sentences what this turn settled; if it "
+            "settled nothing, say that."
+        ),
+        "proceed": "Say what the next step is; if there is none, say that.",
+        "code": "Show the code this turn has; if there is none, say that.",
+        "tests": "Show the tests this turn ran; if it ran none, say that.",
+        "rivals": (
+            "Say which rival account survived and on what; if none did, "
+            "say that."
+        ),
+        "buried": (
+            "Say which account was ruled out and on what; if none was, "
+            "say that."
+        ),
+        "evidence": (
+            "Say what the checks settled; if they settled nothing, say that."
+        ),
+        "gaps": "Say what was left unverified; if nothing was, say that.",
+    },
+    "es": {
+        "conclusion": (
+            "Di en una o dos frases qué dejó establecido este turno; si no "
+            "estableció nada, dilo."
+        ),
+        "proceed": "Di cuál es el siguiente paso; si no hay ninguno, dilo.",
+        "code": "Muestra el código que este turno tiene; si no hay, dilo.",
+        "tests": "Muestra los tests que se ejecutaron; si no hubo, dilo.",
+        "rivals": (
+            "Di qué explicación rival sobrevivió y con qué apoyo; si "
+            "ninguna, dilo."
+        ),
+        "buried": (
+            "Di qué explicación quedó descartada y con qué; si ninguna, dilo."
+        ),
+        "evidence": (
+            "Di qué asentaron las comprobaciones; si no asentaron nada, dilo."
+        ),
+        "gaps": "Di qué quedó sin verificar; si no quedó nada, dilo.",
+    },
+}
+
 # Function words, which appear in ordinary prose and almost never inside an
 # identifier. Counting them beats looking for accents: "¿Qué hace
 # SymbolIndex.compute_structure_hash?" has one accented word and six English
@@ -24824,6 +24882,21 @@ class AgenticSynthesisComposer:
         # emitter re-wraps them anyway, so the wrapper the model chose is
         # not information worth being strict about.
         _bare = [_s.strip("# *") for _s in sections]
+        # A heading comes back as a NAME, and the fallback line is chosen by
+        # KEY, so the headings table is inverted once for this language. The
+        # generic line stands in for a name that is in `sections` but not in
+        # the table, which no current caller produces and which would
+        # otherwise hand the model an empty body.
+        _key_of = {
+            _v: _k
+            for _k, _v in (
+                _SECTION_HEADINGS.get(lang) or _SECTION_HEADINGS["en"]
+            ).items()
+        }
+        _fallbacks = (
+            _SECTION_FALLBACK_BODIES.get(lang) or _SECTION_FALLBACK_BODIES["en"]
+        )
+        _generic = _fallbacks["conclusion"]
 
         def _heads(_line: str) -> str:
             # Bullets and numbering come off too: a model asked for a list
@@ -24870,9 +24943,12 @@ class AgenticSynthesisComposer:
                     # A protected section keeps its heading, but its body must not
                     # be the word SKIP: the guard would hand the model
                     # "## **Código**" with SKIP under it, which is the shape
-                    # that gets copied into the answer.
+                    # that gets copied into the answer. The replacement is the
+                    # section's own line, so Conclusion is told to state what
+                    # the turn settled and How to proceed to name the next
+                    # step, each with leave to say there is none.
                     _kept.append(
-                        "what this turn has for it"
+                        _fallbacks.get(_key_of.get(_heads(_l), ""), _generic)
                         if _body.strip().upper().startswith("SKIP")
                         else _body
                     )
@@ -29373,11 +29449,28 @@ class AgenticOrchestrator:
                     _keys.append("buried")
                 _keys += ["evidence", "gaps"]
                 _secs = [f"## **{_HH[_k]}**" for _k in _keys]
-                # Código, Evidence and Gaps are NOT skippable. Measured: an answer
-                # came back with no Código section at all — the outline had marked
-                # it SKIP — and the code landed above the first rule, outside every
-                # section, because there was nowhere else for it to go.
+                # Conclusion, How to proceed, Código, Evidence and Gaps are
+                # NOT skippable. Measured twice, the same shape both times.
+                # An answer came back with no Código section at all — the
+                # outline had marked it SKIP — and the code landed above the
+                # first rule, outside every section, because there was
+                # nowhere else for it to go. Then two answers of one run came
+                # back opening on Código, with no Conclusion and no How to
+                # proceed: the outline had dropped both, and the prose that
+                # belonged in them was written under Código anyway, one
+                # answer saying what the fix was and where to put the tests
+                # beneath a heading that promises source.
+                #
+                # The two are here for the same reason Código is, not because
+                # the pipeline always has something for them. Conclusion is
+                # the section the long directive calls the only one always
+                # required, and How to proceed is the one the reader acts on.
+                # A turn with little to say in either writes a short one; a
+                # turn with nothing writes the placeholder below. Neither is
+                # worse than the content arriving under the wrong heading.
                 _never = [
+                    f"## **{_HH['conclusion']}**",
+                    f"## **{_HH['proceed']}**",
                     f"## **{_HH['code']}**",
                     f"## **{_HH['evidence']}**",
                     f"## **{_HH['gaps']}**",
