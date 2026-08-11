@@ -23190,6 +23190,11 @@ _SKELETON_RULE_RE = re.compile(r"^[ \t]*\u2500{2,}", re.MULTILINE)
 # re.MULTILINE, because the caller has to know which lines sit inside a
 # code fence and a whole-text scan cannot.
 _MD_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.*?)[ \t]*#*[ \t]*$")
+# The same shape restricted to two and three hashes, for reading an answer
+# back. One hash would collect every Python comment in the Código section;
+# the fence walk makes that safe anyway, but the narrower pattern means a
+# stray comment outside a fence cannot be counted as a section either.
+_ANSWER_HEADING_RE = re.compile(r"^[ \t]{0,3}#{2,3}[ \t]+(.*?)[ \t]*#*[ \t]*$")
 
 
 # ==========================================================================
@@ -23704,6 +23709,38 @@ def _demote_headings(text: str) -> str:
                 continue
         out.append(line)
     return "\n".join(out)
+
+
+def _answer_section_names(text: str) -> List[str]:
+    """
+    The section headings of a delivered answer, in the order written.
+
+    Fenced regions are skipped: the Código section quotes source, and a
+    '## ' inside a fence is code being shown, not a section being opened.
+    Names come back bare — '## **Conclusión**' reads as 'Conclusión' — so
+    they can be compared against an outline without either side having to
+    agree on the wrapper.
+    """
+    # ── Step 1: walk the text, tracking fenced regions ──
+    out: List[str] = []
+    in_fence = False
+    fence = ""
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence, fence = True, marker
+            elif marker == fence:
+                in_fence, fence = False, ""
+            continue
+        if in_fence:
+            continue
+        # ── Step 2: outside a fence, take the heading's bare name ──
+        m = _ANSWER_HEADING_RE.match(line)
+        if m and m.group(1):
+            out.append(m.group(1).strip("# *").strip().rstrip(":").strip())
+    return out
 
 
 def _find_context_echo(text: str, min_pos: int = 0) -> int:
@@ -57688,6 +57725,7 @@ class Filter:
         except Exception as _e_conf:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
         self._audit_opening_against_ledger(body)
+        self._audit_section_order(body)
         self._report_answer_handoff()
 
     def _seal_answer_handoff(self) -> None:
@@ -57816,6 +57854,107 @@ class Filter:
                 )
         except Exception as _e_aud:
             self._log_debug(f"opening audit skipped ({_e_aud!r})")
+
+    def _audit_section_order(self, body: dict) -> None:
+        """Report the answer's section sequence against the one asked for.
+
+        Detection, not correction, for the same reason as the opening audit:
+        outlet edits are not known to reach the reader, and reordering prose
+        here would change nothing while hiding the signal.
+
+        The rule it watches has been rewritten three times. Compliance was
+        established each time by reading answers by hand and reconstructing
+        the requested order from the context dumps — twelve answers across
+        three configurations, hours of it, to arrive at a count small enough
+        that chance explains most of it. One line per turn makes the next
+        such question a grep instead.
+
+        Four things are reported because they fail independently: a sequence
+        can be inverted, carry sections nobody asked for, drop sections that
+        were asked for, or write one twice. The measured failures were of
+        three different kinds — one run inverted the whole sequence, one
+        prefixed four invented sections ahead of the first real one, one
+        wrote the same section at the top and again in place — and a check
+        that collapsed them into a single pass/fail would have called two of
+        those three green.
+
+        A green line here is worth more than the opening audit's: this
+        compares tokens against tokens, with no judgement about prose.
+        """
+        try:
+            # ── Step 1: what was asked, from the outline this turn built ──
+            _outline = getattr(self, "_answer_outline", "") or ""
+            _asked = [
+                _l.strip().strip("# *").strip()
+                for _l in _outline.split("\n")
+                if _l.strip().startswith("## **")
+            ]
+            # ── Step 2: what was written, from the delivered answer ──
+            _msgs = body.get("messages") or []
+            _last = next(
+                (
+                    m
+                    for m in reversed(_msgs)
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None or not isinstance(_last.get("content"), str):
+                self._log_debug(
+                    "[SECTION-ORDER] not measured — no assistant content in "
+                    "the outlet body"
+                )
+                return
+            # Stats is excluded rather than counted as unasked. The outline
+            # never lists it — it is the measured block the workspace note
+            # governs, not a section the outline plans — so counting it
+            # would put one false positive on every turn and make the
+            # unasked-section count useless for the thing it exists to
+            # catch.
+            _written = [
+                _h
+                for _h in _answer_section_names(
+                    _ANSWER_MARK_RE.sub("", _last["content"])
+                )
+                if _h != "Stats"
+            ]
+            if not _asked:
+                self._log_debug(
+                    f"[SECTION-ORDER] not measured — no outline this turn; "
+                    f"wrote: {' > '.join(_written) or '(none)'}"
+                )
+                return
+            # ── Step 3: the four failures, each counted on its own ──
+            _asked_set = set(_asked)
+            _written_set = set(_written)
+            _seen = [_h for _h in _written if _h in _asked_set]
+            _expected = [_h for _h in _asked if _h in set(_seen)]
+            _extra = [_h for _h in _written if _h not in _asked_set]
+            _missing = [_h for _h in _asked if _h not in _written_set]
+            _repeated = sorted({_h for _h in _written if _written.count(_h) > 1})
+            _ordered = _seen == _expected
+            # ── Step 4: one line, greppable, whatever the verdict ──
+            if _ordered and not _extra and not _missing and not _repeated:
+                self._log_debug(
+                    f"[SECTION-ORDER] ok — {len(_seen)} section(s) as asked: "
+                    f"{' > '.join(_seen)}"
+                )
+                return
+            _faults = []
+            if not _ordered:
+                _faults.append("out of order")
+            if _extra:
+                _faults.append(f"unasked={_extra}")
+            if _missing:
+                _faults.append(f"missing={_missing}")
+            if _repeated:
+                _faults.append(f"repeated={_repeated}")
+            self._log_debug(
+                f"[SECTION-ORDER] {'; '.join(_faults)} — asked: "
+                f"{' > '.join(_asked)} — wrote: {' > '.join(_written)}"
+            )
+        except Exception as _e_ord:
+            self._log_debug(f"[SECTION-ORDER] audit skipped ({_e_ord!r})")
 
     def _mark_answer_turn(self, body: dict) -> None:
         """Open the answer with the turn number it belongs to.
