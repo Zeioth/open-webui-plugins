@@ -23183,6 +23183,13 @@ _TIER_POINTER_RE = re.compile(
 # is never a trigger on its own — it is only used to walk back from a
 # confirmed pointer to the top of the block being recited.
 _SKELETON_RULE_RE = re.compile(r"^[ \t]*\u2500{2,}", re.MULTILINE)
+# An ATX heading, per CommonMark: up to three leading spaces, one to six
+# hashes, then a space. The trailing '#*' eats a closing sequence, so
+# '## Open questions ##' yields the label alone rather than a label
+# wearing half a heading. Applied line by line rather than with
+# re.MULTILINE, because the caller has to know which lines sit inside a
+# code fence and a whole-text scan cannot.
+_MD_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.*?)[ \t]*#*[ \t]*$")
 
 
 # ==========================================================================
@@ -23652,6 +23659,51 @@ def _close_dangling_fence(text: str) -> str:
     if not text or text.count("```") % 2 == 0:
         return text
     return text.rstrip() + "\n```"
+
+
+def _demote_headings(text: str) -> str:
+    """
+    Strip ATX heading markers from a block quoted into the final prompt.
+
+    The answer's own sections are '##'. A quoted block wearing the same
+    marker is one the model copies: it reads as a shape to imitate rather
+    than as material to draw on. This file already learned that once, for
+    the workspace labels — 'Your Stats section' came back written out as a
+    heading of its own — and the analyze step's own output carries the
+    same marker while proposing a different order: its shape runs
+    evidence first and its conclusion last, the reverse of the answer's.
+    One turn came back in exactly that order.
+
+    Rendered as a bare label the text carries the same information and
+    proposes nothing, which leaves the answer directive as the only thing
+    in the prompt shaped like an answer. The internal structure — bold
+    labels, lists, fenced code — is untouched: it never competed.
+    """
+    # ── Step 1: track fenced regions, whose '#' lines are code, not headings ──
+    # Not optional. House style puts '# ── Step N ──' inside every function
+    # body and this text quotes code constantly; demoting those would
+    # corrupt the very source the model has to read.
+    out: List[str] = []
+    in_fence = False
+    fence = ""
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence, fence = True, marker
+            elif marker == fence:
+                in_fence, fence = False, ""
+            out.append(line)
+            continue
+        # ── Step 2: outside a fence, demote the heading to a bare label ──
+        if not in_fence:
+            m = _MD_HEADING_RE.match(line)
+            if m and m.group(1):
+                out.append(f"▸ {m.group(1)}")
+                continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def _find_context_echo(text: str, min_pos: int = 0) -> int:
@@ -25048,8 +25100,15 @@ class AgenticSynthesisComposer:
                 # 'keep emitting code'.
                 _synth = _close_dangling_fence(_synth[:12000])
                 _synth += "\n[synthesis truncated]"
+            # Demoted last, after the truncation and the fence repair, so
+            # the fence state it walks is the balanced one. The analyze
+            # step writes its own headings and they are '##', the same
+            # marker the answer's sections use — and its shape is the
+            # answer's in reverse, evidence first and conclusion last.
+            # A finished-looking artifact in a competing order, ninety
+            # lines above the directive, is a second template.
             lines.append("Synthesis (the pipeline's processed conclusion):")
-            lines.append(_synth)
+            lines.append(_demote_headings(_synth))
             lines.append("")
         else:
             lines.append(
