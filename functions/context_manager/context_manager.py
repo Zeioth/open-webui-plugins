@@ -1473,6 +1473,42 @@ def _strip_answer_scaffolding(text: str) -> str:
         return text
 
 
+def _extract_answer_footer(text: str) -> str:
+    """Return the answer's footer block verbatim, or "" when it has none.
+
+    The mirror of _strip_answer_footer: same line scan, same fence toggle,
+    same pattern, keeping what that one drops. It exists for the response
+    cache, which stores answers with the footer already removed — the
+    removal is deliberate and must stay, since a footer carried into the
+    next turn's history is a measurement attached to the wrong evidence.
+    Keeping the block separately lets a cache hit show what was measured
+    when the answer was first written without putting it anywhere the
+    index or long term memory will read it back.
+
+    Rules and blank lines are not carried: the caller reassembles the
+    block under its own heading, so what is wanted here is the labelled
+    lines alone.
+    """
+    # ── Step 1: walk by line, skipping fenced regions ──
+    try:
+        _keep: List[str] = []
+        _in_fence = False
+        for _line in (text or "").split("\n"):
+            if _line.lstrip().startswith("```"):
+                _in_fence = not _in_fence
+                continue
+            if _in_fence:
+                continue
+            # ── Step 2: keep the label lines, drop the bare heading ──
+            if _ANSWER_FOOTER_RE.fullmatch(_line.rstrip()):
+                _stripped = _line.strip().strip("#").strip()
+                if _stripped.startswith("["):
+                    _keep.append(_line.strip())
+        return "\n".join(_keep)
+    except Exception:
+        return ""
+
+
 def _note_body_shown(filt, qid: str) -> None:
     """
     Record that the model has now seen the body of a qid this turn.
@@ -13967,7 +14003,17 @@ class LongTermMemory:
             return None
 
         doc = results["documents"][0][0]
-        return {"response": doc, "query": meta.get("query", ""), "timestamp": ts}
+        # Footer and similarity ride along so the delivering path can say
+        # what this turn is: an echo of an answer measured earlier, and how
+        # closely the question matched. Both are read only there — nothing
+        # downstream of the document sees them.
+        return {
+            "response": doc,
+            "query": meta.get("query", ""),
+            "timestamp": ts,
+            "footer": meta.get("footer", "") or "",
+            "similarity": similarity,
+        }
 
     async def find_duplicate_question(
         self, query: str, project_id: str
@@ -15372,8 +15418,16 @@ class LongTermMemory:
         state: dict,
         code_state_hash: str,
         wait: bool = True,
+        footer: str = "",
     ) -> None:
-        """Store a response in the ChromaDB response cache for future reuse."""
+        """Store a response in the ChromaDB response cache for future reuse.
+
+        `footer` travels as metadata, never as the document: the document is
+        what gets embedded and what a hit re-serves, and it is stored with
+        the footer already stripped for a reason worth not undoing. Held
+        aside, a hit can show what was measured when the answer was first
+        written without the block reaching the index or long term memory.
+        """
         query = self._sanitize_retrieval_query(query)
         if not self._f.valves.enable_response_cache or not HAS_SENTENCE:
             return
@@ -15383,13 +15437,13 @@ class LongTermMemory:
         if not wait:
             asyncio.create_task(
                 self._store_response_in_cache_async(
-                    query, response, context_hash, state, code_state_hash
+                    query, response, context_hash, state, code_state_hash, footer
                 )
             )
             return
 
         await self._store_response_in_cache_sync(
-            query, response, context_hash, state, code_state_hash
+            query, response, context_hash, state, code_state_hash, footer
         )
 
     async def _store_response_in_cache_sync(
@@ -15399,6 +15453,7 @@ class LongTermMemory:
         context_hash: str,
         state: dict,
         code_state_hash: str,
+        footer: str = "",
     ) -> None:
         """
         Synchronously store a response in the ChromaDB response cache.
@@ -15484,6 +15539,7 @@ class LongTermMemory:
                             "context_hash": "",
                             "code_state_hash": code_state_hash,
                             "timestamp": time.time(),
+                            "footer": (footer or "")[:2000],
                         }
                     ],
                 )
@@ -15500,11 +15556,12 @@ class LongTermMemory:
         context_hash: str,
         state: dict,
         code_state_hash: str,
+        footer: str = "",
     ) -> None:
         """Background wrapper for response cache storage."""
         try:
             await self._store_response_in_cache_sync(
-                query, response, context_hash, state, code_state_hash
+                query, response, context_hash, state, code_state_hash, footer
             )
         except Exception as e:
             self._f._log_debug(f"Async response cache store failed: {e}")
@@ -51792,6 +51849,14 @@ class InletOrchestrator:
                     code_state_hash = self._f._activation.compute_code_state_hash(
                         project_id
                     )
+                    # Read off the message BEFORE the scaffolding strip above
+                    # emptied it. The stored document stays footerless — that
+                    # is what keeps a stale measurement out of the history —
+                    # while the block itself travels as metadata, where only
+                    # the delivering path looks.
+                    _cached_footer = _extract_answer_footer(
+                        self._f._coerce_message_content(last_assistant.get("content"))
+                    )
                     await self._f._ltm.store_response_in_cache(
                         prompt_user.get("content", ""),
                         assistant_content,
@@ -51799,6 +51864,7 @@ class InletOrchestrator:
                         state,
                         code_state_hash,
                         wait=False,
+                        footer=_cached_footer,
                     )
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -57492,8 +57558,52 @@ class Filter:
                 # The echo costs one generation, so a cache hit is cheap
                 # rather than free. A cached answer nobody receives is worth
                 # less than that.
+                # The Stats block, rebuilt and labelled. A cached answer
+                # arrives footerless by design, so without this the reader
+                # gets a turn with no block at all and no way to tell it
+                # apart from a measured one — which is the worse of the two,
+                # since the figures are absent rather than wrong.
+                #
+                # The three lines added here are true of THIS turn: nothing
+                # was re-checked, the question matched at a measured
+                # similarity, and the block below belongs to the turn that
+                # first answered it. The original labels follow verbatim,
+                # under a heading that has already said whose they are.
+                _cached_text = cached_response["response"]
+                try:
+                    _cf = (cached_response.get("footer") or "").strip()
+                    if _cf:
+                        _sim = float(cached_response.get("similarity") or 0.0)
+                        _when = cached_response.get("timestamp") or 0
+                        _when_s = (
+                            time.strftime("%Y-%m-%d %H:%M", time.localtime(_when))
+                            if _when
+                            else "an earlier turn"
+                        )
+                        _cached_text = (
+                            _cached_text.rstrip()
+                            + "\n\n---\n\n## **Stats**\n"
+                            + "[Served from the response cache — nothing was "
+                            + "checked this turn]\n"
+                            + f"[First answered {_when_s} · question matched at "
+                            + f"{_sim:.2f} similarity]\n"
+                            + "[The lines below were measured then, not now]\n"
+                            + _cf
+                            + "\n"
+                        )
+                        self._log_debug(
+                            f"outlet: cache hit served with its original Stats "
+                            f"block ({len(_cf)} chars, similarity {_sim:.2f})"
+                        )
+                    else:
+                        self._log_debug(
+                            "outlet: cache hit has no stored Stats block "
+                            "(entry predates footer capture)"
+                        )
+                except Exception as _e_cf:
+                    self._log_debug(f"cached Stats block skipped ({_e_cf!r})")
                 messages = self._commands._deliver_command_response(
-                    messages, cached_response["response"]
+                    messages, _cached_text
                 )
                 body["messages"] = messages
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
@@ -57846,9 +57956,6 @@ class Filter:
                 )
         except Exception as _e_conf:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
-        self._audit_opening_against_ledger(body)
-        self._audit_section_order(body)
-        self._audit_tests_shown(body)
         self._report_answer_handoff()
 
     def _seal_answer_handoff(self) -> None:
@@ -58357,6 +58464,17 @@ class Filter:
             self._replace_asserted_confidence(body)
         except Exception as _e:
             self._log_debug(f"outlet: record append skipped ({_e!r})")
+
+        # The audits run beside the confidence footer, not inside it. They
+        # used to hang off the end of _replace_asserted_confidence, which
+        # returns early when there is no measured tally — exactly what a
+        # turn served from the response cache has. Such a turn left no
+        # audit line at all, so it vanished from the sample without a
+        # trace: absent from the numerator and from the denominator both,
+        # and a rate counted by grep cannot show what it never saw.
+        self._audit_opening_against_ledger(body)
+        self._audit_section_order(body)
+        self._audit_tests_shown(body)
 
         # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
