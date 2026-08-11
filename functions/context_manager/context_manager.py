@@ -25604,6 +25604,21 @@ class AgenticSynthesisComposer:
         # returned untouched rather than in some thinner variant nobody has
         # run.
         if outline.strip():
+            # The first heading the outline actually names, bare. Taken from
+            # the outline and not from _H because nothing reorders the
+            # outline to the canonical sequence — compose_outline keeps the
+            # order the model returned — so a hardcoded Conclusion could
+            # name a section that is not first in the list right below it,
+            # and a rule contradicted by its own list teaches the model to
+            # read neither.
+            _first = next(
+                (
+                    _l.strip().strip("# *").strip()
+                    for _l in outline.strip().split("\n")
+                    if _l.strip().startswith("## **")
+                ),
+                _H["conclusion"],
+            )
             return _resolve_group_breaks(
                 [
                     "",
@@ -25623,8 +25638,22 @@ class AgenticSynthesisComposer:
                     "for letter. They are already in the right language; do "
                     "not translate them and do not reword them.",
                     "",
-                    "3. Write every section listed and no others. Do not "
-                    "add sections of your own and do not repeat one you "
+                    # The order anchor, restored. The no-outline mode has
+                    # carried "Start with Conclusion" since three answers in
+                    # one run left the section out; this mode replaced it
+                    # with a completeness rule and kept nothing about which
+                    # section comes FIRST, leaving "in this order" in the
+                    # preamble as the only thing governing it — 4,800
+                    # characters before the point of generation. Measured:
+                    # of five turns, the one that carried the anchor and the
+                    # three that obeyed anyway all opened on Conclusion; the
+                    # one that inverted the whole sequence did not have it.
+                    # Named from the outline rather than from _H, so the
+                    # rule can never contradict the list printed under it.
+                    f"3. Start with {_first} — it is the FIRST section, and "
+                    "the sections follow in the order listed. Then write "
+                    "every section listed and no others. Do not add "
+                    "sections of your own and do not repeat one you "
                     "already wrote.",
                     "",
                     # Same rule 4 as the long mode. The outline mode is the
@@ -29889,6 +29918,42 @@ class AgenticOrchestrator:
                     f"🔴 Pre-mortem: {_mode} ({_b}/{_t} claims cite "
                     f"unverified symbols)"
                 )
+        # The opening, seeded in the last position of the prompt. The most
+        # recent 2,233 characters the model reads are the Stats note, which
+        # governs the LAST section of the answer; the first thing it has to
+        # decide — which section opens — is governed 4,800 characters back.
+        # One turn opened on the evidence section and closed on the
+        # conclusion, the whole sequence reversed, and the reversal is a
+        # first-token decision: nothing had been generated yet for length
+        # or fatigue to act on. This is the nearest thing to a prefill that
+        # does not depend on the host forwarding an assistant turn.
+        #
+        # The trailing slot has burned this file once: a note placed here
+        # was COPIED into every answer of a run rather than obeyed. That
+        # failure does not apply to this one, and the reason is worth
+        # stating — what it asks the model to reproduce is exactly what the
+        # answer has to open with, so copying it IS obeying it. The two
+        # outcomes coincide, which is the only shape of instruction that
+        # belongs in the position guaranteed to be read last.
+        _open_line = ""
+        try:
+            _open_line = next(
+                (
+                    _l.strip()
+                    for _l in (self._f._answer_outline or "").split("\n")
+                    if _l.strip().startswith("## **")
+                ),
+                "",
+            )
+        except Exception:
+            _open_line = ""
+        if _open_line:
+            _workspace += (
+                "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                "HOW YOUR ANSWER OPENS\n"
+                "Your answer begins with these two lines, exactly:\n\n"
+                "---\n\n" + _open_line
+            )
         dynamic_injections.append(("trailing", _workspace))
         # The note that used to sit here is gone, and where it sat is why.
         # It was a trailing injection, a slot this file chooses so that
