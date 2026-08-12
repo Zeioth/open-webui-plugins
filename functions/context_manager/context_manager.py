@@ -1598,6 +1598,17 @@ def _note_body_shown(filt, qid: str) -> None:
     question being answered is "was this shown", not "was this spelled
     the same way twice".
 
+    Two keys per body means the set answers membership well and counts
+    badly, so the count is kept separately rather than derived from it.
+    The Stats block published len() of this set as "N bodies read" and was
+    therefore reporting up to twice the truth — 36 where about 18 had been
+    shown, the inflation varying with how many qids were qualified. That
+    number is an alarm the reader is asked to trust, and a model handed a
+    count it can see is wrong has a reason to write its own: measured over
+    six divergent turns, every line of prose in the block was copied
+    character for character and only the COUNTS were altered, always
+    downward — 36 to 1, 38 to 1, 29 to 1, "3 of 3" to "1 of 1".
+
     Deliberately tolerant of a missing attribute and of anything raising:
     this is bookkeeping about evidence, and bookkeeping must never be the
     reason evidence fails to reach the model.
@@ -1610,6 +1621,18 @@ def _note_body_shown(filt, qid: str) -> None:
         _seen = getattr(filt, "_bodies_seen_this_turn", None)
         if _seen is None:
             return
+        # ── Step 1: count the body, once, before the lookup keys go in ──
+        # Guarded on the qualified name alone: the bare tail is an alias
+        # for the same body, and a second render of the same qid is the
+        # same body shown twice.
+        if qid not in _seen:
+            try:
+                filt._bodies_shown_count = (
+                    getattr(filt, "_bodies_shown_count", 0) or 0
+                ) + 1
+            except Exception:
+                pass
+        # ── Step 2: both spellings, so a claim citing either resolves ──
         _seen.add(qid)
         _seen.add(qid.rsplit(".", 1)[-1])
     except Exception:
@@ -30068,8 +30091,10 @@ class AgenticOrchestrator:
                     # ── Use case: how much material was brought ──
                     if _uc is not None:
                         _eff = []
-                        _n_bodies = len(
-                            getattr(self._f, "_bodies_seen_this_turn", None) or set()
+                        # The count, not the size of the lookup set. They
+                        # differed by up to a factor of two.
+                        _n_bodies = int(
+                            getattr(self._f, "_bodies_shown_count", 0) or 0
                         )
                         if _n_bodies:
                             _dir = ""
@@ -30212,6 +30237,20 @@ class AgenticOrchestrator:
                     + ("; " + ", ".join(_t_open) if _t_open else "")
                     + "]"
                 )
+                # Stashed for the outlet to compare against what the model
+                # actually wrote. This block is handed over as a literal to
+                # be copied, and a literal that is copied wrongly is worse
+                # than none: measured by hand across four runs, 6 of 28
+                # answers published a block that was not the one measured,
+                # once turning 12% over 3-of-25 into 100% over 1-of-1. The
+                # measurement existed and the reader was shown a different
+                # number. Held here rather than recomputed there, so what is
+                # compared is the exact string that went into the prompt.
+                self._f._measured_stats_lines = [
+                    _l.strip()
+                    for _l in _t_line.split("\n")
+                    if _l.strip().startswith("[") and _l.strip().endswith("]")
+                ]
                 # No opening mark any more: the turn number is the first
                 # line of the Stats block instead. A bare "[T4]" above the
                 # first paragraph was a label with nothing to belong to,
@@ -56454,6 +56493,13 @@ class Filter:
         # against the graph, and what a body RETURNS is not an edge, so
         # such claims land as unresolved and nobody looks again.
         self._bodies_seen_this_turn: Set[str] = set()
+        # Distinct bodies rendered this turn. Not len() of the set above,
+        # which holds two lookup keys per body; see _note_body_shown.
+        self._bodies_shown_count: int = 0
+        # The Stats block as handed to the answering model, one line per
+        # entry. Written when the workspace note is built, read once by the
+        # outlet audit that compares it against what came back.
+        self._measured_stats_lines: List[str] = []
 
         # -- C6: LTM store completion event --
         self._ltm_store_complete: asyncio.Event = asyncio.Event()
@@ -57024,6 +57070,8 @@ class Filter:
             # made it, and a later question must not inherit it.
             self._agentic_effort_override = None
             self._bodies_seen_this_turn = set()
+            self._bodies_shown_count = 0
+            self._measured_stats_lines = []
             # Read and cleared together, at the one point every turn
             # passes through: a run that spends 41% of its wall time
             # re-prefilling reads exactly like one that does not,
@@ -58626,6 +58674,75 @@ class Filter:
         except Exception as _e_ts:
             self._log_debug(f"[TESTS-SHOWN] audit skipped ({_e_ts!r})")
 
+    def _audit_stats_fidelity(self, body: dict) -> None:
+        """Report the Stats block the reader got against the one measured.
+
+        Detection, not correction, like its three siblings — and here that
+        is not a limitation but the whole point. The prompt tells the model
+        that NOTHING downstream corrects this block, and that is true: the
+        write probe settled that outlet edits never reach the reader. What
+        the model writes IS the measurement, so the only thing left is to
+        know how often it writes something else.
+
+        Established by hand across four runs before this existed: 6 of 28
+        answers published a block that differed from the one handed over.
+        Every difference was a COUNT and every count moved the same way,
+        downward — 36 bodies to 1, 38 to 1, "3 of 3 claims" to "1 of 1",
+        and in the worst case 12% over 3-of-25 to 100% over 1-of-1. The
+        prose around them was copied character for character, which is why
+        the block looks right at a glance and has to be diffed to catch.
+
+        Line by line, not as one string: a block that got four of five
+        lines right is a different problem from one that was replaced
+        wholesale, and the line that differs names which figure moved.
+        """
+        try:
+            _want = list(getattr(self, "_measured_stats_lines", None) or [])
+            if not _want:
+                return
+            _msgs = body.get("messages") or []
+            _last = next(
+                (
+                    m
+                    for m in reversed(_msgs)
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None or not isinstance(_last.get("content"), str):
+                return
+            # ── Step 1: the block as written, read from the last heading ──
+            _text = _last["content"]
+            _i = _text.rfind("## **Stats**")
+            if _i < 0:
+                self._log_debug(
+                    f"[STATS-FIDELITY] no Stats block in the answer — "
+                    f"{len(_want)} measured line(s) were handed over"
+                )
+                return
+            _got: List[str] = []
+            for _l in _text[_i + len("## **Stats**") :].split("\n"):
+                _l = _l.strip()
+                if _l.startswith("[") and _l.endswith("]"):
+                    _got.append(_l)
+                elif _got:
+                    break
+            # ── Step 2: compare, and name the lines that moved ──
+            if _got == _want:
+                self._log_debug(
+                    f"[STATS-FIDELITY] ok — all {len(_want)} line(s) copied "
+                    f"as measured"
+                )
+                return
+            _missing = [_l for _l in _want if _l not in _got]
+            _invented = [_l for _l in _got if _l not in _want]
+            self._log_debug(
+                f"[STATS-FIDELITY] {len(_missing)} of {len(_want)} line(s) "
+                f"altered — measured: {_missing} — published: {_invented}"
+            )
+        except Exception as _e_sf:
+            self._log_debug(f"[STATS-FIDELITY] audit skipped ({_e_sf!r})")
+
     def _mark_answer_turn(self, body: dict) -> None:
         """Open the answer with the turn number it belongs to.
 
@@ -58866,6 +58983,7 @@ class Filter:
         self._audit_opening_against_ledger(body)
         self._audit_section_order(body)
         self._audit_tests_shown(body)
+        self._audit_stats_fidelity(body)
 
         # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
