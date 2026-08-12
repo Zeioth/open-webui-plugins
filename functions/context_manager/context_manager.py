@@ -1547,11 +1547,6 @@ def _strip_answer_scaffolding(text: str) -> str:
             return text
         _out, _ = _strip_answer_footer(text)
         _out = _ANSWER_MARK_RE.sub("", _out)
-        # The write probe leaves with them, and for the same reason: it is
-        # a token this file appends, not something the model produced.
-        # Stored, it would enter the index and long term memory and come
-        # back next turn as part of what an answer looks like.
-        _out = _WRITE_PROBE_RE.sub("", _out)
         return _out.strip() or text
     except Exception:
         return text
@@ -23477,14 +23472,6 @@ _MD_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.*?)[ \t]*#*[ \t]*$")
 # the fence walk makes that safe anyway, but the narrower pattern means a
 # stray comment outside a fence cannot be counted as a section either.
 _ANSWER_HEADING_RE = re.compile(r"^[ \t]{0,3}#{2,3}[ \t]+(.*?)[ \t]*#*[ \t]*$")
-# The write probe's token, and the pattern that takes it back out. Named
-# once so the outlet that writes it, the inlet that looks for it, and the
-# scaffolding strip that must not let it into the index or long term
-# memory all agree on the same string. Nothing else in this project or in
-# any answer produces these brackets, which is the whole point: its
-# presence cannot be explained by the model having written it.
-_WRITE_PROBE_TOKEN = "\u27eaOUTLET-WRITE-PROBE\u27eb"
-_WRITE_PROBE_RE = re.compile(r"\n*[ \t]*\u27eaOUTLET-WRITE-PROBE\u27eb[ \t]*")
 # A test definition, sync or async. Names rather than a count, because the
 # useful question is WHICH tests the reader was shown that nobody ran, and
 # a count cannot answer it: five shown against one run says the same thing
@@ -52101,31 +52088,6 @@ class InletOrchestrator:
             f"prev-assistant: processing (hash={response_hash}, "
             f"{len(assistant_content.split())} words)"
         )
-
-        # ── The write probe's verdict, read where the round trip closes ──
-        # This is the answer as the host stored it, which is the answer the
-        # reader has. If the token the outlet appended is here, outlet edits
-        # reach them; if it is not, none of them do and every enforcement
-        # this file does at the outlet has to move into the prompt. Read
-        # before the scaffolding strip below, which takes the token out.
-        try:
-            if getattr(self._f, "_probe_written_last_turn", False):
-                self._f._probe_written_last_turn = False
-                if _WRITE_PROBE_TOKEN in assistant_content:
-                    self._f._log_debug(
-                        "[WRITE-PROBE] SURVIVED — outlet edits reach the "
-                        "reader; enforcement at the outlet is worth doing"
-                    )
-                else:
-                    self._f._log_debug(
-                        "[WRITE-PROBE] ABSENT — the outlet appended it and "
-                        "the stored answer does not carry it, so no outlet "
-                        "edit reaches the reader and every enforcement "
-                        "belongs in the prompt"
-                    )
-        except Exception as _e_pv:
-            self._f._log_debug(f"[WRITE-PROBE] verdict skipped ({_e_pv!r})")
-
         # ------------------------------------------------------------------
         # Region: classify session over the sliced history
         #
@@ -54384,27 +54346,6 @@ class Valves(BaseModel):
         ),
     )
 
-    outlet_write_probe: bool = Field(
-        default=True,
-        description=(
-            "Append an unmistakable token to the end of every answer from "
-            "the outlet, as a test of whether outlet edits reach the reader "
-            "at all. Two turns measured against the word count the next "
-            "inlet logged for the same answer matched the displayed text, "
-            "not the edited text, which suggests every edit made there is "
-            "discarded and that the turn marks and confidence footers now "
-            "visible come from the workspace instructions instead. If the "
-            "token does not appear, no outlet edit does, and the "
-            "enforcement belongs in the prompt.\n\n"
-            "ON by default until the question is settled, because it "
-            "cannot be settled by a valve nobody remembers to turn on: a "
-            "whole run went by with every other measurement in place and "
-            "this one blank. The reading is automatic — the next inlet "
-            "logs [WRITE-PROBE] SURVIVED or ABSENT — so two turns are "
-            "enough. Turn it off once that line has appeared; the token "
-            "is visible at the end of every answer while it is on."
-        ),
-    )
     hypothesis_require_known_symbols: bool = Field(
         default=True,
         description=(
@@ -56375,10 +56316,6 @@ class Filter:
         # it already showed went unseen until the next turn amplified it.
         self._inlet_turns: int = 0
         self._outlet_turns: int = 0
-        # Set when the outlet appends the write probe, cleared when the
-        # next inlet reports on it. One turn's memory, so a verdict is
-        # never printed for a turn that never carried the token.
-        self._probe_written_last_turn: bool = False
         # Every test name composed into a harness this turn. Written by
         # _compose, read once by the outlet audit: the tests the reader is
         # shown are written by the final model and need not be the ones the
@@ -58218,6 +58155,17 @@ class Filter:
         place when a pipeline ran. A turn that made no claims keeps the
         model's own line, because there is nothing measured to put there.
 
+        What this actually reaches is the log, not the reader. Outlet
+        writes are discarded by the host, measured with a probe (see
+        _audit_opening_against_ledger). The line the reader sees is the one
+        the model wrote, which usually agrees because the workspace hands
+        it the same tally before generation — and when it does not, the
+        published figure is wrong and nothing here corrects it. One run
+        showed 59% over 17-of-29 against a ledger holding 84% over 21-of-25.
+        The guarantee lives in the prompt; what remains here is the
+        measurement, which is worth keeping because it is what makes such a
+        divergence visible at all.
+
         Never raises: a footer is presentation, and presentation must not
         be the reason an answer fails to reach the reader.
         """
@@ -58445,12 +58393,21 @@ class Filter:
         hand. That does not scale, and an instruction whose compliance is
         unobserved is an instruction nobody can iterate on.
 
-        Detection, not correction. Outlet edits do not reach the reader —
-        two turns measured against the next inlet's word count matched the
-        displayed text, not the edited text — so rewriting the paragraph
-        here would change nothing and hide the signal. A log line is worth
-        more: it says whether the supplied list of unsettled propositions
-        did the job the rule could not.
+        Detection, not correction. Outlet edits do not reach the reader,
+        and this is measured rather than suspected: a token nothing else
+        could produce was appended here to two answers, and neither the
+        conversation as stored nor the conversation as displayed carried
+        it. Every write this class makes to body["messages"] — the turn
+        mark, the measured confidence footer, and anything a later hand
+        might add — is discarded by the host. Rewriting the paragraph here
+        would change nothing and hide the signal. A log line is worth more:
+        it says whether the supplied list of unsettled propositions did the
+        job the rule could not.
+
+        The probe that settled it has been removed; re-adding it is a dozen
+        lines if a host upgrade ever makes the question live again. What it
+        did: append an unmistakable token in the outlet, then look for it
+        in the next inlet, where the answer arrives as the host stored it.
 
         Matched on the symbols the opening names against the symbols of
         claims that came back unsettled.
@@ -58512,8 +58469,8 @@ class Filter:
         """Report the answer's section sequence against the one asked for.
 
         Detection, not correction, for the same reason as the opening audit:
-        outlet edits are not known to reach the reader, and reordering prose
-        here would change nothing while hiding the signal.
+        outlet edits do not reach the reader — settled, see there — so
+        reordering prose here would change nothing while hiding the signal.
 
         The rule it watches has been rewritten three times. Compliance was
         established each time by reading answers by hand and reconstructing
@@ -58669,52 +58626,6 @@ class Filter:
         except Exception as _e_ts:
             self._log_debug(f"[TESTS-SHOWN] audit skipped ({_e_ts!r})")
 
-    def _append_write_probe(self, body: dict) -> None:
-        """Append the write-probe token, when the valve asks for it.
-
-        A method of its own, called beside the audits, because of where it
-        used to live: the tail of _replace_asserted_confidence, behind
-        three early returns — no pipeline this turn, a pipeline that
-        settled nothing, no assistant content. On any of those the probe
-        never fired, and a token that did not run is absent from the answer
-        for the same reason a discarded edit is. The one experiment this
-        valve exists for would have come back unreadable.
-
-        Out here it fires on every turn that has an answer, so absence
-        means one thing only: the edit did not reach the reader.
-
-        The reading is done for you. The next inlet looks for the token in
-        the answer the host hands back and says whether it survived, so the
-        question is settled by a log line rather than by remembering to
-        scroll to the bottom of a reply.
-        """
-        try:
-            if not getattr(self.valves, "outlet_write_probe", False):
-                return
-            _msgs = body.get("messages") or []
-            _last = next(
-                (
-                    m
-                    for m in reversed(_msgs)
-                    if isinstance(m, dict) and m.get("role") == "assistant"
-                ),
-                None,
-            )
-            if _last is None or not isinstance(_last.get("content"), str):
-                self._log_debug(
-                    "[WRITE-PROBE] not appended — no assistant content in "
-                    "the outlet body"
-                )
-                return
-            _last["content"] = _last["content"].rstrip() + "\n\n" + _WRITE_PROBE_TOKEN
-            self._probe_written_last_turn = True
-            self._log_debug(
-                "[WRITE-PROBE] appended — the next inlet reports whether it "
-                "survived the round trip"
-            )
-        except Exception as _e_pr:
-            self._log_debug(f"[WRITE-PROBE] append skipped ({_e_pr!r})")
-
     def _mark_answer_turn(self, body: dict) -> None:
         """Open the answer with the turn number it belongs to.
 
@@ -58725,6 +58636,12 @@ class Filter:
         commit summary opens with [T{n}], and an L1 or L2 summary renders
         its covers_turns range into the prompt. A separate identifier space
         would have needed its own carrier in all three.
+
+        The mark does not reach the reader either: outlet writes are
+        discarded by the host, measured (see _audit_opening_against_ledger).
+        What survives into the history is the [Turn: N] line of the Stats
+        block, which the model writes from the workspace. This is kept for
+        the log line it emits and for the day the host stops discarding.
 
         Never raises: a mark is presentation, and presentation must not be
         the reason an answer fails to arrive.
@@ -58949,7 +58866,6 @@ class Filter:
         self._audit_opening_against_ledger(body)
         self._audit_section_order(body)
         self._audit_tests_shown(body)
-        self._append_write_probe(body)
 
         # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
