@@ -54385,9 +54385,24 @@ class Valves(BaseModel):
     )
 
     outlet_write_probe: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "Append an unmistakable token to the end of every answer from the outlet, as a one-run test of whether outlet edits reach the reader at all. Two turns measured against the word count the next inlet logged for the same answer matched the displayed text, not the edited text, which suggests every edit made there is discarded and that the turn marks and confidence footers now visible come from the workspace instructions instead. If the token does not appear, no outlet edit does, and the enforcement belongs in the prompt. Leave off outside that test."
+            "Append an unmistakable token to the end of every answer from "
+            "the outlet, as a test of whether outlet edits reach the reader "
+            "at all. Two turns measured against the word count the next "
+            "inlet logged for the same answer matched the displayed text, "
+            "not the edited text, which suggests every edit made there is "
+            "discarded and that the turn marks and confidence footers now "
+            "visible come from the workspace instructions instead. If the "
+            "token does not appear, no outlet edit does, and the "
+            "enforcement belongs in the prompt.\n\n"
+            "ON by default until the question is settled, because it "
+            "cannot be settled by a valve nobody remembers to turn on: a "
+            "whole run went by with every other measurement in place and "
+            "this one blank. The reading is automatic — the next inlet "
+            "logs [WRITE-PROBE] SURVIVED or ABSENT — so two turns are "
+            "enough. Turn it off once that line has appeared; the token "
+            "is visible at the end of every answer while it is on."
         ),
     )
     hypothesis_require_known_symbols: bool = Field(
