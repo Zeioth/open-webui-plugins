@@ -1433,21 +1433,6 @@ class CodeBlock(BaseModel):
     # set. Kept on the block because nothing else carries it: the timestamp
     # is there but a wall-clock time is not what a reader means by "the
     # patch from three messages ago".
-    patch_turn: int = 0
-    # The chat that produced it, so a list can say "this conversation"
-    # truthfully. committed_changes is project state and outlives the chat:
-    # three identical entries once showed up from three separate test runs.
-    patch_chat: str = ""
-    # md5 of the base this patch was written against. A later paste replaces
-    # the base — observed going 2,756,625 → 2,759,575 chars between two runs
-    # because the new paste already had the previous patch in it — and a
-    # patch computed against the old one is not a patch of the new one.
-    patch_base_md5: str = ""
-    # Set aside by "/patches !P2", cleared by "/patches +P2". A flag rather
-    # than a deletion so the undo is real: a patch removed from the list
-    # cannot be brought back, and in a long session the cost of one wrong
-    # keystroke would be a rewrite the reader has to ask for again.
-    patch_disabled: bool = False
 
     # REMOVED: potentially_affected: bool = False
 
@@ -2704,6 +2689,49 @@ class SymbolIndex:
     # ── Internal helpers (iteration) ─────────────────────────────────────
 
 
+class Patch(BaseModel):
+    """A rewrite the model proposed, held until the reader asks for it.
+
+    Its own record because it is not a CodeBlock. It arrived as one — that
+    is how assistant code reaches the pipeline — and was kept in
+    committed_changes with four fields bolted onto CodeBlock for the
+    purpose. Every consequence of that showed up as a bug: the list was
+    project-scoped where a conversation was meant, three identical entries
+    once appearing from three earlier runs; the duplicate detector treated
+    a second rewrite of one symbol as a repeat of the first and dropped it,
+    because as a block that is what it looked like; a cap of ten sat on a
+    derived view of the same list; and a field added late defaulted to
+    zero on every row an older version had written.
+
+    What a patch actually is: some source, the symbols it replaces, the
+    turn and chat it came from, and the paste it was written against. None
+    of that is block bookkeeping.
+    """
+
+    # ── What it changes ──
+    content: str
+    symbols: List[str] = Field(default_factory=list)
+
+    # ── Where it came from ──
+    chat_id: str = ""
+    turn: int = 0
+    created_at: float = Field(default_factory=time.time)
+
+    # md5 of the base it was written against. A later paste replaces the
+    # base, and a patch computed against the old one is not a patch of the
+    # new one — applying it anyway is how a stale rewrite silently undoes a
+    # newer one.
+    base_md5: str = ""
+
+    # Set aside by "/patches !P2", cleared by "+P2". A flag, not a
+    # deletion, so the undo is real.
+    disabled: bool = False
+
+    def label(self) -> str:
+        """The symbols this patch replaces, for a one-line listing."""
+        return ", ".join(sorted(set(self.symbols))) or "unknown symbol"
+
+
 class ConversationState(BaseModel):
     """
     Persistent conversation state for a single project.
@@ -2715,6 +2743,10 @@ class ConversationState(BaseModel):
     active_blocks: Dict[str, "CodeBlock"] = Field(default_factory=dict)
     recent_changes: List["CodeBlock"] = Field(default_factory=list)
     committed_changes: List["CodeBlock"] = Field(default_factory=list)
+    # Rewrites held for this project, newest last. Separate from the three
+    # above: those are code the reader gave or the model committed, these
+    # are proposals nobody has applied yet.
+    patches: List["Patch"] = Field(default_factory=list)
 
     # -- Conversation counters ----------------------------------------------
     message_count: int = 0
@@ -3113,10 +3145,18 @@ class ConversationStateManager:
             self._f._log_debug(f"_load_from_db: docstring restore failed: {e}")
 
         # ── Build and return ConversationState ─────────────────────────────
+        _patches: List[Patch] = []
+        for _pd in data.get("patches", []) or []:
+            try:
+                _patches.append(Patch(**_pd))
+            except Exception:
+                pass
+
         return ConversationState(
             active_blocks=active,
             recent_changes=recent,
             committed_changes=committed,
+            patches=_patches,
             feedback_history=feedback,
             message_count=data.get("message_count", 0),
             last_compression_timestamp=data.get("last_compression_timestamp", 0.0),
@@ -3198,6 +3238,7 @@ class ConversationStateManager:
             "active_blocks": active_blocks_meta,
             "recent_changes": [b.dict() for b in state.recent_changes],
             "committed_changes": [b.dict() for b in state.committed_changes],
+            "patches": [_p.dict() for _p in (state.patches or [])],
             "feedback_history": [fb.dict() for fb in state.feedback_history],
             "message_count": state.message_count,
             "last_compression_timestamp": state.last_compression_timestamp,
@@ -13499,6 +13540,7 @@ class StateStore:
             "active_blocks": active_blocks_meta,
             "recent_changes": [b.dict() for b in state.recent_changes],
             "committed_changes": [b.dict() for b in state.committed_changes],
+            "patches": [_p.dict() for _p in (state.patches or [])],
             "feedback_history": [fb.dict() for fb in state.feedback_history],
             "message_count": state.message_count,
             "last_compression_timestamp": state.last_compression_timestamp,
@@ -30309,22 +30351,14 @@ class AgenticOrchestrator:
                 if _held:
                     _rows = []
                     for _pi, _pb in enumerate(_held, 1):
-                        _pn = ", ".join(
-                            sorted(
-                                {
-                                    getattr(_ps, "name", "")
-                                    for _ps in (_pb.symbols or [])
-                                    if getattr(_ps, "name", "")
-                                }
-                            )
-                        )
-                        _pt = getattr(_pb, "patch_turn", 0) or 0
+                        _pn = _pb.label()
+                        _pt = _pb.turn
                         _rows.append(
                             f"P{_pi} — {_pn or 'unknown symbol'}"
                             + (f", from turn {_pt}" if _pt else "")
                             + (
                                 " (set aside)"
-                                if getattr(_pb, "patch_disabled", False)
+                                if _pb.disabled
                                 else ""
                             )
                         )
@@ -33368,15 +33402,46 @@ class CommandRouter:
         """
         try:
             _state = self._f._conversation_state_manager.get(project_id)
-            _all = [
+            _all: List["Patch"] = list(getattr(_state, "patches", None) or [])
+            # One-time lift of anything an earlier version left in
+            # committed_changes. Reading both forever would keep the old
+            # shape alive; converting once and writing back retires it
+            # without losing a patch somebody is still counting on.
+            _old = [
                 _b
                 for _b in (getattr(_state, "committed_changes", None) or [])
                 if getattr(_b, "is_proposed_patch", False)
             ]
+            if _old:
+                for _b in _old:
+                    _all.append(
+                        Patch(
+                            content=_b.content or "",
+                            symbols=[
+                                getattr(_s, "name", "")
+                                for _s in (_b.symbols or [])
+                                if getattr(_s, "name", "")
+                            ],
+                            chat_id=getattr(_b, "patch_chat", "") or "",
+                            turn=int(getattr(_b, "patch_turn", 0) or 0),
+                            base_md5=getattr(_b, "patch_base_md5", "") or "",
+                            disabled=bool(getattr(_b, "patch_disabled", False)),
+                        )
+                    )
+                _state.patches = _all
+                _state.committed_changes = [
+                    _b
+                    for _b in (_state.committed_changes or [])
+                    if not getattr(_b, "is_proposed_patch", False)
+                ]
+                self._f._log_debug(
+                    f"[PATCHES] lifted {len(_old)} patch(es) out of "
+                    f"committed_changes into their own record"
+                )
         except Exception:
             return []
         _chat = getattr(self._f, "_chat_id_this_turn", "") or ""
-        _mine = [_b for _b in _all if getattr(_b, "patch_chat", "") == _chat]
+        _mine = [_p for _p in _all if _p.chat_id == _chat]
         return _mine or _all
 
     @staticmethod
@@ -33470,7 +33535,7 @@ class CommandRouter:
         _out: List[str] = []
         for _n in which:
             _pb = patches[_n - 1]
-            _off = " — SET ASIDE" if getattr(_pb, "patch_disabled", False) else ""
+            _off = " — SET ASIDE" if _pb.disabled else ""
             _diff, _note = self._patch_diff(_src, _pb)
             _out.append(f"**P{_n}**{_off}")
             if _note:
@@ -33604,8 +33669,8 @@ class CommandRouter:
                 continue
             _off = _m.group(1) == "!"
             _pb = patches[_n - 1]
-            _was = bool(getattr(_pb, "patch_disabled", False))
-            _pb.patch_disabled = _off
+            _was = bool(_pb.disabled)
+            _pb.disabled = _off
             if _was == _off:
                 _done.append(
                     f"P{_n} was already {'set aside' if _off else 'active'}"
@@ -33653,14 +33718,12 @@ class CommandRouter:
         if _tokens and _tokens[0].lower() in ("clear", "reset"):
             try:
                 _state = self._f._conversation_state_manager.get(project_id)
-                _before = len(_state.committed_changes or [])
-                _drop = {id(_b) for _b in _patches}
-                _state.committed_changes = [
-                    _b
-                    for _b in (_state.committed_changes or [])
-                    if id(_b) not in _drop
+                _before = len(_state.patches or [])
+                _drop = {id(_p) for _p in _patches}
+                _state.patches = [
+                    _p for _p in (_state.patches or []) if id(_p) not in _drop
                 ]
-                _n = _before - len(_state.committed_changes)
+                _n = _before - len(_state.patches)
                 self._f._log_debug(f"[PATCHES] cleared {_n} patch(es)")
                 return (
                     f"{_n} patch(es) dropped. The pasted source was never "
@@ -33714,9 +33777,9 @@ class CommandRouter:
                 _names = [
                     getattr(_s, "name", "") for _s in (_b.symbols or []) if _s
                 ]
-            _turn = getattr(_b, "patch_turn", 0) or 0
+            _turn = _b.turn
             _where = f"turn {_turn}" if _turn else "this session"
-            _off = bool(getattr(_b, "patch_disabled", False))
+            _off = bool(_b.disabled)
             _lines.append(
                 f"**P{_i}**{' — SET ASIDE' if _off else ''} · {_where} · "
                 f"`{', '.join(_names) or '?'}` · "
@@ -33725,7 +33788,7 @@ class CommandRouter:
             if _doc:
                 _lines.append(f"    {_doc}")
         # ── Step 2: say what can be done with them ──
-        _n_off = sum(1 for _b in _patches if getattr(_b, "patch_disabled", False))
+        _n_off = sum(1 for _b in _patches if _b.disabled)
         _lines += [
             "",
             f"`/file [name.py]` hands back the pasted source with the "
@@ -33803,6 +33866,7 @@ class CommandRouter:
         _skipped: List[str] = []
         _used_aside = False
         _base_md5 = hashlib.md5(_src.encode()).hexdigest()[:16]
+        _chosen: List[Tuple[int, "Patch"]] = []
         for _i, _pb in enumerate(_patches, 1):
             if _sel is not None and _i not in _sel:
                 continue
@@ -33811,23 +33875,31 @@ class CommandRouter:
             # what to apply, not a filter over the active ones, and asking
             # for something by number is a clearer statement of intent than
             # a flag set several turns ago.
-            if getattr(_pb, "patch_disabled", False):
+            if _pb.disabled:
                 if not _explicit:
                     _skipped.append(f"P{_i} (set aside)")
                     continue
                 _used_aside = True
-            _was = getattr(_pb, "patch_base_md5", "") or ""
+            _was = _pb.base_md5 or ""
             if _was and _was != _base_md5:
                 # Written against a different paste. Applying it anyway is
                 # how a stale rewrite silently undoes a newer one.
                 _skipped.append(f"P{_i} (written against another paste)")
                 continue
-            _out = self._f._patcher._splice_symbols(_src, _pb.content or "")
-            if not _out:
-                _skipped.append(f"P{_i} (no longer applies)")
-                continue
-            _src, _names = _out
-            _used.append(f"P{_i} ({', '.join(_names)})")
+            _chosen.append((_i, _pb))
+        # One pass for all of them, not one pass each: composing patch by
+        # patch re-parses the file per patch and each parse is of the
+        # PREVIOUS result, so nothing can be memoised. Ten patches took
+        # twenty-seven seconds that way.
+        if _chosen:
+            _src, _names_per = self._f._patcher.splice_many(
+                _src, [_p.content or "" for _, _p in _chosen]
+            )
+            for (_i, _), _names in zip(_chosen, _names_per):
+                if _names:
+                    _used.append(f"P{_i} ({', '.join(_names)})")
+                else:
+                    _skipped.append(f"P{_i} (no longer applies)")
         if _patches and not _used and _sel != []:
             return (
                 "Nothing was delivered: none of the requested patches could "
@@ -34359,6 +34431,10 @@ class PatchApplier:
     def __init__(self, filter_ref: "Filter") -> None:
         """Hold the parent Filter, for valves and the debug log."""
         self._f = filter_ref
+        # content hash -> {qualified name: (line_start, line_end)}
+        self._spans_cache: "OrderedDict[str, Dict[str, Tuple[int, int]]]" = (
+            OrderedDict()
+        )
 
     def _apply_unified_diff(self, original: str, diff_text: str) -> Optional[str]:
         """
@@ -34500,7 +34576,36 @@ class PatchApplier:
         return "\n".join(result_lines)
 
     @staticmethod
-    def symbol_spans(source: str) -> Dict[str, Tuple[int, int]]:
+    def reindent_body(body: str, col: int) -> str:
+        """Shift a definition to the indentation its target sits at.
+
+        A method lives indented inside its class; a body the model wrote as
+        a top-level function does not. Splicing one into the other's span
+        puts unindented code inside a class and the file stops parsing —
+        found by feeding a module-level rewrite of a method into the
+        splice, which produced an IndentationError 15,731 lines in.
+
+        The model is asked for a complete definition and gives one; where
+        it sits is the caller's business, not something to demand of the
+        answer. Relative indentation inside the body is preserved, so only
+        the block as a whole moves. Blank lines stay blank rather than
+        collecting trailing spaces.
+        """
+        _lines = body.split("\n")
+        _first = next((_l for _l in _lines if _l.strip()), "")
+        _have = len(_first) - len(_first.lstrip())
+        if _have == col:
+            return body
+        if _have > col:
+            _cut = _have - col
+            return "\n".join(
+                _l[_cut:] if _l[:_cut].strip() == "" else _l.lstrip()
+                for _l in _lines
+            )
+        _pad = " " * (col - _have)
+        return "\n".join(_pad + _l if _l.strip() else _l for _l in _lines)
+
+    def symbol_spans(self, source: str) -> Dict[str, Tuple[int, int]]:
         """Every definition's line span, keyed by qualified name.
 
         1-indexed and inclusive, matching ast. Shared by the splice, which
@@ -34508,7 +34613,34 @@ class PatchApplier:
         needs it to know what the replacement replaced — deferred
         application means the original body is still in the base, so a
         patch can be shown as a real diff instead of a symbol name.
+
+        Memoised by content hash, because the source it is asked about is
+        the same 2.7 MB paste over and over: measured at 2.66 s per parse,
+        and three separate paths pay it — the dry run when a patch is
+        held, the viewer once per patch shown, and delivery once per patch
+        applied. Hashing 2.7 MB costs about 5 ms, so a hit is three orders
+        of magnitude cheaper than a miss. Four entries is enough for a
+        base plus the results of composing onto it; the values are name to
+        two ints, a few hundred KB for a file this size.
         """
+        try:
+            _key = hashlib.md5(source.encode("utf-8", "replace")).hexdigest()
+            _hit = self._spans_cache.get(_key)
+            if _hit is not None:
+                self._spans_cache.move_to_end(_key)
+                return _hit
+        except Exception:
+            _key = ""
+        _out = self._symbol_spans_uncached(source)
+        if _key:
+            self._spans_cache[_key] = _out
+            while len(self._spans_cache) > 4:
+                self._spans_cache.popitem(last=False)
+        return _out
+
+    @staticmethod
+    def _symbol_spans_uncached(source: str) -> Dict[str, Tuple[int, int]]:
+        """The parse itself. Separated so the memo above stays readable."""
         _out: Dict[str, Tuple[int, int]] = {}
         _stack: List[str] = []
 
@@ -34527,6 +34659,77 @@ class PatchApplier:
 
         _walk(ast.parse(source))
         return _out
+
+    def splice_many(
+        self, base_content: str, proposals: List[str]
+    ) -> Tuple[str, List[List[str]]]:
+        """Apply several rewrites onto one base in a single pass.
+
+        Composing by calling the single-patch splice N times re-parses the
+        whole file N times, and each pass parses the RESULT of the last, so
+        a memo cannot help: measured at 2.66 s per parse, three patches
+        took eight seconds and ten took twenty-seven. Here the base is
+        parsed once, every proposal resolved against that one map, and the
+        replacements spliced back to front so the earlier spans stay valid.
+
+        Later wins on a symbol two proposals both rewrite, which is the
+        rule the rest of this feature states: "/file -P3" bringing P1's
+        version back only makes sense if P3 was overriding it. Applying
+        both would put one body in the file and call it two patches.
+
+        Returns (source, per-proposal replaced names). A proposal that
+        resolves to nothing contributes an empty list and is skipped, so
+        the caller can report which ones landed; unlike the single-patch
+        splice this is not all-or-nothing, because the caller chose this
+        set deliberately and one stale member should not void the rest.
+        """
+        try:
+            _base_spans = self.symbol_spans(base_content)
+        except Exception as _e_b:
+            self._f._log_debug(f"[PATCH-APPLY] compose skipped ({_e_b!r})")
+            return base_content, [[] for _ in proposals]
+        # ── Step 1: resolve every proposal against the ONE base map ──
+        _lines_base = base_content.split("\n")
+        _plan: Dict[Tuple[int, int], str] = {}
+        _names_per: List[List[str]] = []
+        for _pc in proposals:
+            _mine: List[str] = []
+            try:
+                _new = self.symbol_spans(_pc or "")
+            except Exception:
+                _names_per.append([])
+                continue
+            _lines_new = (_pc or "").split("\n")
+            for _name, (_ns, _ne) in _new.items():
+                if any(_name.startswith(_o + ".") for _o in _new if _o != _name):
+                    continue
+                _key = _name
+                if _key not in _base_spans:
+                    _tail = _name.rsplit(".", 1)[-1]
+                    _c = [
+                        _k
+                        for _k in _base_spans
+                        if _k == _tail or _k.endswith("." + _tail)
+                    ]
+                    if len(_c) != 1:
+                        continue
+                    _key = _c[0]
+                # Later proposals overwrite earlier ones on the same span.
+                _bs0, _be0 = _base_spans[_key]
+                _tgt = _lines_base[_bs0 - 1] if _bs0 - 1 < len(_lines_base) else ""
+                _plan[(_bs0, _be0)] = self.reindent_body(
+                    "\n".join(_lines_new[_ns - 1 : _ne]),
+                    len(_tgt) - len(_tgt.lstrip()),
+                )
+                _mine.append(_key)
+            _names_per.append(_mine)
+        if not _plan:
+            return base_content, _names_per
+        # ── Step 2: one splice pass, back to front ──
+        _lines = base_content.split("\n")
+        for (_bs, _be), _body in sorted(_plan.items(), reverse=True):
+            _lines = _lines[: _bs - 1] + _body.split("\n") + _lines[_be:]
+        return "\n".join(_lines), _names_per
 
     def _splice_symbols(
         self, base_content: str, proposed_content: str
@@ -34566,6 +34769,7 @@ class PatchApplier:
             # ── Step 1: spans in the base, keyed by qualified name ──
             _spans = self.symbol_spans
             _base_spans = _spans(base_content)
+            _base_lines = base_content.split("\n")
             # The proposal is parsed on its own so a syntax error in what the
             # model wrote is reported as that, and not as an unexplained
             # skip. A truncated reply — which this model produces — lands
@@ -34612,7 +34816,23 @@ class PatchApplier:
                         continue
                     _key = _cands[0]
                 _bs, _be = _base_spans[_key]
-                _plan.append((_bs, _be, _key, "\n".join(_new_lines[_ns - 1 : _ne])))
+                # Shifted to the column the target sits at: a method lives
+                # indented inside its class and a body written as a
+                # top-level function does not.
+                _tgt = (
+                    _base_lines[_bs - 1] if _bs - 1 < len(_base_lines) else ""
+                )
+                _plan.append(
+                    (
+                        _bs,
+                        _be,
+                        _key,
+                        self.reindent_body(
+                            "\n".join(_new_lines[_ns - 1 : _ne]),
+                            len(_tgt) - len(_tgt.lstrip()),
+                        ),
+                    )
+                )
 
             if _unresolved or not _plan:
                 self._f._log_debug(
@@ -44239,19 +44459,12 @@ class ActiveCodeUpdater:
                             # indexed is the merged base afterwards, which
                             # is the file the reader will hold — never this
                             # block, whose body may still be wrong.
+                            # The only flag the block still needs: route me
+                            # to the patch path and away from the index.
+                            # Turn, chat and base belong to the Patch that
+                            # gets made from it, not to a block that will
+                            # be discarded either way.
                             blk.is_proposed_patch = True
-                            try:
-                                blk.patch_turn = int(
-                                    self._f._project_state_manager.get_pstate(
-                                        project_id
-                                    ).get("napmem_turn_number", 0)
-                                    or 0
-                                )
-                            except Exception:
-                                blk.patch_turn = 0
-                            blk.patch_chat = (
-                                getattr(self._f, "_chat_id_this_turn", "") or ""
-                            )
                             self._f._log_debug(
                                 f"[PATCH-APPLY] assistant block kept for the "
                                 f"patch path — it rewrites "
@@ -44978,10 +45191,29 @@ class ActiveCodeUpdater:
                         )
                         _applied = bool(_probe)
                         if _applied:
-                            new_block.patch_base_md5 = hashlib.md5(
-                                (_base.content or "").encode()
-                            ).hexdigest()[:16]
-                            state.committed_changes.append(new_block)
+                            state.patches.append(
+                                Patch(
+                                    content=new_block.content or "",
+                                    symbols=[
+                                        getattr(_s2, "name", "")
+                                        for _s2 in (new_block.symbols or [])
+                                        if getattr(_s2, "name", "")
+                                    ],
+                                    chat_id=getattr(
+                                        self._f, "_chat_id_this_turn", ""
+                                    )
+                                    or "",
+                                    turn=int(
+                                        self._f._project_state_manager.get_pstate(
+                                            project_id
+                                        ).get("napmem_turn_number", 0)
+                                        or 0
+                                    ),
+                                    base_md5=hashlib.md5(
+                                        (_base.content or "").encode()
+                                    ).hexdigest()[:16],
+                                )
+                            )
                             self._f._log_debug(
                                 "[PATCH-APPLY] held — the rewrite applies "
                                 "cleanly and is kept as a patch; the base is "
