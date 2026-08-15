@@ -6,7 +6,7 @@ author_url: https://github.com/zeioth
 funding_url: https://github.com/open-webui
 version: 10.0.0
 license: GPL3
-requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter==0.25.2, tree-sitter-language-pack==1.8.1, llmlingua>=0.2.2, scikit-learn==1.9.0
+requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter==0.25.2, tree-sitter-language-pack==1.8.1, llmlingua>=0.2.2, scikit-learn==1.9.0, pyflakes
 """
 
 import os
@@ -22,6 +22,8 @@ import json
 import asyncio
 import threading
 import textwrap
+import base64
+import uuid
 import math
 import numpy as np
 from collections import OrderedDict, defaultdict, Counter
@@ -1422,6 +1424,30 @@ class CodeBlock(BaseModel):
     pinned: bool = False
     obsolete: bool = False
     is_raw: bool = False
+    # Set by the restatement guard when an assistant block rewrites symbols
+    # the index already holds AND the turn asked for a change. It routes the
+    # block to PatchApplier and away from the index: the merged base is what
+    # gets indexed, never this block.
+    is_proposed_patch: bool = False
+    # The turn that produced this patch, stamped where is_proposed_patch is
+    # set. Kept on the block because nothing else carries it: the timestamp
+    # is there but a wall-clock time is not what a reader means by "the
+    # patch from three messages ago".
+    patch_turn: int = 0
+    # The chat that produced it, so a list can say "this conversation"
+    # truthfully. committed_changes is project state and outlives the chat:
+    # three identical entries once showed up from three separate test runs.
+    patch_chat: str = ""
+    # md5 of the base this patch was written against. A later paste replaces
+    # the base — observed going 2,756,625 → 2,759,575 chars between two runs
+    # because the new paste already had the previous patch in it — and a
+    # patch computed against the old one is not a patch of the new one.
+    patch_base_md5: str = ""
+    # Set aside by "/patches !P2", cleared by "/patches +P2". A flag rather
+    # than a deletion so the undo is real: a patch removed from the list
+    # cannot be brought back, and in a long session the cost of one wrong
+    # keystroke would be a rewrite the reader has to ask for again.
+    patch_disabled: bool = False
 
     # REMOVED: potentially_affected: bool = False
 
@@ -30257,6 +30283,70 @@ class AgenticOrchestrator:
                 # and everything else measured about the turn already lives
                 # in one place. The outlet still prepends its own mark for
                 # the stored history, which the reader never sees.
+                # ── Held rewrites, when the conversation has any ──
+                # Placed BEFORE the Stats note so the tail of the prompt
+                # keeps the shape that fixed section order: the Stats note
+                # and then the seeded opening, adjacent to generation.
+                #
+                # Emitted only when patches exist, which is most turns of
+                # most sessions never. A note nobody needs is an artifact
+                # near the answer template, and this file has measured what
+                # those cost: a quoted block wearing "##" got copied, and
+                # bare labels in a list got promoted back to headings. So:
+                # no headings, no fenced code, nothing shaped like a block
+                # to reproduce — names and one sentence each.
+                #
+                # It explains rather than lists because a list alone taught
+                # the wrong thing: shown only "P2", the pipeline spent an
+                # investigate step hunting a symbol called P2 in the index,
+                # and the answer said the guard "is already in the
+                # function" when it is held OUT of the source. What the
+                # identifiers mean has to travel with them.
+                try:
+                    _held = self._f._commands._patches_for_chat(project_id)
+                except Exception:
+                    _held = []
+                if _held:
+                    _rows = []
+                    for _pi, _pb in enumerate(_held, 1):
+                        _pn = ", ".join(
+                            sorted(
+                                {
+                                    getattr(_ps, "name", "")
+                                    for _ps in (_pb.symbols or [])
+                                    if getattr(_ps, "name", "")
+                                }
+                            )
+                        )
+                        _pt = getattr(_pb, "patch_turn", 0) or 0
+                        _rows.append(
+                            f"P{_pi} — {_pn or 'unknown symbol'}"
+                            + (f", from turn {_pt}" if _pt else "")
+                            + (
+                                " (set aside)"
+                                if getattr(_pb, "patch_disabled", False)
+                                else ""
+                            )
+                        )
+                    _workspace += (
+                        "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                        "HELD REWRITES\n"
+                        f"{len(_held)} rewrite(s) you proposed earlier in this "
+                        "conversation are held as patches. They are NOT in "
+                        "the source you were given: the reader applies them "
+                        "when they ask for the file, and you cannot apply "
+                        "one yourself. So a function whose rewrite is held "
+                        "still reads here as it did before.\n"
+                        + "\n".join(_rows)
+                        + "\nThe reader takes the file with /file, all but "
+                        "one with /file -P2, only some with /file P1 P3, and "
+                        "sees exactly what one changes with /patches P2. "
+                        "Naming one of these is how you point at it. Do not "
+                        "retype a function from this file to show it — the "
+                        "fence characters do not survive; send them to "
+                        "/patches P2 instead."
+                    )
+
                 # Always plural now. The block carries its **Stats** heading
                 # even when every axis was dropped, so what is handed over is
                 # never a single line, and the singular wording that used to
@@ -32582,6 +32672,19 @@ class CommandRouter:
             response = await self._handle_expand_command(content, project_id)
             return True, self._deliver_command_response(messages, response)
 
+        # /file — hand back the pasted source with every applied rewrite in
+        # it. A slash command rather than a phrase on purpose: "give me the
+        # diff" is already taken by the diff_compute intent, which answers
+        # from a previous answer's fenced block and never reaches the model,
+        # and a phrase for this would sit next to it and be caught by it.
+        if self._f.valves.enable_file_command and content.startswith("/patches"):
+            response = await self._handle_patches_command(project_id, content)
+            return True, self._deliver_command_response(messages, response)
+
+        if self._f.valves.enable_file_command and content.startswith("/file"):
+            response = await self._handle_file_command(content, project_id, __user__)
+            return True, self._deliver_command_response(messages, response)
+
         # /freeze [N] and /unfreeze: manual control of the Block A KV freeze.
         # Gated behind enable_freeze_command; when disabled, these fall through
         # untouched and reach the model as ordinary text. The startswith checks
@@ -32752,6 +32855,25 @@ class CommandRouter:
                 getattr(_v, "cleanup_status_command_enabled", True)
                 and getattr(_v, "cleanup_suggestions_enabled", True),
                 "list the code blocks that have gone quiet",
+            ),
+            (
+                "/patches [P2 …] [!P2 …] [+P2 …] [clear]",
+                getattr(_v, "enable_file_command", True),
+                "the rewrites this conversation is holding. Bare, it lists "
+                "them with what each one does. A number shows the actual "
+                "diff against the pasted source, `!` sets one aside so it "
+                "stops being included, `+` brings it back, and `clear` "
+                "forgets them all. Nothing here touches the pasted source",
+            ),
+            (
+                "/file [name.py] [P1 P3 | -P2 …]",
+                getattr(_v, "enable_file_command", True),
+                "hand back the pasted source as a download, with the held "
+                "rewrites applied and verified. Bare, it takes every active "
+                "one; numbers take only those, `-` leaves those out for this "
+                "delivery alone. The name defaults to the paste's, with a "
+                ".py suffix; a file that does not compile is refused rather "
+                "than delivered",
             ),
             ("/help", True, "this list"),
         ]
@@ -33234,6 +33356,504 @@ class CommandRouter:
             f"or the budget is spent). The map is pinned at its current state."
         )
 
+    def _patches_for_chat(self, project_id: str) -> List["CodeBlock"]:
+        """The patches this conversation produced, oldest first.
+
+        Scoped to the chat because committed_changes is project state and
+        outlives it: a list once showed three identical entries, one per
+        earlier test run, under a heading claiming they belonged to the
+        session being read. Blocks stamped before patch_chat existed carry
+        "" and are shown only when the current chat has none of its own, so
+        an older session's work is visible rather than silently dropped.
+        """
+        try:
+            _state = self._f._conversation_state_manager.get(project_id)
+            _all = [
+                _b
+                for _b in (getattr(_state, "committed_changes", None) or [])
+                if getattr(_b, "is_proposed_patch", False)
+            ]
+        except Exception:
+            return []
+        _chat = getattr(self._f, "_chat_id_this_turn", "") or ""
+        _mine = [_b for _b in _all if getattr(_b, "patch_chat", "") == _chat]
+        return _mine or _all
+
+    @staticmethod
+    def _parse_patch_selectors(
+        tokens: List[str], total: int
+    ) -> Tuple[Optional[List[int]], str, str, bool]:
+        """Turn '/file' arguments into the indices to apply.
+
+        Returns (indices or None for all, filename, error, explicit). The
+        `explicit` flag says the indices were NAMED rather than derived by
+        exclusion, which decides whether a patch set aside is included: "P2"
+        asks for it, "-P3" does not.
+
+        A token matching
+        P<n> selects; the same token with a leading minus excludes, and
+        several of them exclude several — '-P2 -P3' means everything except
+        those two. Anything else is the filename, so '/file P1 out.py' is
+        unambiguous without positional rules.
+
+        Mixing the two forms is refused rather than guessed at: '/file P1
+        -P2' can be read as "only P1" or as "P1 and everything but P2", and
+        a wrong reading here silently ships a file the reader did not ask
+        for.
+        """
+        _inc: List[int] = []
+        _exc: List[int] = []
+        _name = ""
+        _bad: List[str] = []
+        for _t in tokens:
+            _m = re.fullmatch(r"(-)?[Pp](\d+)", _t)
+            if not _m:
+                # A filename, not any leftover word. Requiring a dot keeps a
+                # stray token from becoming the output name: "/file P1 out"
+                # names nothing, it selects P1.
+                if not _name and "." in _t:
+                    _name = _t
+                continue
+            _n = int(_m.group(2))
+            if _n < 1 or _n > total:
+                _bad.append(_t)
+                continue
+            (_exc if _m.group(1) else _inc).append(_n)
+        if _bad:
+            return (
+                None,
+                _name,
+                f"no such patch: {', '.join(_bad)}. There "
+                f"{'is 1 patch' if total == 1 else f'are {total} patches'}, "
+                f"P1 to P{total}.",
+                False,
+            )
+        if _inc and _exc:
+            return (
+                None,
+                _name,
+                "mixing selected and excluded patches is ambiguous. Use "
+                "either 'P1 P3' to pick, or '-P2' to leave out.",
+                False,
+            )
+        if _inc:
+            return sorted(set(_inc)), _name, "", True
+        if _exc:
+            _keep = [_i for _i in range(1, total + 1) if _i not in set(_exc)]
+            return _keep, _name, "", False
+        return None, _name, "", False
+
+    def _render_patch_diffs(
+        self, project_id: str, patches: List["CodeBlock"], which: List[int]
+    ) -> str:
+        """Show what the named patches actually change, as diffs.
+
+        Capped rather than unbounded: four rewrites of long functions is
+        already a wall of text, and a wall is not more informative than a
+        list. Past the cap it says how many and asks for numbers, which is
+        the same shape as the rest of this command.
+        """
+        _MAX = 4
+        if len(which) > _MAX:
+            return (
+                f"{len(which)} patches asked for; that is a lot of diff at "
+                f"once. Ask for up to {_MAX} by number, or use `/patches` "
+                f"for the summary."
+            )
+        try:
+            _base = self._patch_base(project_id)
+        except Exception as _e_b:
+            return f"The pasted source could not be read: {_e_b!r}"
+        if _base is None:
+            return "There is no pasted source to compare these against."
+        _src = _base.content or ""
+        _out: List[str] = []
+        for _n in which:
+            _pb = patches[_n - 1]
+            _off = " — SET ASIDE" if getattr(_pb, "patch_disabled", False) else ""
+            _diff, _note = self._patch_diff(_src, _pb)
+            _out.append(f"**P{_n}**{_off}")
+            if _note:
+                _out.append(f"    {_note}")
+            elif _diff and _diff.lstrip().startswith("#"):
+                # An "identical" verdict is not nothing: it means the pasted
+                # source ALREADY holds this rewrite, which is what happens
+                # when the file is pasted again after the change was taken
+                # out to an editor. Saying so is more useful than showing an
+                # empty diff and letting the reader wonder.
+                _out.append(
+                    f"    {_diff.lstrip('# ').strip()}\n"
+                    f"    Nothing to apply — the paste already contains it."
+                )
+            elif _diff:
+                _out.append("```diff\n" + _diff + "\n```")
+            else:
+                _out.append("    no change against the pasted source")
+            _out.append("")
+        return "\n".join(_out).rstrip()
+
+    def _patch_base(self, project_id: str) -> Optional["CodeBlock"]:
+        """The pasted source: the biggest active block the assistant did not
+        write. One definition, used by the viewer and by /file alike."""
+        _state = self._f._conversation_state_manager.get(project_id)
+        _cands = [
+            _b
+            for _b in (getattr(_state, "active_blocks", None) or {}).values()
+            if not getattr(_b, "generated_by_assistant", False) and (_b.content or "")
+        ]
+        return max(_cands, key=lambda _b: len(_b.content or "")) if _cands else None
+
+    def _patch_diff(self, base_source: str, patch: "CodeBlock") -> Tuple[str, str]:
+        """The real diff a patch would make, against the source as pasted.
+
+        Only possible because application is deferred: the base still holds
+        the body the rewrite replaces, so this is a comparison and not a
+        recollection. Eagerly applied, the original was overwritten and the
+        most that could be said was which symbol had changed — which is
+        what prompted this.
+
+        Returns (diff, note). Either may be empty. The note carries the
+        reason when there is no diff to show, because "nothing" and "this
+        patch does not belong to this paste" are different answers.
+        """
+        try:
+            _spans = self._f._patcher.symbol_spans
+            _base = _spans(base_source)
+            _new = _spans(patch.content or "")
+        except SyntaxError as _e:
+            return "", f"the patch does not parse ({_e.msg} at line {_e.lineno})"
+        except Exception as _e:
+            return "", f"could not be read ({_e!r})"
+        if not _new:
+            return "", "holds no complete definition"
+        _bl = base_source.split("\n")
+        _nl = (patch.content or "").split("\n")
+        _out: List[str] = []
+        for _name, (_ns, _ne) in _new.items():
+            if any(_name.startswith(_o + ".") for _o in _new if _o != _name):
+                continue
+            _key = _name
+            if _key not in _base:
+                _tail = _name.rsplit(".", 1)[-1]
+                _cands = [
+                    _k for _k in _base if _k == _tail or _k.endswith("." + _tail)
+                ]
+                if len(_cands) != 1:
+                    _out.append(
+                        f"# {_name}: not in the pasted source "
+                        f"({len(_cands)} matches) — written against another paste?"
+                    )
+                    continue
+                _key = _cands[0]
+            _bs, _be = _base[_key]
+            _old_body = _bl[_bs - 1 : _be]
+            _new_body = _nl[_ns - 1 : _ne]
+            _d = list(
+                difflib.unified_diff(
+                    _old_body,
+                    _new_body,
+                    fromfile=f"a/{_key}",
+                    tofile=f"b/{_key}",
+                    lineterm="",
+                    n=2,
+                )
+            )
+            _out.extend(_d if _d else [f"# {_key}: identical to the pasted source"])
+        return "\n".join(_out), ""
+
+    @staticmethod
+    def _command_args(command_text: str, verb: str) -> List[str]:
+        """The arguments on a command's own line, and nothing else.
+
+        A command is one line. Splitting the whole message treats whatever
+        follows as arguments, and a message that arrives as "/patches" plus
+        a pasted copy of the previous answer then yields tokens nobody
+        typed — observed as "No such patch: P15" in reply to a bare
+        "/patches", the 15 coming from the pasted list.
+        """
+        _first = (command_text or "").split("\n", 1)[0]
+        return _first[len(verb) :].strip().split()
+
+    def _apply_patch_flags(
+        self, patches: List["CodeBlock"], tokens: List[str]
+    ) -> Tuple[List[str], str]:
+        """Set aside or bring back patches, by "!P2" and "+P2".
+
+        Numbering is positional over the WHOLE list and never renumbers, so
+        setting P2 aside leaves P3 called P3. Renumbering would make "+P2"
+        point at whatever slid into the gap, and an undo that undoes the
+        wrong thing is worse than no undo.
+
+        This exists because excluding is per-command: in a long session
+        "/file -P2 -P5 -P7" has to be retyped every time, and one forgotten
+        token ships a file with a rewrite in it that the reader had already
+        decided against. Setting aside is stated once.
+
+        Returns (report lines, error).
+        """
+        _done: List[str] = []
+        _bad: List[str] = []
+        _total = len(patches)
+        for _t in tokens:
+            _m = re.fullmatch(r"([!+])[Pp](\d+)", _t)
+            if not _m:
+                continue
+            _n = int(_m.group(2))
+            if _n < 1 or _n > _total:
+                _bad.append(_t)
+                continue
+            _off = _m.group(1) == "!"
+            _pb = patches[_n - 1]
+            _was = bool(getattr(_pb, "patch_disabled", False))
+            _pb.patch_disabled = _off
+            if _was == _off:
+                _done.append(
+                    f"P{_n} was already {'set aside' if _off else 'active'}"
+                )
+            else:
+                _done.append(f"P{_n} {'set aside' if _off else 'brought back'}")
+        if _bad:
+            return _done, (
+                f"no such patch: {', '.join(_bad)}. There "
+                f"{'is 1 patch' if _total == 1 else f'are {_total} patches'}, "
+                f"P1 to P{_total}."
+            )
+        return _done, ""
+
+    async def _handle_patches_command(
+        self, project_id: str, command_text: str = ""
+    ) -> str:
+        """List the rewrites this session applied, with what each one does.
+
+        A bare list of symbol names is not a decision aid: knowing that
+        `_close_dangling_fence` was rewritten says nothing about whether to
+        keep that rewrite. What makes each line answerable is the
+        docstring, which this project's conventions require on every
+        delivered function and which the model therefore already wrote.
+        Lifted from the block with ast, so the summary is the author's own
+        sentence and not a paraphrase of it.
+
+        Deterministic on purpose. The list is read from state and printed;
+        no model is asked to recall it. That matters here more than
+        elsewhere, because a mis-copied entry would point at a patch the
+        reader did not mean.
+        """
+        _patches = self._patches_for_chat(project_id)
+        # ── Step 0: "!P2" sets aside, "+P2" brings back, then list ──
+        _flags: List[str] = []
+        _tokens = self._command_args(command_text, "/patches")
+        # The raw text as well as the tokens: a bare "/patches" once came
+        # back "No such patch: P15", which can only happen if something
+        # reached here that the reader did not type, and guessing at which
+        # something is what this line replaces.
+        self._f._log_debug(
+            f"[PATCHES] command {command_text[:80]!r} → tokens {_tokens}"
+        )
+        # ── Step 0a: "clear" drops every patch held for this chat ──
+        if _tokens and _tokens[0].lower() in ("clear", "reset"):
+            try:
+                _state = self._f._conversation_state_manager.get(project_id)
+                _before = len(_state.committed_changes or [])
+                _drop = {id(_b) for _b in _patches}
+                _state.committed_changes = [
+                    _b
+                    for _b in (_state.committed_changes or [])
+                    if id(_b) not in _drop
+                ]
+                _n = _before - len(_state.committed_changes)
+                self._f._log_debug(f"[PATCHES] cleared {_n} patch(es)")
+                return (
+                    f"{_n} patch(es) dropped. The pasted source was never "
+                    f"modified, so nothing is lost but the list itself."
+                )
+            except Exception as _e_c:
+                return f"Nothing was cleared: {_e_c!r}"
+        if _tokens and _patches:
+            _flags, _err = self._apply_patch_flags(_patches, _tokens)
+            if _err:
+                return f"Nothing changed: {_err}"
+            # ── Step 0b: a bare "P2" asks to SEE it, not to change it ──
+            _show: List[int] = []
+            for _t in _tokens:
+                _m = re.fullmatch(r"[Pp](\d+)", _t)
+                if _m:
+                    _n = int(_m.group(1))
+                    if 1 <= _n <= len(_patches):
+                        _show.append(_n)
+                    else:
+                        return (
+                            f"No such patch: {_t}. There "
+                            f"{'is 1 patch' if len(_patches) == 1 else f'are {len(_patches)} patches'}"
+                            f", P1 to P{len(_patches)}."
+                        )
+            if _show:
+                return self._render_patch_diffs(project_id, _patches, sorted(set(_show)))
+        if not _patches:
+            return (
+                "No rewrites have been applied in this session. Ask for a "
+                "change to a function and the answer's code is spliced into "
+                "the pasted source; `/file` then hands back the result."
+            )
+
+        # ── Step 1: one line per patch, symbol and its own docstring ──
+        _lines = [f"{len(_patches)} rewrite(s) applied to the pasted source:", ""]
+        for _i, _b in enumerate(_patches, 1):
+            _names: List[str] = []
+            _doc = ""
+            try:
+                _tree = ast.parse(_b.content or "")
+                for _n in ast.walk(_tree):
+                    if isinstance(
+                        _n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                    ):
+                        _names.append(_n.name)
+                        if not _doc:
+                            _d = ast.get_docstring(_n) or ""
+                            _doc = _d.strip().split("\n")[0].strip()
+            except Exception:
+                _names = [
+                    getattr(_s, "name", "") for _s in (_b.symbols or []) if _s
+                ]
+            _turn = getattr(_b, "patch_turn", 0) or 0
+            _where = f"turn {_turn}" if _turn else "this session"
+            _off = bool(getattr(_b, "patch_disabled", False))
+            _lines.append(
+                f"**P{_i}**{' — SET ASIDE' if _off else ''} · {_where} · "
+                f"`{', '.join(_names) or '?'}` · "
+                f"{len((_b.content or '').splitlines())} lines"
+            )
+            if _doc:
+                _lines.append(f"    {_doc}")
+        # ── Step 2: say what can be done with them ──
+        _n_off = sum(1 for _b in _patches if getattr(_b, "patch_disabled", False))
+        _lines += [
+            "",
+            f"`/file [name.py]` hands back the pasted source with the "
+            f"{len(_patches) - _n_off} active one(s) in it."
+            + (
+                f" {_n_off} set aside; `/patches +P<n>` brings one back."
+                if _n_off
+                else " `/patches !P<n>` sets one aside for good."
+            ),
+            "`/patches P2` shows what one actually changes. `/file P1 P3` "
+            "takes only those, `/file -P2` leaves one out for a single "
+            "delivery. `/patches clear` forgets them all.",
+        ]
+        if _flags:
+            _lines = [f"{', '.join(_flags)}.", ""] + _lines
+        return "\n".join(_lines)
+
+    async def _handle_file_command(
+        self, command_text: str, project_id: str, __user__: Optional[dict] = None
+    ) -> str:
+        """Deliver the base block, patches and all, as a downloadable file.
+
+        The block is found the same way the patch path finds it: the biggest
+        active block that the assistant did not write. That is the pasted
+        source, and after a run of rewrites it is the pasted source with
+        those rewrites spliced in — the applier updates it in place rather
+        than keeping a copy, so there is nothing to assemble here.
+
+        The name matters and is not the block's. An attachment arrives as
+        Pasted_Text_<digits>.txt; a file offered under that name is one the
+        reader has to rename before it is a Python file at all. An optional
+        argument sets it, and the default is the extension the content
+        implies.
+        """
+        # ── Step 1: the name, from the argument or from the content ──
+        _patches = self._patches_for_chat(project_id)
+        _sel, _name, _err, _explicit = self._parse_patch_selectors(
+            self._command_args(command_text, "/file"), len(_patches)
+        )
+        if _err:
+            return f"Nothing was delivered: {_err}"
+        # ── Step 2: the base, resolved the one way this file resolves it ──
+        # _patch_base, not a second copy of the same search: the viewer and
+        # the delivery must agree on WHICH block is the pasted source, or a
+        # diff would be computed against one thing and the file built from
+        # another.
+        try:
+            _base = self._patch_base(project_id)
+        except Exception as _e_s:
+            self._f._log_debug(f"[PATCH-FILE] base lookup failed ({_e_s!r})")
+            return f"The base block could not be read: {_e_s!r}"
+        if _base is None:
+            return (
+                "There is no pasted source in this project to hand back. "
+                "Paste the file first, then ask for changes."
+            )
+        if not _name:
+            _stem = (getattr(_base, "file_path", "") or "source").rsplit("/", 1)[-1]
+            _name = re.sub(r"\.(txt|md)$", "", _stem) or "source"
+        # An extension is not decoration here. A file delivered without one
+        # is a file the reader has to rename before an editor will treat it
+        # as Python, which is the whole reason it is being handed over as a
+        # file rather than pasted into the chat. Applied to an explicit
+        # argument too: "/file output" means a name, not a demand for a
+        # bare one.
+        if "." not in _name:
+            _name = f"{_name}.py"
+        # ── Step 3: compose the requested subset onto the pasted base ──
+        # The base is left alone; what is delivered is built here. Patches
+        # apply oldest first, so two rewrites of the same symbol resolve the
+        # way a reader expects: the later one wins, and dropping it brings
+        # the earlier one back.
+        _src = _base.content or ""
+        _used: List[str] = []
+        _skipped: List[str] = []
+        _used_aside = False
+        _base_md5 = hashlib.md5(_src.encode()).hexdigest()[:16]
+        for _i, _pb in enumerate(_patches, 1):
+            if _sel is not None and _i not in _sel:
+                continue
+            # A patch set aside stays out of "/file" and out of "/file -P3".
+            # Naming it explicitly overrides that: "/file P2" is a list of
+            # what to apply, not a filter over the active ones, and asking
+            # for something by number is a clearer statement of intent than
+            # a flag set several turns ago.
+            if getattr(_pb, "patch_disabled", False):
+                if not _explicit:
+                    _skipped.append(f"P{_i} (set aside)")
+                    continue
+                _used_aside = True
+            _was = getattr(_pb, "patch_base_md5", "") or ""
+            if _was and _was != _base_md5:
+                # Written against a different paste. Applying it anyway is
+                # how a stale rewrite silently undoes a newer one.
+                _skipped.append(f"P{_i} (written against another paste)")
+                continue
+            _out = self._f._patcher._splice_symbols(_src, _pb.content or "")
+            if not _out:
+                _skipped.append(f"P{_i} (no longer applies)")
+                continue
+            _src, _names = _out
+            _used.append(f"P{_i} ({', '.join(_names)})")
+        if _patches and not _used and _sel != []:
+            return (
+                "Nothing was delivered: none of the requested patches could "
+                "be applied to the pasted source. "
+                + (" ".join(_skipped) if _skipped else "")
+            )
+        self._f._log_debug(
+            f"[PATCH-FILE] composing {len(_used)} of {len(_patches)} patch(es): "
+            f"{_used or 'none'}"
+            + (f"; skipped {_skipped}" if _skipped else "")
+        )
+        _uid = (__user__ or {}).get("id") or ""
+        _report = await self._f._patcher.deliver_patched_file(
+            _base, _name, _uid, _src
+        )
+        if _used or _skipped:
+            _report += "\n\nApplied: " + (", ".join(_used) or "none") + "."
+            if _skipped:
+                _report += " Skipped: " + ", ".join(_skipped) + "."
+            if _used_aside:
+                _report += (
+                    " One or more of those had been set aside and were "
+                    "included because you named them."
+                )
+        return _report
+
     async def _handle_clean_command(self, command_text: str, project_id: str) -> str:
         """Handle /clean [all|<hash>]. Lists or removes inactive blocks."""
         if (
@@ -33713,6 +34333,681 @@ class CommandRouter:
         ):
             return True
         return False
+class PatchApplier:
+    """Applies a change the model proposed onto the pasted source.
+
+    One responsibility, one place. The three routines below used to sit in
+    the middle of CodeBlockManager among block bookkeeping, symbol
+    extraction and content classification, and the cost of that was
+    measured rather than aesthetic: a splice was wired into a path that
+    only ever runs for unified diffs, which is the one input the splice
+    exists to avoid needing. Reading the whole route would have shown it;
+    the route was not in one place to read.
+
+    What lives here is everything that turns a proposal into new source:
+    the unified-diff applier, the symbol splice, and the entry point that
+    chooses between them. What deliberately does NOT live here is
+    classify_content, which decides between eight content types for four
+    callers, and the assistant-restatement guard, which protects the index
+    from model-written code in general. Both are about this feature only
+    by coincidence, and pulling them in would trade a small class for a
+    large one that everything else depends on.
+
+    The surface is one call: apply_change_with_diff(base, proposed).
+    """
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        """Hold the parent Filter, for valves and the debug log."""
+        self._f = filter_ref
+
+    def _apply_unified_diff(self, original: str, diff_text: str) -> Optional[str]:
+        """
+        Apply a unified diff patch to original text.
+
+        Parses the diff hunks and applies them in reverse order (so line
+        numbers remain correct as earlier hunks are applied).
+
+        Args:
+            original: The original source code.
+            diff_text: The unified diff content (from `git diff` or similar).
+
+        All or nothing. A hunk whose context does not match used to be
+        skipped while its siblings applied, which left the block in a state
+        neither the reader nor the model had ever seen — and everything
+        downstream (symbol re-extraction, re-indexing, the new hash) then
+        ran as though the patch had succeeded. Partial application of a
+        patch against a 2.7 MB file is the worst failure this path can
+        have: silent, plausible, and load-bearing. One hunk that does not
+        match now rejects the whole diff.
+
+        Every exit says why, on a [PATCH-APPLY] line through _log_debug.
+        The three warnings that already existed went to `logger`, which is
+        not the channel this project's logs are read from, so a patch that
+        never applied looked exactly like a patch that was never proposed.
+
+        Returns:
+            The patched source code, or None if the diff cannot be applied.
+        """
+        if not self._f.valves.enable_diff_application:
+            self._f._log_debug(
+                "[PATCH-APPLY] skipped — enable_diff_application is off"
+            )
+            return None
+
+        lines = original.splitlines(keepends=False)
+        result_lines = lines[:]
+        hunks = []
+
+        # Normalize line endings before parsing: a CRLF diff otherwise
+        # carries \r into every context/old line and fails the exact-match
+        # check against \n content.
+        diff_text = diff_text.replace("\r\n", "\n").replace("\r", "\n")
+
+        # ── 1. Parse diff hunks ─────────────────────────────────────────────
+        for match in re.finditer(
+            r"@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@(.*?)(?=@@|\Z)", diff_text, re.DOTALL
+        ):
+            old_start = int(match.group(1))
+            old_count_str = match.group(2)
+            old_count = int(old_count_str) if old_count_str else 1
+            new_count_str = match.group(4)
+            new_count = int(new_count_str) if new_count_str else 1
+            hunk_body = match.group(5)
+            # git-style hunk headers carry the enclosing declaration on the
+            # header line itself ("@@ -a,b +c,d @@ def foo():"). group(5)
+            # starts right after the second @@, so that tail — one leading
+            # space plus the declaration — parsed as a bogus context line and
+            # made every git-produced hunk fail the exact-match check
+            # ("hunk mismatch at line 1"). The hunk body proper starts after
+            # the header line's own newline; whatever precedes it is header
+            # remainder and is discarded.
+            hunk_body = hunk_body.split("\n", 1)[1] if "\n" in hunk_body else ""
+            hunk_body = hunk_body.strip("\n")
+
+            old_lines, new_lines = [], []
+            for line in hunk_body.split("\n"):
+                if line.startswith("-"):
+                    old_lines.append(line[1:])
+                elif line.startswith("+"):
+                    new_lines.append(line[1:])
+                elif line.startswith(" "):
+                    old_lines.append(line[1:])
+                    new_lines.append(line[1:])
+
+            if old_count == 0:
+                old_start_idx = old_start
+            else:
+                old_start_idx = old_start - 1
+
+            if new_count == 0:
+                new_lines = []
+
+            hunks.append((old_start_idx, old_lines, new_lines))
+
+        if not hunks:
+            self._f._log_debug(
+                f"[PATCH-APPLY] rejected — no hunk header parsed from "
+                f"{len(diff_text)} chars of diff"
+            )
+            return None
+
+        # ── 2. Apply hunks in reverse order ─────────────────────────────────
+        # Reverse so earlier hunks' line numbers stay valid as later ones
+        # are spliced in.
+        for _i, (old_start_idx, old_lines, new_lines) in enumerate(reversed(hunks)):
+            # ── 2a. Bounds check ─────────────────────────────────────────────
+            if old_start_idx < 0 or old_start_idx + len(old_lines) > len(result_lines):
+                self._f._log_debug(
+                    f"[PATCH-APPLY] rejected — hunk {len(hunks) - _i} of "
+                    f"{len(hunks)} out of bounds (start={old_start_idx}, "
+                    f"lines={len(old_lines)}, file has {len(result_lines)}); "
+                    f"nothing applied"
+                )
+                return None
+
+            # ── 2b. Verify context matches ──────────────────────────────────
+            _have = result_lines[old_start_idx : old_start_idx + len(old_lines)]
+            if _have != old_lines:
+                _at = next(
+                    (
+                        _k
+                        for _k in range(len(old_lines))
+                        if _k >= len(_have) or _have[_k] != old_lines[_k]
+                    ),
+                    0,
+                )
+                self._f._log_debug(
+                    f"[PATCH-APPLY] rejected — hunk {len(hunks) - _i} of "
+                    f"{len(hunks)} does not match at file line "
+                    f"{old_start_idx + _at + 1}; expected "
+                    f"{(old_lines[_at] if _at < len(old_lines) else '')!r}, "
+                    f"found {(_have[_at] if _at < len(_have) else '(end of file)')!r}"
+                    f"; nothing applied"
+                )
+                return None
+
+            # ── 2c. Apply hunk ──────────────────────────────────────────────
+            result_lines = (
+                result_lines[:old_start_idx]
+                + new_lines
+                + result_lines[old_start_idx + len(old_lines) :]
+            )
+
+        self._f._log_debug(
+            f"[PATCH-APPLY] applied — {len(hunks)} hunk(s), "
+            f"{len(lines)} lines in, {len(result_lines)} lines out"
+        )
+        return "\n".join(result_lines)
+
+    @staticmethod
+    def symbol_spans(source: str) -> Dict[str, Tuple[int, int]]:
+        """Every definition's line span, keyed by qualified name.
+
+        1-indexed and inclusive, matching ast. Shared by the splice, which
+        needs it to know what to replace, and by the patch viewer, which
+        needs it to know what the replacement replaced — deferred
+        application means the original body is still in the base, so a
+        patch can be shown as a real diff instead of a symbol name.
+        """
+        _out: Dict[str, Tuple[int, int]] = {}
+        _stack: List[str] = []
+
+        def _walk(_node) -> None:
+            for _child in ast.iter_child_nodes(_node):
+                if isinstance(
+                    _child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    _key = ".".join(_stack + [_child.name])
+                    _out[_key] = (_child.lineno, _child.end_lineno or _child.lineno)
+                    _stack.append(_child.name)
+                    _walk(_child)
+                    _stack.pop()
+                else:
+                    _walk(_child)
+
+        _walk(ast.parse(source))
+        return _out
+
+    def _splice_symbols(
+        self, base_content: str, proposed_content: str
+    ) -> Optional[Tuple[str, List[str]]]:
+        """Replace whole definitions in the base with the ones just written.
+
+        Symbol-addressed rather than line-addressed, which removes the three
+        things a unified diff needs from the model and this one cannot
+        supply. Measured, all three in a single reply:
+
+        - The file name. It emitted `--- a/_close_dangling_fence`, naming
+          the function, because an attachment reaches it as
+          Pasted_Text_<digits>.txt and the real name is nowhere in its
+          context. The base is matched by file_path, so nothing matched.
+        - Absolute line numbers. It emitted `@@ -1,7 +1,7 @@` for a
+          function living at line 23,640 of 58,073. It cannot count that
+          far and should not have to.
+        - Verbatim context. A diff carries the surrounding lines, and this
+          file's are full of backticks the model cannot emit inside a
+          fenced block; it substituted quotes and produced a hunk whose
+          minus and plus lines were identical. Copying literals is the one
+          thing this model is measurably bad at — the same failure that
+          published a Stats block reading 100% where 12% was measured.
+
+        A whole definition has none of those problems: it is addressed by a
+        name the model knows, it carries no context, and writing complete
+        functions with docstrings is already how this project asks for
+        code. What the model is good at is what is asked of it.
+
+        Returns (patched_source, replaced_names) or None. All or nothing,
+        like the diff path: a proposal naming five functions of which four
+        resolve leaves the file in a state nobody chose.
+        """
+        try:
+            import ast as _ast
+
+            # ── Step 1: spans in the base, keyed by qualified name ──
+            _spans = self.symbol_spans
+            _base_spans = _spans(base_content)
+            # The proposal is parsed on its own so a syntax error in what the
+            # model wrote is reported as that, and not as an unexplained
+            # skip. A truncated reply — which this model produces — lands
+            # here, and "the proposal does not parse" is the actionable
+            # sentence.
+            try:
+                _new_spans = _spans(proposed_content)
+            except SyntaxError as _e_prop:
+                self._f._log_debug(
+                    f"[PATCH-APPLY] splice rejected — the proposed code does "
+                    f"not parse ({_e_prop.msg} at line {_e_prop.lineno}); "
+                    f"likely a truncated reply"
+                )
+                return None
+            if not _new_spans:
+                self._f._log_debug(
+                    "[PATCH-APPLY] splice not attempted — the proposed block "
+                    "holds no complete definition"
+                )
+                return None
+
+            # ── Step 2: resolve every proposed name against the base ──
+            # A bare name is accepted when exactly one base symbol ends with
+            # it, so a method written without its class still lands. Two
+            # matches is ambiguous and refuses rather than guessing.
+            _plan: List[Tuple[int, int, str, str]] = []
+            _unresolved: List[str] = []
+            _new_lines = proposed_content.split("\n")
+            for _name, (_ns, _ne) in _new_spans.items():
+                if any(_name.startswith(_o + ".") for _o in _new_spans if _o != _name):
+                    continue  # nested in another proposed definition
+                _key = _name
+                if _key not in _base_spans:
+                    _tail = _name.rsplit(".", 1)[-1]
+                    _cands = [
+                        _k
+                        for _k in _base_spans
+                        if _k == _tail or _k.endswith("." + _tail)
+                    ]
+                    if len(_cands) != 1:
+                        _unresolved.append(
+                            f"{_name} ({len(_cands)} matches)"
+                        )
+                        continue
+                    _key = _cands[0]
+                _bs, _be = _base_spans[_key]
+                _plan.append((_bs, _be, _key, "\n".join(_new_lines[_ns - 1 : _ne])))
+
+            if _unresolved or not _plan:
+                self._f._log_debug(
+                    f"[PATCH-APPLY] splice rejected — "
+                    f"{len(_unresolved)} name(s) did not resolve to exactly "
+                    f"one base symbol: {_unresolved or '(none resolved at all)'}"
+                )
+                return None
+
+            # ── Step 3: splice back to front so earlier spans stay valid ──
+            _lines = base_content.split("\n")
+            for _bs, _be, _key, _body in sorted(_plan, reverse=True):
+                _lines = _lines[: _bs - 1] + _body.split("\n") + _lines[_be:]
+            _patched = "\n".join(_lines)
+
+            # ── Step 4: it must still parse, or nothing happened ──
+            try:
+                _ast.parse(_patched)
+            except SyntaxError as _e_syn:
+                self._f._log_debug(
+                    f"[PATCH-APPLY] splice rejected — the result does not "
+                    f"parse ({_e_syn.msg} at line {_e_syn.lineno}); base left "
+                    f"untouched"
+                )
+                return None
+            return _patched, [_p[2] for _p in _plan]
+        except Exception as _e_sp:
+            self._f._log_debug(f"[PATCH-APPLY] splice skipped ({_e_sp!r})")
+            return None
+
+    def verify_source(self, source: str) -> Tuple[bool, str]:
+        """Compile and lint the patched source before anyone is handed it.
+
+        The ritual this project already performs by hand on every delivery,
+        run where it cannot be forgotten. py_compile is the hard gate: a
+        file that does not compile is not a deliverable, whatever else is
+        true of it. pyflakes is advisory and compared against nothing —
+        the count is reported so a jump is visible, not used to refuse.
+
+        Returns (ok, human-readable verdict). Never raises: a linter that
+        is missing or throws must not be able to withhold a file that
+        compiles.
+        """
+        # ── Step 1: the hard gate ──
+        try:
+            compile(source, "<patched>", "exec")
+        except SyntaxError as _e_syn:
+            return False, (
+                f"does not compile: {_e_syn.msg} at line {_e_syn.lineno}"
+            )
+        except Exception as _e_c:
+            return False, f"does not compile: {_e_c!r}"
+        # ── Step 2: the advisory pass ──
+        _lint = "pyflakes unavailable"
+        try:
+            import io as _io
+            import tempfile as _tf
+            from pyflakes.api import check as _pf_check
+            from pyflakes.reporter import Reporter as _PfReporter
+
+            _out, _err = _io.StringIO(), _io.StringIO()
+            with _tf.NamedTemporaryFile(
+                "w", suffix=".py", delete=False, encoding="utf-8"
+            ) as _fh:
+                _fh.write(source)
+                _tmp = _fh.name
+            try:
+                _n = _pf_check(source, _tmp, _PfReporter(_out, _err))
+                _lint = f"{_n} pyflakes warning(s)"
+            finally:
+                try:
+                    os.unlink(_tmp)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return True, f"compiles cleanly, {_lint}"
+
+    async def _register_file(
+        self, file_id: str, name: str, path: str, user_id: str, content: str = ""
+    ) -> bool:
+        """Record the written file in OpenWebUI's own file table.
+
+        Without this the `files` event still renders a download card, but
+        its Content and Preview tabs come back empty: the card asks the API
+        for the file by id, and an id this plugin invented is in no table.
+        Observed exactly that way before this existed.
+
+        Follows OpenWebUI's own upload_file: an id, the display name, the
+        on-disk path as `{id}_{name}`, and a meta block. Called through its
+        model layer rather than by writing SQL, because the schema does
+        move — a release added an `access_control` column and every insert
+        against the old table failed — and the model layer moves with it.
+
+        Everything is guarded and returns False rather than raising:
+        insert_new_file has been sync and is async in later versions, the
+        import path can change, and none of that should cost the reader a
+        download that already works over the execute channel.
+        """
+        if not user_id:
+            self._f._log_debug(
+                "[PATCH-FILE] not registered — no user id on this turn; the "
+                "download still works, the card's tabs will be empty"
+            )
+            return False
+        try:
+            from open_webui.models.files import FileForm, Files
+
+            # `data.content` is what the card's Content and Preview tabs
+            # read — the frontend does `selectedFile?.data?.content` — and
+            # an upload only gets it from process_file, a separate
+            # extraction pass that runs after the insert. Registering
+            # without it produced exactly what was observed: a card that
+            # opens, reports "No content", and previews an empty Python
+            # block. Set here rather than by calling process_file, which
+            # would also embed 2.7 MB into the vector store for a file
+            # nobody asked to make searchable.
+            _form = FileForm(
+                **{
+                    "id": file_id,
+                    "filename": name,
+                    "path": path,
+                    "data": {"content": content},
+                    "meta": {
+                        "name": name,
+                        "content_type": "text/x-python",
+                        "size": os.path.getsize(path),
+                    },
+                }
+            )
+            _res = Files.insert_new_file(user_id, _form)
+            if hasattr(_res, "__await__"):
+                _res = await _res
+            if not _res:
+                self._f._log_debug(
+                    "[PATCH-FILE] not registered — insert_new_file returned "
+                    "nothing"
+                )
+                return False
+            self._f._log_debug(f"[PATCH-FILE] registered — file id {file_id}")
+            return True
+        except Exception as _e_reg:
+            self._f._log_debug(
+                f"[PATCH-FILE] not registered ({_e_reg!r}) — the download "
+                f"still works; only the card's tabs are affected"
+            )
+            return False
+
+    async def deliver_patched_file(
+        self,
+        base_block: "CodeBlock",
+        name: str,
+        user_id: str = "",
+        source: Optional[str] = None,
+    ) -> str:
+        """Write the patched source out and push it to the reader's browser.
+
+        Three deliveries, weakest dependency first, because they fail for
+        unrelated reasons:
+
+        1. The file is written under OpenWebUI's uploads directory, which
+           this process can write because the filter runs inside it. That
+           path works even with no browser attached, and is what a
+           `docker cp` reaches.
+        2. A `files` event attaches it to the message. Short name, which is
+           the one the backend persists; the long alias reaches the
+           frontend but is never written to the database.
+        3. An `execute` event triggers the actual download. Base64 rather
+           than a raw string literal, because the source is Python full of
+           quotes, backslashes and newlines that would have to survive
+           being embedded in JavaScript. Fire-and-forget rather than
+           __event_call__: OpenWebUI's own guidance is that the two-way
+           channel breaks on iOS Safari during a download.
+
+        The size is the risk worth watching. A 2.7 MB file is about 3.7 MB
+        of base64 in one Socket.IO event, and python-socketio defaults
+        max_http_buffer_size to 1,000,000 bytes. Whether OpenWebUI raises
+        it is not documented, so the byte count goes in the log line: if
+        the download never arrives, that number is the first thing to
+        read.
+
+        Returns a short human-readable report for the chat.
+        """
+        # `source` is the composed result when a caller built one; the
+        # block's own content otherwise. Deferred patching means the base is
+        # never the thing delivered, so the caller decides what is.
+        _src = base_block.content if source is None else source
+        _src = _src or ""
+        # ── Step 1: it must compile before it is offered ──
+        _ok, _verdict = self.verify_source(_src)
+        if not _ok:
+            self._f._log_debug(f"[PATCH-FILE] refused — the patched source {_verdict}")
+            return (
+                f"The patched source was NOT delivered: it {_verdict}.\n\n"
+                f"The base block is left as it is so the failure can be "
+                f"inspected; nothing was written."
+            )
+        # ── Step 2: to disk, where nothing else can go wrong ──
+        _path = ""
+        try:
+            _dir = "/app/backend/data/uploads"
+            os.makedirs(_dir, exist_ok=True)
+            _fid = uuid.uuid4().hex
+            _path = os.path.join(_dir, f"{_fid}_{name}")
+            with open(_path, "w", encoding="utf-8") as _fh:
+                _fh.write(_src)
+            self._f._log_debug(
+                f"[PATCH-FILE] written — {_path} ({len(_src)} chars, {_verdict})"
+            )
+        except Exception as _e_w:
+            self._f._log_debug(f"[PATCH-FILE] write failed ({_e_w!r})")
+            return f"The patched source {_verdict}, but it could not be written: {_e_w!r}"
+        # ── Step 3: attach it to the message, once it is a real file ──
+        # The event is emitted only when the registration took, because an
+        # unregistered card is worse than no card: it opens, promises a
+        # preview, and shows nothing.
+        _emitter = getattr(self._f, "_event_emitter", None)
+        _registered = await self._register_file(_fid, name, _path, user_id, _src)
+        if _emitter and _registered:
+            try:
+                await _emitter(
+                    {
+                        "type": "files",
+                        "data": {
+                            "files": [
+                                {
+                                    "type": "file",
+                                    "id": _fid,
+                                    "name": name,
+                                    "file": {
+                                        "id": _fid,
+                                        "filename": name,
+                                        "path": _path,
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                )
+                self._f._log_debug("[PATCH-FILE] files event emitted")
+            except Exception as _e_f:
+                self._f._log_debug(f"[PATCH-FILE] files event failed ({_e_f!r})")
+        # ── Step 4: the download itself ──
+        _b64 = base64.b64encode(_src.encode("utf-8")).decode("ascii")
+        if _emitter:
+            try:
+                await _emitter(
+                    {
+                        "type": "execute",
+                        "data": {
+                            "code": (
+                                "(function(){"
+                                f'const b=atob("{_b64}");'
+                                "const n=b.length;const u=new Uint8Array(n);"
+                                "for(let i=0;i<n;i++){u[i]=b.charCodeAt(i);}"
+                                "const bl=new Blob([u],{type:'text/x-python'});"
+                                "const url=URL.createObjectURL(bl);"
+                                "const a=document.createElement('a');"
+                                f"a.href=url;a.download={name!r};"
+                                "document.body.appendChild(a);a.click();"
+                                "URL.revokeObjectURL(url);a.remove();"
+                                "})();"
+                            )
+                        },
+                    }
+                )
+                self._f._log_debug(
+                    f"[PATCH-FILE] download event emitted — {len(_b64)} base64 "
+                    f"chars; if nothing arrives, this is the number to check "
+                    f"against the socket buffer limit"
+                )
+            except Exception as _e_d:
+                self._f._log_debug(f"[PATCH-FILE] download event failed ({_e_d!r})")
+        return (
+            f"`{name}` is ready: {len(_src)} characters, {_verdict}.\n\n"
+            f"The download should have started. It is also on disk at "
+            f"`{_path}`."
+        )
+
+    async def apply_change_with_diff(
+        self, base_block: "CodeBlock", proposed_block: "CodeBlock"
+    ) -> bool:
+        """
+        Apply a unified diff from a proposed change onto a base block.
+
+        If the diff applies successfully, the base block is updated with the
+        new content, symbols are re-extracted, and the symbol index is updated.
+
+        Args:
+            base_block: The original code block to patch.
+            proposed_block: The diff-containing proposed change.
+
+        Returns:
+            True if the diff was applied successfully, False otherwise.
+        """
+        # ── 1. Validate inputs ──────────────────────────────────────────────
+        # Each rejection says which one it was. All four used to return a
+        # bare False, so a patch that was never a patch, one the classifier
+        # misread, and one that failed to apply were indistinguishable from
+        # a turn where the model proposed nothing at all.
+        # PROPOSED_CHANGE means classify_content saw a diff. A rewritten
+        # function is BASE_CODE by that rule, so the flag set by the
+        # restatement guard is the other way in — and the only other way,
+        # since the guard sets it solely when the turn asked for a change.
+        if proposed_block.content_type != ContentType.PROPOSED_CHANGE and not getattr(
+            proposed_block, "is_proposed_patch", False
+        ):
+            self._f._log_debug(
+                f"[PATCH-APPLY] not attempted — block is "
+                f"{proposed_block.content_type.value}, not a proposed change"
+            )
+            return False
+
+        _has_hunks = "@@" in proposed_block.content and (
+            "-" in proposed_block.content or "+" in proposed_block.content
+        )
+        self._f._log_debug(
+            f"[PATCH-APPLY] attempting — base {base_block.file_path or '?'} "
+            f"({len(base_block.content)} chars) ← proposal "
+            f"({len(proposed_block.content)} chars, "
+            f"{'diff' if _has_hunks else 'no hunk headers'})"
+        )
+
+        # ── 2. Apply, by diff when there is one and by symbol otherwise ─────
+        # The splice is the fallback rather than the primary only because
+        # the diff path predates it; where both could work they agree, and
+        # where they disagree the diff has already refused. A diff that
+        # parses but does not apply falls through here too: its failure is
+        # about line numbers and copied context, and the splice needs
+        # neither.
+        new_code = None
+        _how = ""
+        if _has_hunks:
+            new_code = self._apply_unified_diff(
+                base_block.content, proposed_block.content
+            )
+            _how = "diff"
+        if not new_code:
+            _spliced = self._splice_symbols(
+                base_block.content, proposed_block.content
+            )
+            if _spliced:
+                new_code, _names = _spliced
+                _how = "splice"
+                self._f._log_debug(
+                    f"[PATCH-APPLY] applied by symbol — replaced "
+                    f"{len(_names)} definition(s): {_names}"
+                )
+        if not new_code:
+            return False
+        if new_code == base_block.content:
+            self._f._log_debug(
+                f"[PATCH-APPLY] rejected — the {_how} applied but changed "
+                f"nothing; base left untouched"
+            )
+            return False
+
+        project_id = self._f.valves.project_id
+
+        # ── 3. Remove old symbols from index ───────────────────────────────
+        self._f._symbol_index.remove_all_for_block(
+            base_block.hash, base_block.symbols, project_id
+        )
+
+        # ── 4. Update block content and hash ───────────────────────────────
+        base_block.content = new_code
+        base_block.hash = hashlib.md5(new_code.encode()).hexdigest()[:16]
+
+        # ── 5. Re-extract symbols ───────────────────────────────────────────
+        base_block.symbols = await SignatureExtractor.extract_async(
+            new_code, base_block.file_path
+        )
+
+        # ── 6. Re-index symbols ─────────────────────────────────────────────
+        for sym in base_block.symbols:
+            sym.parent_block_hash = base_block.hash
+            self._f._symbol_index.add(sym, base_block.hash, project_id)
+
+        # ── 7. Update cached token count ───────────────────────────────────
+        if self._f.tokenizer:
+            base_block._cached_token_count = len(self._f.tokenizer.encode(new_code))
+        else:
+            base_block._cached_token_count = len(new_code) // 4
+
+        # ── 8. Update metadata ─────────────────────────────────────────────
+        base_block.timestamp = time.time()
+        base_block.is_active = True
+        base_block.importance_score = min(base_block.importance_score + 2.0, 10.0)
+
+        # ── 9. Invalidate cache ─────────────────────────────────────────────
+        self._f._activation.invalidate_lightweight_cache(project_id)
+
+        return True
+
+
 
 
 class CodeBlockManager:
@@ -34847,174 +36142,6 @@ class CodeBlockManager:
                 return True
 
         return False
-
-    def _apply_unified_diff(self, original: str, diff_text: str) -> Optional[str]:
-        """
-        Apply a unified diff patch to original text.
-
-        Parses the diff hunks and applies them in reverse order (so line
-        numbers remain correct as earlier hunks are applied).
-
-        Args:
-            original: The original source code.
-            diff_text: The unified diff content (from `git diff` or similar).
-
-        Returns:
-            The patched source code, or None if the diff cannot be applied.
-        """
-        if not self._f.valves.enable_diff_application:
-            return None
-
-        lines = original.splitlines(keepends=False)
-        result_lines = lines[:]
-        hunks = []
-
-        # Normalize line endings before parsing: a CRLF diff otherwise
-        # carries \r into every context/old line and fails the exact-match
-        # check against \n content.
-        diff_text = diff_text.replace("\r\n", "\n").replace("\r", "\n")
-
-        # ── 1. Parse diff hunks ─────────────────────────────────────────────
-        for match in re.finditer(
-            r"@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@(.*?)(?=@@|\Z)", diff_text, re.DOTALL
-        ):
-            old_start = int(match.group(1))
-            old_count_str = match.group(2)
-            old_count = int(old_count_str) if old_count_str else 1
-            new_count_str = match.group(4)
-            new_count = int(new_count_str) if new_count_str else 1
-            hunk_body = match.group(5)
-            # git-style hunk headers carry the enclosing declaration on the
-            # header line itself ("@@ -a,b +c,d @@ def foo():"). group(5)
-            # starts right after the second @@, so that tail — one leading
-            # space plus the declaration — parsed as a bogus context line and
-            # made every git-produced hunk fail the exact-match check
-            # ("hunk mismatch at line 1"). The hunk body proper starts after
-            # the header line's own newline; whatever precedes it is header
-            # remainder and is discarded.
-            hunk_body = hunk_body.split("\n", 1)[1] if "\n" in hunk_body else ""
-            hunk_body = hunk_body.strip("\n")
-
-            old_lines, new_lines = [], []
-            for line in hunk_body.split("\n"):
-                if line.startswith("-"):
-                    old_lines.append(line[1:])
-                elif line.startswith("+"):
-                    new_lines.append(line[1:])
-                elif line.startswith(" "):
-                    old_lines.append(line[1:])
-                    new_lines.append(line[1:])
-
-            if old_count == 0:
-                old_start_idx = old_start
-            else:
-                old_start_idx = old_start - 1
-
-            if new_count == 0:
-                new_lines = []
-
-            hunks.append((old_start_idx, old_lines, new_lines))
-
-        # ── 2. Apply hunks in reverse order ─────────────────────────────────
-        applied_any = False
-        for old_start_idx, old_lines, new_lines in reversed(hunks):
-            # ── 2a. Bounds check ─────────────────────────────────────────────
-            if old_start_idx < 0 or old_start_idx + len(old_lines) > len(result_lines):
-                logger.warning(
-                    f"Unified diff hunk out of bounds (start={old_start_idx}, "
-                    f"lines={len(old_lines)}, total={len(result_lines)})"
-                )
-                continue
-
-            # ── 2b. Verify context matches ──────────────────────────────────
-            if (
-                result_lines[old_start_idx : old_start_idx + len(old_lines)]
-                != old_lines
-            ):
-                logger.warning(f"Unified diff hunk mismatch at line {old_start_idx}")
-                continue
-
-            # ── 2c. Apply hunk ──────────────────────────────────────────────
-            result_lines = (
-                result_lines[:old_start_idx]
-                + new_lines
-                + result_lines[old_start_idx + len(old_lines) :]
-            )
-            applied_any = True
-
-        if not applied_any and hunks:
-            logger.warning("No hunks were applied from the unified diff")
-            return None
-
-        return "\n".join(result_lines)
-
-    async def apply_change_with_diff(
-        self, base_block: "CodeBlock", proposed_block: "CodeBlock"
-    ) -> bool:
-        """
-        Apply a unified diff from a proposed change onto a base block.
-
-        If the diff applies successfully, the base block is updated with the
-        new content, symbols are re-extracted, and the symbol index is updated.
-
-        Args:
-            base_block: The original code block to patch.
-            proposed_block: The diff-containing proposed change.
-
-        Returns:
-            True if the diff was applied successfully, False otherwise.
-        """
-        # ── 1. Validate inputs ──────────────────────────────────────────────
-        if proposed_block.content_type != ContentType.PROPOSED_CHANGE:
-            return False
-
-        if not (
-            "@@" in proposed_block.content
-            and ("-" in proposed_block.content or "+" in proposed_block.content)
-        ):
-            return False
-
-        # ── 2. Apply the diff ───────────────────────────────────────────────
-        new_code = self._apply_unified_diff(base_block.content, proposed_block.content)
-        if not new_code or new_code == base_block.content:
-            return False
-
-        project_id = self._f.valves.project_id
-
-        # ── 3. Remove old symbols from index ───────────────────────────────
-        self._f._symbol_index.remove_all_for_block(
-            base_block.hash, base_block.symbols, project_id
-        )
-
-        # ── 4. Update block content and hash ───────────────────────────────
-        base_block.content = new_code
-        base_block.hash = hashlib.md5(new_code.encode()).hexdigest()[:16]
-
-        # ── 5. Re-extract symbols ───────────────────────────────────────────
-        base_block.symbols = await SignatureExtractor.extract_async(
-            new_code, base_block.file_path
-        )
-
-        # ── 6. Re-index symbols ─────────────────────────────────────────────
-        for sym in base_block.symbols:
-            sym.parent_block_hash = base_block.hash
-            self._f._symbol_index.add(sym, base_block.hash, project_id)
-
-        # ── 7. Update cached token count ───────────────────────────────────
-        if self._f.tokenizer:
-            base_block._cached_token_count = len(self._f.tokenizer.encode(new_code))
-        else:
-            base_block._cached_token_count = len(new_code) // 4
-
-        # ── 8. Update metadata ─────────────────────────────────────────────
-        base_block.timestamp = time.time()
-        base_block.is_active = True
-        base_block.importance_score = min(base_block.importance_score + 2.0, 10.0)
-
-        # ── 9. Invalidate cache ─────────────────────────────────────────────
-        self._f._activation.invalidate_lightweight_cache(project_id)
-
-        return True
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 8. Data flow edges
@@ -42982,6 +44109,45 @@ class ActiveCodeUpdater:
         # NameError was caught by the except below and the whole guard
         # became a no-op that logged once a turn and let every restated
         # body through. It ran that way for every run since it was added.
+        # A turn that ASKED for a change is the one exception. Everything
+        # above is about the model restating a body from memory to
+        # illustrate it, and the evidence for that is a run of four
+        # explanatory answers whose bodies were all wrong. A restatement
+        # and a proposed change look identical — both write a symbol the
+        # index already holds, and both differ from it, the restatement
+        # because it is wrong and the change because it is a change — so
+        # the content cannot tell them apart. The question can.
+        #
+        # code_action comes from classify_turn and is read, not computed
+        # here. The timing works out: this guard runs in Step 0 of the
+        # inlet and classification of the CURRENT turn happens after, so
+        # what pstate holds now is the classification of the turn that
+        # produced the answer being processed. Measured on one run —
+        # "Modifica _close_dangling_fence" and "Modifica también
+        # _repair_truncated_json" both classified `modify`, "gracias"
+        # classified `explain`, and the four historical answers that
+        # motivated this guard were explanations.
+        #
+        # Anything other than `modify` blocks, including a missing or
+        # failed classification: the fail-safe default is `explain`, and
+        # the safe side of this decision is the one that protects the
+        # index.
+        _asked_for_a_change = False
+        if role == "assistant" and project_id:
+            try:
+                _pst = self._f._project_state_manager.get_pstate(project_id)
+                _asked_for_a_change = (
+                    str(
+                        (_pst.get("turn_classification") or {}).get("code_action", "")
+                        or ""
+                    )
+                    .strip()
+                    .lower()
+                    == "modify"
+                )
+            except Exception:
+                _asked_for_a_change = False
+
         if role == "assistant" and new_blocks_pending and project_id:
             try:
                 _indexed = set(
@@ -43051,6 +44217,36 @@ class ActiveCodeUpdater:
                         _n in _indexed or _n.rsplit(".", 1)[-1] in _indexed_bare
                         for _n in _names
                     ):
+                        if _asked_for_a_change:
+                            # Kept for the patch path, and ONLY for it: the
+                            # block is marked so the block loop routes it to
+                            # PatchApplier instead of the index. What gets
+                            # indexed is the merged base afterwards, which
+                            # is the file the reader will hold — never this
+                            # block, whose body may still be wrong.
+                            blk.is_proposed_patch = True
+                            try:
+                                blk.patch_turn = int(
+                                    self._f._project_state_manager.get_pstate(
+                                        project_id
+                                    ).get("napmem_turn_number", 0)
+                                    or 0
+                                )
+                            except Exception:
+                                blk.patch_turn = 0
+                            blk.patch_chat = (
+                                getattr(self._f, "_chat_id_this_turn", "") or ""
+                            )
+                            self._f._log_debug(
+                                f"[PATCH-APPLY] assistant block kept for the "
+                                f"patch path — it rewrites "
+                                f"{len(_names)} indexed symbol(s) ("
+                                + ", ".join(_names[:4])
+                                + ") and the turn asked for a change; it is "
+                                "still kept out of the index"
+                            )
+                            _kept2.append((blk, syms, raw))
+                            continue
                         self._f._log_debug(
                             f"assistant block dropped — it restates "
                             f"{len(_names)} symbol(s) the index already "
@@ -43713,6 +44909,88 @@ class ActiveCodeUpdater:
                     )
 
         # --- 5. Handle content-type specific actions ---
+        # A complete function classifies as BASE_CODE, not PROPOSED_CHANGE:
+        # classify_content routes on a diff pattern, and a rewritten body has
+        # none. So the whole patch path below was unreachable for the one
+        # form this model produces well — it cannot write a usable diff
+        # against this file (it does not know the file's name, cannot count
+        # to line 23,640, and cannot emit the backticks the context is full
+        # of), and writing complete functions is how this project asks for
+        # code in the first place.
+        #
+        # is_proposed_patch is the restatement guard's verdict, set only when
+        # the turn asked for a change. Such a block goes to the patch path
+        # INSTEAD of the index, which is why it is handled here and returns
+        # rather than falling through to the BASE_CODE branch.
+        if getattr(new_block, "is_proposed_patch", False):
+            # The base is the block that OWNS the symbol being rewritten,
+            # asked of the index rather than searched for. Two earlier
+            # attempts guessed instead and both missed: matching on
+            # file_path never fires, because an attachment arrives as
+            # Pasted_Text_<digits>.txt while the model names the real file
+            # or the function; and scanning for a BASE_CODE block found
+            # nothing either, since a pasted file is spliced in unfenced
+            # and never passes through the branch that assigns that type.
+            # find_blocks answers the question directly and is the same
+            # call /expand uses to locate a body.
+            _applied = False
+            _tried: List[str] = []
+            _seen_hashes: set = set()
+            _dry = self._f.valves.defer_patch_application
+            for _sym in new_block.symbols or []:
+                _nm = getattr(_sym, "name", "")
+                if not _nm:
+                    continue
+                for _h in self._f._symbol_index.find_blocks(_nm, project_id) or []:
+                    if _h in _seen_hashes:
+                        continue
+                    _seen_hashes.add(_h)
+                    _base = state.active_blocks.get(_h)
+                    if _base is None or getattr(_base, "generated_by_assistant", False):
+                        continue
+                    _tried.append(_h[:8])
+                    if _dry:
+                        # Deferred: prove the rewrite WOULD apply, then keep
+                        # it instead of committing it. Applying on the spot
+                        # buys nothing the reader sees — Block A is frozen,
+                        # so the next turn's model reads the original either
+                        # way — and it costs the ability to choose. Once the
+                        # base is overwritten there is no original left to
+                        # rebuild a subset from, so "all but the second one"
+                        # is unanswerable.
+                        _probe = self._f._patcher._splice_symbols(
+                            _base.content, new_block.content
+                        )
+                        _applied = bool(_probe)
+                        if _applied:
+                            new_block.patch_base_md5 = hashlib.md5(
+                                (_base.content or "").encode()
+                            ).hexdigest()[:16]
+                            state.committed_changes.append(new_block)
+                            self._f._log_debug(
+                                "[PATCH-APPLY] held — the rewrite applies "
+                                "cleanly and is kept as a patch; the base is "
+                                "untouched until /file asks for it"
+                            )
+                            break
+                        continue
+                    _applied = await self._f._patcher.apply_change_with_diff(
+                        _base, new_block
+                    )
+                    if _applied:
+                        state.committed_changes.append(new_block)
+                        break
+                if _applied:
+                    break
+            if not _applied:
+                self._f._log_debug(
+                    f"[PATCH-APPLY] the proposed rewrite did not apply — "
+                    f"index named {len(_seen_hashes)} owning block(s), "
+                    f"{len(_tried)} eligible ({_tried or 'none'}); nothing "
+                    f"was changed and it stays out of the index"
+                )
+            return
+
         if new_block.content_type == ContentType.PROPOSED_CHANGE:
             if new_block.file_path:
                 state.recent_changes = [
@@ -43726,12 +45004,21 @@ class ActiveCodeUpdater:
                 ]
             state.recent_changes.append(new_block)
             if self._f.valves.enable_diff_application and not is_conflicting:
+                # The base is found by file_path equality. Worth a line of
+                # its own when nothing matches: an attachment arrives named
+                # after the upload (Pasted_Text_<digits>.txt) while a diff
+                # the model writes names the real file, and those two never
+                # compare equal. A patch discarded here never reaches the
+                # applier, so none of its lines fire and the turn looks
+                # like one where no change was proposed.
+                _tried = False
                 for base in list(state.active_blocks.values()):
                     if (
                         base.content_type == ContentType.BASE_CODE
                         and base.file_path == new_block.file_path
                     ):
-                        if await self._f._code_blocks.apply_change_with_diff(
+                        _tried = True
+                        if await self._f._patcher.apply_change_with_diff(
                             base, new_block
                         ):
                             state.recent_changes = [
@@ -43741,6 +45028,24 @@ class ActiveCodeUpdater:
                             ]
                             state.committed_changes.append(new_block)
                             break
+                if not _tried:
+                    _bases = sorted(
+                        {
+                            (_b.file_path or "(no path)")
+                            for _b in state.active_blocks.values()
+                            if _b.content_type == ContentType.BASE_CODE
+                        }
+                    )
+                    self._f._log_debug(
+                        f"[PATCH-APPLY] no base — the proposed change is for "
+                        f"{new_block.file_path or '(no path)'!r}, and the "
+                        f"base block(s) held are {_bases or '(none)'}"
+                    )
+            elif is_conflicting:
+                self._f._log_debug(
+                    "[PATCH-APPLY] not attempted — the proposed change was "
+                    "flagged as conflicting"
+                )
         elif new_block.content_type == ContentType.COMMITTED_CHANGE:
             state.committed_changes.append(new_block)
         elif (
@@ -51507,6 +52812,58 @@ class InletOrchestrator:
             pass
         user_query = last_user_msg.get("content", "") if last_user_msg else ""
 
+        # ── Expand a patch reference before anything downstream sees it ──
+        # "P2" is an identifier this plugin invented; only this plugin knows
+        # what it points at. The workspace note explains them, but the
+        # workspace reaches the answer call alone: the pre-planner's system
+        # is the aligned prefix and its user turn is a template around
+        # {question}, so without this it reads P2 as a symbol name — and did,
+        # spending a whole investigate step hunting one in the index.
+        #
+        # Annotating the question instead of every stage's prompt is one
+        # point of change that reaches all of them, since they all derive
+        # from it. Guarded on the patch existing AND the number being in
+        # range, so a P2 that happens to be a variable in the reader's own
+        # code is left alone.
+        try:
+            _held = self._f._commands._patches_for_chat(self.get_project_id())
+            if _held and isinstance(user_query, str) and user_query:
+                _seen: List[str] = []
+                # Uppercase only. The list prints "P2", so that is the form
+                # a reader copies; a lowercase "p2" in prose is far more
+                # likely to be a variable — "el parámetro p2" expanded into
+                # a patch reference before this narrowed. The commands stay
+                # case-insensitive, because there the intent is explicit.
+                for _m in re.finditer(r"\bP(\d+)\b", user_query):
+                    _n = int(_m.group(1))
+                    if not (1 <= _n <= len(_held)) or _m.group(0) in _seen:
+                        continue
+                    _seen.append(_m.group(0))
+                    _pb = _held[_n - 1]
+                    _nm = ", ".join(
+                        sorted(
+                            {
+                                getattr(_ps, "name", "")
+                                for _ps in (_pb.symbols or [])
+                                if getattr(_ps, "name", "")
+                            }
+                        )
+                    )
+                    user_query = user_query.replace(
+                        _m.group(0),
+                        f"{_m.group(0)} (a held rewrite of "
+                        f"{_nm or 'an unnamed symbol'}, not yet in the source)",
+                        1,
+                    )
+                if _seen:
+                    last_user_msg["content"] = user_query
+                    self._f._log_debug(
+                        f"[PATCHES] expanded {', '.join(_seen)} in the question "
+                        f"so the pipeline reads them as patches, not symbols"
+                    )
+        except Exception as _e_px:
+            self._f._log_debug(f"[PATCHES] reference expansion skipped ({_e_px!r})")
+
         has_code_blocks = False
         user_question = user_query
         if last_user_msg and user_query:
@@ -54385,6 +55742,37 @@ class Valves(BaseModel):
         ),
     )
 
+    defer_patch_application: bool = Field(
+        default=True,
+        description=(
+            "Hold a rewrite as a patch instead of splicing it into the "
+            "pasted source the moment it arrives. Deferred, the base stays "
+            "as pasted and '/file' composes the result on demand, so any "
+            "subset can be asked for: '/file P1 P3' takes two of them, "
+            "'/file -P2' takes all but one. Applied eagerly there is no "
+            "original left to rebuild a subset from. It is verified either "
+            "way — a rewrite that would not splice is refused when it "
+            "arrives, not silently at delivery. Turn this off to go back to "
+            "the eager behaviour, where the base carries the changes and "
+            "the index reflects them."
+        ),
+    )
+
+    enable_file_command: bool = Field(
+        default=True,
+        description=(
+            "Enable '/file [name.py]', which hands back the pasted source "
+            "with every rewrite the model proposed and the patcher applied, "
+            "as a browser download. The source is verified before it is "
+            "offered: a file that does not compile is refused rather than "
+            "delivered, since the whole point is that it can be opened and "
+            "run. A slash command rather than a phrase, because 'give me "
+            "the file with the changes' sits next to the diff_compute "
+            "intent, which answers from a previous answer's fenced block "
+            "without reaching the model at all."
+        ),
+    )
+
     hypothesis_require_known_symbols: bool = Field(
         default=True,
         description=(
@@ -56233,6 +57621,7 @@ class Filter:
         self._multi_phase = MultiPhasePlanner(self)
         self._commands = CommandRouter(self)
         self._code_blocks = CodeBlockManager(self)
+        self._patcher = PatchApplier(self)
         self._activation = ActivationEngine(self)
         self._meta_reasoning = MetacognitiveReasoningEngine(self)
         self._epistemic = EpistemicStrategies(self)
