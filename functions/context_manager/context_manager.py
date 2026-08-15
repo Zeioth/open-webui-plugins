@@ -2727,6 +2727,28 @@ class Patch(BaseModel):
     # deletion, so the undo is real.
     disabled: bool = False
 
+    # What the rewrite drops that the body it replaces defined, and how big
+    # each side is. Recorded when the patch is HELD, where the splice
+    # already runs, rather than when the file is composed: a rewrite that
+    # quietly removed five class attributes was only reported at delivery,
+    # long after the reader could still remember asking for it.
+    drops: List[str] = Field(default_factory=list)
+    base_lines: int = 0
+    new_lines: int = 0
+
+    def size_note(self) -> str:
+        """How the rewrite compares in size to what it replaces.
+
+        The cheap signal: a 116-line class coming back as 9 lines is the
+        shape of a rewrite that dropped things, visible in a listing
+        without reading a diff. Falls back to the body's own length for
+        patches held before this was recorded.
+        """
+        if not self.base_lines:
+            return f"{self.new_lines or len((self.content or '').splitlines())} lines"
+        return f"replaces {self.base_lines} lines with {self.new_lines}"
+
+
     def label(self) -> str:
         """The symbols this patch replaces, for a one-line listing.
 
@@ -30368,9 +30390,12 @@ class AgenticOrchestrator:
                         _rows.append(
                             f"P{_pi} — {_pn or 'unknown symbol'}"
                             + (f", from turn {_pt}" if _pt else "")
+                            + (" (set aside)" if _pb.disabled else "")
                             + (
-                                " (set aside)"
-                                if _pb.disabled
+                                f" — WARNING: drops {len(_pb.drops)} name(s) "
+                                f"the source defines "
+                                f"({', '.join(_pb.drops[:4])})"
+                                if _pb.drops
                                 else ""
                             )
                         )
@@ -32921,13 +32946,15 @@ class CommandRouter:
                 "list the code blocks that have gone quiet",
             ),
             (
-                "/patches [P2 …] [!P2 …] [+P2 …] [clear]",
+                "/patches [P2 …|all] [!P2 …] [+P2 …] [clear]",
                 getattr(_v, "enable_file_command", True),
                 "the rewrites this conversation is holding. Bare, it lists "
                 "them with what each one does. A number shows the actual "
-                "diff against the pasted source, `!` sets one aside so it "
-                "stops being included, `+` brings it back, and `clear` "
-                "forgets them all. Nothing here touches the pasted source",
+                "diff against the pasted source and `all` shows every one "
+                "of them, which is the review pass before taking the file. "
+                "`!` sets one aside so it stops being included, `+` brings "
+                "it back, and `clear` forgets them all. Nothing here "
+                "touches the pasted source",
             ),
             (
                 "/file [name.py] [P1 P3 | -P2 …]",
@@ -33420,7 +33447,7 @@ class CommandRouter:
             f"or the budget is spent). The map is pinned at its current state."
         )
 
-    def _patches_for_chat(self, project_id: str) -> List["CodeBlock"]:
+    def _patches_for_chat(self, project_id: str) -> List["Patch"]:
         """The patches this conversation produced, oldest first.
 
         Scoped to the chat because committed_changes is project state and
@@ -33559,7 +33586,11 @@ class CommandRouter:
         return None, _name, "", False
 
     def _render_patch_diffs(
-        self, project_id: str, patches: List["CodeBlock"], which: List[int]
+        self,
+        project_id: str,
+        patches: List["Patch"],
+        which: List[int],
+        cap: bool = True,
     ) -> str:
         """Show what the named patches actually change, as diffs.
 
@@ -33569,11 +33600,11 @@ class CommandRouter:
         the same shape as the rest of this command.
         """
         _MAX = 4
-        if len(which) > _MAX:
+        if cap and len(which) > _MAX:
             return (
                 f"{len(which)} patches asked for; that is a lot of diff at "
-                f"once. Ask for up to {_MAX} by number, or use `/patches` "
-                f"for the summary."
+                f"once. Ask for up to {_MAX} by number, `/patches all` for "
+                f"every one of them, or `/patches` for the summary."
             )
         try:
             _base = self._patch_base(project_id)
@@ -33690,7 +33721,7 @@ class CommandRouter:
         return _first[len(verb) :].strip().split()
 
     def _apply_patch_flags(
-        self, patches: List["CodeBlock"], tokens: List[str]
+        self, patches: List["Patch"], tokens: List[str]
     ) -> Tuple[List[str], str]:
         """Set aside or bring back patches, by "!P2" and "+P2".
 
@@ -33812,17 +33843,29 @@ class CommandRouter:
                 _t
                 for _t in _tokens
                 if not re.fullmatch(r"[-!+]?[Pp]\d+", _t)
-                and _t.lower() not in ("clear", "reset")
+                and _t.lower() not in ("clear", "reset", "all", "diff")
             ]
             if _junk:
                 return (
                     f"Not a patch instruction: {', '.join(_junk)}.\n\n"
                     f"`/patches` lists them, `/patches P2` shows what one "
-                    f"changes, `/patches !P2` sets one aside, `/patches +P2` "
+                    f"changes and `/patches all` shows every one, "
+                    f"`/patches !P2` sets one aside, `/patches +P2` "
                     f"brings it back, `/patches clear` forgets them all. "
                     f"Applying is `/file`, not `/patches`: `/file` takes "
                     f"every active one, `/file P1 P3` takes only those, "
                     f"`/file -P2` leaves one out."
+                )
+            # "all" is the review pass before /file: every diff, in order,
+            # with no numbers to type. It lifts the cap that a bare list of
+            # numbers respects, because the cap guards against a wall
+            # nobody asked for and this is a wall somebody asked for.
+            if any(_t.lower() in ("all", "diff") for _t in _tokens):
+                return self._render_patch_diffs(
+                    project_id,
+                    _patches,
+                    list(range(1, len(_patches) + 1)),
+                    cap=False,
                 )
             if _show:
                 return self._render_patch_diffs(
@@ -33887,11 +33930,19 @@ class CommandRouter:
             _off = bool(_b.disabled)
             _lines.append(
                 f"**P{_i}**{' — SET ASIDE' if _off else ''} · {_where} · "
-                f"`{_b.label()}` · "
-                f"{len((_b.content or '').splitlines())} lines"
+                f"`{_b.label()}` · {_b.size_note()}"
             )
             if _doc:
                 _lines.append(f"    {_doc}")
+            # The warning goes where the patch is read, not only where it
+            # is applied. A rewrite that drops names still compiles, so
+            # nothing else about it looks wrong.
+            if _b.drops:
+                _lines.append(
+                    f"    ⚠ drops {len(_b.drops)} name(s) the source "
+                    f"defines: {', '.join(_b.drops[:5])}"
+                    + (f" and {len(_b.drops) - 5} more" if len(_b.drops) > 5 else "")
+                )
         # ── Step 2: say what can be done with them ──
         _n_off = sum(1 for _b in _patches if _b.disabled)
         _lines += [
@@ -33903,9 +33954,11 @@ class CommandRouter:
                 if _n_off
                 else " `/patches !P<n>` sets one aside for good."
             ),
-            "`/patches P2` shows what one actually changes. `/file P1 P3` "
-            "takes only those, `/file -P2` leaves one out for a single "
-            "delivery. `/patches clear` forgets them all.",
+            "`/patches P2` shows what one actually changes and "
+            "`/patches all` shows every one — the review pass before "
+            "taking the file. `/file P1 P3` takes only those, `/file -P2` "
+            "leaves one out for a single delivery. `/patches clear` "
+            "forgets them all.",
         ]
         _n_else = self._patches_elsewhere(project_id)
         if _n_else:
@@ -34905,7 +34958,7 @@ class PatchApplier:
 
     def _splice_symbols(
         self, base_content: str, proposed_content: str
-    ) -> Optional[Tuple[str, List[str]]]:
+    ) -> Optional[Tuple[str, List[str], List[Tuple[str, List[str]]]]]:
         """Replace whole definitions in the base with the ones just written.
 
         Symbol-addressed rather than line-addressed, which removes the three
@@ -34931,9 +34984,14 @@ class PatchApplier:
         functions with docstrings is already how this project asks for
         code. What the model is good at is what is asked of it.
 
-        Returns (patched_source, replaced_names) or None. All or nothing,
-        like the diff path: a proposal naming five functions of which four
-        resolve leaves the file in a state nobody chose.
+        Returns (patched_source, replaced_names, losses) or None. All or
+        nothing, like the diff path: a proposal naming five functions of
+        which four resolve leaves the file in a state nobody chose.
+
+        `losses` is what the rewrite dropped, computed here as well as in
+        splice_many so the check does not depend on which route ran. It
+        lived in one of them for a while, which is the same asymmetry this
+        feature has already paid for three times over.
         """
         try:
             import ast as _ast
@@ -34968,6 +35026,7 @@ class PatchApplier:
             # it, so a method written without its class still lands. Two
             # matches is ambiguous and refuses rather than guessing.
             _plan: List[Tuple[int, int, str, str]] = []
+            _losses1: List[Tuple[str, List[str]]] = []
             _unresolved: List[str] = []
             _new_lines = proposed_content.split("\n")
             for _name, (_ns, _ne) in _new_spans.items():
@@ -34994,6 +35053,16 @@ class PatchApplier:
                 _tgt = (
                     _base_lines[_bs - 1] if _bs - 1 < len(_base_lines) else ""
                 )
+                _lost1 = self.structural_loss(
+                    "\n".join(_base_lines[_bs - 1 : _be]),
+                    "\n".join(_new_lines[_ns - 1 : _ne]),
+                )
+                if _lost1:
+                    self._f._log_debug(
+                        f"[PATCH-APPLY] {_key} loses {len(_lost1)} name(s) "
+                        f"the pasted source defines: {_lost1[:8]}"
+                    )
+                    _losses1.append((_key, _lost1))
                 _plan.append(
                     (
                         _bs,
@@ -35030,7 +35099,7 @@ class PatchApplier:
                     f"untouched"
                 )
                 return None
-            return _patched, [_p[2] for _p in _plan]
+            return _patched, [_p[2] for _p in _plan], _losses1
         except Exception as _e_sp:
             self._f._log_debug(f"[PATCH-APPLY] splice skipped ({_e_sp!r})")
             return None
@@ -45380,6 +45449,21 @@ class ActiveCodeUpdater:
                             _base.content, new_block.content
                         )
                         _applied = bool(_probe)
+                        # How many lines the rewrite replaces, from the
+                        # base's own span for the symbols it resolved.
+                        _probe_base_lines = 0
+                        if _applied:
+                            try:
+                                _bsp = self._f._patcher.symbol_spans(
+                                    _base.content or ""
+                                )
+                                _probe_base_lines = sum(
+                                    _bsp[_k3][1] - _bsp[_k3][0] + 1
+                                    for _k3 in _probe[1]
+                                    if _k3 in _bsp
+                                )
+                            except Exception:
+                                _probe_base_lines = 0
                         if _applied:
                             state.patches.append(
                                 Patch(
@@ -45404,6 +45488,15 @@ class ActiveCodeUpdater:
                                     base_md5=hashlib.md5(
                                         (_base.content or "").encode()
                                     ).hexdigest()[:16],
+                                    drops=[
+                                        _n3
+                                        for _, _v3 in (_probe[2] or [])
+                                        for _n3 in _v3
+                                    ],
+                                    base_lines=_probe_base_lines,
+                                    new_lines=len(
+                                        (new_block.content or "").splitlines()
+                                    ),
                                 )
                             )
                             self._f._log_debug(
