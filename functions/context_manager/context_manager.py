@@ -43891,11 +43891,26 @@ class ActiveCodeUpdater:
                     f"DIAG proc: block #{_bi} process START "
                     f"(dup={is_dup}, {len(syms)} syms, {len(new_block.content)} chars)"
                 )
-                if is_dup and existing:
+                # A held patch is never a duplicate. Two rewrites of the
+                # same symbol are two patches — the second supersedes the
+                # first and dropping it brings the first back — but they
+                # look alike enough that the duplicate detector groups
+                # them, and the duplicate path has no patch branch. A
+                # second rewrite of _close_dangling_fence went in as
+                # dup=True and vanished: neither held nor refused, and
+                # "/file" then composed 1 of 2 where 3 were expected.
+                if is_dup and existing and not getattr(
+                    new_block, "is_proposed_patch", False
+                ):
                     await self._process_duplicate_block(
                         existing, new_block, syms, state, project_id, existing_hash
                     )
                 else:
+                    if is_dup and existing:
+                        self._f._log_debug(
+                            "[PATCH-APPLY] the rewrite looks like a duplicate "
+                            "of an earlier block; treated as its own patch"
+                        )
                     await self._process_new_block(new_block, syms, state, project_id)
                 self._f._log_debug(f"DIAG proc: block #{_bi} process DONE")
 
@@ -52826,7 +52841,21 @@ class InletOrchestrator:
         # range, so a P2 that happens to be a variable in the reader's own
         # code is left alone.
         try:
-            _held = self._f._commands._patches_for_chat(self.get_project_id())
+            # Never on a command. The expansion runs before Step 3 dispatches
+            # them, so annotating here rewrites the arguments: "/patches P1"
+            # arrived at the parser as "/patches P1 (a held rewrite of
+            # _close_dangling_fence, not yet in the source)" and tokenised
+            # into eleven words. It survived only because P1 came first. In
+            # a command P1 already means what it has to mean; the expansion
+            # is for prose, where it does not.
+            _is_cmd = isinstance(user_query, str) and user_query.lstrip().startswith(
+                self._f._commands.command_prefix()
+            )
+            _held = (
+                []
+                if _is_cmd
+                else self._f._commands._patches_for_chat(self.get_project_id())
+            )
             if _held and isinstance(user_query, str) and user_query:
                 _seen: List[str] = []
                 # Uppercase only. The list prints "P2", so that is the form
