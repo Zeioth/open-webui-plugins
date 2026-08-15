@@ -2728,8 +2728,20 @@ class Patch(BaseModel):
     disabled: bool = False
 
     def label(self) -> str:
-        """The symbols this patch replaces, for a one-line listing."""
-        return ", ".join(sorted(set(self.symbols))) or "unknown symbol"
+        """The symbols this patch replaces, for a one-line listing.
+
+        A name a longer one already qualifies is dropped: rewriting a
+        method resolves both the class and the method, and listing
+        "CodePathView, is_stale" reads as two changes where there is one.
+        """
+        _names = sorted(set(_n for _n in self.symbols if _n))
+        _kept = [
+            _n
+            for _n in _names
+            if not any(_o != _n and _o.endswith("." + _n) for _o in _names)
+            and not any(_o != _n and _o.startswith(_n + ".") for _o in _names)
+        ]
+        return ", ".join(_kept or _names) or "unknown symbol"
 
 
 class ConversationState(BaseModel):
@@ -33790,8 +33802,32 @@ class CommandRouter:
                             f"{'is 1 patch' if len(_patches) == 1 else f'are {len(_patches)} patches'}"
                             f", P1 to P{len(_patches)}."
                         )
+            # Checked BEFORE acting on the numbers, because the invented
+            # command that prompted this was "/patches apply P1 P3": doing
+            # the recognisable part of an instruction nobody wrote is worse
+            # than refusing it, since the reader is left believing the verb
+            # meant something. An answer once recommended exactly that,
+            # composed from the forms the workspace note lists.
+            _junk = [
+                _t
+                for _t in _tokens
+                if not re.fullmatch(r"[-!+]?[Pp]\d+", _t)
+                and _t.lower() not in ("clear", "reset")
+            ]
+            if _junk:
+                return (
+                    f"Not a patch instruction: {', '.join(_junk)}.\n\n"
+                    f"`/patches` lists them, `/patches P2` shows what one "
+                    f"changes, `/patches !P2` sets one aside, `/patches +P2` "
+                    f"brings it back, `/patches clear` forgets them all. "
+                    f"Applying is `/file`, not `/patches`: `/file` takes "
+                    f"every active one, `/file P1 P3` takes only those, "
+                    f"`/file -P2` leaves one out."
+                )
             if _show:
-                return self._render_patch_diffs(project_id, _patches, sorted(set(_show)))
+                return self._render_patch_diffs(
+                    project_id, _patches, sorted(set(_show))
+                )
         if not _patches:
             _n_else = self._patches_elsewhere(project_id)
             return (
