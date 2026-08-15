@@ -32626,6 +32626,24 @@ class CommandRouter:
         # ── Step 1: the valve, or the shipped default ──
         return str(getattr(self._f.valves, "command_prefix", "//") or "//")
 
+    def looks_like_command(self, content: str) -> bool:
+        """True when the text reads as a command, in EITHER accepted form.
+
+        Both work at dispatch: normalise_command rewrites the configured
+        prefix onto "/", and the comparisons are written against "/", so a
+        bare "/patches" reaches them untouched and matches. Anything asking
+        "is this a command?" has to accept the same two forms, or it
+        disagrees with the router about what a command is.
+
+        It did. The patch-reference expansion tested only the configured
+        prefix, so "//patches P1" was left alone and "/patches P1" — the
+        form actually typed — was annotated into "/patches P1 (a held
+        rewrite of ...)" and tokenised into eleven words.
+        """
+        _text = str(content or "").lstrip()
+        _pfx = self.command_prefix()
+        return _text.startswith(_pfx) or _text.startswith("/")
+
     def normalise_command(self, content: str) -> str:
         """Rewrite a typed command onto the slash the dispatch expects.
 
@@ -33441,8 +33459,28 @@ class CommandRouter:
         except Exception:
             return []
         _chat = getattr(self._f, "_chat_id_this_turn", "") or ""
-        _mine = [_p for _p in _all if _p.chat_id == _chat]
-        return _mine or _all
+        # This chat's, always — never a fallback to everything the project
+        # holds. The fallback made P<n> mean different patches at different
+        # moments: a fresh chat showed three from an earlier session as P1
+        # to P3, and the first rewrite made in this one silently became P1,
+        # so "/file P1" applied something other than what had been read.
+        # Numbering has to be stable for a number to be an instruction.
+        #
+        # Nothing is hidden by this: patches held elsewhere are counted in
+        # the listing's footer, unnumbered, because a number is a handle
+        # and they cannot be handled from here.
+        return [_p for _p in _all if _p.chat_id == _chat]
+
+    def _patches_elsewhere(self, project_id: str) -> int:
+        """How many held patches belong to other conversations."""
+        try:
+            _state = self._f._conversation_state_manager.get(project_id)
+            _chat = getattr(self._f, "_chat_id_this_turn", "") or ""
+            return sum(
+                1 for _p in (getattr(_state, "patches", None) or []) if _p.chat_id != _chat
+            )
+        except Exception:
+            return 0
 
     @staticmethod
     def _parse_patch_selectors(
@@ -33719,11 +33757,14 @@ class CommandRouter:
             try:
                 _state = self._f._conversation_state_manager.get(project_id)
                 _before = len(_state.patches or [])
-                _drop = {id(_p) for _p in _patches}
-                _state.patches = [
-                    _p for _p in (_state.patches or []) if id(_p) not in _drop
-                ]
-                _n = _before - len(_state.patches)
+                # Everything held for the project, not just this chat's.
+                # The listing is scoped so a number always means the same
+                # patch; clearing is the one place the reader means "get
+                # rid of the lot", and a clear that left another chat's
+                # patches behind would answer "0 dropped" to somebody
+                # looking at three of them.
+                _state.patches = []
+                _n = _before
                 self._f._log_debug(f"[PATCHES] cleared {_n} patch(es)")
                 return (
                     f"{_n} patch(es) dropped. The pasted source was never "
@@ -33752,10 +33793,19 @@ class CommandRouter:
             if _show:
                 return self._render_patch_diffs(project_id, _patches, sorted(set(_show)))
         if not _patches:
+            _n_else = self._patches_elsewhere(project_id)
             return (
-                "No rewrites have been applied in this session. Ask for a "
-                "change to a function and the answer's code is spliced into "
-                "the pasted source; `/file` then hands back the result."
+                "No rewrites are held for this conversation. Ask for a "
+                "change to a function and the answer's code is kept as a "
+                "patch; `/file` then hands back the pasted source with it "
+                "applied."
+                + (
+                    f"\n\n{_n_else} patch(es) belong to other conversations "
+                    f"in this project. Open that chat to use them, or "
+                    f"`/patches clear` to drop every one held."
+                    if _n_else
+                    else ""
+                )
             )
 
         # ── Step 1: one line per patch, symbol and its own docstring ──
@@ -33802,6 +33852,13 @@ class CommandRouter:
             "takes only those, `/file -P2` leaves one out for a single "
             "delivery. `/patches clear` forgets them all.",
         ]
+        _n_else = self._patches_elsewhere(project_id)
+        if _n_else:
+            _lines.append(
+                f"{_n_else} more are held for other conversations in this "
+                f"project; they are not numbered here because P1 to "
+                f"P{len(_patches)} address these."
+            )
         if _flags:
             _lines = [f"{', '.join(_flags)}.", ""] + _lines
         return "\n".join(_lines)
@@ -45165,11 +45222,29 @@ class ActiveCodeUpdater:
             _tried: List[str] = []
             _seen_hashes: set = set()
             _dry = self._f.valves.defer_patch_application
+            # The pasted source first, and usually only. find_blocks names
+            # every block holding a symbol of that name, and a chat
+            # accumulates small ones — a fenced example, a test file, an
+            # earlier answer's snippet. One turn tried thirteen of them in a
+            # row, each rejected for a different reason, none of them the
+            # file the reader pasted. Trying the base first means the normal
+            # case costs one attempt; the rest stay as a fallback for a
+            # symbol the base genuinely does not hold.
+            try:
+                _pref = self._f._commands._patch_base(project_id)
+            except Exception:
+                _pref = None
             for _sym in new_block.symbols or []:
                 _nm = getattr(_sym, "name", "")
                 if not _nm:
                     continue
-                for _h in self._f._symbol_index.find_blocks(_nm, project_id) or []:
+                _cands = list(
+                    self._f._symbol_index.find_blocks(_nm, project_id) or []
+                )
+                if _pref is not None and getattr(_pref, "hash", "") in _cands:
+                    _cands.remove(_pref.hash)
+                    _cands.insert(0, _pref.hash)
+                for _h in _cands[:3]:
                     if _h in _seen_hashes:
                         continue
                     _seen_hashes.add(_h)
@@ -45194,11 +45269,13 @@ class ActiveCodeUpdater:
                             state.patches.append(
                                 Patch(
                                     content=new_block.content or "",
-                                    symbols=[
-                                        getattr(_s2, "name", "")
-                                        for _s2 in (new_block.symbols or [])
-                                        if getattr(_s2, "name", "")
-                                    ],
+                                    # The names the splice RESOLVED, not the
+                                    # ones extracted from the proposal: a
+                                    # method written without its class
+                                    # extracts as "is_stale" and resolves to
+                                    # "CodePathView.is_stale", and the second
+                                    # is what the file actually holds.
+                                    symbols=list(_probe[1]),
                                     chat_id=getattr(
                                         self._f, "_chat_id_this_turn", ""
                                     )
@@ -53080,9 +53157,9 @@ class InletOrchestrator:
             # into eleven words. It survived only because P1 came first. In
             # a command P1 already means what it has to mean; the expansion
             # is for prose, where it does not.
-            _is_cmd = isinstance(user_query, str) and user_query.lstrip().startswith(
-                self._f._commands.command_prefix()
-            )
+            _is_cmd = isinstance(
+                user_query, str
+            ) and self._f._commands.looks_like_command(user_query)
             _held = (
                 []
                 if _is_cmd
@@ -53101,19 +53178,16 @@ class InletOrchestrator:
                         continue
                     _seen.append(_m.group(0))
                     _pb = _held[_n - 1]
-                    _nm = ", ".join(
-                        sorted(
-                            {
-                                getattr(_ps, "name", "")
-                                for _ps in (_pb.symbols or [])
-                                if getattr(_ps, "name", "")
-                            }
-                        )
-                    )
+                    # label(), not a comprehension over symbol objects:
+                    # Patch.symbols holds names, and getattr(str, "name")
+                    # returns "" for every one of them — which is how a
+                    # reference expanded to "a held rewrite of an unnamed
+                    # symbol" for a patch whose symbols were known.
+                    _nm = _pb.label()
                     user_query = user_query.replace(
                         _m.group(0),
-                        f"{_m.group(0)} (a held rewrite of "
-                        f"{_nm or 'an unnamed symbol'}, not yet in the source)",
+                        f"{_m.group(0)} (a held rewrite of {_nm}, "
+                        f"not yet in the source)",
                         1,
                     )
                 if _seen:
