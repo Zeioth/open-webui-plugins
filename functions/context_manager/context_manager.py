@@ -33845,30 +33845,49 @@ class CommandRouter:
             )
 
         # ── Step 1: one line per patch, symbol and its own docstring ──
-        _lines = [f"{len(_patches)} rewrite(s) applied to the pasted source:", ""]
+        # "held", not "applied": deferred patching means the pasted source
+        # is untouched until /file asks. The old wording said the opposite
+        # of what the note two lines down says.
+        _lines = [
+            f"{len(_patches)} rewrite(s) held for this conversation:",
+            "",
+        ]
         for _i, _b in enumerate(_patches, 1):
-            _names: List[str] = []
+            # label(), not a second extraction from the content: the names
+            # the splice resolved are what the file actually holds, and
+            # re-deriving them here produced "CodePathView, is_stale" for
+            # one method.
             _doc = ""
             try:
                 _tree = ast.parse(_b.content or "")
+                # The DEEPEST definition's docstring, not the first one
+                # ast.walk reaches. A rewritten method arrives wrapped in
+                # its class, and the class's docstring describes the class
+                # — "A cached snapshot of an activated subgraph" appeared
+                # under a patch that changed a staleness check.
+                _best = None
                 for _n in ast.walk(_tree):
                     if isinstance(
-                        _n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-                    ):
-                        _names.append(_n.name)
-                        if not _doc:
-                            _d = ast.get_docstring(_n) or ""
-                            _doc = _d.strip().split("\n")[0].strip()
+                        _n, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ) and ast.get_docstring(_n):
+                        _best = _n
+                if _best is None:
+                    for _n in ast.walk(_tree):
+                        if isinstance(_n, ast.ClassDef) and ast.get_docstring(_n):
+                            _best = _n
+                            break
+                if _best is not None:
+                    _doc = (
+                        (ast.get_docstring(_best) or "").strip().split("\n")[0].strip()
+                    )
             except Exception:
-                _names = [
-                    getattr(_s, "name", "") for _s in (_b.symbols or []) if _s
-                ]
+                _doc = ""
             _turn = _b.turn
             _where = f"turn {_turn}" if _turn else "this session"
             _off = bool(_b.disabled)
             _lines.append(
                 f"**P{_i}**{' — SET ASIDE' if _off else ''} · {_where} · "
-                f"`{', '.join(_names) or '?'}` · "
+                f"`{_b.label()}` · "
                 f"{len((_b.content or '').splitlines())} lines"
             )
             if _doc:
@@ -33985,7 +34004,7 @@ class CommandRouter:
         # PREVIOUS result, so nothing can be memoised. Ten patches took
         # twenty-seven seconds that way.
         if _chosen:
-            _src, _names_per = self._f._patcher.splice_many(
+            _src, _names_per, _losses = self._f._patcher.splice_many(
                 _src, [_p.content or "" for _, _p in _chosen]
             )
             for (_i, _), _names in zip(_chosen, _names_per):
@@ -34017,6 +34036,16 @@ class CommandRouter:
                     " One or more of those had been set aside and were "
                     "included because you named them."
                 )
+        # Losses last, because they are the line worth reading. A rewrite
+        # that drops names the pasted source defined still compiles, so
+        # nothing else in this report would mention it.
+        if _losses:
+            _report += "\n\n**Check these:** " + "; ".join(
+                f"`{_k}` no longer defines {', '.join(_v[:6])}"
+                + (f" and {len(_v) - 6} more" if len(_v) > 6 else "")
+                for _k, _v in _losses
+            ) + ". The rewrite replaced the whole definition; anything it "
+            "did not repeat is gone."
         return _report
 
     async def _handle_clean_command(self, command_text: str, project_id: str) -> str:
@@ -34668,6 +34697,46 @@ class PatchApplier:
         )
         return "\n".join(result_lines)
 
+    def structural_loss(self, old_body: str, new_body: str) -> List[str]:
+        """Names a rewrite drops that the body it replaces defined.
+
+        A rewrite is meant to change one definition, and what the model
+        sends back is whatever it decided to send. Asked to change a
+        METHOD, it returned the whole enclosing class — correctly
+        rewritten, but rebuilt from what it could see, and five of the
+        class's twelve fields were simply not in it. The splice applied it,
+        the result compiled, five attributes were gone, and nothing said
+        so: compiling is not the same as being complete.
+
+        Only losses are reported. A rewrite that adds is doing its job; one
+        that silently removes an attribute or a method nobody mentioned is
+        the reader's problem to judge, so it has to reach them.
+        """
+        def _defined(_src: str) -> set:
+            _out: set = set()
+            try:
+                for _n in ast.walk(ast.parse(_src)):
+                    if isinstance(
+                        _n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                    ):
+                        _out.add(_n.name)
+                    elif isinstance(_n, ast.AnnAssign) and isinstance(
+                        _n.target, ast.Name
+                    ):
+                        _out.add(_n.target.id)
+                    elif isinstance(_n, ast.Assign):
+                        for _t in _n.targets:
+                            if isinstance(_t, ast.Name):
+                                _out.add(_t.id)
+            except Exception:
+                return set()
+            return _out
+
+        try:
+            return sorted(_defined(old_body) - _defined(new_body))
+        except Exception:
+            return []
+
     @staticmethod
     def reindent_body(body: str, col: int) -> str:
         """Shift a definition to the indentation its target sits at.
@@ -34755,7 +34824,7 @@ class PatchApplier:
 
     def splice_many(
         self, base_content: str, proposals: List[str]
-    ) -> Tuple[str, List[List[str]]]:
+    ) -> Tuple[str, List[List[str]], List[Tuple[str, List[str]]]]:
         """Apply several rewrites onto one base in a single pass.
 
         Composing by calling the single-patch splice N times re-parses the
@@ -34780,10 +34849,11 @@ class PatchApplier:
             _base_spans = self.symbol_spans(base_content)
         except Exception as _e_b:
             self._f._log_debug(f"[PATCH-APPLY] compose skipped ({_e_b!r})")
-            return base_content, [[] for _ in proposals]
+            return base_content, [[] for _ in proposals], []
         # ── Step 1: resolve every proposal against the ONE base map ──
         _lines_base = base_content.split("\n")
         _plan: Dict[Tuple[int, int], str] = {}
+        _losses: List[Tuple[str, List[str]]] = []
         _names_per: List[List[str]] = []
         for _pc in proposals:
             _mine: List[str] = []
@@ -34810,19 +34880,28 @@ class PatchApplier:
                 # Later proposals overwrite earlier ones on the same span.
                 _bs0, _be0 = _base_spans[_key]
                 _tgt = _lines_base[_bs0 - 1] if _bs0 - 1 < len(_lines_base) else ""
+                _new_body = "\n".join(_lines_new[_ns - 1 : _ne])
+                _lost = self.structural_loss(
+                    "\n".join(_lines_base[_bs0 - 1 : _be0]), _new_body
+                )
+                if _lost:
+                    self._f._log_debug(
+                        f"[PATCH-APPLY] {_key} loses {len(_lost)} name(s) the "
+                        f"pasted source defines: {_lost[:8]}"
+                    )
+                    _losses.append((_key, _lost))
                 _plan[(_bs0, _be0)] = self.reindent_body(
-                    "\n".join(_lines_new[_ns - 1 : _ne]),
-                    len(_tgt) - len(_tgt.lstrip()),
+                    _new_body, len(_tgt) - len(_tgt.lstrip())
                 )
                 _mine.append(_key)
             _names_per.append(_mine)
         if not _plan:
-            return base_content, _names_per
+            return base_content, _names_per, _losses
         # ── Step 2: one splice pass, back to front ──
         _lines = base_content.split("\n")
         for (_bs, _be), _body in sorted(_plan.items(), reverse=True):
             _lines = _lines[: _bs - 1] + _body.split("\n") + _lines[_be:]
-        return "\n".join(_lines), _names_per
+        return "\n".join(_lines), _names_per, _losses
 
     def _splice_symbols(
         self, base_content: str, proposed_content: str
