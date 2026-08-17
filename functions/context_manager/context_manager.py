@@ -19580,9 +19580,31 @@ class AgenticStaticVerifier:
         # wearing the voice of a measurement. Letting the coverage budget
         # ration them would be rationing the cheapest evidence in the pass.
         _counts = self._count_checks(claims)
+        # Logged rather than only folded into `mode`, because `mode` reaches
+        # the reader through step.output -> _digest() -> workspace, and the
+        # digest can drop it entirely. A guard whose firing cannot be
+        # observed cannot be trusted either way: the first run of this check
+        # left no trace in the debug log at all, and neither "it worked" nor
+        # "it never ran" could be told from the outside. The zero case is
+        # logged too — that is the one worth seeing, since a detector that
+        # silently matches nothing looks exactly like a detector that is
+        # working.
         if _counts:
             checks = list(checks) + _counts
             mode += f" + {len(_counts)} count check(s)"
+            self._f._log_debug(
+                f"🤖 Verify: {len(_counts)} count check(s) generated — "
+                + "; ".join(
+                    f"C{c['claim']}:{c['n']} {c['of']}"
+                    f"{' (narrowed)' if c['narrowed'] else ''} of {c['src']}"
+                    for c in _counts[:4]
+                )
+                + (" …" if len(_counts) > 4 else "")
+            )
+        else:
+            self._f._log_debug(
+                f"🤖 Verify: no count claim(s) found in {len(claims)} claim(s)"
+            )
 
         # Region: deterministic execution + verdict stamping
         results = [self._execute(ch, project_id) for ch in checks]
