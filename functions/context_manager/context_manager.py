@@ -12,6 +12,7 @@ requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree
 import os
 import time
 import re
+import unicodedata
 import anyio
 import hashlib
 import difflib
@@ -3046,20 +3047,37 @@ class ConversationStateManager:
             )
             raw_active = {}
 
-        # Per-value validation: the block-rebuild loops below assume every
-        # value is a dict (v.get("content"), CodeBlock(**v)). A single value
-        # that deserialized as a str — from a malformed prior save — otherwise
-        # raises 'str' object has no attribute 'get'/'hash' and takes down the
-        # whole inlet before the pipeline can start. Drop non-dict values here,
-        # once, so both loops see only well-formed entries.
+        # Per-value validation. Two shapes must hold before the rebuild loops
+        # below can run: the value is a dict (v.get("content"), CodeBlock(**v)),
+        # and its "content" is a str (content_field.startswith). A malformed
+        # prior save can break either, and both surface as an AttributeError
+        # raised inside the inlet — "'str' object has no attribute 'get'" for
+        # the first, "'NoneType' object has no attribute 'startswith'" for the
+        # second — which takes the whole turn down before the pipeline starts.
+        # Both are screened here, once, so every loop below sees well-formed
+        # entries, and the reason is recorded per key so the log names which
+        # shape failed rather than only how many entries went missing.
         if raw_active:
-            _bad_keys = [k for k, v in raw_active.items() if not isinstance(v, dict)]
+            _bad_keys: Dict[str, str] = {}
+            for k, v in raw_active.items():
+                if not isinstance(v, dict):
+                    _bad_keys[k] = f"value is {type(v).__name__}, not dict"
+                elif not isinstance(v.get("content", ""), str):
+                    _bad_keys[k] = (
+                        f"content is {type(v.get('content')).__name__}, not str"
+                    )
             if _bad_keys:
+                _sample = "; ".join(
+                    f"{k}: {why}" for k, why in list(_bad_keys.items())[:3]
+                )
                 self._f._log_debug(
-                    f"⚠️  CORRUPT STATE: {len(_bad_keys)} active_block value(s) "
-                    f"are not dicts for '{project_id}' "
-                    f"(e.g. {type(raw_active[_bad_keys[0]]).__name__}); "
-                    f"dropping them to keep the turn alive."
+                    f"⚠️  CORRUPT STATE: dropping {len(_bad_keys)} of "
+                    f"{len(raw_active)} active_block entr(ies) for "
+                    f"'{project_id}' to keep the turn alive — {_sample}"
+                    + (" …" if len(_bad_keys) > 3 else "")
+                    + f". Their code is not served this turn. If this recurs, "
+                    f"`/forget all` rebuilds the project state from scratch; "
+                    f"the state file is {self._f.valves.state_db_path}."
                 )
                 for k in _bad_keys:
                     raw_active.pop(k, None)
@@ -3089,7 +3107,7 @@ class ConversationStateManager:
                     f"batch content fetch failed: {e}"
                 )
 
-        # Aplicar el resultado del batch al raw_active antes de construir bloques
+        # Apply the batch lookup back onto raw_active before building blocks.
         for content_hash, block_key in hash_to_block_key.items():
             raw_active[block_key]["content"] = content_lookup.get(
                 content_hash,
@@ -3109,8 +3127,14 @@ class ConversationStateManager:
                 if blk.last_mentioned_msg_idx is None:
                     blk.last_mentioned_msg_idx = data.get("message_count", 0)
                 active[k] = blk
-            except Exception:
-                self._f._log_debug(f"Skipping corrupted block {k} in state DB")
+            except Exception as _e_blk:
+                # Naming the exception turns a block that silently stops
+                # being served into one line that says which block and why.
+                self._f._log_debug(
+                    f"_load_from_db: skipping corrupt active_block '{k}' in "
+                    f"'{project_id}' ({type(_e_blk).__name__}: {_e_blk}) — "
+                    f"its code is not served this turn"
+                )
 
         # ── Rebuild recent and committed lists ─────────────────────────────
         recent: List[CodeBlock] = []
@@ -3122,8 +3146,14 @@ class ConversationStateManager:
                     else ContentType.GENERAL
                 )
                 recent.append(CodeBlock(**b))
-            except Exception:
-                pass
+            except Exception as _e_rec:
+                # A dropped entry here shortens the recent-changes list with
+                # no trace anywhere, which reads downstream as "nothing
+                # changed recently" rather than as a load failure.
+                self._f._log_debug(
+                    f"_load_from_db: skipping corrupt recent_changes entry in "
+                    f"'{project_id}' ({type(_e_rec).__name__}: {_e_rec})"
+                )
 
         committed: List[CodeBlock] = []
         for b in data.get("committed_changes", []):
@@ -3134,8 +3164,11 @@ class ConversationStateManager:
                     else ContentType.GENERAL
                 )
                 committed.append(CodeBlock(**b))
-            except Exception:
-                pass
+            except Exception as _e_com:
+                self._f._log_debug(
+                    f"_load_from_db: skipping corrupt committed_changes entry "
+                    f"in '{project_id}' ({type(_e_com).__name__}: {_e_com})"
+                )
 
         feedback: List[AppliedChangeFeedback] = []
         for fb in data.get("feedback_history", []):
@@ -3183,8 +3216,14 @@ class ConversationStateManager:
         for _pd in data.get("patches", []) or []:
             try:
                 _patches.append(Patch(**_pd))
-            except Exception:
-                pass
+            except Exception as _e_pat:
+                # Patches are addressable by id from /patches; one dropped
+                # silently makes that command report a set the user cannot
+                # reconcile with what they submitted.
+                self._f._log_debug(
+                    f"_load_from_db: skipping corrupt patch entry in "
+                    f"'{project_id}' ({type(_e_pat).__name__}: {_e_pat})"
+                )
 
         return ConversationState(
             active_blocks=active,
@@ -19426,7 +19465,7 @@ class AgenticStaticVerifier:
     be worse than no verdict.
     """
 
-    _VALID_CHECK_KINDS = ("calls", "called_by", "exists", "has_docstring")
+    _VALID_CHECK_KINDS = ("calls", "called_by", "exists", "has_docstring", "counts")
 
     _CHECKS_CONTRACT = (
         "## Claims to verify\n{claims_block}\n\n"
@@ -19535,6 +19574,15 @@ class AgenticStaticVerifier:
         if checks is None:
             checks = self._fallback_checks(claims)
             mode = "deterministic-fallback"
+        # Appended after the budget trim inside both routes, deliberately.
+        # A count check is a dict lookup and costs nothing to run, and the
+        # claims it targets are the ones most able to reach the reader
+        # wearing the voice of a measurement. Letting the coverage budget
+        # ration them would be rationing the cheapest evidence in the pass.
+        _counts = self._count_checks(claims)
+        if _counts:
+            checks = list(checks) + _counts
+            mode += f" + {len(_counts)} count check(s)"
 
         # Region: deterministic execution + verdict stamping
         results = [self._execute(ch, project_id) for ch in checks]
@@ -19763,6 +19811,112 @@ class AgenticStaticVerifier:
             out.append(check)
         return out
 
+    # A quantity asserted about symbols: a number, the modifiers that may
+    # precede the noun, the noun itself, and the modifiers that may follow
+    # it. Both sides are captured because both languages this system
+    # answers in put them in different places — "17 static methods" puts
+    # the narrowing word first, "17 metodos estaticos" puts it last — and a
+    # pattern that reads only one side sees the Spanish claim as an
+    # unqualified count and confirms it against a total it does not mean.
+    # That is not hypothetical: the two fabricated counts this check exists
+    # to catch were both written in Spanish.
+    _COUNT_CLAIM_RE = re.compile(
+        r"\b(\d{1,4})\s+((?:[^\W\d_]+\s+){0,2}?)"
+        r"(m[e\u00e9]todos?|methods?|miembros?|members?|callers?|llamadores?)"
+        r"\b((?:\s+[^\W\d_]+){0,2})",
+        re.IGNORECASE | re.UNICODE,
+    )
+    # Nouns that mean "who calls this", in either language; everything else
+    # the pattern admits is counted as a member of the subject.
+    _COUNT_CALLER_NOUNS = ("caller", "llamador")
+    # Modifiers that narrow the set below what the index can reconstruct.
+    # The index records kind ("function" | "class" | "method") and parent,
+    # and nothing about decorators, async-ness or visibility — so a claim
+    # carrying one of these is asking a question the member count cannot
+    # answer, and the verdict must say so instead of comparing totals.
+    _COUNT_NARROWING = frozenset(
+        {
+            # English
+            "static", "async", "public", "private", "abstract", "class",
+            "classmethod", "staticmethod", "self-contained", "stateful",
+            "stateless", "helper", "nested", "inherited", "overridden",
+            # Spanish
+            "estatico", "estaticos", "estatica", "estaticas",
+            "asincrono", "asincronos", "asincrona", "asincronas",
+            "publico", "publicos", "publica", "publicas",
+            "privado", "privados", "privada", "privadas",
+            "abstracto", "abstractos", "abstracta", "abstractas",
+            "autocontenido", "autocontenidos", "autocontenida",
+            "autocontenidas", "anidado", "anidados", "heredado",
+            "heredados", "auxiliar", "auxiliares", "propio", "propios",
+        }
+    )
+
+    @staticmethod
+    def _fold_accents(word: str) -> str:
+        """Lowercase a word and strip the accents Spanish modifiers carry.
+
+        The narrowing set is written unaccented so one entry covers both
+        spellings; a model writing "estaticos" and one writing
+        "est\u00e1ticos" are making the same claim.
+        """
+        return (
+            unicodedata.normalize("NFKD", word.lower())
+            .encode("ascii", "ignore")
+            .decode("ascii")
+        )
+
+    @classmethod
+    def _count_checks(cls, claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
+        """Checks for every claim that asserts HOW MANY of something there are.
+
+        These are generated deterministically rather than elicited, and the
+        reason is the failure they exist to catch: a turn reported "17
+        metodos estaticos" and "12 metodos autocontenidos" about a class
+        holding 26 methods and no static ones at all. Counts are the
+        cheapest kind of claim to fabricate — they read as precise, they
+        need no citation to sound settled, and nothing downstream told them
+        apart from a claim that had been checked. Asking the same model
+        that wrote the count to also propose the check that would catch it
+        is asking the wrong party.
+
+        Only the two shapes the index can answer are emitted: members of a
+        class and callers of a symbol. A claim whose noun the index cannot
+        count produces no check, which leaves it exactly where it was.
+        """
+        out: List[Dict[str, Any]] = []
+        for n, c in enumerate(claims, 1):
+            _subject = (c.subject or "").strip() or next(
+                iter(c.valid_qids or c.qids or []), ""
+            )
+            if not _subject:
+                continue
+            for _m in cls._COUNT_CLAIM_RE.finditer(c.text or ""):
+                _asserted = int(_m.group(1))
+                _noun = cls._fold_accents(_m.group(3))
+                # Both sides of the noun, because the two languages put the
+                # narrowing word on opposite sides of it.
+                _mods = {
+                    cls._fold_accents(w)
+                    for w in (_m.group(2) + " " + _m.group(4)).split()
+                }
+                out.append(
+                    {
+                        "claim": n,
+                        "kind": "counts",
+                        "src": _subject,
+                        "dst": "",
+                        "of": (
+                            "callers"
+                            if _noun.startswith(cls._COUNT_CALLER_NOUNS)
+                            else "members"
+                        ),
+                        "n": _asserted,
+                        "narrowed": bool(_mods & cls._COUNT_NARROWING),
+                    }
+                )
+        return out
+
     @staticmethod
     def _fallback_checks(claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
         """Deterministic pass: pairwise edges for 2+ cited qids, existence
@@ -19806,6 +19960,54 @@ class AgenticStaticVerifier:
                 if self._qid_for(src_n, project_id):
                     return "confirmed", f"'{src_n}' exists in the index"
                 return "refuted", f"'{src_n}' is not in the index"
+
+            if kind == "counts":
+                # Never "refuted". The index is built from ingested blocks
+                # and is complete only when the whole project has been
+                # ingested, so a disagreement is as easily a partial index
+                # as a wrong number — and this class's own doctrine is that
+                # a false refutation costs more than a missing verdict.
+                # "unsupported" is the honest verdict: it keeps the claim
+                # out of the settled buckets, which is what puts it in the
+                # answer's unverified section and out of its confidence.
+                _n = int(check.get("n", -1))
+                _of = str(check.get("of", "members"))
+                if _of == "callers":
+                    _bare = src_n.rsplit(".", 1)[-1]
+                    _actual = len(
+                        self._f._symbol_index.get_callers(_bare, project_id)
+                    )
+                    _what = f"caller(s) of '{_bare}'"
+                else:
+                    _cls = src_n.rsplit(".", 1)[-1]
+                    _members = self._f._symbol_index.get_class_members(
+                        _cls, project_id
+                    )
+                    if not _members:
+                        return (
+                            "unverifiable",
+                            f"'{_cls}' has no indexed members to count",
+                        )
+                    _actual = len(_members)
+                    _what = f"member(s) of '{_cls}'"
+                if check.get("narrowed"):
+                    # The claim counted a SUBSET the index cannot rebuild
+                    # (static, async, public...). Reporting the total is
+                    # still worth doing — it bounds the assertion — but it
+                    # cannot confirm it.
+                    return (
+                        "unsupported",
+                        f"claim counts {_n} within a narrower category; the "
+                        f"index holds {_actual} {_what} in total and records "
+                        f"no decorator or visibility to narrow by",
+                    )
+                if _actual == _n:
+                    return "confirmed", f"the index holds {_actual} {_what}"
+                return (
+                    "unsupported",
+                    f"the index holds {_actual} {_what}, the claim says "
+                    f"{_n} (the index may be partial)",
+                )
 
             if kind == "has_docstring":
                 qid = self._qid_for(src_n, project_id)
@@ -24073,6 +24275,47 @@ def _close_dangling_fence(text: str) -> str:
     return text.rstrip() + "\n```"
 
 
+def _plan_has_code(plan: "AgenticPlan") -> bool:
+    """Whether any step of the plan left a non-empty fenced block behind.
+
+    Read from the steps rather than from a flag, because the fence is what
+    the synthesis will actually see: a step that ran but produced no block
+    leaves the model a Code heading with nothing to fill it, and the
+    observed response to that is a paragraph describing code instead of
+    code.
+    """
+    for _s in getattr(plan, "steps", None) or []:
+        for _blk in re.findall(r"```(?:python)?\s*(.*?)```", (_s.output or ""), re.S):
+            if _blk.strip():
+                return True
+    return False
+
+
+def _code_section_wanted(
+    has_code: bool, use_case: str, asked_for_artifact: bool
+) -> bool:
+    """Whether the answer should offer a Code section at all.
+
+    One rule with one home, because two answer routes ask this question and
+    each used to answer it differently. The long directive gated the
+    heading on this expression; the outline route listed Code
+    unconditionally AND marked it non-skippable, so an architecture turn
+    that the long route would have left without a Code section got a
+    mandatory one and filled it with a sentence saying there was no code.
+    The section orders were identical, so the divergence was invisible
+    from the shape of the answer.
+
+    has_code alone is satisfied on an architecture or planning turn merely
+    by a step having quoted a body while answering something structural,
+    which is why those two also require that the user asked to be GIVEN an
+    artifact. Programming, refactoring and scaffolding keep the plain gate:
+    code IS the answer there.
+    """
+    return has_code and (
+        use_case not in (UseCase.ARCHITECTURE, UseCase.PLANNING) or asked_for_artifact
+    )
+
+
 def _demote_headings(text: str) -> str:
     """
     Strip ATX heading markers from a block quoted into the final prompt.
@@ -25321,6 +25564,20 @@ class AgenticSynthesisComposer:
                     )
                 _idx += 2
                 continue
+            # A line shaped like a heading that resolves to no section in
+            # `sections` is dropped rather than carried. It reaches the
+            # answer as a heading otherwise — the emitter passes unmatched
+            # lines through untouched — and the model writes the section
+            # under it, which is how a section the pipeline deliberately
+            # withheld comes back anyway. Bodies are one line of prose and
+            # do not open with a hash, so the shape is a safe discriminator.
+            if _l.lstrip().startswith("#"):
+                self._f._log_debug(
+                    f"🤖 Outline: dropped a heading-shaped line naming no "
+                    f"offered section ({_l.strip()[:60]!r})"
+                )
+                _idx += 1
+                continue
             _kept.append(_l)
             _idx += 1
         if not [_l for _l in _kept if _heads(_l)]:
@@ -25784,16 +26041,7 @@ class AgenticSynthesisComposer:
         #
         # Measured on the old rule: a block of five test_* functions and a
         # run_all_tests left Code closed.
-        _has_code = False
-        for _s in plan.steps:
-            for _blk in re.findall(
-                r"```(?:python)?\s*(.*?)```", (_s.output or ""), re.S
-            ):
-                if _blk.strip():
-                    _has_code = True
-                    break
-            if _has_code:
-                break
+        _has_code = _plan_has_code(plan)
         # A design_tests step that completed wrote acceptance tests meant to
         # be kept; that is the only thing the Tests section is for. Read
         # from the plan's own steps rather than from the presence of a fence
@@ -26454,10 +26702,7 @@ class AgenticSynthesisComposer:
         # only when the user asked to be GIVEN a concrete artifact — has to
         # agree. Programming, refactoring and scaffolding keep the old gate:
         # code IS the answer there.
-        _code_wanted = has_code and (
-            use_case not in (UseCase.ARCHITECTURE, UseCase.PLANNING)
-            or asked_for_artifact
-        )
+        _code_wanted = _code_section_wanted(has_code, use_case, asked_for_artifact)
         if _code_wanted:
             out += [
                 "",
@@ -29832,7 +30077,56 @@ class AgenticOrchestrator:
                 # conditioned on the turn having tests, then removed
                 # entirely once a browser-run block was shown to verify a
                 # copy rather than the project.
-                _keys = ["conclusion", "proceed", "code"]
+                # Código is gated on the SAME rule the long directive
+                # uses, through the same function, because the two routes
+                # answering this question differently is what put an empty
+                # Código section into an architecture answer: the long
+                # route would have withheld the heading, the outline route
+                # listed it unconditionally and protected it below, and
+                # the model dutifully wrote a sentence saying there was no
+                # code to show. The section order was canonical either
+                # way, so nothing about the answer's shape revealed which
+                # route had produced it.
+                _uc_now = ""
+                _artifact_now = False
+                try:
+                    _tc_now = (
+                        self._f._project_state_manager.get_pstate(project_id).get(
+                            "turn_classification"
+                        )
+                        or {}
+                    )
+                    _uc_now = str(_tc_now.get("use_case", "")).upper()
+                    _artifact_now = bool(_tc_now.get("direct_retrieval") is True)
+                except Exception:
+                    _uc_now = ""
+                    _artifact_now = False
+                _code_now = _code_section_wanted(
+                    _plan_has_code(plan), _uc_now, _artifact_now
+                )
+                # The outline is composed BEFORE the generative re-plan
+                # waves, and a wave step can append a fenced block to the
+                # plan afterwards. Withholding the heading on a snapshot
+                # that a later step invalidates is the one way this gate
+                # can do harm: code with no section to live in lands above
+                # the first rule, outside the answer's structure entirely
+                # — the failure the protection below was added to stop.
+                # So the gate stands down exactly where the snapshot can
+                # go stale, which under the shipped default ('shadow',
+                # waves logged and never executed) is nowhere.
+                if (
+                    not _code_now
+                    and _ge_mode == "on"
+                    and _replans_used < self._f.valves.agentic_max_replans
+                ):
+                    _code_now = True
+                    self._f._log_debug(
+                        "🤖 Outline: Código offered despite the gate — a "
+                        "re-plan wave may still write code after this point"
+                    )
+                _keys = ["conclusion", "proceed"]
+                if _code_now:
+                    _keys.append("code")
                 if _rivals_now:
                     _keys.append("rivals")
                 if _buried_now:
@@ -29858,10 +30152,17 @@ class AgenticOrchestrator:
                 # A turn with little to say in either writes a short one; a
                 # turn with nothing writes the placeholder below. Neither is
                 # worse than the content arriving under the wrong heading.
+                # Código is protected only when it was offered. Protecting
+                # a section absent from the list is not merely dead — it is
+                # the instruction that turned "no code this turn" from a
+                # heading withheld into a heading the model had to fill.
                 _never = [
                     f"## **{_HH['conclusion']}**",
                     f"## **{_HH['proceed']}**",
-                    f"## **{_HH['code']}**",
+                ]
+                if _code_now:
+                    _never.append(f"## **{_HH['code']}**")
+                _never += [
                     f"## **{_HH['evidence']}**",
                     f"## **{_HH['gaps']}**",
                 ]
