@@ -14227,6 +14227,19 @@ class LongTermMemory:
             # Silent on purpose: the valve being off is a decision, not a
             # failure, and a line per turn saying so is noise.
             return None
+        # A cache is an answer to "what did we say last time". A request to
+        # produce proposals is a request for what we did NOT say last time,
+        # so a hit here is not a saving — it is the one response that
+        # cannot be correct. Observed live: this lookup ran against "genera
+        # otra ronda de mejoras (sin repetición)" and reached 0.786, close
+        # enough that a slightly kinder threshold would have replayed the
+        # very answer the user was asking not to receive.
+        if _looks_generative(query):
+            self._f._log_debug(
+                "[RESPONSE-CACHE] skipped — the request asks for something "
+                "new, and a stored answer is by definition something old"
+            )
+            return None
         col = getattr(self._f, "_response_cache_collection", None)
         if col is None:
             self._f._log_debug(
@@ -24756,6 +24769,45 @@ def _code_section_wanted(
     return has_code or asked_for_artifact
 
 
+# A request to PRODUCE something new, in either language. Deterministic and
+# read at inlet time, where the preplanner's question_type does not exist
+# yet — that classification happens inside the agentic pipeline, long after
+# the response cache has been consulted and the memories retrieved.
+#
+# What it guards is narrow and specific: when the ask is for proposals, the
+# model's OWN previous answers are the worst possible context. Measured, a
+# turn asked for a list of improvements and received 5,281 bytes of past
+# assistant text carrying the six proposals it had produced weeks earlier —
+# including two counts that were fabricated and two recommendations that
+# were false — and reproduced them. Nothing downstream could catch it:
+# recalled text is not a claim, so no verifier reads it, and the answer
+# arrived carrying the authority of the pipeline that never checked it.
+_GENERATIVE_REQUEST_RE = re.compile(
+    r"\b(genera|generar|gener[aá]me|prop[oó]n|proponme|propone|sug[ie]re|"
+    r"sugi[eé]reme|suger[ei]ncias?|ide[ai]s?|mejoras?|alternativas?|"
+    r"opciones|propuestas?|"
+    r"suggest|propose|generate|brainstorm|improvements?|ideas?|"
+    r"alternatives?|options|recommendations?)\b"
+    r"|otra ronda|another round|sin repetici[oó]n|no repeat|"
+    r"distint[ao]s?\b.{0,30}\b(a las anteriores|de antes)|"
+    r"different from",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _looks_generative(question: str) -> bool:
+    """Whether the request asks for something new to be produced.
+
+    Deliberately generous on the recall side and cheap on the cost side:
+    the two things it gates — a response-cache lookup and the replay of
+    past assistant text — are both optional context. A false positive
+    costs a cache hit that would have saved time; a false negative hands
+    the model its own old answer and asks it to be original. Those are not
+    symmetric, so the pattern errs toward firing.
+    """
+    return bool(_GENERATIVE_REQUEST_RE.search(question or ""))
+
+
 def _heads_of(line: str, sections: List[str]) -> str:
     """The section named by `line`, or "" — bullets, hashes and bold ignored.
 
@@ -26860,7 +26912,12 @@ class AgenticSynthesisComposer:
                     "",
                     "2. WRITE EACH HEADING EXACTLY AS IT APPEARS, letter "
                     "for letter. They are already in the right language; do "
-                    "not translate them and do not reword them.",
+                    "not translate them and do not reword them. This list "
+                    "is CLOSED: write no heading that is not on it, and "
+                    "write none of them twice. When a section holds several "
+                    "things, they are numbered items INSIDE it — never "
+                    "sub-headings, and never a new section of your own "
+                    "naming.",
                     "",
                     # The order anchor, restored. The no-outline mode has
                     # carried "Start with Conclusion" since three answers in
@@ -47351,6 +47408,47 @@ class SystemPromptBuilder:
                     f"LTM: filtered {dropped} fragment(s) from current session"
                 )
             memories = filtered
+
+        # ------------------------------------------------------------------
+        # Region: On a request to PRODUCE, drop the assistant's own past text
+        # ------------------------------------------------------------------
+        # Recall is what memory is for, and on almost every turn replaying
+        # what was said before is the point. On a request for proposals it
+        # inverts: the model is handed its own previous answer and asked to
+        # be original, and it obliges by repeating it. Measured — a turn
+        # asked for a list of improvements received 5,281 bytes of past
+        # assistant text and returned the same six proposals, two of them
+        # resting on counts that had been fabricated and since disproved.
+        # Recalled text is not a claim, so no verifier in this pipeline
+        # reads it; the repetition arrives wearing the confidence of a turn
+        # that checked everything else.
+        #
+        # User turns and session summaries stay. Those carry what was ASKED
+        # and what was decided, which is the context that keeps a second
+        # round from re-proposing what was already rejected — the opposite
+        # of the failure above.
+        _q = ""
+        for _m in reversed(current_messages or []):
+            if isinstance(_m, dict) and _m.get("role") == "user":
+                _q = str(_m.get("content") or "")
+                break
+        if _q and _looks_generative(_q):
+            _kept = [
+                _m
+                for _m in memories
+                if str((_m.get("meta") or {}).get("role", "user")).lower()
+                != "assistant"
+                or (_m.get("meta") or {}).get("is_session_summary")
+                or (_m.get("meta") or {}).get("is_hierarchical_summary")
+            ]
+            _dropped = len(memories) - len(_kept)
+            if _dropped:
+                self._f._log_debug(
+                    f"🧠 LTM: dropped {_dropped} past assistant answer(s) — "
+                    f"the request asks for new proposals, and prior answers "
+                    f"are what makes them repeat"
+                )
+            memories = _kept
 
         if not memories:
             return ""
