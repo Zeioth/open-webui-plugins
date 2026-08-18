@@ -24187,6 +24187,11 @@ class AgenticToolBroker:
     """
 
     _MAX_BODY_CHARS = 6000
+    # How many times the cap a body may exceed before "grep the rest" stops
+    # being advice and becomes a trap. Two is deliberately generous: at that
+    # ratio one further expansion still recovers the tail, so every case the
+    # old wording served keeps the old wording, byte for byte.
+    _OVERSIZED_BODY_RATIO = 2
     _MAX_EDGES = 20
     _MAX_GREP_LINES = 20
     _MAX_GREP_SCAN_CHARS = 2_000_000
@@ -24360,6 +24365,45 @@ class AgenticToolBroker:
             lambda: _si.get_all_qualified_names(project_id),
         )
 
+    def _oversized_index_hint(self, qid: str, project_id: str) -> str:
+        """What the index can say about a symbol whose body will not fit.
+
+        The point of this string is to replace a recovery route the step
+        cannot take with one it can. A class too large to serve is not a
+        class the pipeline knows nothing about — the index holds every
+        member of it, and a member IS servable. Naming them turns "the tail
+        was not inspected" from a permanent gap into a list of next
+        requests.
+
+        Returns an empty string on any failure. This is decoration on a
+        truncation notice that is already complete without it; a symbol
+        index that cannot answer must not turn a served body into an
+        exception.
+        """
+        try:
+            _bare = qid.rsplit(".", 1)[-1]
+            _members = self._f._symbol_index.get_class_members(_bare, project_id)
+            if not _members:
+                return ""
+            # get_class_members returns qualified id STRINGS already ordered
+            # by line_start. Deduplicating with dict.fromkeys keeps that
+            # order, which is the one a reader wants: sorting alphabetically
+            # would hand the step a list bearing no relation to the file it
+            # is about to ask for pieces of.
+            _names = list(
+                dict.fromkeys(str(m).rsplit(".", 1)[-1] for m in _members)
+            )
+            if not _names:
+                return ""
+            _head = ", ".join(_names[:12])
+            return (
+                f" The index holds {len(_names)} member(s) of {_bare}: "
+                + _head
+                + (f", … ({len(_names) - 12} more)" if len(_names) > 12 else "")
+            )
+        except Exception:
+            return ""
+
     def _expand(self, sym: str, project_id: str) -> str:
         """Full body of a symbol from the first live block, char-capped."""
         qid = self._qid_for(sym, project_id)
@@ -24389,12 +24433,43 @@ class AgenticToolBroker:
             # how to get the rest instead of stopping.
             _shown = body[:_cap]
             _total = len(body)
-            body = (
-                _shown + f"\n# ... [truncated by broker: showing {_cap} of {_total} "
-                f"chars. To see the rest, GREP a distinctive token from the "
-                f"missing region, or state that the tail of {qid} was not "
-                f"inspected — do NOT guess its remaining calls.]"
+            # Which advice is honest depends on how much is missing. Grepping
+            # back a tail worth a fraction of the cap is a real recovery; a
+            # symbol many times the cap cannot be reassembled that way at
+            # all, and saying otherwise sends the step after a goal it can
+            # never reach. Observed live: a 167k-char class against a 16k
+            # cap produced two gap-fill steps chasing a tail eleven
+            # expansions deep, both reporting the same gap again.
+            # Gated on HAVING somewhere better to send the step, not on the
+            # ratio alone. Five of the symbols past this ratio are plain
+            # functions, and "expand a NAMED member instead" is not merely
+            # unhelpful for a function — it names a recovery route that does
+            # not exist, which is worse than the grep advice it replaced.
+            # An empty hint means no members were found, and then today's
+            # wording stands unchanged.
+            _hint = (
+                self._oversized_index_hint(qid, project_id)
+                if _total > _cap * self._OVERSIZED_BODY_RATIO
+                else ""
             )
+            if _hint:
+                body = (
+                    _shown
+                    + f"\n# ... [truncated by broker: showing {_cap} of "
+                    f"{_total} chars. {qid} is {_total // _cap}x the cap and "
+                    f"CANNOT be reassembled by expanding it — do not ask for "
+                    f"its body again, and do not guess its remaining "
+                    f"contents. Expand a NAMED member instead."
+                    + _hint
+                    + "]"
+                )
+            else:
+                body = (
+                    _shown + f"\n# ... [truncated by broker: showing {_cap} of {_total} "
+                    f"chars. To see the rest, GREP a distinctive token from the "
+                    f"missing region, or state that the tail of {qid} was not "
+                    f"inspected — do NOT guess its remaining calls.]"
+                )
         return f"### Body of {qid}\n```\n{body}\n```"
 
     def _edges(self, sym: str, project_id: str, incoming: bool) -> str:
@@ -26634,7 +26709,11 @@ class AgenticSynthesisComposer:
                 [
                     "",
                     "Structure your reply with these headed sections, in "
-                    "this order, and write each one in your own prose:",
+                    "this order, and write each one in your own prose. Each "
+                    "section below carries ONE line: that line is what the "
+                    "section is about, not how long it may be. Develop it "
+                    "from the workspace — name the symbols it concerns and "
+                    "say what was found about them.",
                     "",
                     # Both halves are measured. One answer dropped the
                     # opening rule and kept the internal ones; another kept
@@ -27175,6 +27254,12 @@ class AgenticSynthesisComposer:
             # whether there is anything to say.
             or unsettled_claims
             or unsettled_subjects
+            # A contradiction can be the ONLY gap a turn has: every claim
+            # settled, and two of them settled opposite ways. Without this
+            # term the row added below would be computed and then have no
+            # section to be written into — the same shape of loss the
+            # coherence check itself suffered, reproduced one layer down.
+            or (getattr(self._f, "_serial_contradicted", "") or "")
         ):
             out += [
                 "",
@@ -27219,6 +27304,20 @@ class AgenticSynthesisComposer:
             if unsettled_subjects:
                 _rows.append(
                     ("behaviour never established", ", ".join(unsettled_subjects))
+                )
+            # A symbol two steps disagree about, one confirming and one
+            # refuting from the same evidence. The coherence check already
+            # computes this to decide whether to withhold the generative
+            # wave, and then dropped it — a finding the pipeline trusted
+            # enough to change its own behaviour over never reached the
+            # reader. Its own row rather than a merge into the list above,
+            # because "never established" and "established twice, opposite
+            # ways" are different states and the rule below is written for
+            # the first.
+            _contra = getattr(self._f, "_serial_contradicted", "") or ""
+            if _contra:
+                _rows.append(
+                    ("contradicted between steps", " ".join(_contra.split())[:200])
                 )
             if _rows:
                 out += [""] + [f"- {_k}: {_v}" for _k, _v in _rows]
@@ -30289,6 +30388,15 @@ class AgenticOrchestrator:
         _coh_mode = self._f.valves.agentic_coherence_check
         if _coh_mode in ("shadow", "on"):
             _contradiction = self._detect_cross_step_contradiction()
+            # Carried to the answer regardless of mode. The check already
+            # decides whether to withhold the generative wave; that is a
+            # decision about the PIPELINE. Whether the reader is told that
+            # two steps reached opposite verdicts on a symbol is a separate
+            # question, and the answer to it was previously "no" in both
+            # modes — the finding lived and died in one debug line. A
+            # symbol the workspace cannot agree with itself about is the
+            # definition of something this turn did not settle.
+            self._f._serial_contradicted = _contradiction or ""
             if _contradiction:
                 if _coh_mode == "shadow":
                     self._f._log_debug(
@@ -59687,6 +59795,7 @@ class Filter:
             self._cut_logged_this_turn = False
             self._serial_dropped_gaps = []
             self._serial_unreadable_subjects = []
+            self._serial_contradicted = ""
             self._serial_winner_corroboration = None
             self._serial_eliminated_accounts = []
             _lf = getattr(self, "_llm_failures_this_turn", None) or {}
