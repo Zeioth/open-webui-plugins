@@ -19465,7 +19465,14 @@ class AgenticStaticVerifier:
     be worse than no verdict.
     """
 
-    _VALID_CHECK_KINDS = ("calls", "called_by", "exists", "has_docstring", "counts")
+    _VALID_CHECK_KINDS = (
+        "calls",
+        "called_by",
+        "exists",
+        "has_docstring",
+        "counts",
+        "graph_absence",
+    )
 
     _CHECKS_CONTRACT = (
         "## Claims to verify\n{claims_block}\n\n"
@@ -19604,6 +19611,15 @@ class AgenticStaticVerifier:
         else:
             self._f._log_debug(
                 f"🤖 Verify: no count claim(s) found in {len(claims)} claim(s)"
+            )
+        _absence = self._graph_absence_checks(claims)
+        if _absence:
+            checks = list(checks) + _absence
+            mode += f" + {len(_absence)} graph-absence check(s)"
+            self._f._log_debug(
+                f"🤖 Verify: {len(_absence)} graph-absence check(s) generated — "
+                + "; ".join(f"C{c['claim']}:{c['src']}" for c in _absence[:5])
+                + (" …" if len(_absence) > 5 else "")
             )
 
         # Region: deterministic execution + verdict stamping
@@ -19874,6 +19890,71 @@ class AgenticStaticVerifier:
         }
     )
 
+    # An assertion that something is MISSING from the call graph, in either
+    # language. The negation and the word "graph" have to travel together:
+    # a claim merely mentioning the graph is ordinary, it is the claim
+    # reasoning FROM its silence that needs checking.
+    _GRAPH_ABSENCE_RE = re.compile(
+        r"(?:no\s+(?:aparece|figura|est[a\u00e1]|se\s+registra)|ausente|"
+        r"not\s+(?:in|registered|present|captured|recorded)|"
+        r"does\s+not\s+appear|is\s+absent|missing\s+from)"
+        r"[^.;]{0,60}?\b(?:grafo|graph)\b"
+        r"|\b(?:grafo|graph)\b[^.;]{0,60}?"
+        r"(?:no\s+(?:lo\s+)?(?:registra|captura|contiene|recoge)|"
+        r"does\s+not\s+(?:record|capture|contain))",
+        re.IGNORECASE | re.UNICODE,
+    )
+    # Identifier-shaped tokens: an underscore, a dot or an interior capital.
+    # Prose in both languages is filtered out by that requirement, which is
+    # what lets the check run on free text without a symbol list.
+    _CODEY_TOKEN_RE = re.compile(
+        r"\b(?:[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]*"
+        r"|_[A-Za-z0-9_]+"
+        r"|[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+"
+        r"|[a-z]+[A-Z][A-Za-z0-9]*"
+        r"|[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*)\b"
+    )
+
+    @classmethod
+    def _graph_absence_checks(cls, claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
+        """Checks for claims that reason FROM a symbol's absence in the graph.
+
+        The graph records calls between indexed callables. Functions,
+        methods and classes are indexed; a module-level variable is not, and
+        neither is an attribute, a constant or a lock. Nothing that is not a
+        callable can ever appear in it, so its absence carries no
+        information at all — and a turn read that absence as evidence,
+        concluding that a `threading.Lock` held at module scope "is used
+        dynamically" because no edge pointed at it, and recommending the
+        lock be split per project. The lock guards one shared SQLite
+        connection; splitting it would have restored the race it exists to
+        prevent.
+
+        The claim was cited, settled and true about everything it said the
+        code DID. Only the inference was unsound, which is why the ledger
+        could not see it: the failure is not a false statement but a
+        conclusion drawn from silence that was never evidence.
+
+        Emitted for identifier-shaped tokens only — something carrying an
+        underscore, a dot or an interior capital — so the pattern can run
+        over free prose in either language without a symbol list to hand.
+        """
+        out: List[Dict[str, Any]] = []
+        for n, c in enumerate(claims, 1):
+            _text = c.text or ""
+            if not cls._GRAPH_ABSENCE_RE.search(_text):
+                continue
+            for _tok in dict.fromkeys(cls._CODEY_TOKEN_RE.findall(_text)):
+                out.append(
+                    {
+                        "claim": n,
+                        "kind": "graph_absence",
+                        "src": _tok,
+                        "dst": "",
+                    }
+                )
+        return out
+
     @staticmethod
     def _fold_accents(word: str) -> str:
         """Lowercase a word and strip the accents Spanish modifiers carry.
@@ -19990,6 +20071,29 @@ class AgenticStaticVerifier:
                 if self._qid_for(src_n, project_id):
                     return "confirmed", f"'{src_n}' exists in the index"
                 return "refuted", f"'{src_n}' is not in the index"
+
+            if kind == "graph_absence":
+                # Two outcomes, and only one of them is a finding. A token
+                # the index holds as a callable CAN legitimately be absent
+                # from the graph — that is an ordinary "nothing calls it"
+                # and none of this check's business. A token the index does
+                # not hold is not a callable at all, and the graph was
+                # never able to say anything about it either way.
+                _bare = src_n.rsplit(".", 1)[-1]
+                _known = self._f._symbol_index.get_all_names(project_id) or set()
+                if _bare in _known or src_n in _known:
+                    return (
+                        "unverifiable",
+                        f"'{src_n}' is an indexed callable; its absence from "
+                        f"the graph is an ordinary absence of callers",
+                    )
+                return (
+                    "unsupported",
+                    f"the graph records calls between indexed callables, and "
+                    f"'{src_n}' is not one — a module variable, attribute or "
+                    f"constant can never appear in it, so its absence there "
+                    f"is not evidence about how it is used",
+                )
 
             if kind == "counts":
                 # Never "refuted". The index is built from ingested blocks
@@ -27013,10 +27117,32 @@ class AgenticSynthesisComposer:
             if unsettled_claims or unsettled_subjects:
                 out += [
                     "",
-                    "Two of those bear on the opening paragraph: a claim "
+                    "Two of those bear on EVERY section that recommends or "
+                    f"concludes anything — {_H['conclusion']} and "
+                    f"{_H['proceed']} both, not the opening alone: a claim "
                     "that came back unsettled may not be asserted there, "
                     "nor its opposite; a symbol whose behaviour was never "
                     "established may be named but not described.",
+                ]
+            if unsettled_subjects:
+                # Naming them here, rather than pointing back at the row
+                # above, because the row is a label and this is the rule.
+                # A measured turn shelved a symbol under "behaviour never
+                # established" and then opened by recommending it be
+                # hardened against the very behaviour it had just said it
+                # never checked — which turned out, on reading, to already
+                # work. The rule was in the prompt and it was not broken by
+                # accident: it asked about "the opening paragraph" while
+                # the recommendation lived in two sections, and it referred
+                # to a list the model had to scroll back to resolve.
+                out += [
+                    "",
+                    "Concretely: "
+                    + ", ".join(unsettled_subjects)
+                    + " — for each of these, a sentence proposing to FIX, "
+                    "harden or change it is a claim about how it behaves "
+                    "today, and this turn did not establish that. Name the "
+                    "gap instead of the fix.",
                 ]
 
         return _split_heading_lines(_resolve_group_breaks(out))
@@ -30984,11 +31110,31 @@ class AgenticOrchestrator:
                 )
         # ── Step 3: emit, and say which source it came from ──
         if _open_line:
+            # The unsettled subjects ride along in the trailing slot for the
+            # same reason the opening line does: the section that opens the
+            # answer is the one most likely to carry a recommendation, and
+            # it is decided first, before any of the gap block 4,800
+            # characters back has been acted on. One line naming them costs
+            # nothing and sits where the decision is made.
+            _shelved = ""
+            try:
+                _us = (
+                    getattr(self._f, "_agentic_coverage", None) or {}
+                ).get("unsettled_subjects") or []
+                if _us:
+                    _shelved = (
+                        "\n\nThis turn did NOT establish how these behave: "
+                        + ", ".join(_us[:8])
+                        + (" …" if len(_us) > 8 else "")
+                        + ". Do not open by proposing to fix any of them."
+                    )
+            except Exception:
+                _shelved = ""
             _workspace += (
                 "\n\n[WORKSPACE NOTE — not part of your answer]\n"
                 "HOW YOUR ANSWER OPENS\n"
                 "Your answer begins with these two lines, exactly:\n\n"
-                "---\n\n" + _open_line
+                "---\n\n" + _open_line + _shelved
             )
             self._f._log_debug(
                 f"[ANSWER-SEED] {_open_line!r} from the {_seed_from}"
@@ -60978,6 +61124,111 @@ class Filter:
         except Exception as _e_ts:
             self._log_debug(f"[TESTS-SHOWN] audit skipped ({_e_ts!r})")
 
+    def _audit_gap_promotion(self, body: dict) -> None:
+        """Report symbols named in a recommendation that the same turn shelved.
+
+        The failure this watches is not a wrong fact — every claim can be
+        cited and settled and the answer still arrive at a proposal it has
+        no grounds for. A measured turn recommended hardening
+        `_repair_truncated_json` against nested arrays and escaped strings,
+        and listed, in its own unverified section, that it had never checked
+        either behaviour. Both already worked. The recommendation was built
+        on the absence of a reading and read as a finding.
+
+        The two sections make the contradiction mechanical: a symbol the
+        answer proposes to change, which the answer also lists as
+        unverified, is a proposal resting on a gap. That is cheaper to
+        detect than to judge, needs no model, and is exactly the shape the
+        confidence figure cannot express — a turn can be 88% settled on
+        what the code IS while a recommendation about it rests on nothing.
+
+        Detection only. Outlet edits never reach the reader, so this counts
+        the rate and leaves the answer alone; the rule, if the rate warrants
+        one, belongs in the prompt.
+        """
+        try:
+            # ── Step 1: the two sections, from the delivered answer ────────
+            project_id = self._project_state_manager.get_project_id()
+            _msgs = body.get("messages") or []
+            _last = next(
+                (
+                    m
+                    for m in reversed(_msgs)
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            _text = (_last or {}).get("content") or ""
+            if not _text.strip():
+                self._log_debug("[GAP-PROMOTION] not measured — empty answer")
+                return
+            # Every language table is consulted rather than one chosen from
+            # the query: the answer's headings are already in front of us,
+            # and matching them directly cannot disagree with itself the way
+            # a second language guess could.
+            _by_name: Dict[str, str] = {}
+            for _tbl in _SECTION_HEADINGS.values():
+                for _k, _v in _tbl.items():
+                    _by_name[_v.strip("# *").strip().casefold()] = _k
+            _sections: Dict[str, str] = {}
+            _current = ""
+            for _l in _text.split("\n"):
+                _bare = _l.strip().strip("# *").strip()
+                _hit = _by_name.get(_bare.casefold(), "")
+                if _hit:
+                    _current = _hit
+                    _sections[_current] = ""
+                elif _current:
+                    _sections[_current] += _l + "\n"
+
+            # ── Step 2: symbols on each side, using the shared reference re ─
+            _proposing = (_sections.get("conclusion", "") or "") + (
+                _sections.get("proceed", "") or ""
+            )
+            _shelved = _sections.get("gaps", "") or ""
+            if not _proposing.strip() or not _shelved.strip():
+                self._log_debug(
+                    "[GAP-PROMOTION] not measured — no proposal or no gap section"
+                )
+                return
+            # Identifier-shaped tokens the index recognises, rather than the
+            # hypothesis regex, which requires a dot or a call suffix. Every
+            # symbol in the measured failure was written bare — a module
+            # function named as plain prose — so that regex saw one of the
+            # two contradictions and missed the one the answer was built on.
+            def _syms(_blob: str) -> set:
+                return {
+                    _w
+                    for _w in set(re.findall(r"[A-Za-z_]\w*(?:\.\w+)*", _blob))
+                    if _w in _known
+                }
+
+            _known = set(self._symbol_index.get_all_names(project_id) or [])
+            if not _known:
+                self._log_debug(
+                    "[GAP-PROMOTION] not measured — empty symbol index"
+                )
+                return
+            _prop_syms = _syms(_proposing)
+            _gap_syms = _syms(_shelved)
+
+            # ── Step 3: the overlap is the finding ─────────────────────────
+            _both = sorted(_prop_syms & _gap_syms)
+            if not _both:
+                self._log_debug(
+                    f"[GAP-PROMOTION] ok — none of the {len(_prop_syms)} symbol(s) "
+                    f"proposed appear among the {len(_gap_syms)} shelved"
+                )
+                return
+            self._log_debug(
+                f"[GAP-PROMOTION] {len(_both)} symbol(s) recommended AND listed "
+                f"unverified: {', '.join(_both[:5])}"
+                + (" …" if len(_both) > 5 else "")
+                + " — the proposal rests on a reading the turn says it never made"
+            )
+        except Exception as _e:
+            self._log_debug(f"[GAP-PROMOTION] not measured — {type(_e).__name__}: {_e}")
+
     def _audit_stats_fidelity(self, body: dict) -> None:
         """Report the Stats block the reader got against the one measured.
 
@@ -61288,6 +61539,7 @@ class Filter:
         self._audit_section_order(body)
         self._audit_tests_shown(body)
         self._audit_stats_fidelity(body)
+        self._audit_gap_promotion(body)
 
         # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
