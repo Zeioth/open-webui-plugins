@@ -20219,6 +20219,35 @@ class AgenticStaticVerifier:
                         )
                     _actual = len(_members)
                     _what = f"member(s) of '{_cls}'"
+                    # A class whose members are spread over more than one
+                    # block is a class the index is holding TWICE. Obsolete
+                    # blocks have their symbols removed, but only when the
+                    # replacing block carries the same file_path — and a
+                    # re-pasted file arrives under a new synthetic name
+                    # every time, so successive versions never match and
+                    # never supersede. The member list is then the union of
+                    # every version ever pasted, and a method deleted three
+                    # versions ago still counts. Reporting the total as
+                    # settled fact there is the one outcome this check must
+                    # not produce: the number would be wrong, cited, and
+                    # carrying the authority of a static verification.
+                    _blocks = set()
+                    for _m in _members:
+                        try:
+                            _blocks |= set(
+                                self._f._symbol_index.find_blocks(_m, project_id)
+                            )
+                        except Exception:
+                            continue
+                    if len(_blocks) > 1:
+                        return (
+                            "unsupported",
+                            f"the index reports {_actual} {_what}, but they "
+                            f"come from {len(_blocks)} different blocks — the "
+                            f"same class indexed more than once, so the total "
+                            f"is a union across versions and not a count of "
+                            f"any one of them",
+                        )
                 if check.get("narrowed"):
                     # The claim counted a SUBSET the index cannot rebuild
                     # (static, async, public...). Reporting the total is
@@ -24627,10 +24656,22 @@ def _code_section_wanted(
     not from whether a step chose to quote it, and a withheld heading does
     not stop it being written; it only stops it being written where the
     contract can reach.
+
+    But "asked to be GIVEN an artifact" is not "asked to be given CODE".
+    The classifier sets direct_retrieval for any concrete deliverable, and
+    "how many static methods does X have, and which ones" asks for a list
+    of names — measured, that took the unconditional override and produced
+    a Code section reading "no code required; the question is purely
+    informational": the empty heading this gate exists to prevent, coming
+    back through the door opened to fix its opposite. The use case is what
+    separates them. On an architecture or planning turn the artifact asked
+    for is a relation or a decision, so code must have been pulled in as
+    well; everywhere else code IS the deliverable and either signal alone
+    carries it.
     """
-    if asked_for_artifact:
-        return True
-    return has_code and use_case not in (UseCase.ARCHITECTURE, UseCase.PLANNING)
+    if use_case in (UseCase.ARCHITECTURE, UseCase.PLANNING):
+        return has_code and asked_for_artifact
+    return has_code or asked_for_artifact
 
 
 def _heads_of(line: str, sections: List[str]) -> str:
