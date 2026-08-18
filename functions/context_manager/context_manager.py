@@ -19911,7 +19911,15 @@ class AgenticStaticVerifier:
             _subject = (c.subject or "").strip() or next(
                 iter(c.valid_qids or c.qids or []), ""
             )
-            if not _subject:
+            # The subject has to look like a symbol before it can be looked
+            # up as one. A step returned "class ContextBuilder: ..." in this
+            # field — a fragment of source, not a name — and the check built
+            # on it asked the index for members of " ...", spending a slot to
+            # arrive at "unverifiable". A dotted identifier is the whole of
+            # what get_class_members and get_callers can take.
+            if not _subject or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", _subject
+            ):
                 continue
             for _m in cls._COUNT_CLAIM_RE.finditer(c.text or ""):
                 _asserted = int(_m.group(1))
@@ -24338,6 +24346,22 @@ def _code_section_wanted(
     )
 
 
+def _heads_of(line: str, sections: List[str]) -> str:
+    """The section named by `line`, or "" — bullets, hashes and bold ignored.
+
+    Shared by compose_outline's inline-body pre-pass and its own _heads so
+    the two cannot disagree about what counts as naming a section. They did
+    disagree once already, in the direction that matters least visibly: the
+    pre-pass has to recognise a name to know a line is worth splitting, and
+    a second copy of this normalisation drifting from the first would split
+    lines that _heads then refuses, or leave lines _heads could have taken.
+    """
+    _bare = [_s.strip("# *") for _s in sections]
+    _t = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s*", "", line.strip())
+    _t = _t.strip("# *").strip().rstrip(":").strip()
+    return next((_b for _b in _bare if _t == _b), "")
+
+
 def _demote_headings(text: str) -> str:
     """
     Strip ATX heading markers from a block quoted into the final prompt.
@@ -25493,6 +25517,31 @@ class AgenticSynthesisComposer:
             for _l in (_resp or "").splitlines()
             if _l.strip() and not _l.strip().startswith("```")
         ]
+        # Split "Heading: body" onto two lines before anything reads them.
+        # Asked for a heading followed by a body line, the model regularly
+        # answers with one line per section instead — "- ## Conclusión: the
+        # guard returns early" or "- **Conclusión**: SKIP". _heads() already
+        # tolerates the bullet, the hashes and the bold, but a colon with
+        # text after it left the name unrecognisable, so the outline counted
+        # zero of four sections named and was thrown away whole. It was not
+        # a malformed outline: every section WAS named, on the wrong side of
+        # a colon. Splitting here means the counter, the SKIP test and the
+        # body accounting downstream all see the two-line shape they were
+        # written for, and no other code has to know this ever happened.
+        _split: List[str] = []
+        for _l in _lines:
+            _m = re.match(r"^(.*?):\s+(\S.*)$", _l)
+            if _m and _heads_of(_m.group(1), sections) and not _heads_of(_l, sections):
+                _split.append(_m.group(1).strip())
+                _split.append(_m.group(2).strip())
+            else:
+                _split.append(_l)
+        if len(_split) != len(_lines):
+            self._f._log_debug(
+                f"🤖 Outline: split {len(_split) - len(_lines)} inline "
+                f"heading/body line(s) onto their own lines"
+            )
+        _lines = _split
         # Every section named, or none: a partial outline would leave the
         # final model with instructions for some sections and silence for
         # the rest, which is worse than the uniform version of either.
@@ -25523,10 +25572,10 @@ class AgenticSynthesisComposer:
         def _heads(_line: str) -> str:
             # Bullets and numbering come off too: a model asked for a list
             # of sections often gives a list, and "- Conclusión" is the
-            # same heading as "## **Conclusión**" for this purpose.
-            _t = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s*", "", _line.strip())
-            _t = _t.strip("# *").strip().rstrip(":").strip()
-            return next((_b for _b in _bare if _t == _b), "")
+            # same heading as "## **Conclusión**" for this purpose. The
+            # normalisation itself lives at module level so the pre-pass
+            # that splits inline bodies applies exactly this rule.
+            return _heads_of(_line, sections)
 
         _named = sum(1 for _l in _lines if _heads(_l))
         if _named < len(sections):
