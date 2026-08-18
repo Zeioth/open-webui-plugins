@@ -565,6 +565,34 @@ _SECTION_HEADINGS: Dict[str, Dict[str, str]] = {
 # Imperative on purpose: the directive tells the model to develop the line
 # into prose, so a line that read as content would be developed into prose
 # about the placeholder.
+# What "How to proceed" must carry when the request was to PRODUCE proposals
+# rather than to find something out. The generic body asks for "the next
+# step", and on a generative turn there is no next step — there is a list,
+# which is the entire answer. Measured against the generic body, that turn
+# wrote "no immediate action required" under this heading and put its eight
+# proposals under the evidence heading instead: the payload in the section
+# meant for what supports it, and the section meant for what to do saying
+# there was nothing. The section order was canonical and every auditor
+# passed, because none of them measure which section the content is in.
+_GENERATIVE_PROCEED_BODY: Dict[str, str] = {
+    "en": (
+        "This is the answer: the proposals themselves, ordered by what they "
+        "are worth against what they cost, each naming the symbol it "
+        "concerns and the deficit that justifies it. Do not summarise them "
+        "here and develop them below — below is where the evidence for "
+        "them goes. If a proposal rests on something this turn did not "
+        "check, say so in the same line rather than dropping it."
+    ),
+    "es": (
+        "Esto es la respuesta: las propuestas mismas, ordenadas por lo que "
+        "valen frente a lo que cuestan, cada una nombrando el símbolo al "
+        "que afecta y la carencia que la justifica. No las resumas aquí "
+        "para desarrollarlas abajo — abajo va la evidencia que las "
+        "sostiene. Si una propuesta se apoya en algo que este turno no "
+        "comprobó, dilo en la misma línea en vez de omitirlo."
+    ),
+}
+
 _SECTION_FALLBACK_BODIES: Dict[str, Dict[str, str]] = {
     "en": {
         "conclusion": (
@@ -19155,12 +19183,40 @@ class AgenticEvidenceVerifier:
 
         # ── Step 2: parse, refusing anything malformed ──
         cleaned = response.replace("```json", "").replace("```", "").strip()
+        raw = None
         try:
             raw = json.loads(cleaned).get("verdicts", [])
             assert isinstance(raw, list)
         except Exception:
-            self._f._log_debug("🤖 Evidence: unparseable verdicts")
-            return {}
+            # The most expensive call in the pipeline, discarded whole on a
+            # parse error: measured at 147s and 3,501 tokens for a return of
+            # {} and "0 settled from code", while the retry that followed
+            # cost another 136s. Half the turn's wall clock went to one
+            # malformed brace. The producer normalises a fence or a
+            # truncation when it can see one, and when it cannot this was
+            # the end of the road — even though the repair that recovers a
+            # JSON object cut mid-generation lives in this same file and is
+            # what every other consumer of a long contract falls back to.
+            # A partial verdict list settles the claims it reaches; {}
+            # settles none of them.
+            _repaired = None
+            try:
+                _repaired = JsonContracts._repair_truncated_json(cleaned)
+            except Exception:
+                _repaired = None
+            _cand = (_repaired or {}).get("verdicts")
+            if isinstance(_cand, list) and _cand:
+                raw = _cand
+                self._f._log_debug(
+                    f"🤖 Evidence: verdicts unparseable — repaired to "
+                    f"{len(raw)} verdict(s) from the {len(cleaned)}-char reply"
+                )
+            else:
+                self._f._log_debug(
+                    f"🤖 Evidence: unparseable verdicts and unrepairable "
+                    f"({len(cleaned)} chars) — no claim settled by this call"
+                )
+                return {}
 
         # ── Step 3: keep only verdicts whose quote is really in the body ──
         by_index = {n: s for s, idxs in groups.items() for n in idxs}
@@ -22290,7 +22346,7 @@ class AgenticPreplanner:
         'chosen framing relies on>", ...], '
         '"difficulty": "<low|medium|high>", '
         '"question_type": "<exploratory|confirmatory|descriptive|'
-        'mechanism>", "ask": ""}\n\n'
+        'mechanism|generative>", "ask": ""}\n\n'
         "difficulty grades how much investigative work the CHOSEN framing "
         "needs — judge the work, not the topic: low = a single clear "
         "framing answerable by direct lookup or explanation of code already "
@@ -22307,7 +22363,14 @@ class AgenticPreplanner:
         "cause Y'); descriptive = a factual inventory or lookup ('how many "
         "callers', 'where is X used', 'what does X return'); mechanism = "
         "how something works internally ('how does X do Y', 'walk me "
-        "through the flow'). A MALFUNCTION is NEVER mechanism: if the "
+        "through the flow'); generative = the request asks the assistant to "
+        "PRODUCE proposals, options or a design rather than to find out "
+        "something that is already true ('suggest improvements', 'what "
+        "could we do about X', 'propose a refactor'). The test for "
+        "generative is whether the answer is a set of things the user "
+        "could DO: an inventory of what exists is descriptive even when it "
+        "is long, and a single recommendation that follows from one "
+        "finding is not generative either. A MALFUNCTION is NEVER mechanism: if the "
         "request describes a symptom — wrong, different, empty, missing or "
         "intermittent output, a crash, 'sometimes', 'same input different "
         "result', 'without code changes' — it is exploratory (no cause "
@@ -22616,6 +22679,7 @@ class AgenticPreplanner:
             "confirmatory",
             "descriptive",
             "mechanism",
+            "generative",
         ):
             question_type = ""
         # Region: anomaly override (deterministic net under the LLM
@@ -23589,6 +23653,24 @@ class AgenticPlanner:
                     "(callers/callees of the named symbols), then analyze; "
                     "hypothesize only if the trace surfaces a genuine "
                     "unknown.\n\n" + _UNVERIFIED_RULE
+                ),
+                "generative": (
+                    "Question type: GENERATIVE (produce proposals, not "
+                    "findings). Shape: investigate + analyze, and do NOT "
+                    "schedule hypothesize — competing hypotheses arbitrate "
+                    "between rival explanations of ONE thing, and separate "
+                    "proposals are not rivals: they can all be true at "
+                    "once, so there is nothing for a competition to kill.\n\n"
+                    "Every proposal rests on something being ABSENT, "
+                    "unbounded or wrong today, and that is the part to "
+                    "investigate. Plan step(s) that establish those "
+                    "deficits — not another inventory of what the code "
+                    "does. A proposal whose deficit was never checked is "
+                    "the one failure mode of this shape, and it reads "
+                    "exactly like the others: measured, a turn recommended "
+                    "hardening a function against inputs it already "
+                    "handled, having listed in the same answer that it had "
+                    "never checked them.\n\n" + _UNVERIFIED_RULE
                 ),
             }
             qtype_hint = _shapes.get(question_type, "")
@@ -25892,9 +25974,20 @@ class AgenticSynthesisComposer:
                 _SECTION_HEADINGS.get(lang) or _SECTION_HEADINGS["en"]
             ).items()
         }
-        _fallbacks = (
+        _fallbacks = dict(
             _SECTION_FALLBACK_BODIES.get(lang) or _SECTION_FALLBACK_BODIES["en"]
         )
+        # Copied, then overridden for one key on one kind of turn. Mutating
+        # the module table would carry the swap into every later turn in
+        # the process, which is how a per-turn shape becomes a permanent
+        # one without anything in the code saying so.
+        if (
+            str(getattr(self._f, "_preplanner_question_type", "") or "")
+            == "generative"
+        ):
+            _fallbacks["proceed"] = _GENERATIVE_PROCEED_BODY.get(
+                lang, _GENERATIVE_PROCEED_BODY["en"]
+            )
         _generic = _fallbacks["conclusion"]
 
         def _heads(_line: str) -> str:
@@ -27055,14 +27148,38 @@ class AgenticSynthesisComposer:
             "",
             _GROUP_BREAK,
             "",
-            f"## **{_H['proceed']}** — the next concrete step, ordered so "
-            "the one that settles the most uncertainty comes first: the "
-            "symbol to read, the check to run, the thing to instrument. "
+            (
+                # The long route asks for "the next step" and permits
+                # omitting the heading. On a turn asked to PRODUCE
+                # proposals both are wrong: the list is not a step, and
+                # omitting the heading omits the answer. The same swap the
+                # outline route makes, made here too — the two routes
+                # answering one question differently is the failure this
+                # file has already paid for once, on the Code section.
+                f"## **{_H['proceed']}** — this is the answer: the "
+                "proposals themselves, ordered by what they are worth "
+                "against what they cost, each naming the symbol it "
+                "concerns and the deficit that justifies it. Do not "
+                "summarise them here and develop them below. Say so in "
+                "the same line when a proposal rests on something this "
+                "turn did not check. NEVER omit this heading."
+                if _generative
+                else f"## **{_H['proceed']}** — the next concrete step, "
+                "ordered so the one that settles the most uncertainty "
+                "comes first: the symbol to read, the check to run, the "
+                "thing to instrument. "
+            )
+            + 
             # "five of fourteen said no further step was necessary" is the
             # measurement, and it belongs here rather than in the model's
             # copy: a heading and a paragraph spent to say nothing.
-            "Actionable, not generic advice. OMIT IT ENTIRELY when the "
-            "turn settled what was asked and nothing is left to do.",
+            (
+                ""
+                if _generative
+                else "Actionable, not generic advice. OMIT IT ENTIRELY "
+                "when the turn settled what was asked and nothing is "
+                "left to do."
+            ),
         ]
         # Only truthful because the last-mile pass ran first. Before it,
         # this would be asking the model to hide a gap; after it, every
@@ -27106,6 +27223,12 @@ class AgenticSynthesisComposer:
         # agree. Programming, refactoring and scaffolding keep the old gate:
         # code IS the answer there.
         _code_wanted = _code_section_wanted(has_code, use_case, asked_for_artifact)
+        # Read once, from the same field the outline route reads, so the
+        # two cannot disagree about which turn this is.
+        _generative = (
+            str(getattr(self._f, "_preplanner_question_type", "") or "")
+            == "generative"
+        )
         if _code_wanted:
             out += [
                 "",
@@ -61382,6 +61505,74 @@ class Filter:
         except Exception as _e_ts:
             self._log_debug(f"[TESTS-SHOWN] audit skipped ({_e_ts!r})")
 
+    def _audit_index_versions(self) -> None:
+        """Report how many classes the index is holding more than one copy of.
+
+        A superseded block has its symbols removed from the index, but only
+        when the block replacing it carries the same file_path. A file
+        pasted into the chat arrives under a fresh synthetic name every
+        time, so two pastes of one file never match, the older block is
+        never marked obsolete, and its symbols stay. Every lookup that
+        walks the symbol table then reads the union of every version ever
+        pasted: member counts inflate, the skeleton lists methods that were
+        deleted, and the call graph keeps edges into symbols that no longer
+        exist.
+
+        One symbol at a time this is invisible — the count is merely
+        slightly high, and slightly high reads as right. Counting the
+        affected classes turns it into a number that says whether the
+        obsoleting rule is worth changing, and a project-wide zero says the
+        indexed state is clean and the counts can be trusted.
+
+        Diagnostics only: reads the index, writes a log line, changes
+        nothing. Never raises.
+        """
+        try:
+            # ── Step 1: every class the index knows ────────────────────────
+            project_id = self._inlet_orch.get_project_id()
+            _classes = self._symbol_index.get_classes(project_id) or set()
+            if not _classes:
+                return
+
+            # ── Step 2: how many blocks back each one's members ────────────
+            _split: List[Tuple[str, int, int]] = []
+            for _cls in _classes:
+                _members = self._symbol_index.get_class_members(_cls, project_id)
+                if len(_members) < 2:
+                    continue
+                _blocks = set()
+                for _m in _members:
+                    try:
+                        _blocks |= set(self._symbol_index.find_blocks(_m, project_id))
+                    except Exception:
+                        continue
+                if len(_blocks) > 1:
+                    _split.append((_cls, len(_members), len(_blocks)))
+
+            # ── Step 3: one line, and it says what to do about it ──────────
+            if not _split:
+                self._log_debug(
+                    f"[INDEX-VERSIONS] ok — none of the {len(_classes)} indexed "
+                    f"class(es) span more than one block"
+                )
+                return
+            _split.sort(key=lambda _t: -_t[1])
+            _sample = "; ".join(
+                f"{_c} ({_n} members over {_b} blocks)" for _c, _n, _b in _split[:3]
+            )
+            self._log_debug(
+                f"[INDEX-VERSIONS] {len(_split)} of {len(_classes)} class(es) "
+                f"indexed more than once: {_sample}"
+                + (" …" if len(_split) > 3 else "")
+                + " — member counts and the skeleton are unions across pasted "
+                "versions, not any one of them; `/forget all` before re-pasting "
+                "rebuilds a single-version index"
+            )
+        except Exception as _e:
+            self._log_debug(
+                f"[INDEX-VERSIONS] not measured — {type(_e).__name__}: {_e}"
+            )
+
     def _audit_gap_promotion(self, body: dict) -> None:
         """Report symbols named in a recommendation that the same turn shelved.
 
@@ -61816,6 +62007,7 @@ class Filter:
         self._audit_tests_shown(body)
         self._audit_stats_fidelity(body)
         self._audit_gap_promotion(body)
+        self._audit_index_versions()
 
         # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
