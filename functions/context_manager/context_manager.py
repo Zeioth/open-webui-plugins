@@ -19472,6 +19472,7 @@ class AgenticStaticVerifier:
         "has_docstring",
         "counts",
         "graph_absence",
+        "counts_listed",
     )
 
     _CHECKS_CONTRACT = (
@@ -19611,6 +19612,18 @@ class AgenticStaticVerifier:
         else:
             self._f._log_debug(
                 f"🤖 Verify: no count claim(s) found in {len(claims)} claim(s)"
+            )
+        _selfc = self._self_count_checks(claims)
+        if _selfc:
+            checks = list(checks) + _selfc
+            mode += f" + {len(_selfc)} self-count check(s)"
+            self._f._log_debug(
+                f"🤖 Verify: {len(_selfc)} self-count check(s) generated — "
+                + "; ".join(
+                    f"C{c['claim']}:says {c['n']} lists {c['listed']}"
+                    for c in _selfc[:5]
+                )
+                + (" …" if len(_selfc) > 5 else "")
             )
         _absence = self._graph_absence_checks(claims)
         if _absence:
@@ -19915,6 +19928,72 @@ class AgenticStaticVerifier:
         r"|[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*)\b"
     )
 
+    # A number, then a colon, then the things being counted. Deliberately
+    # blind to the noun between them: the failure this catches was written
+    # as "4 son publicos: A, B, C, D, E", and "publicos" is an adjective no
+    # noun list would have held.
+    _LISTED_COUNT_RE = re.compile(
+        r"\b(\d{1,3})\b[^:.\n\d]{0,80}:\s*([^.\n]{4,400})",
+        re.UNICODE,
+    )
+    # A hedged count is not a count. "at least 13 methods: a, b, c" names
+    # examples on purpose and is right to; comparing the two numbers there
+    # manufactures a contradiction out of correct writing. Checked against
+    # the text immediately preceding the number, in both languages.
+    _COUNT_HEDGE_RE = re.compile(
+        r"(?:al\s+menos|por\s+lo\s+menos|m[a\u00e1]s\s+de|hasta|unos|"
+        r"aproximadamente|cerca\s+de|entre|at\s+least|more\s+than|"
+        r"up\s+to|about|around|approximately|roughly|over|some|~)\s*$",
+        re.IGNORECASE | re.UNICODE,
+    )
+
+    @classmethod
+    def _self_count_checks(cls, claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
+        """Checks a claim that says how many, then lists them, against itself.
+
+        The cheapest verification in this file: no index, no graph, no
+        model. A turn wrote "de los 27 metodos, 4 son publicos" and named
+        five, in two consecutive runs. The same sentence also failed to add
+        up — 4 and 22 make 26, not the 27 it had just asserted — so it
+        contradicted itself twice in one line while every claim under it
+        was cited and settled.
+
+        Nothing else here can catch this. The count check compares against
+        the index and the index agrees with the total; the enumeration is
+        the model's own subdivision of it, and no external source has an
+        opinion on where it drew the line. Only the sentence disagrees with
+        the sentence.
+
+        Emitted only when the listed items are code-shaped and there are at
+        least two, so an ordinary prose colon introducing a phrase produces
+        nothing.
+        """
+        out: List[Dict[str, Any]] = []
+        for n, c in enumerate(claims, 1):
+            _text = c.text or ""
+            for _m in cls._LISTED_COUNT_RE.finditer(_text):
+                if cls._COUNT_HEDGE_RE.search(_text[: _m.start(1)]):
+                    continue
+                _items = [
+                    _t
+                    for _t in cls._CODEY_TOKEN_RE.findall(_m.group(2))
+                ]
+                _items = list(dict.fromkeys(_items))
+                if len(_items) < 2:
+                    continue
+                out.append(
+                    {
+                        "claim": n,
+                        "kind": "counts_listed",
+                        "src": "",
+                        "dst": "",
+                        "n": int(_m.group(1)),
+                        "listed": len(_items),
+                        "sample": ", ".join(_items[:4]),
+                    }
+                )
+        return out
+
     @classmethod
     def _graph_absence_checks(cls, claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
         """Checks for claims that reason FROM a symbol's absence in the graph.
@@ -20071,6 +20150,22 @@ class AgenticStaticVerifier:
                 if self._qid_for(src_n, project_id):
                     return "confirmed", f"'{src_n}' exists in the index"
                 return "refuted", f"'{src_n}' is not in the index"
+
+            if kind == "counts_listed":
+                _n = int(check.get("n", -1))
+                _listed = int(check.get("listed", -1))
+                if _n == _listed:
+                    return (
+                        "confirmed",
+                        f"the claim says {_n} and names {_listed}",
+                    )
+                return (
+                    "unsupported",
+                    f"the claim says {_n} and then names {_listed} "
+                    f"({check.get('sample', '')}) — the sentence disagrees "
+                    f"with itself, and nothing outside it can settle which "
+                    f"half is right",
+                )
 
             if kind == "graph_absence":
                 # Two outcomes, and only one of them is a finding. A token
@@ -24444,10 +24539,23 @@ def _code_section_wanted(
     which is why those two also require that the user asked to be GIVEN an
     artifact. Programming, refactoring and scaffolding keep the plain gate:
     code IS the answer there.
+
+    A request to be given an artifact overrides has_code entirely, and that
+    is the one branch here written from a failure rather than from
+    reasoning. "dame el código de X" classified as PROGRAMMING with
+    direct_retrieval set, and no step of the plan happened to fence what it
+    read, so has_code was false and the section was withheld from a turn
+    whose entire request was that section. The model wrote the code anyway
+    — under a heading it invented, placed after the unverified section,
+    outside the canonical order and outside every rule that governs the
+    real one. The code the reader asked for comes from the body in context,
+    not from whether a step chose to quote it, and a withheld heading does
+    not stop it being written; it only stops it being written where the
+    contract can reach.
     """
-    return has_code and (
-        use_case not in (UseCase.ARCHITECTURE, UseCase.PLANNING) or asked_for_artifact
-    )
+    if asked_for_artifact:
+        return True
+    return has_code and use_case not in (UseCase.ARCHITECTURE, UseCase.PLANNING)
 
 
 def _heads_of(line: str, sections: List[str]) -> str:
@@ -61148,7 +61256,15 @@ class Filter:
         """
         try:
             # ── Step 1: the two sections, from the delivered answer ────────
-            project_id = self._project_state_manager.get_project_id()
+            # Resolved exactly as the outlet body resolves it a few lines
+            # below: get_project_id lives on InletOrchestrator, not on the
+            # state manager. The first version reached for it on the wrong
+            # object and every turn of a nine-turn run logged
+            # "not measured — AttributeError" instead of a rate. A guard
+            # that reports its own failure in the same field it reports a
+            # clean result is at least honest; one that never says anything
+            # else is not a guard.
+            project_id = self._inlet_orch.get_project_id()
             _msgs = body.get("messages") or []
             _last = next(
                 (
@@ -61197,10 +61313,20 @@ class Filter:
             # function named as plain prose — so that regex saw one of the
             # two contradictions and missed the one the answer was built on.
             def _syms(_blob: str) -> set:
+                # Indexed AND identifier-shaped, both. Membership in the
+                # index alone matched the bare Spanish word "plan" in
+                # prose, because a symbol of that name exists — one flag in
+                # six on the first measured run, and the kind of noise that
+                # teaches a reader to skip the line. Requiring an
+                # underscore, a dot or an interior capital is the same
+                # discriminator the graph-absence check uses, and it costs
+                # nothing here: a symbol a recommendation is built on gets
+                # written in code voice.
                 return {
                     _w
                     for _w in set(re.findall(r"[A-Za-z_]\w*(?:\.\w+)*", _blob))
                     if _w in _known
+                    and AgenticStaticVerifier._CODEY_TOKEN_RE.fullmatch(_w)
                 }
 
             _known = set(self._symbol_index.get_all_names(project_id) or [])
