@@ -26621,6 +26621,22 @@ class AgenticSynthesisComposer:
         # Measured on the old rule: a block of five test_* functions and a
         # run_all_tests left Code closed.
         _has_code = _plan_has_code(plan)
+        # Resolved here, where there IS a self, and handed down. The
+        # directive is a @staticmethod and every piece of turn state it
+        # needs arrives the same way.
+        _code_action = ""
+        try:
+            _code_action = str(
+                (
+                    self._f._project_state_manager.get_pstate(project_id).get(
+                        "turn_classification"
+                    )
+                    or {}
+                ).get("code_action", "")
+                or ""
+            )
+        except Exception:
+            _code_action = ""
         # A design_tests step that completed wrote acceptance tests meant to
         # be kept; that is the only thing the Tests section is for. Read
         # from the plan's own steps rather than from the presence of a fence
@@ -26702,6 +26718,9 @@ class AgenticSynthesisComposer:
             _had_repair,
             _question_language(question),
             getattr(self._f, "_answer_outline", "") or "",
+            str(getattr(self._f, "_preplanner_question_type", "") or ""),
+            str(getattr(self._f, "_serial_contradicted", "") or ""),
+            _code_action,
         )
         return "\n".join(lines).rstrip()
 
@@ -26771,6 +26790,9 @@ class AgenticSynthesisComposer:
         had_repair: bool = False,
         lang: str = "en",
         outline: str = "",
+        question_type: str = "",
+        contradicted: str = "",
+        code_action: str = "",
     ) -> List[str]:
         """
         Instruct the final model on the SHAPE of its answer.
@@ -26910,10 +26932,15 @@ class AgenticSynthesisComposer:
         # landed. A latent UnboundLocalError in the fallback of the answer
         # directive is the worst place for one: it surfaces exactly when the
         # primary route has already failed.
-        _generative = (
-            str(getattr(self._f, "_preplanner_question_type", "") or "")
-            == "generative"
-        )
+        # Passed in, not read. This method is a @staticmethod — every other
+        # piece of turn state it needs arrives as an argument from the one
+        # caller, which reads it off the filter. Four self._f lookups added
+        # here across as many patches were four NameErrors in a method with
+        # no self, and because the pipeline catches its own failures and
+        # degrades to a single-pass turn, the answers came back with no
+        # template at all rather than with an error. Five turns produced
+        # nothing the section machinery had touched.
+        _generative = str(question_type or "") == "generative"
 
         # With an outline in hand the long form is redundant: a step that
         # read the whole workspace has already decided what belongs where,
@@ -27329,21 +27356,8 @@ class AgenticSynthesisComposer:
         # nineteenth argument through for the third field of it buys
         # nothing. Failure is silent and falls back to the two-signal
         # behaviour, which is what this method did before.
-        _action = ""
-        try:
-            _action = str(
-                (
-                    self._f._project_state_manager.get_pstate(
-                        self._f.valves.project_id
-                    ).get("turn_classification")
-                    or {}
-                ).get("code_action", "")
-                or ""
-            )
-        except Exception:
-            _action = ""
         _code_wanted = _code_section_wanted(
-            has_code, use_case, asked_for_artifact, _action
+            has_code, use_case, asked_for_artifact, code_action
         )
         if _code_wanted:
             out += [
@@ -27547,7 +27561,7 @@ class AgenticSynthesisComposer:
             # term the row added below would be computed and then have no
             # section to be written into — the same shape of loss the
             # coherence check itself suffered, reproduced one layer down.
-            or (getattr(self._f, "_serial_contradicted", "") or "")
+            or (contradicted or "")
         ):
             out += [
                 "",
@@ -27602,7 +27616,7 @@ class AgenticSynthesisComposer:
             # because "never established" and "established twice, opposite
             # ways" are different states and the rule below is written for
             # the first.
-            _contra = getattr(self._f, "_serial_contradicted", "") or ""
+            _contra = contradicted or ""
             if _contra:
                 _rows.append(
                     ("contradicted between steps", " ".join(_contra.split())[:200])
