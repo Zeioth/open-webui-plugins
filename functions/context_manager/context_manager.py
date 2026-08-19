@@ -576,20 +576,32 @@ _SECTION_HEADINGS: Dict[str, Dict[str, str]] = {
 # passed, because none of them measure which section the content is in.
 _GENERATIVE_PROCEED_BODY: Dict[str, str] = {
     "en": (
-        "This is the answer: the proposals themselves, ordered by what they "
-        "are worth against what they cost, each naming the symbol it "
-        "concerns and the deficit that justifies it. Do not summarise them "
-        "here and develop them below — below is where the evidence for "
-        "them goes. If a proposal rests on something this turn did not "
-        "check, say so in the same line rather than dropping it."
+        "Number the proposals here: what to change, in which symbol, and "
+        "what is missing today that makes it worth doing."
     ),
     "es": (
-        "Esto es la respuesta: las propuestas mismas, ordenadas por lo que "
-        "valen frente a lo que cuestan, cada una nombrando el símbolo al "
-        "que afecta y la carencia que la justifica. No las resumas aquí "
-        "para desarrollarlas abajo — abajo va la evidencia que las "
-        "sostiene. Si una propuesta se apoya en algo que este turno no "
-        "comprobó, dilo en la misma línea en vez de omitirlo."
+        "Numera aquí las propuestas: qué cambiar, en qué símbolo, y qué "
+        "falta hoy que lo justifique."
+    ),
+}
+
+# Its other half. Swapping only the section the list SHOULD go in left the
+# section it was going to just as inviting: rule 5 asks every section but
+# Conclusion to be a list of one finding per item, the workspace hands the
+# model its claims under exactly that description, and the proposals landed
+# there again. Measured — the answer wrote nine numbered proposals under
+# the evidence heading while the section above it paraphrased the
+# instruction that had asked for them.
+_GENERATIVE_EVIDENCE_BODY: Dict[str, str] = {
+    "en": (
+        "Say what the checks settled about the symbols named above. The "
+        "proposals themselves belong in the section before this one; do "
+        "not restate them here."
+    ),
+    "es": (
+        "Di qué asentaron las comprobaciones sobre los símbolos nombrados "
+        "arriba. Las propuestas van en la sección anterior; no las repitas "
+        "aquí."
     ),
 }
 
@@ -24719,8 +24731,16 @@ def _plan_has_code(plan: "AgenticPlan") -> bool:
     return False
 
 
+# The code actions whose answer IS code. "explain", "debug" and "review"
+# discuss code that already exists; these two produce some.
+_CODE_WRITING_ACTIONS = frozenset({"modify", "generate"})
+
+
 def _code_section_wanted(
-    has_code: bool, use_case: str, asked_for_artifact: bool
+    has_code: bool,
+    use_case: str,
+    asked_for_artifact: bool,
+    code_action: str = "",
 ) -> bool:
     """Whether the answer should offer a Code section at all.
 
@@ -24763,10 +24783,22 @@ def _code_section_wanted(
     for is a relation or a decision, so code must have been pulled in as
     well; everywhere else code IS the deliverable and either signal alone
     carries it.
+
+    A turn classified as writing code is the third signal, and it is the
+    one that was missing. "añade un log a _emit_status" classified as
+    PROGRAMMING with code_action=modify, asked for no artifact, and no step
+    of the plan happened to fence anything — so both existing signals read
+    false and the section was withheld from a turn whose whole request was
+    to write a line of code. Whether an investigate step chose to quote
+    something is not evidence about what the ANSWER owes the reader.
     """
     if use_case in (UseCase.ARCHITECTURE, UseCase.PLANNING):
         return has_code and asked_for_artifact
-    return has_code or asked_for_artifact
+    return (
+        has_code
+        or asked_for_artifact
+        or str(code_action or "").strip().lower() in _CODE_WRITING_ACTIONS
+    )
 
 
 # A request to PRODUCE something new, in either language. Deterministic and
@@ -26040,6 +26072,9 @@ class AgenticSynthesisComposer:
             _fallbacks["proceed"] = _GENERATIVE_PROCEED_BODY.get(
                 lang, _GENERATIVE_PROCEED_BODY["en"]
             )
+            _fallbacks["evidence"] = _GENERATIVE_EVIDENCE_BODY.get(
+                lang, _GENERATIVE_EVIDENCE_BODY["en"]
+            )
         _generic = _fallbacks["conclusion"]
 
         def _heads(_line: str) -> str:
@@ -26867,6 +26902,18 @@ class AgenticSynthesisComposer:
             ),
         }
         _H = _SECTION_HEADINGS.get(lang) or _SECTION_HEADINGS["en"]
+        # Resolved here, above the branch, because both routes below read it
+        # and the long one reads it FIRST. Defined next to _code_wanted it
+        # sat 80 lines after its own first use, which Python does not catch
+        # until the line runs — and the line only runs when an outline is
+        # discarded, a path that has not fired since the outline rescue
+        # landed. A latent UnboundLocalError in the fallback of the answer
+        # directive is the worst place for one: it surfaces exactly when the
+        # primary route has already failed.
+        _generative = (
+            str(getattr(self._f, "_preplanner_question_type", "") or "")
+            == "generative"
+        )
 
         # With an outline in hand the long form is redundant: a step that
         # read the whole workspace has already decided what belongs where,
@@ -27213,13 +27260,10 @@ class AgenticSynthesisComposer:
                 # outline route makes, made here too — the two routes
                 # answering one question differently is the failure this
                 # file has already paid for once, on the Code section.
-                f"## **{_H['proceed']}** — this is the answer: the "
-                "proposals themselves, ordered by what they are worth "
-                "against what they cost, each naming the symbol it "
-                "concerns and the deficit that justifies it. Do not "
-                "summarise them here and develop them below. Say so in "
-                "the same line when a proposal rests on something this "
-                "turn did not check. NEVER omit this heading."
+                f"## **{_H['proceed']}** — number the proposals here: "
+                "what to change, in which symbol, and what is missing "
+                "today that makes it worth doing. NEVER omit this "
+                "heading."
                 if _generative
                 else f"## **{_H['proceed']}** — the next concrete step, "
                 "ordered so the one that settles the most uncertainty "
@@ -27279,12 +27323,27 @@ class AgenticSynthesisComposer:
         # only when the user asked to be GIVEN a concrete artifact — has to
         # agree. Programming, refactoring and scaffolding keep the old gate:
         # code IS the answer there.
-        _code_wanted = _code_section_wanted(has_code, use_case, asked_for_artifact)
-        # Read once, from the same field the outline route reads, so the
-        # two cannot disagree about which turn this is.
-        _generative = (
-            str(getattr(self._f, "_preplanner_question_type", "") or "")
-            == "generative"
+        # Read here rather than added to the signature: use_case and
+        # asked_for_artifact already arrive as parameters, but they were
+        # resolved by the caller from this same dict, and threading a
+        # nineteenth argument through for the third field of it buys
+        # nothing. Failure is silent and falls back to the two-signal
+        # behaviour, which is what this method did before.
+        _action = ""
+        try:
+            _action = str(
+                (
+                    self._f._project_state_manager.get_pstate(
+                        self._f.valves.project_id
+                    ).get("turn_classification")
+                    or {}
+                ).get("code_action", "")
+                or ""
+            )
+        except Exception:
+            _action = ""
+        _code_wanted = _code_section_wanted(
+            has_code, use_case, asked_for_artifact, _action
         )
         if _code_wanted:
             out += [
@@ -27433,14 +27492,22 @@ class AgenticSynthesisComposer:
         # ── the audit trail: what was checked, and how ──
         out += [
             "",
-            f"## **{_H['evidence']}** — the facts that carry the "
-            "conclusion: the symbols, call relations and code paths "
-            "that were checked against the indexed graph, each stated "
-            "so the reader can go and confirm it. Never give an "
-            "unverified claim the same voice as a verified one. When "
-            "this turn verified NOTHING, say so in one line and stop: "
-            "an empty check reported honestly beats a paragraph "
-            "written to fill the heading.",
+            (
+                f"## **{_H['evidence']}** — what the checks settled about "
+                "the symbols named above. The proposals themselves belong "
+                "in the section before this one; do not restate them "
+                "here. Never give an unverified claim the same voice as a "
+                "verified one."
+                if _generative
+                else f"## **{_H['evidence']}** — the facts that carry the "
+                "conclusion: the symbols, call relations and code paths "
+                "that were checked against the indexed graph, each stated "
+                "so the reader can go and confirm it. Never give an "
+                "unverified claim the same voice as a verified one. When "
+                "this turn verified NOTHING, say so in one line and stop: "
+                "an empty check reported honestly beats a paragraph "
+                "written to fill the heading."
+            ),
         ]
 
         # ── Step 2: the honest gap, only when there is one ──
@@ -30723,6 +30790,7 @@ class AgenticOrchestrator:
                 # route had produced it.
                 _uc_now = ""
                 _artifact_now = False
+                _action_now = ""
                 try:
                     _tc_now = (
                         self._f._project_state_manager.get_pstate(project_id).get(
@@ -30732,11 +30800,13 @@ class AgenticOrchestrator:
                     )
                     _uc_now = str(_tc_now.get("use_case", "")).upper()
                     _artifact_now = bool(_tc_now.get("direct_retrieval") is True)
+                    _action_now = str(_tc_now.get("code_action", "") or "")
                 except Exception:
                     _uc_now = ""
                     _artifact_now = False
+                    _action_now = ""
                 _code_now = _code_section_wanted(
-                    _plan_has_code(plan), _uc_now, _artifact_now
+                    _plan_has_code(plan), _uc_now, _artifact_now, _action_now
                 )
                 # The outline is composed BEFORE the generative re-plan
                 # waves, and a wave step can append a fenced block to the
@@ -61634,6 +61704,7 @@ class Filter:
 
             # ── Step 2: how many blocks back each one's members ────────────
             _split: List[Tuple[str, int, int]] = []
+            _unmeasured = 0
             for _cls in _classes:
                 _members = self._symbol_index.get_class_members(_cls, project_id)
                 if len(_members) < 2:
@@ -61644,6 +61715,15 @@ class Filter:
                         _blocks |= set(self._symbol_index.find_blocks(_m, project_id))
                     except Exception:
                         continue
+                # No block resolved for any member is not a clean class, it
+                # is a class this pass could not look at. Folding the two
+                # together would let a lookup failure report as health —
+                # and this line is what decides whether the obsoleting rule
+                # is worth changing, so a false clean here is the one
+                # answer that costs something.
+                if not _blocks:
+                    _unmeasured += 1
+                    continue
                 if len(_blocks) > 1:
                     _split.append((_cls, len(_members), len(_blocks)))
 
@@ -61652,6 +61732,11 @@ class Filter:
                 self._log_debug(
                     f"[INDEX-VERSIONS] ok — none of the {len(_classes)} indexed "
                     f"class(es) span more than one block"
+                    + (
+                        f" ({_unmeasured} could not be resolved to any block)"
+                        if _unmeasured
+                        else ""
+                    )
                 )
                 return
             _split.sort(key=lambda _t: -_t[1])
@@ -61660,7 +61745,9 @@ class Filter:
             )
             self._log_debug(
                 f"[INDEX-VERSIONS] {len(_split)} of {len(_classes)} class(es) "
-                f"indexed more than once: {_sample}"
+                f"indexed more than once"
+                + (f" ({_unmeasured} unresolved)" if _unmeasured else "")
+                + f": {_sample}"
                 + (" …" if len(_split) > 3 else "")
                 + " — member counts and the skeleton are unions across pasted "
                 "versions, not any one of them; `/forget all` before re-pasting "
@@ -61751,6 +61838,11 @@ class Filter:
             # symbol in the measured failure was written bare — a module
             # function named as plain prose — so that regex saw one of the
             # two contradictions and missed the one the answer was built on.
+            _known = set(self._symbol_index.get_all_names(project_id) or [])
+            if not _known:
+                self._log_debug("[GAP-PROMOTION] not measured — empty symbol index")
+                return
+
             def _syms(_blob: str) -> set:
                 # Indexed AND identifier-shaped, both. Membership in the
                 # index alone matched the bare Spanish word "plan" in
@@ -61768,12 +61860,6 @@ class Filter:
                     and AgenticStaticVerifier._CODEY_TOKEN_RE.fullmatch(_w)
                 }
 
-            _known = set(self._symbol_index.get_all_names(project_id) or [])
-            if not _known:
-                self._log_debug(
-                    "[GAP-PROMOTION] not measured — empty symbol index"
-                )
-                return
             _prop_syms = _syms(_proposing)
             _gap_syms = _syms(_shelved)
 
