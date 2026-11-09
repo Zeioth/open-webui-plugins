@@ -615,16 +615,12 @@ _SECTION_FALLBACK_BODIES: Dict[str, Dict[str, str]] = {
         "code": "Show the code this turn has; if there is none, say that.",
         "tests": "Show the tests this turn ran; if it ran none, say that.",
         "rivals": (
-            "Say which rival account survived and on what; if none did, "
-            "say that."
+            "Say which rival account survived and on what; if none did, " "say that."
         ),
         "buried": (
-            "Say which account was ruled out and on what; if none was, "
-            "say that."
+            "Say which account was ruled out and on what; if none was, " "say that."
         ),
-        "evidence": (
-            "Say what the checks settled; if they settled nothing, say that."
-        ),
+        "evidence": ("Say what the checks settled; if they settled nothing, say that."),
         "gaps": "Say what was left unverified; if nothing was, say that.",
     },
     "es": {
@@ -636,12 +632,9 @@ _SECTION_FALLBACK_BODIES: Dict[str, Dict[str, str]] = {
         "code": "Muestra el código que este turno tiene; si no hay, dilo.",
         "tests": "Muestra los tests que se ejecutaron; si no hubo, dilo.",
         "rivals": (
-            "Di qué explicación rival sobrevivió y con qué apoyo; si "
-            "ninguna, dilo."
+            "Di qué explicación rival sobrevivió y con qué apoyo; si " "ninguna, dilo."
         ),
-        "buried": (
-            "Di qué explicación quedó descartada y con qué; si ninguna, dilo."
-        ),
+        "buried": ("Di qué explicación quedó descartada y con qué; si ninguna, dilo."),
         "evidence": (
             "Di qué asentaron las comprobaciones; si no asentaron nada, dilo."
         ),
@@ -707,9 +700,7 @@ def _account_outline_body(accounts: Optional[List[dict]], kind: str, lang: str) 
             _how = _f["buried_falsified" if _cause == "falsified" else "buried_other"]
         else:
             _how = _f[
-                "rival_stalled"
-                if _cause in ("stalled", "budget")
-                else "rival_other"
+                "rival_stalled" if _cause in ("stalled", "budget") else "rival_other"
             ]
         # The synthetic upload prefix comes off here rather than at the
         # forge, because this is the only place the text is shown to a
@@ -717,6 +708,7 @@ def _account_outline_body(accounts: Optional[List[dict]], kind: str, lang: str) 
         _h = _PASTED_QUALIFIER_RE.sub("", str(_a.get("hypothesis") or "")).strip()
         _parts.append(f"{_lead}: {_h} — {_how}")
     return "; ".join(_parts) + "."
+
 
 # Function words, which appear in ordinary prose and almost never inside an
 # identifier. Counting them beats looking for accents: "¿Qué hace
@@ -2788,7 +2780,6 @@ class Patch(BaseModel):
         if not self.base_lines:
             return f"{self.new_lines or len((self.content or '').splitlines())} lines"
         return f"replaces {self.base_lines} lines with {self.new_lines}"
-
 
     def label(self) -> str:
         """The symbols this patch replaces, for a one-line listing.
@@ -15867,9 +15858,7 @@ class LongTermMemory:
                         f"entry/entries at capacity ({max_entries})"
                     )
             except Exception as e:
-                self._f._log_debug(
-                    f"[RESPONSE-CACHE] eviction failed ({e!r})"
-                )
+                self._f._log_debug(f"[RESPONSE-CACHE] eviction failed ({e!r})")
 
         # ------------------------------------------------------------------
         # Region: Upsert the new entry
@@ -19969,18 +19958,54 @@ class AgenticStaticVerifier:
     _COUNT_NARROWING = frozenset(
         {
             # English
-            "static", "async", "public", "private", "abstract", "class",
-            "classmethod", "staticmethod", "self-contained", "stateful",
-            "stateless", "helper", "nested", "inherited", "overridden",
+            "static",
+            "async",
+            "public",
+            "private",
+            "abstract",
+            "class",
+            "classmethod",
+            "staticmethod",
+            "self-contained",
+            "stateful",
+            "stateless",
+            "helper",
+            "nested",
+            "inherited",
+            "overridden",
             # Spanish
-            "estatico", "estaticos", "estatica", "estaticas",
-            "asincrono", "asincronos", "asincrona", "asincronas",
-            "publico", "publicos", "publica", "publicas",
-            "privado", "privados", "privada", "privadas",
-            "abstracto", "abstractos", "abstracta", "abstractas",
-            "autocontenido", "autocontenidos", "autocontenida",
-            "autocontenidas", "anidado", "anidados", "heredado",
-            "heredados", "auxiliar", "auxiliares", "propio", "propios",
+            "estatico",
+            "estaticos",
+            "estatica",
+            "estaticas",
+            "asincrono",
+            "asincronos",
+            "asincrona",
+            "asincronas",
+            "publico",
+            "publicos",
+            "publica",
+            "publicas",
+            "privado",
+            "privados",
+            "privada",
+            "privadas",
+            "abstracto",
+            "abstractos",
+            "abstracta",
+            "abstractas",
+            "autocontenido",
+            "autocontenidos",
+            "autocontenida",
+            "autocontenidas",
+            "anidado",
+            "anidados",
+            "heredado",
+            "heredados",
+            "auxiliar",
+            "auxiliares",
+            "propio",
+            "propios",
         }
     )
 
@@ -20055,10 +20080,7 @@ class AgenticStaticVerifier:
             for _m in cls._LISTED_COUNT_RE.finditer(_text):
                 if cls._COUNT_HEDGE_RE.search(_text[: _m.start(1)]):
                     continue
-                _items = [
-                    _t
-                    for _t in cls._CODEY_TOKEN_RE.findall(_m.group(2))
-                ]
+                _items = [_t for _t in cls._CODEY_TOKEN_RE.findall(_m.group(2))]
                 _items = list(dict.fromkeys(_items))
                 if len(_items) < 2:
                     continue
@@ -20284,15 +20306,11 @@ class AgenticStaticVerifier:
                 _of = str(check.get("of", "members"))
                 if _of == "callers":
                     _bare = src_n.rsplit(".", 1)[-1]
-                    _actual = len(
-                        self._f._symbol_index.get_callers(_bare, project_id)
-                    )
+                    _actual = len(self._f._symbol_index.get_callers(_bare, project_id))
                     _what = f"caller(s) of '{_bare}'"
                 else:
                     _cls = src_n.rsplit(".", 1)[-1]
-                    _members = self._f._symbol_index.get_class_members(
-                        _cls, project_id
-                    )
+                    _members = self._f._symbol_index.get_class_members(_cls, project_id)
                     if not _members:
                         return (
                             "unverifiable",
@@ -24526,9 +24544,7 @@ class AgenticToolBroker:
             # order, which is the one a reader wants: sorting alphabetically
             # would hand the step a list bearing no relation to the file it
             # is about to ask for pieces of.
-            _names = list(
-                dict.fromkeys(str(m).rsplit(".", 1)[-1] for m in _members)
-            )
+            _names = list(dict.fromkeys(str(m).rsplit(".", 1)[-1] for m in _members))
             if not _names:
                 return ""
             _head = ", ".join(_names[:12])
@@ -24590,18 +24606,16 @@ class AgenticToolBroker:
             )
             if _hint:
                 body = (
-                    _shown
-                    + f"\n# ... [truncated by broker: showing {_cap} of "
+                    _shown + f"\n# ... [truncated by broker: showing {_cap} of "
                     f"{_total} chars. {qid} is {_total // _cap}x the cap and "
                     f"CANNOT be reassembled by expanding it — do not ask for "
                     f"its body again, and do not guess its remaining "
-                    f"contents. Expand a NAMED member instead."
-                    + _hint
-                    + "]"
+                    f"contents. Expand a NAMED member instead." + _hint + "]"
                 )
             else:
                 body = (
-                    _shown + f"\n# ... [truncated by broker: showing {_cap} of {_total} "
+                    _shown
+                    + f"\n# ... [truncated by broker: showing {_cap} of {_total} "
                     f"chars. To see the rest, GREP a distinctive token from the "
                     f"missing region, or state that the tail of {qid} was not "
                     f"inspected — do NOT guess its remaining calls.]"
@@ -26065,10 +26079,7 @@ class AgenticSynthesisComposer:
         # the module table would carry the swap into every later turn in
         # the process, which is how a per-turn shape becomes a permanent
         # one without anything in the code saying so.
-        if (
-            str(getattr(self._f, "_preplanner_question_type", "") or "")
-            == "generative"
-        ):
+        if str(getattr(self._f, "_preplanner_question_type", "") or "") == "generative":
             _fallbacks["proceed"] = _GENERATIVE_PROCEED_BODY.get(
                 lang, _GENERATIVE_PROCEED_BODY["en"]
             )
@@ -27297,7 +27308,7 @@ class AgenticSynthesisComposer:
                 "comes first: the symbol to read, the check to run, the "
                 "thing to instrument. "
             )
-            + 
+            +
             # "five of fourteen said no further step was necessary" is the
             # measurement, and it belongs here rather than in the model's
             # copy: a heading and a paragraph spent to say nothing.
@@ -31214,9 +31225,7 @@ class AgenticOrchestrator:
                         _eff = []
                         # The count, not the size of the lookup set. They
                         # differed by up to a factor of two.
-                        _n_bodies = int(
-                            getattr(self._f, "_bodies_shown_count", 0) or 0
-                        )
+                        _n_bodies = int(getattr(self._f, "_bodies_shown_count", 0) or 0)
                         if _n_bodies:
                             _dir = ""
                             try:
@@ -31626,8 +31635,7 @@ class AgenticOrchestrator:
                 # neither. Nothing is safer than something wrong here.
                 _open_line = ""
                 self._f._log_debug(
-                    f"[ANSWER-SEED] not emitted — language unresolved "
-                    f"({_e_seed!r})"
+                    f"[ANSWER-SEED] not emitted — language unresolved " f"({_e_seed!r})"
                 )
         # ── Step 3: emit, and say which source it came from ──
         if _open_line:
@@ -31639,9 +31647,9 @@ class AgenticOrchestrator:
             # nothing and sits where the decision is made.
             _shelved = ""
             try:
-                _us = (
-                    getattr(self._f, "_agentic_coverage", None) or {}
-                ).get("unsettled_subjects") or []
+                _us = (getattr(self._f, "_agentic_coverage", None) or {}).get(
+                    "unsettled_subjects"
+                ) or []
                 if _us:
                     _shelved = (
                         "\n\nThis turn did NOT establish how these behave: "
@@ -31657,9 +31665,7 @@ class AgenticOrchestrator:
                 "Your answer begins with these two lines, exactly:\n\n"
                 "---\n\n" + _open_line + _shelved
             )
-            self._f._log_debug(
-                f"[ANSWER-SEED] {_open_line!r} from the {_seed_from}"
-            )
+            self._f._log_debug(f"[ANSWER-SEED] {_open_line!r} from the {_seed_from}")
         dynamic_injections.append(("trailing", _workspace))
         # The note that used to sit here is gone, and where it sat is why.
         # It was a trailing injection, a slot this file chooses so that
@@ -34555,7 +34561,9 @@ class CommandRouter:
             _state = self._f._conversation_state_manager.get(project_id)
             _chat = getattr(self._f, "_chat_id_this_turn", "") or ""
             return sum(
-                1 for _p in (getattr(_state, "patches", None) or []) if _p.chat_id != _chat
+                1
+                for _p in (getattr(_state, "patches", None) or [])
+                if _p.chat_id != _chat
             )
         except Exception:
             return 0
@@ -34720,9 +34728,7 @@ class CommandRouter:
             _key = _name
             if _key not in _base:
                 _tail = _name.rsplit(".", 1)[-1]
-                _cands = [
-                    _k for _k in _base if _k == _tail or _k.endswith("." + _tail)
-                ]
+                _cands = [_k for _k in _base if _k == _tail or _k.endswith("." + _tail)]
                 if len(_cands) != 1:
                     _out.append(
                         f"# {_name}: not in the pasted source "
@@ -34792,9 +34798,7 @@ class CommandRouter:
             _was = bool(_pb.disabled)
             _pb.disabled = _off
             if _was == _off:
-                _done.append(
-                    f"P{_n} was already {'set aside' if _off else 'active'}"
-                )
+                _done.append(f"P{_n} was already {'set aside' if _off else 'active'}")
             else:
                 _done.append(f"P{_n} {'set aside' if _off else 'brought back'}")
         if _bad:
@@ -35112,13 +35116,10 @@ class CommandRouter:
             )
         self._f._log_debug(
             f"[PATCH-FILE] composing {len(_used)} of {len(_patches)} patch(es): "
-            f"{_used or 'none'}"
-            + (f"; skipped {_skipped}" if _skipped else "")
+            f"{_used or 'none'}" + (f"; skipped {_skipped}" if _skipped else "")
         )
         _uid = (__user__ or {}).get("id") or ""
-        _report = await self._f._patcher.deliver_patched_file(
-            _base, _name, _uid, _src
-        )
+        _report = await self._f._patcher.deliver_patched_file(_base, _name, _uid, _src)
         if _used or _skipped:
             _report += "\n\nApplied: " + (", ".join(_used) or "none") + "."
             if _skipped:
@@ -35132,11 +35133,15 @@ class CommandRouter:
         # that drops names the pasted source defined still compiles, so
         # nothing else in this report would mention it.
         if _losses:
-            _report += "\n\n**Check these:** " + "; ".join(
-                f"`{_k}` no longer defines {', '.join(_v[:6])}"
-                + (f" and {len(_v) - 6} more" if len(_v) > 6 else "")
-                for _k, _v in _losses
-            ) + ". The rewrite replaced the whole definition; anything it "
+            _report += (
+                "\n\n**Check these:** "
+                + "; ".join(
+                    f"`{_k}` no longer defines {', '.join(_v[:6])}"
+                    + (f" and {len(_v) - 6} more" if len(_v) > 6 else "")
+                    for _k, _v in _losses
+                )
+                + ". The rewrite replaced the whole definition; anything it "
+            )
             "did not repeat is gone."
         return _report
 
@@ -35619,6 +35624,8 @@ class CommandRouter:
         ):
             return True
         return False
+
+
 class PatchApplier:
     """Applies a change the model proposed onto the pasted source.
 
@@ -35679,9 +35686,7 @@ class PatchApplier:
             The patched source code, or None if the diff cannot be applied.
         """
         if not self._f.valves.enable_diff_application:
-            self._f._log_debug(
-                "[PATCH-APPLY] skipped — enable_diff_application is off"
-            )
+            self._f._log_debug("[PATCH-APPLY] skipped — enable_diff_application is off")
             return None
 
         lines = original.splitlines(keepends=False)
@@ -35804,6 +35809,7 @@ class PatchApplier:
         that silently removes an attribute or a method nobody mentioned is
         the reader's problem to judge, so it has to reach them.
         """
+
         def _defined(_src: str) -> set:
             _out: set = set()
             try:
@@ -35853,8 +35859,7 @@ class PatchApplier:
         if _have > col:
             _cut = _have - col
             return "\n".join(
-                _l[_cut:] if _l[:_cut].strip() == "" else _l.lstrip()
-                for _l in _lines
+                _l[_cut:] if _l[:_cut].strip() == "" else _l.lstrip() for _l in _lines
             )
         _pad = " " * (col - _have)
         return "\n".join(_pad + _l if _l.strip() else _l for _l in _lines)
@@ -36080,18 +36085,14 @@ class PatchApplier:
                         if _k == _tail or _k.endswith("." + _tail)
                     ]
                     if len(_cands) != 1:
-                        _unresolved.append(
-                            f"{_name} ({len(_cands)} matches)"
-                        )
+                        _unresolved.append(f"{_name} ({len(_cands)} matches)")
                         continue
                     _key = _cands[0]
                 _bs, _be = _base_spans[_key]
                 # Shifted to the column the target sits at: a method lives
                 # indented inside its class and a body written as a
                 # top-level function does not.
-                _tgt = (
-                    _base_lines[_bs - 1] if _bs - 1 < len(_base_lines) else ""
-                )
+                _tgt = _base_lines[_bs - 1] if _bs - 1 < len(_base_lines) else ""
                 _lost1 = self.structural_loss(
                     "\n".join(_base_lines[_bs - 1 : _be]),
                     "\n".join(_new_lines[_ns - 1 : _ne]),
@@ -36160,9 +36161,7 @@ class PatchApplier:
         try:
             compile(source, "<patched>", "exec")
         except SyntaxError as _e_syn:
-            return False, (
-                f"does not compile: {_e_syn.msg} at line {_e_syn.lineno}"
-            )
+            return False, (f"does not compile: {_e_syn.msg} at line {_e_syn.lineno}")
         except Exception as _e_c:
             return False, f"does not compile: {_e_c!r}"
         # ── Step 2: the advisory pass ──
@@ -36248,8 +36247,7 @@ class PatchApplier:
                 _res = await _res
             if not _res:
                 self._f._log_debug(
-                    "[PATCH-FILE] not registered — insert_new_file returned "
-                    "nothing"
+                    "[PATCH-FILE] not registered — insert_new_file returned " "nothing"
                 )
                 return False
             self._f._log_debug(f"[PATCH-FILE] registered — file id {file_id}")
@@ -36324,7 +36322,9 @@ class PatchApplier:
             )
         except Exception as _e_w:
             self._f._log_debug(f"[PATCH-FILE] write failed ({_e_w!r})")
-            return f"The patched source {_verdict}, but it could not be written: {_e_w!r}"
+            return (
+                f"The patched source {_verdict}, but it could not be written: {_e_w!r}"
+            )
         # ── Step 3: attach it to the message, once it is a real file ──
         # The event is emitted only when the registration took, because an
         # unregistered card is worse than no card: it opens, promises a
@@ -36451,9 +36451,7 @@ class PatchApplier:
             )
             _how = "diff"
         if not new_code:
-            _spliced = self._splice_symbols(
-                base_block.content, proposed_block.content
-            )
+            _spliced = self._splice_symbols(base_block.content, proposed_block.content)
             if _spliced:
                 new_code, _names = _spliced
                 _how = "splice"
@@ -36506,8 +36504,6 @@ class PatchApplier:
         self._f._activation.invalidate_lightweight_cache(project_id)
 
         return True
-
-
 
 
 class CodeBlockManager:
@@ -45399,8 +45395,10 @@ class ActiveCodeUpdater:
                 # second rewrite of _close_dangling_fence went in as
                 # dup=True and vanished: neither held nor refused, and
                 # "/file" then composed 1 of 2 where 3 were expected.
-                if is_dup and existing and not getattr(
-                    new_block, "is_proposed_patch", False
+                if (
+                    is_dup
+                    and existing
+                    and not getattr(new_block, "is_proposed_patch", False)
                 ):
                     await self._process_duplicate_block(
                         existing, new_block, syms, state, project_id, existing_hash
@@ -45840,9 +45838,7 @@ class ActiveCodeUpdater:
                         )
                     )
             except Exception as _e_tests:
-                self._f._log_debug(
-                    f"[TEST-SCAFFOLD] gate skipped ({_e_tests!r})"
-                )
+                self._f._log_debug(f"[TEST-SCAFFOLD] gate skipped ({_e_tests!r})")
 
         # ── Step 4: map block content → symbols (skip failed extractions) ──
         content_to_syms: Dict[str, List[CodeSymbol]] = {
@@ -46461,9 +46457,7 @@ class ActiveCodeUpdater:
                 _nm = getattr(_sym, "name", "")
                 if not _nm:
                     continue
-                _cands = list(
-                    self._f._symbol_index.find_blocks(_nm, project_id) or []
-                )
+                _cands = list(self._f._symbol_index.find_blocks(_nm, project_id) or [])
                 if _pref is not None and getattr(_pref, "hash", "") in _cands:
                     _cands.remove(_pref.hash)
                     _cands.insert(0, _pref.hash)
@@ -46514,9 +46508,7 @@ class ActiveCodeUpdater:
                                     # "CodePathView.is_stale", and the second
                                     # is what the file actually holds.
                                     symbols=list(_probe[1]),
-                                    chat_id=getattr(
-                                        self._f, "_chat_id_this_turn", ""
-                                    )
+                                    chat_id=getattr(self._f, "_chat_id_this_turn", "")
                                     or "",
                                     turn=int(
                                         self._f._project_state_manager.get_pstate(
@@ -55203,7 +55195,9 @@ class InletOrchestrator:
                 "[NO-OUTLET] response cache store skipped — the answer this "
                 "would store never completed"
             )
-        elif self._f.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2:
+        elif (
+            self._f.valves.enable_response_cache and HAS_SENTENCE and len(messages) >= 2
+        ):
             prompt_user = next(
                 (
                     m
