@@ -163,6 +163,9 @@ from shared_resources import (
 #       MultiPhasePlanner · CommandRouter · CodeBlockManager
 #
 # 14. METACOGNITIVE REASONING
+#       HardCoreRule · EPISTEMIC_HARD_CORE
+#       EpistemicRegime · AuxiliaryStanding
+#       AuxiliaryHypothesis · ProtectiveBelt
 #       MetacognitiveReasoningEngine · EpistemicStrategies
 #       HypothesisForge
 #
@@ -273,6 +276,24 @@ class PeerReviewResult:
     is_external: bool = False
 
 
+def _prediction_key(text: str) -> str:
+    """
+    Normalise a derived prediction so a restatement is counted once.
+
+    Case, spacing, quoting and closing punctuation are what a later cycle
+    changes when it repeats a prediction ("X calls Y" against "`X` calls
+    `Y`."). Anything more is a different sentence and may be a different
+    prediction; this does not try to tell.
+    """
+    return re.sub(r"[`'\"]", "", " ".join(text.lower().split())).rstrip(" .;:!")
+
+
+# How many symbols a dossier records as what its verdict was tested
+# against. Each is fingerprinted when the graveyard is read, so the bound
+# keeps that read cheap.
+_TESTED_AGAINST_MAX = 48
+
+
 @dataclass
 class HypothesisDossier:
     """
@@ -301,7 +322,22 @@ class HypothesisDossier:
     refuted_symbol_checks: int = 0
     refuted_relation_checks: int = 0
     coverage_score: float = 0.0
+    # Ranks the rivals today. It counts the symbols the hypothesis, its
+    # analysis and its predictions name that EXIST, plus the call
+    # relations among them that hold: a hypothesis earns it by naming
+    # real code, whether or not it predicted anything about it.
     corroboration: float = 0.0
+    # The experiment's outcome, accumulated over cycles: the distinct
+    # derived consequences the graph, the contract checker or the
+    # evidence judge confirmed, and those they refuted. These are the
+    # predictions a hypothesis was at risk of failing — what Lakatos
+    # calls its corroborated excess content. Ranking rivals by it was
+    # tried in shadow and retired (patch 61): over seven live
+    # competitions it picked a different winner four times, none of them
+    # right, because the predictions it counts are the mechanism's
+    # skeleton, not its cause.
+    predictions_corroborated: int = 0
+    predictions_refuted: int = 0
     generation_confidence: float = -1.0  # S5: -1.0 = not generated
     assumptions: int = 0
     anchors_touched: int = 0
@@ -324,6 +360,12 @@ class HypothesisDossier:
     # tested against six bodies; the names say which six, which is the
     # difference between auditing a verdict and taking its word.
     nodes_expanded: List[str] = field(default_factory=list)
+    # The symbols the verdict rests on: every body read, every symbol a
+    # claim named, both ends of every call relation checked. A refutation
+    # holds for the code it was tested against and for no other, so this
+    # is what decides when a burial stops holding (see
+    # HypothesisForge._refutation_still_holds and TestedCode).
+    tested_against: List[str] = field(default_factory=list)
     blind_spots: List[str] = field(default_factory=list)
     # RS-4: how a surviving rival relates to the winner, set at
     # judgment time (competing / complementary / independent).
@@ -373,66 +415,13 @@ class CompetitionRecord:
     question_type: str = ""
 
 
-# Compression ratio below which a generation is degenerate. Measured:
-# the most repetitive legitimate output of 25 samples compressed to
-# 0.149 and the median to 0.345; the three recorded corruptions to
-# 0.080, 0.082 and 0.113. 0.13 sits in the gap with margin on both
-# sides — no healthy sample falls below it, and no corrupt one above.
-# How many claims one agentic step may contribute. The forge has had a
-# budget since the experiment prompt gained one; the steps had none —
-# not in the prompt, not in the parser — and a step took the invitation:
-# 15203 tokens, 598 lines of claim objects, 88 of them distinct, 225
-# seconds. It had not lost the thread. It was emitting the claims array
-# it had been asked for, and was never told when to stop.
-#
-# 12 is measured rather than guessed: across the recorded dumps a healthy
-# step produces a median of 3 claims and at most 9, and a whole
-# seven-step turn totalled 20. The ceiling sits a third above the largest
-# honest step, so it can only cut a generation that has already left the
-# distribution.
-#
-# Module scope because two places need the SAME number: the JSON contract
-# every step reads, and the ledger that parses what comes back. Stating
-# it in one and enforcing it in the other from separate constants is how
-# the forge came to discard 88 of 98 claims without saying so.
-# How many tools one step may request in a single reply. The parser has
-# always deduplicated and taken the first four; the model was never told,
-# and a step took the invitation exactly as the claims list did: 7448
-# tokens over 114 seconds alternating
-#
-#     TOOL: EXPAND(ConversationStateManager._save_to_db)
-#     TOOL: EXPAND(ConversationStateManager._save_to_db_async)
-#
-# until it hit the ceiling. Two symbols, hundreds of times. The four that
-# would have been used were in the first two lines; the other 7400 tokens
-# were written, paid for and discarded — and the truncation cost the step
-# its claims, which cost the analyze step a usable workspace, which is
-# why the user was handed a function whose signature runs straight into
-# the middle of its own body.
-#
-# 4 is not a new limit. It is the limit that already existed in the
-# parser, finally said out loud.
 # What sits between the KV prefix and whatever follows it. One constant,
-# because two places build that junction and they had drifted apart:
-# _align_system_to_prefix joined prelim + separator + role, while the six
-# agentic call sites passed the prelim BARE as their system prompt.
-#
-# Six tokens of difference, and it cost about ten minutes a run. A KV
-# checkpoint is only usable at or before the point where the new prompt
-# diverges from the cached one, and llama.cpp creates them where prompts
-# END. A checkpoint left by one route therefore sat past the other
-# route's divergence and was rejected: 248 of 345 checkpoint checks in
-# one run, several failing by a single token ("checkpoint@72213 against
-# 72212"), each rejection costing a 72k-token re-prefill at 80-98s.
-#
-# The junction is worse than a plain offset, which is why matching it
-# byte-for-byte matters. Qwen2 pre-tokenises punctuation together with
-# the newlines that follow it, so a prelim ending "prelim." emits the
-# chunk "." when bare and ".\n\n" when the separator follows — the two
-# routes diverge at the LAST token of the shared text, not after it.
-# Verified against the Qwen2 pre-tokeniser pattern: with the separator on
-# both sides the prefix chunks identically for every role tried, and
-# without it they never can.
+# because every route that builds that junction must build it the same
+# way: llama.cpp checkpoints where prompts end, and two routes that differ
+# by a few tokens there reject each other's checkpoints (a 72k-token
+# re-prefill each time). The separator also has to be present on both
+# sides: Qwen2 pre-tokenises punctuation together with the newlines after
+# it, so a bare prelim and a separated one diverge on its last token.
 _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 
 # ══ THE PREFIX INVARIANT ═════════════════════════════════════════════════
@@ -441,40 +430,21 @@ _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 #
 #     system = static_block + SEP + hub_tier + SEP
 #
-# Everything else — the user profile, Block B, each call's role, the
-# answer's workspace and format — rides in the user turn. Four separate
-# patches enforce this and each is useless without the others.
+# Everything else — profile, Block B, each call's role, the answer's
+# workspace and format — rides in the user turn. llama.cpp checkpoints at
+# message boundaries and a recurrent model cannot rewind elsewhere, so one
+# token of difference costs a full re-prefill (~70k tokens, 85-130 s) and
+# nothing fails or warns.
 #
-# WHY, because it is not guessable from the code. llama.cpp writes its KV
-# checkpoints at MESSAGE boundaries and a recurrent model cannot rewind to
-# anywhere else. So the only resumable position is the end of the system
-# message, and the only way a checkpoint survives is for that position to
-# hold the same content next time. A single token of difference costs a
-# full re-prefill of the whole prompt — 70000 tokens, 85 to 130 seconds —
-# and nothing fails, warns or looks wrong. The turn is just slow.
+# HOW IT BREAKS: appending anything to static_block or hub_tier not derived
+# purely from the indexed code; _aligned_prefix returning other than
+# prelim + SEP; the two assemblers placing the profile or Block B
+# differently; a chat template separating roles in one token or inserting
+# anything between system and first user turn.
 #
-# Measured over one session: fifteen full re-prefills, three of them
-# missing by ONE token. Diagnosing it took four attempts and three false
-# theories (ChatML boundaries, tokenizer merges, checkpoint spacing); what
-# settled it was llama.cpp's --log-prompts-dir, because the difference is
-# made by the chat template AFTER this file has finished assembling.
-#
-# HOW IT BREAKS. Any of these puts content back in the system message and
-# the re-prefills return silently:
-#
-#   · appending anything to static_block or hub_tier that is not derived
-#     purely from the indexed code
-#   · _aligned_prefix returning something other than prelim + SEP
-#   · either assembler placing the profile or Block B differently from
-#     the other — the aligned prefix must stay a byte-prefix of the
-#     answer prompt
-#   · a chat template that separates roles in one token (the margin is
-#     four) or inserts anything between the system and the first user turn
-#
-# HOW TO TELL. `⏱️ Answer call` in the log: ~15-35s means the checkpoint is
-# being reached, ~110s means it is not. On the server,
-# `checking checkpoint with [N] against M` names the miss, and
-# `forcing full prompt re-processing` counts them.
+# HOW TO TELL: `⏱️ Answer call` ~15-35 s means the checkpoint is reached,
+# ~110 s means not; the server's `forcing full prompt re-processing`
+# counts the misses.
 # ═════════════════════════════════════════════════════════════════════════
 
 # Reading and Did are stripped alongside Confidence. The reason that counts
@@ -551,29 +521,13 @@ _SECTION_HEADINGS: Dict[str, Dict[str, str]] = {
     },
 }
 
-# The body line handed to a protected section whose outline body came back
-# SKIP. It replaces "what this turn has for it", which was a fragment of the
-# directive one line above it ("the line under each heading says what this
-# turn established for it") and read in the prompt as a leak rather than as
-# anything to act on. Protecting Conclusion and How to proceed made that
-# text frequent, since those two are the ones the outline actually drops.
-#
-# Each says the same thing in the section's own terms: report what there
-# is, and if there is nothing, say so plainly. A section honestly declared
-# empty is worth more than one padded to look full, and both are worth more
-# than its content arriving under a heading that promised something else.
-# Imperative on purpose: the directive tells the model to develop the line
-# into prose, so a line that read as content would be developed into prose
-# about the placeholder.
-# What "How to proceed" must carry when the request was to PRODUCE proposals
-# rather than to find something out. The generic body asks for "the next
-# step", and on a generative turn there is no next step — there is a list,
-# which is the entire answer. Measured against the generic body, that turn
-# wrote "no immediate action required" under this heading and put its eight
-# proposals under the evidence heading instead: the payload in the section
-# meant for what supports it, and the section meant for what to do saying
-# there was nothing. The section order was canonical and every auditor
-# passed, because none of them measure which section the content is in.
+# The body line for a protected section whose outline came back SKIP:
+# report what there is, or say plainly there is nothing. Imperative, so it
+# is acted on rather than developed into prose about itself.
+# What "How to proceed" must carry when the request was to PRODUCE
+# proposals: on a generative turn the list is the answer, and with the
+# generic "next step" body the proposals landed under the evidence
+# heading instead.
 _GENERATIVE_PROCEED_BODY: Dict[str, str] = {
     "en": (
         "Number the proposals here: what to change, in which symbol, and "
@@ -752,6 +706,103 @@ _LANG_MARKERS: Dict[str, Tuple[str, ...]] = {
         "es",
         "al",
         "lo",
+        "como",
+        "quien",
+        "quienes",
+        "donde",
+        "cual",
+        "cuales",
+        "cuanto",
+        "cuantos",
+        "llama",
+        "llaman",
+        "usa",
+        "usan",
+        "tiene",
+        "tienen",
+        "puede",
+        "pueden",
+        "sirve",
+        "funciona",
+        "explica",
+        "dime",
+        "haz",
+        "eso",
+        "esto",
+        "ese",
+        "esa",
+        "su",
+        "sus",
+        "mi",
+        "le",
+        "les",
+        "nos",
+        "sin",
+        "muy",
+        "ya",
+        "ahora",
+        "cada",
+        "todos",
+        "otro",
+        "otra",
+        "estos",
+        "estas",
+        "aqui",
+        "asi",
+        "tambien",
+        "despues",
+        "antes",
+        "solo",
+        "bien",
+        "mal",
+        "mejor",
+        "peor",
+        "quiero",
+        "necesito",
+        "tengo",
+        "puedes",
+        "podrias",
+        "dame",
+        "hazme",
+        "mira",
+        "sale",
+        "pasa",
+        "falla",
+        "hacer",
+        "ver",
+        "arregla",
+        "corrige",
+        "revisa",
+        "comprueba",
+        "verifica",
+        "refactoriza",
+        "optimiza",
+        "simplifica",
+        "mejora",
+        "implementa",
+        "crea",
+        "escribe",
+        "genera",
+        "muestra",
+        "lista",
+        "busca",
+        "encuentra",
+        "compara",
+        "analiza",
+        "resume",
+        "cambia",
+        "quita",
+        "elimina",
+        "borra",
+        "mueve",
+        "renombra",
+        "documenta",
+        "prueba",
+        "extrae",
+        "divide",
+        "une",
+        "sigue",
+        "continua",
     ),
     "en": (
         "the",
@@ -773,31 +824,322 @@ _LANG_MARKERS: Dict[str, Tuple[str, ...]] = {
         "and",
         "or",
         "not",
-        "a",
         "an",
         "of",
         "to",
         "in",
         "it",
         "on",
+        "where",
+        "who",
+        "why",
+        "can",
+        "do",
+        "call",
+        "calls",
+        "called",
+        "use",
+        "uses",
+        "used",
+        "explain",
+        "there",
+        "its",
+        "be",
+        "by",
+        "at",
+        "as",
+        "was",
+        "will",
+        "should",
+        "would",
+        "could",
+        "you",
+        "we",
+        "if",
+        "have",
+        "any",
+        "all",
+        "but",
+        "my",
+        "these",
+        "those",
+        "here",
+        "also",
+        "after",
+        "before",
+        "only",
+        "want",
+        "need",
+        "please",
+        "give",
+        "show",
+        "tell",
+        "make",
+        "fix",
+        "check",
+        "verify",
+        "refactor",
+        "optimize",
+        "simplify",
+        "improve",
+        "implement",
+        "create",
+        "write",
+        "generate",
+        "find",
+        "compare",
+        "analyze",
+        "summarize",
+        "change",
+        "remove",
+        "delete",
+        "move",
+        "rename",
+        "test",
+        "split",
+        "keep",
+        "continue",
     ),
 }
+# Marker words that are also words of the other language ("no", "son";
+# "todo" is a TODO), left out of the count (_language_scores).
+_LANG_AMBIGUOUS = frozenset(("no", "son", "todo", "resume", "lista", "mal", "solo"))
+# The 300 most frequent words of each language that the other does not
+# use (common in one, rare in the other; the Spanish ones also without
+# their accents), and the one-word replies a chat is made of
+# ("continuar", "vale", "dale"). The lists above are what a question
+# about code is made of; these let a short message say its language
+# at all (_language_scores). Against 1,300 words per language: no
+# wrong verdict more, and the few short messages more left undecided
+# are settled by the chat or the pre-planner.
+_LANG_VOCABULARY = {
+    "es": (
+        "acuerdo adelante además agua ahora ahí al algo alguien alguna algunas "
+        "algunos algún amigos amor ante antes aquí así aunque año años aún bajo "
+        "bien buen buena bueno buenos cada cambio casa casi caso centro ciudad "
+        "claro como con continuar contra cosa cosas creo cual cualquier cuando "
+        "cuatro cuenta cómo dale damelo dar de debe decir del dentro derecho "
+        "desarrollo desde después dice dicho dijo dinero dios donde dos durante día "
+        "días e ejemplo el ella ellos embargo en entonces entre equipo eran eres es "
+        "esa ese eso esos españa esta estaba estado estados estamos estar estas "
+        "este esto estos estoy está están falta familia fin forma frente fue fuera "
+        "fueron gente gobierno gracias gran grandes grupo guerra gusta ha haber "
+        "hablar había hace hacer hacia haciendo han hasta hay hazlo hecho hijo "
+        "historia hizo hombre hombres hora horas hoy igual importante incluso "
+        "información ir la lado las le les ley listo lo los luego lugar madre mal "
+        "manera mas mañana medio mejor menos meses mi mientras mierda millones mis "
+        "misma mismo momento muchas mucho muchos muerte mujer mujeres mundo muy más "
+        "méxico nacional nada nadie ni noche nombre nos nosotros nuestra nuestro "
+        "nuestros nueva nuevo nunca número o otra otras otro otros para parece "
+        "parte partido pasa pasado país perfecto pero persona personas poco podemos "
+        "poder podría política por porque presidente primer primera primero "
+        "problema problemas pruebalo pueblo puede pueden puedes puedo pues punto "
+        "que quien quiere quiero qué realidad saber se según semana ser será señor "
+        "si sido siempre siendo sin sino sistema sobre sociedad soy su sus sé sí "
+        "sólo tal también tan tanto tarde te tema tenemos tener tengo tenía ti "
+        "tiempo tiene tienen tienes tipo toda todas todo todos trabajo tras través "
+        "tres tu tus tú un una uno unos va vale vamos varios vas veces venga ver "
+        "verdad vez vida voy y yo él "
+    ),
+    "en": (
+        "able about actually after again against ago all already also always an "
+        "another any anything are area around at away back bad based be because "
+        "been before being believe best better between book both business but by "
+        "called came can car care case change children company could country course "
+        "court day days did different does doing done down during each early end "
+        "enough even ever every everyone everything face fact family far feel few "
+        "find first five following found four friends from game games get getting "
+        "give given go god going good got government great group guys had half hand "
+        "hard have having head health help her here high him his home hope house "
+        "how however important including information into is it its just keep kind "
+        "know last later law least left less let level life like little long look "
+        "looking lot love made make makes making many may maybe mean means men "
+        "might mind money more most much music must my name national need never "
+        "next night not nothing now number off often old one only or order other "
+        "others our out over own part party people person place please point power "
+        "president public put read really right said same say says school season "
+        "second see seen service she shit should side since small so some someone "
+        "something start state states still stop story such support sure system "
+        "take talk team tell than thank thanks that their them then there these "
+        "they thing things think this those though thought three through time today "
+        "together told too took try trying two under united until up use used using "
+        "very want war was water way we week well went were what when where which "
+        "who whole why will with within without women work working world would year "
+        "years yes yet your "
+    ),
+}
+_LANG_WORDS = {
+    _k: frozenset(_LANG_MARKERS[_k]) | frozenset(_LANG_VOCABULARY[_k].split())
+    for _k in _LANG_MARKERS
+}
+# English words Spanish uses as its own when it talks about code ("el
+# test", "un commit", "el for"): they do not make a sentence English.
+_ENGLISH_LOANWORDS = frozenset(
+    (
+        "array backend batch benchmark buffer bug bugs build cache call callback "
+        "chat class commit debug default deploy diff email embedding false feedback "
+        "file files flag for framework frontend handler hash if index input job key "
+        "keys link list log logs loop merge mock null online output parser pipeline "
+        "plugin prompt prompts push query ranking release return review run score "
+        "script set software sprint stack step steps string stub tag test tests "
+        "thread ticket timeout token tokens true web while worker wrapper "
+    ).split()
+)
+# Code written into a sentence without backticks: a call with its
+# arguments ("O(1)" too) and the operands of an operator; and, once the
+# identifiers are out, a capital that stands alone ("X", "Y").
+_CODE_EXPRESSION_RE = re.compile(
+    r"\b[A-Za-z_]\w*\([^()\n]*\)|\b[\w.]+(?:\s+/\s+|\s*[*=<>+%]+\s*)[\w.]+"
+)
+_LONE_CAPITAL_RE = re.compile(r"\b[A-Z]\b(?!\s+[a-záéíóúñ])")
+# Endings no English word has.
+_SPANISH_ENDING_RE = re.compile(r"(?:cion|ciones|mente|iendo)$")
+# What a message quotes rather than says: text in double quotes or
+# guillemets, in single quotes that are not apostrophes, and the lines of
+# a pasted traceback or log.
+_QUOTED_TEXT_RE = re.compile(
+    r"\"[^\"\n]{1,300}\"|“[^”\n]{1,300}”|«[^»\n]{1,300}»"
+    r"|(?<!\w)'[^'\n]{1,300}'(?!\w)"
+    r"|^[ \t]*(?:Traceback\b|File \"|\[?\d{1,2}:\d{2}:\d{2}|>>> |\$ "
+    r"|[A-Za-z_.]*(?:Error|Exception|Warning)\b:).*$",
+    re.MULTILINE,
+)
+# How many of a chat's earlier user messages vote on its language, and how
+# much of each is read (Filter._chat_language).
+_CHAT_LANGUAGE_MESSAGES = 6
+_CHAT_LANGUAGE_CHARS = 4000
+# Identifier-shaped tokens: dotted, with an underscore or a digit, or with
+# an interior capital. They are names, in English whatever the question's
+# language, and are left out of the count (_language_evidence).
+_CODE_TOKEN_RE = re.compile(
+    r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+"
+    r"|\b\w*_\w*\b"
+    r"|\b[A-Za-z]+\d\w*\b"
+    r"|\b[A-Za-z]*[a-z][A-Z]\w*\b"
+)
 
 
-def _question_language(question: str) -> str:
-    """Which language's headings to emit, from the reader's own question.
-
-    A function-word count, not a model call: it runs on every turn, it must
-    not fail, and a wrong guess costs a heading in the wrong language rather
-    than anything structural. Ties and empty questions fall back to English,
-    which is what the emitter produced before this existed.
+def _confidence_share(cov: Dict[str, Any]) -> float:
     """
-    _w = re.findall(r"[a-záéíóúñü]+", (question or "").lower())
-    if not _w:
+    The part of the confidence figure left after the independent survivors.
+
+    The winner's share of the corroboration it and they hold, when the
+    forge recorded it; an even split among them otherwise (a coverage dict
+    from before the share, or a winner with no corroboration at all).
+    """
+    indep = int(cov.get("rivals_independent", 0) or 0)
+    if not indep:
+        return 1.0
+    share = float(cov.get("winner_share", 0.0) or 0.0)
+    return share if 0.0 < share <= 1.0 else 1.0 / (1 + indep)
+
+
+def _confidence_share_words(cov: Dict[str, Any]) -> str:
+    """How the confidence line says what _confidence_share did to the figure."""
+    indep = int(cov.get("rivals_independent", 0) or 0)
+    share = float(cov.get("winner_share", 0.0) or 0.0)
+    if 0.0 < share <= 1.0:
+        return (
+            f"scaling the figure by {share:.2f}, this account's share of "
+            f"their corroboration"
+        )
+    return f"dividing the figure by {1 + indep}" if indep > 1 else "halving the figure"
+
+
+# A fenced block inside a pasted .txt (InletOrchestrator.merge_pasted_files).
+_PASTED_FENCE_RE = re.compile(r"```[ \t]*([\w+-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
+
+# The note _detect_and_generate_cot appends to a follow-up's question.
+_FOLLOW_UP_NOTE_RE = re.compile(r"\(Follow-up: the subject is [^)]*\)")
+
+
+def _language_scores(text: str) -> Tuple[int, int]:
+    """
+    How many of the writer's own words are Spanish, and how many English.
+
+    A word count, not a model call: it runs on every turn and must not
+    fail. Counted over the writer's prose only:
+
+    - not what was added or pasted: the follow-up note the pipeline appends
+      is English and outvoted "¿y quién la llama?"; the reference line of a
+      re-attached file is English too; a pasted class brings its docstrings,
+      a pasted traceback its message;
+    - not what is quoted, which is in the language of what it quotes;
+    - not identifiers: live, "¿ActivationEngine llama a
+      _prepare_seed_symbols?" was headed in English, its two names read as
+      prose and "a" counted as the English article.
+
+    An accented word counts for Spanish, and so do "¿" and "¡" when
+    present. Their absence counts for nothing: they are often left out.
+
+    Returns:
+        (Spanish, English).
+    """
+    _own = _FOLLOW_UP_NOTE_RE.sub("", text or "")
+    _own = CommandRouter._REFERENCE_LINE_RE.sub("", _own)
+    _own = re.sub(r"```.*?(?:```|$)", " ", _own, flags=re.DOTALL)
+    _own = re.sub(r"`[^`\n]*`", " ", _own)
+    _own = _QUOTED_TEXT_RE.sub(" ", _own)
+    _own = _CODE_EXPRESSION_RE.sub(" ", _own)
+    _own = _CODE_TOKEN_RE.sub(" ", _own)
+    _own = _LONE_CAPITAL_RE.sub(" ", _own)
+    _w = [
+        _x
+        for _x in re.findall(r"[a-záéíóúñü]+", _own.lower())
+        if _x not in _LANG_AMBIGUOUS
+    ]
+    _es = sum(
+        1
+        for _x in _w
+        if len(_x) > 1
+        and (
+            _x in _LANG_WORDS["es"]
+            or re.search(r"[áéíóúñ]", _x)
+            or _SPANISH_ENDING_RE.search(_x)
+        )
+    )
+    # "y", "o" and "e" are also what a variable is called: they count
+    # once between them, and only beside a Spanish word.
+    if _es and any(len(_x) == 1 and _x in _LANG_WORDS["es"] for _x in _w):
+        _es += 1
+    _en = sum(
+        1 for _x in _w if _x in _LANG_WORDS["en"] and _x not in _ENGLISH_LOANWORDS
+    )
+    if "¿" in _own or "¡" in _own:
+        _es += 2
+    return _es, _en
+
+
+def _language_evidence(text: str) -> str:
+    """
+    The language the writer's own words are in, or "" when they do not say.
+
+    A verdict only where the words leave no doubt:
+
+    - words of one language and none of the other;
+    - two or more Spanish words, whatever English comes with them. The two
+      are not symmetric: Spanish about code carries English (a `for`, an
+      error message, "el cache"), and English carries no "de", "que" or
+      "para".
+
+    Anything else is "" and is settled by who has more to go on
+    (Filter._answer_language).
+    """
+    _es, _en = _language_scores(text)
+    if _es >= 2 or (_es and not _en):
+        return "es"
+    if _en and not _es:
         return "en"
-    _score = {_k: sum(1 for _x in _w if _x in _v) for _k, _v in _LANG_MARKERS.items()}
-    _best = max(_score, key=lambda k: _score[k])
-    return _best if _score[_best] > _score.get("en", 0) else "en"
+    return ""
+
+
+def _question_language(question: str, fallback: str = "en") -> str:
+    """Which language's headings to emit: the question's, else `fallback`."""
+    _lang = _language_evidence(question)
+    if _lang:
+        return _lang
+    _es, _en = _language_scores(question)
+    return "en" if _en > _es else fallback
 
 
 def _split_heading_lines(lines: List[str]) -> List[str]:
@@ -876,6 +1218,10 @@ _ANSWER_FOOTER_RE = re.compile(
 # the first. A pattern with two jobs acquires the union of their scopes.
 _CONFIDENCE_LINE_RE = re.compile(r"^[ \t]*\[Confidence:[^\]\n]*\][ \t]*$", re.M | re.I)
 _ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
+# Marker of the outlet probe: a short block the plugin appends to the answer
+# through the event emitter, so that the next inlet can report whether the
+# host kept it in the history it hands back.
+_EMIT_PROBE_MARK = "[emit-probe]"
 
 
 def _strip_answer_footer(text: str) -> Tuple[str, int]:
@@ -963,25 +1309,13 @@ def _strip_answer_footer(text: str) -> Tuple[str, int]:
     return "\n".join(_out), _n
 
 
-# Handed to the model on any path that answers without measuring. A footer
-# is a claim about evidence, and on these paths there is none: one turn
-# served a stored artifact in ten seconds and still published `98% — 7/7
-# claims settled against code`, a shape the ledger never emits, over a turn
-# that opened no body and made no claim.
-# The whole answer when the artifact asked for does not exist. Fixed text,
-# not an instruction: the answer does not vary with the question, and every
-# turn that generated it instead produced sections about what it could not
-# verify, a list of git commands the reader cannot run from a chat, and a
-# confidence figure over a turn that opened no body — roughly two minutes to
-# say `there is no diff`.
-#
-# The fetcher's own note is interpolated verbatim so the reader can see WHERE
-# it was looked for. That note is the only part that carries information, and
-# it is also what makes this debuggable: a canned reply has no generation to
-# inspect afterwards.
+# Handed to the model on any path that answers without measuring: a
+# footer claims evidence, and these paths have none.
+# The whole answer when the requested artifact does not exist: fixed text,
+# since the answer does not vary with the question. The fetcher's note is
+# interpolated verbatim, so the reader sees where it was looked for.
 # Distinguishes the two things try_direct_retrieval returns: an instruction
-# to be injected, and a reply to be delivered. Stripped before delivery, so
-# it never reaches the reader.
+# to inject and a reply to deliver. Stripped before delivery.
 _DIRECT_ABSENCE_MARK = "\x00ABSENCE\x00"
 _DIRECT_ABSENCE_REPLY = (
     "{note}\n\n"
@@ -1001,6 +1335,9 @@ _NO_MEASURED_FOOTER_NOTE = (
     "that did not happen."
 )
 
+# How many tools one step may request per reply: the parser's limit,
+# stated in the prompt too, so a step does not loop on requests that
+# would be discarded.
 _MAX_TOOLS_PER_ROUND = 4
 # A body cut below this is worse than an honest omission: too little to carry a
 # method's shape, and enough to look like the whole of it.
@@ -1025,6 +1362,9 @@ _FOCUS_MIN_PARTIAL_CHARS = 4000
 # ceiling. Both report when they bind; this does not.
 _MAX_CLAIMS_PER_STEP = 20
 
+# Compression ratio below which a generation is degenerate: healthy
+# outputs measured at 0.149 and above, recorded corruptions at 0.113
+# and below.
 _DEGENERACY_COMPRESSION_MAX = 0.13
 
 
@@ -1183,10 +1523,11 @@ class DetectionCatalog:
         (
             "claim shape",
             "MetacognitiveReasoningEngine._CALL_RELATION_RE / "
-            "_NEG_RELATION_RE, _CONTRACT_RETURN_RE / _CONTRACT_ASSERT_RE",
-            "'A calls B', 'A does not call B', 'X returns int'…",
+            "_NEG_RELATION_RE / _EXISTENCE_CLAIM_RE, "
+            "_CONTRACT_RETURN_RE / _CONTRACT_ASSERT_RE",
+            "'A calls B', 'A does not call B', 'X exists', 'X returns int'…",
             "Which deterministic check rules on a claim: the call "
-            "graph, or the AST contract checker.",
+            "graph, the symbol index, or the AST contract checker.",
         ),
         (
             "self-contradiction",
@@ -1632,7 +1973,47 @@ def _extract_answer_footer(text: str) -> str:
         return ""
 
 
-def _note_body_shown(filt, qid: str) -> None:
+# Names a text can cite: anything in backticks, and dotted identifiers
+# written without them.
+_NAMED_SYMBOL_RE = re.compile(r"`([^`\s]+)`|\b([A-Za-z_]\w*(?:\.\w+)+)\b")
+
+
+def _named_indexed_symbols(text: str, idx: Any, project_id: str) -> List[str]:
+    """
+    The indexed symbols a piece of text names, each resolved to one qid.
+
+    A qualified id the index holds is taken as written; a bare or partly
+    qualified name is taken only when exactly one symbol carries its last
+    part. Anything else is dropped rather than guessed.
+
+    Args:
+        text: A question or message.
+        idx: The SymbolIndex.
+        project_id: Current project identifier.
+
+    Returns:
+        Distinct qids in the order the text names them.
+    """
+    try:
+        qualified = idx.get_all_qualified_names(project_id) or set()
+    except Exception:
+        return []
+    named: List[str] = []
+    for _m in _NAMED_SYMBOL_RE.finditer(text or ""):
+        token = (_m.group(1) or _m.group(2) or "").strip("().,;:¿?¡!")
+        if not token:
+            continue
+        if token in qualified:
+            qid = token
+        else:
+            resolved = idx.get_qualified_names_for(token.split(".")[-1], project_id)
+            qid = next(iter(resolved)) if len(resolved) == 1 else ""
+        if qid and qid not in named:
+            named.append(qid)
+    return named
+
+
+def _note_body_shown(filt, qid: str, step_local: bool = False) -> None:
     """
     Record that the model has now seen the body of a qid this turn.
 
@@ -1641,6 +2022,14 @@ def _note_body_shown(filt, qid: str) -> None:
     and its bare tail go in, because a claim may cite either and the
     question being answered is "was this shown", not "was this spelled
     the same way twice".
+
+    The three places do not reach the same prompts. The hub tier and
+    Block B are part of the context every step of the turn is given; a
+    resolved EXPAND is appended to the one step that asked and is gone
+    from the next step's prompt. "Shown this turn" is the right question
+    for the accounting, and the wrong one for deciding whether a later
+    step still has the body in front of it, so the shared renders are
+    also kept apart in _bodies_in_shared_context.
 
     Two keys per body means the set answers membership well and counts
     badly, so the count is kept separately rather than derived from it.
@@ -1660,6 +2049,8 @@ def _note_body_shown(filt, qid: str) -> None:
     Args:
         filt: The Filter holding the per-turn set.
         qid: The symbol whose body was rendered.
+        step_local: True when the body went to a single step's prompt
+            (a resolved EXPAND) rather than to the shared context.
     """
     try:
         _seen = getattr(filt, "_bodies_seen_this_turn", None)
@@ -1679,6 +2070,14 @@ def _note_body_shown(filt, qid: str) -> None:
         # ── Step 2: both spellings, so a claim citing either resolves ──
         _seen.add(qid)
         _seen.add(qid.rsplit(".", 1)[-1])
+        # ── Step 3: the renders every step of the turn can still read ──
+        # Qualified name only: this set decides whether a body is served
+        # again, and a bare tail would withhold a same-named method of a
+        # different class.
+        if not step_local:
+            _shared = getattr(filt, "_bodies_in_shared_context", None)
+            if _shared is not None:
+                _shared.add(qid)
     except Exception:
         pass
 
@@ -3470,6 +3869,12 @@ class ActivationGraph:
 
     def __init__(self):
         self._activations: Dict[str, ActivationState] = {}
+        # Where the seeds came from, by qid. Both are registered as "seed"
+        # in _activations; Block B needs to tell them apart, because only
+        # the first says what this question is about (see
+        # ActivationEngine.build_activation_graph).
+        self.question_seeds: Set[str] = set()
+        self.history_seeds: Set[str] = set()
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Seed activation
@@ -3845,6 +4250,346 @@ class AppliedChangeFeedback(BaseModel):
     success: bool = True
     user_comment: str = ""
     resolved: bool = False
+
+
+# Function words that carry no hint of which symbol a query means. Without
+# this filter a Spanish query such as 'explica como el parse con los tokens'
+# looked up `con`, `los` and `como` as substrings of symbol names and filled
+# the candidate quota with `config`, `connect`, `context`... Verbs that also
+# occur in identifiers (get, set, use, run, add) are deliberately absent.
+_QUERY_STOPWORDS = frozenset("""
+    the and for are but not you all can was one our out has how its may now
+    who why what when where which while with from that this these those then
+    than into over does did doing done have had here there their them they
+    will would should could about also any been being both each more most
+    other some such only same very just like your
+    los las del que con por para una uno unos unas como pero más mas esta
+    este esto estos estas ese esa eso esos esas desde hasta sobre entre cada
+    todo todos toda todas tiene tienen hace hacen cuando donde dónde qué cual
+    cuál cuales cuáles quien quién cómo porque también tambien ahora solo
+    sólo muy así asi sin son está están estan ser fue han hay nos les mis tus
+    sus otro otra otros otras mismo misma tras ante bajo según segun durante
+    mediante hacia además ademas aunque sino entonces puede pueden debe deben
+    """.split())
+_NAME_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+
+
+def _name_tokens(name: str) -> set:
+    """Return the lower-cased word parts of an identifier.
+
+    `parse_query` gives {"parse", "query"} and `ContextBuilder` gives
+    {"context", "builder"}, so a query word can be told apart from a
+    mere substring of a longer word.
+    """
+    return {
+        tok.lower() for part in name.split("_") for tok in _NAME_TOKEN_RE.findall(part)
+    }
+
+
+def _rank_query_candidates(
+    words: Any, names: Any, exclude: set, min_len: int, limit: int
+) -> List[str]:
+    """
+    Order the indexed names that the words of a query point at.
+
+    Stopwords and bare numbers are dropped and longer words go first, since
+    a long word narrows the field while a short one matches half the index.
+    Within a word, names that carry it as a whole token (`parse` in
+    `parse_query`) come before names that only contain it (`parsed`).
+    Matches are taken round-robin across the words, so one generic word
+    cannot use up the whole quota, and ties break alphabetically so the
+    same query always yields the same candidates.
+
+    Args:
+        words: The words of the query.
+        names: The indexed bare names.
+        exclude: Names already chosen, never returned again.
+        min_len: Shortest word taken into account.
+        limit: Maximum number of names to return.
+
+    Returns:
+        The ranked names, at most `limit` of them.
+    """
+    if limit <= 0:
+        return []
+    usable = sorted(
+        {
+            w.lower()
+            for w in words
+            if len(w) >= min_len
+            and not w.isdigit()
+            and w.lower() not in _QUERY_STOPWORDS
+        },
+        key=lambda w: (-len(w), w),
+    )
+    lowered = [(n, n.lower()) for n in sorted(names) if n not in exclude]
+    per_word: List[List[str]] = []
+    for w in usable:
+        whole, inner = [], []
+        for name, low in lowered:
+            if w not in low:
+                continue
+            (whole if w in _name_tokens(name) else inner).append(name)
+        per_word.append(whole + inner)
+
+    ranked: List[str] = []
+    seen: set = set()
+    depth = 0
+    while len(ranked) < limit and any(depth < len(lst) for lst in per_word):
+        for lst in per_word:
+            if depth < len(lst) and lst[depth] not in seen:
+                seen.add(lst[depth])
+                ranked.append(lst[depth])
+                if len(ranked) >= limit:
+                    break
+        depth += 1
+    return ranked
+
+
+# History seeds restart the PPR walk alongside the explicit ones. Only the
+# most steadily mentioned few are kept, and their total mass stays below this
+# share of the explicit seeds' mass: many history seeds would otherwise
+# dilute the symbol the user literally named.
+_HISTORY_SEEDS_MAX = 8
+_HISTORY_MASS_SHARE = 0.5
+
+# A claim that states the default of a named setting, in the four word
+# orders seen (AgenticStaticVerifier._default_value_checks). The fourth,
+# "a field named X with a default value of N", is how a step wrote an
+# invented 0.15 that no check was generated for.
+_DEFAULT_LITERAL = (
+    r"\*{0,2}`?(-?\d+(?:\.\d+)?|True|False|None|\"[^\"\n]*\"|'[^'\n]*')`?"
+)
+_APPROX = r"(?:approximately|about|around|roughly|aproximadamente|unos|~|≈)?\s*"
+_DEFAULT_VALUE_CLAIM_RE = re.compile(
+    r"(?:default(?:\s+value)?|valor\s+por\s+defecto)\s+(?:of|for|de|del)\s+"
+    r"`?(?P<a>[A-Za-z_][\w.]*)`?\s+(?:is|es|=)\s+"
+    + _APPROX
+    + _DEFAULT_LITERAL.replace("(", "(?P<va>", 1)
+    + r"|`?(?P<b>[A-Za-z_][\w.]*)`?\s+(?:defaults\s+to|has\s+(?:a\s+)?default"
+    r"(?:\s+value)?\s+of|por\s+defecto\s+(?:es|vale))\s+"
+    + _APPROX
+    + _DEFAULT_LITERAL.replace("(", "(?P<vb>", 1)
+    + r"|`?(?P<c>[A-Za-z_][\w.]*)`?\s*\(default(?:\s+value)?:?\s*=?\s*"
+    + _APPROX
+    + _DEFAULT_LITERAL.replace("(", "(?P<vc>", 1)
+    + r"|`?(?P<d>[A-Za-z_][\w.]*)`?,?\s+"
+    r"(?:(?:is|es|est[aá])\s+(?:declared|defined|declarad[oa]|definid[oa])\s+)?"
+    r"(?:with|con)\s+(?:a\s+|un\s+)?"
+    r"(?:default(?:\s+value)?|valor\s+por\s+defecto)\s+(?:of\s+|de\s+|=\s*)?"
+    + _APPROX
+    + _DEFAULT_LITERAL.replace("(", "(?P<vd>", 1),
+    re.IGNORECASE,
+)
+# A question about the default of a named setting
+# (AgenticStaticVerifier.declared_default_answer).
+_DEFAULT_QUESTION_RE = re.compile(
+    r"(?:valor(?:es)?\s+por\s+defecto|por\s+defecto|default(?:\s+value)?)\s+"
+    r"(?:de|del|of|for|para)\s+(?:la\s+|el\s+|the\s+)?"
+    r"(?:v[aá]lvula\s+|valve\s+|setting\s+|par[aá]metro\s+|campo\s+|field\s+)?"
+    r"`?(?P<a>[A-Za-z_][\w.]*)`?"
+    r"|what\s+does\s+`?(?P<b>[A-Za-z_][\w.]*)`?\s+default\s+to",
+    re.IGNORECASE,
+)
+_APPROX_WORD_RE = re.compile(
+    r"approximately|about|around|roughly|aproximadamente|unos|~|≈", re.IGNORECASE
+)
+
+# Words by which a claim speaks of one function reaching another. Wide on
+# purpose: a claim that has one goes to the model.
+_CALL_WORD_RE = re.compile(
+    r"\b(?:call(?:s|ed|ing|er|ers)?|invok\w+|llam\w+|invoc\w+|delegat\w+|"
+    r"dispatch\w*|hands?|handed|pass(?:es|ed|ing)?|forward\w*|trigger\w*|"
+    r"submit\w*|via|through|from|by|desde|por|"
+    r"us(?:e|es|ed|ing)|usa\w*|utiliz\w*|employ\w*|relies|rely|depends?)\b",
+    re.IGNORECASE,
+)
+
+# Claims that open with a call fact, formalized without the model
+# (AgenticStaticVerifier._formalize_plain_claims).
+_LEADING_CALLS_CLAIM_RE = re.compile(
+    r"^\s*(?:the\s+)?(?:(?:method|function)\s+)?`?(?P<a>[A-Za-z_][\w.]*)`?"
+    r"(?:\(\))?\s+(?:directly\s+)?(?:calls|invokes|llama\s+a|invoca\s+a)\s+"
+    r"`?(?P<b>[A-Za-z_][\w.]*)`?(?=[\s(,;:).!]|$)",
+    re.IGNORECASE,
+)
+_LEADING_CALLED_BY_CLAIM_RE = re.compile(
+    r"^\s*(?:the\s+)?(?:(?:method|function)\s+)?`?(?P<a>[A-Za-z_][\w.]*)`?"
+    r"(?:\(\))?\s+(?:is\s+(?:called|invoked)|es\s+llamad[oa]|es\s+invocad[oa])"
+    r"\s+(?:directly\s+)?(?:only\s+)?(?:by|from|por|desde)\s+"
+    r"`?(?P<b>[A-Za-z_][\w.]*)`?(?=[\s(,;:).!]|$)",
+    re.IGNORECASE,
+)
+
+# Relation questions the index answers in full (MetacognitiveReasoning-
+# Engine.list_named_relation). "¿Qué llama a X?" asks for callers; the
+# callees form needs "a qué": "¿A qué llama X?".
+_CALLERS_QUESTION_RE = re.compile(
+    r"\bqui[eé]n(?:es)?\s+(?:la\s+|lo\s+|le\s+|las\s+|los\s+)?(?:llaman?|usan?)\b"
+    r"|\bqu[eé]\s+(?:funciones\s+|m[eé]todos\s+|c[oó]digo\s+)?llaman?\s+a\b"
+    r"|\bdesde\s+d[oó]nde\s+se\s+(?:llama|usa|invoca)\b"
+    r"|\bd[oó]nde\s+se\s+(?:llama|usa|invoca)\b"
+    r"|\b(?:who|what)\s+calls\b|\bcallers\s+of\b"
+    r"|\bwhere\s+is\s+\S+\s+(?:called|used)\b",
+    re.IGNORECASE,
+)
+_CALLEES_QUESTION_RE = re.compile(
+    r"\ba\s+qu[eé]\s+(?:funciones\s+|m[eé]todos\s+)?llama\b"
+    r"|\bqu[eé]\s+(?:funciones|m[eé]todos)\s+(?:llama|usa)\b"
+    r"|\bwhat\s+does\s+\S+\s+call\b|\bcallees\s+of\b",
+    re.IGNORECASE,
+)
+# Method names that builtin types and the standard library share with the
+# project; edges in are keyed by bare name, so their callers are not this
+# symbol's callers.
+_COMMON_METHOD_NAMES = frozenset(
+    n
+    for t in (dict, list, set, str, bytes, object, int, float)
+    for n in dir(t)
+    if not n.startswith("__")
+) | frozenset(
+    "run start stop close open read write send execute commit submit put "
+    "debug info warning error exception dumps loads search match sub call "
+    "apply load save __init__".split()
+)
+_RELATION_LIST_PER_CLASS = 12
+# How far up the call graph two accounts are looked for a shared caller
+# (HypothesisForge._classify_rival_relation).
+_RIVAL_SHARED_CALLER_DEPTH = 2
+
+# The line the forge's analysis step ends with (HypothesisForge, phase
+# 3), in the words the prompt asks for or their Spanish.
+_ANALYSIS_VERDICT_RE = re.compile(
+    r"VERDICT(?:O)?\s*[:：]\s*\**\s*(NOT\s+ESTABLISHED|NO\s+ESTABLECID[AO]"
+    r"|ESTABLISHED|ESTABLECID[AO]|REFUTED|REFUTAD[AO])",
+    re.IGNORECASE,
+)
+
+
+def _analysis_verdict(analysis: str) -> str:
+    """
+    What a forge analysis concluded about its own hypothesis.
+
+    Returns:
+        "established", "not_established" or "refuted"; "" when the
+        analysis states no verdict (it was skipped, or written before
+        the line was asked for).
+    """
+    found = _ANALYSIS_VERDICT_RE.findall(str(analysis or ""))
+    if not found:
+        return ""
+    last = " ".join(found[-1].upper().split())
+    if last.startswith(("NOT", "NO ")):
+        return "not_established"
+    if last.startswith("REFUT"):
+        return "refuted"
+    return "established"
+
+
+# What a hypothesize step's output gets when its competition named no
+# winner. The step's own text above it still lists the mechanisms it
+# proposed, and the answer took one of them as the cause: live, a
+# rival the judgment had ruled ineligible was the answer's conclusion,
+# at 100% confidence.
+_NO_CAUSE_VERDICT = (
+    "\n\n**Serial verdict: no cause established.** The mechanisms proposed "
+    "above were tested and none was established: they are candidates, not "
+    "findings. What was confirmed about them is that the code they name "
+    "exists and is wired as they say, which makes none of them the cause. "
+)
+
+# A file name a claim put in front of a symbol (AgenticEvidenceLedger.
+# _canonical_qid).
+_CITED_FILE_PREFIX_RE = re.compile(
+    r"^[\w\-]+\.(?:py|pyi|txt|md|js|jsx|ts|tsx|java|kt|go|rs|rb)\.(?=[A-Za-z_])"
+)
+
+
+def _enclosing_classes(content: str, line_start: int, indent: int) -> str:
+    """Dotted chain of the classes a line indented `indent` sits in, or ""."""
+    _indent = indent
+    chain: List[str] = []
+    for cm in reversed(list(_CLASS_LINE_RE.finditer(content, 0, line_start))):
+        _ci = len(cm.group(1).expandtabs())
+        if _ci < _indent:
+            chain.append(cm.group(2))
+            _indent = _ci
+            if _ci == 0:
+                break
+    return ".".join(reversed(chain))
+
+
+_CLASS_LINE_RE = re.compile(r"^([ \t]*)class\s+([A-Za-z_]\w*)", re.MULTILINE)
+
+
+def _outline_identifiers(text: str) -> Set[str]:
+    """The code names a text mentions, as bare names (compose_outline)."""
+    names: Set[str] = set()
+    for chunk in re.findall(r"`([^`\n]{1,120})`", text or ""):
+        names.update(re.findall(r"[A-Za-z_][\w.]*", chunk))
+    names.update(_CODE_TOKEN_RE.findall(text or ""))
+    return {
+        n.rsplit(".", 1)[-1]
+        for n in names
+        if n.rsplit(".", 1)[-1] and _CODE_TOKEN_RE.fullmatch(n.rsplit(".", 1)[-1])
+    }
+
+
+# How much of the turn the outline call reads (AgenticSynthesisComposer.
+# _outline_workspace).
+_OUTLINE_SYNTH_CHARS = 6000
+_OUTLINE_MAX_CLAIMS = 24
+
+# How much of a rival's text a metric_forge_rivals row keeps
+# (HypothesisForge._record_rivals).
+_RIVAL_TEXT_CHARS = 400
+_RIVAL_CLAIMS_CHARS = 2000
+
+# Pipeline metrics (StateStore.init_db): how long rows are kept, and the
+# one INSERT per table that Filter._record_metric queues.
+_METRICS_KEEP_DAYS = 30
+_METRIC_INSERTS = {
+    "llm_call": (
+        "INSERT INTO metric_llm_calls (project_id, turn_started, ts, label, "
+        "in_tokens, out_tokens, seconds, wait_seconds, truncated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ),
+    "turn": (
+        "INSERT INTO metric_turns (project_id, turn_started, ts, question, "
+        "bodies_shown, block_b_chars, carry_over, backed, structure_hash, "
+        "from_cache) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ),
+    "forge_rival": (
+        "INSERT INTO metric_forge_rivals (project_id, turn_started, ts, "
+        "rivals, l1_rank, won, status, cause_of_death, corroboration, "
+        "predictions_corroborated, predictions_refuted, cycles_used, "
+        "nodes_read, coverage_score, hypothesis, confirmed_claims, "
+        "refuted_claims, analysis_head) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ),
+}
+
+# A bare seed name shared by more symbols than this says nothing about
+# which one is meant (ActivationEngine._narrow_ambiguous_seeds).
+_AMBIGUOUS_SEED_MAX = 3
+
+# How many of a question's own seeds are sure of a body in Block B,
+# raised to LOD-3 when activation alone did not (ContextBuilder.
+# build_block_b, Step 8.6).
+_QUESTION_SEED_BODIES = 3
+
+# A follow-up is a message of at most this many words that names no symbol
+# and opens as a continuation or points back at something already said;
+# its subject is looked for in this many earlier user messages.
+_FOLLOW_UP_MAX_WORDS = 12
+_FOLLOW_UP_LOOKBACK = 3
+_FOLLOW_UP_MARKER_RE = re.compile(
+    r"^\W*(?:y|e|and|also|tambi[eé]n|entonces|then|pero|but|so|"
+    r"what about|how about)\b"
+    r"|\b(?:it|its|itself|this|that|these|those|them|they|"
+    r"esto|eso|ello|este|esta|estos|estas|ese|esa|esos|esas)\b",
+    re.IGNORECASE,
+)
 
 
 class ActivationEngine:
@@ -4266,6 +5011,13 @@ class ActivationEngine:
         CrossEncoder call per entry point (~79 per rebuild) to "disambiguate"
         a literal that needs no semantics.
 
+        Candidates for the CrossEncoder and for the substring fallback come
+        from _rank_query_candidates: stopwords are dropped, longer words rank
+        first and the order is deterministic, so a filler word such as 'con'
+        or 'the' cannot take the quota a meaningful word needs and the same
+        query always reaches the same candidates. Exact matches come back in
+        the order the query mentions them.
+
         Returns:
             A tuple of (exact_matches, partial_matches).
             Both lists are guaranteed to contain only strings.
@@ -4282,22 +5034,20 @@ class ActivationEngine:
         all_names = self._f._symbol_index.get_all_names(project_id)
         query_words = set(re.findall(r"\b\w+\b", query))
 
-        exact = list(all_names.intersection(query_words))
+        _first_seen: Dict[str, int] = {}
+        for _m in re.finditer(r"\b\w+\b", query):
+            _first_seen.setdefault(_m.group(0), _m.start())
+        exact = sorted(
+            all_names.intersection(query_words),
+            key=lambda n: (_first_seen.get(n, 0), n),
+        )
         partial = []
 
         # ---- Region: If few exact matches, try CrossEncoder/LLM ----
         if len(exact) < 3 and len(query_words) > 0 and len(all_names) > 0:
-            candidates = set()
-            for word in query_words:
-                if len(word) < 3:
-                    continue
-                for name in all_names:
-                    if word.lower() in name.lower() and name not in exact:
-                        candidates.add(name)
-                        if len(candidates) >= 20:
-                            break
-                if len(candidates) >= 20:
-                    break
+            candidates = _rank_query_candidates(
+                query_words, all_names, set(exact), 3, 20
+            )
 
             if candidates:
                 pairs = [(query, name) for name in candidates]
@@ -4328,20 +5078,15 @@ class ActivationEngine:
 
         # ---- Region: Fallback to substring matching ----
         if len(partial) < 3:
-            for word in query_words:
-                if len(word) < 4:
-                    continue
-                for name in all_names:
-                    if (
-                        word.lower() in name.lower()
-                        and name not in exact
-                        and name not in partial
-                    ):
-                        partial.append(name)
-                        if len(partial) >= 5:
-                            break
-                    if len(partial) >= 5:
-                        break
+            partial.extend(
+                _rank_query_candidates(
+                    query_words,
+                    all_names,
+                    set(exact) | set(partial),
+                    4,
+                    5 - len(partial),
+                )
+            )
 
         # ---- Region: Final sanitisation ----
         # Ensure every element is a string and non-empty
@@ -4561,35 +5306,60 @@ Output only the symbol name.
         self, messages: Optional[List[dict]], project_id: str, lookback: int = 6
     ) -> Dict[str, float]:
         """
-        Extract symbols with high mention frequency in recent messages.
-        Returns {symbol_name: boost_score} where boost_score ∈ (0.0, 0.6].
+        Extract the symbols the recent conversation keeps coming back to.
+
+        Only prose counts: pasted files, fenced code and the synthetic
+        reference lines spliced into pastes are stripped first, the same
+        cleaning the query gets, because otherwise every symbol of a pasted
+        file would count as a mention. A message counts once per symbol; the
+        user's words weigh 1.0 and the assistant's 0.5, since an answer names
+        many symbols the user never asked about. The score is the share of
+        the recent messages that mention the symbol, so one mention in six
+        messages is worth a sixth of a mention in all of them, rather than
+        the full boost as when scores were scaled to the most mentioned
+        symbol. Only the top _HISTORY_SEEDS_MAX symbols are kept.
+
+        Returns {symbol_name: boost_score} where boost_score is in
+        (0.0, history_seeds_max_boost].
         """
         all_names = self._f._symbol_index.get_all_names(project_id)
         if not all_names or not messages:
             return {}
 
         recent = messages[-lookback:] if len(messages) > lookback else messages
-        mention_counts: Counter = Counter()
+        mention_weight: Dict[str, float] = {}
+        considered = 0
 
+        # ── Step 1: prose of each recent user and assistant message ──
         for msg in recent:
             content = msg.get("content", "")
-            if not content:
+            if msg.get("role") not in ("user", "assistant") or not isinstance(
+                content, str
+            ):
                 continue
-            words = set(re.findall(r"\b\w+\b", content))
-            for sym in all_names.intersection(words):
-                mention_counts[sym] += 1
+            considered += 1
+            text = self._f._commands._REFERENCE_LINE_RE.sub("", content)
+            text = self._f._commands._extract_text_for_classification(text) or ""
+            text = "\n".join(
+                line
+                for line in text.splitlines()
+                if not self._f._commands._STRUCTURAL_LINE_START.match(line)
+            )
+            if not text.strip():
+                continue
+            turn_weight = 1.0 if msg.get("role") == "user" else 0.5
+            for sym in all_names.intersection(set(re.findall(r"\b\w+\b", text))):
+                mention_weight[sym] = mention_weight.get(sym, 0.0) + turn_weight
 
-        if not mention_counts:
+        if not mention_weight or considered == 0:
             return {}
 
-        max_count = max(mention_counts.values())
+        # ── Step 2: share of the window, strongest few only ──
+        max_boost = self._f.valves.history_seeds_max_boost
+        ranked = sorted(mention_weight.items(), key=lambda kv: (-kv[1], kv[0]))
         result = {
-            sym: min(
-                self._f.valves.history_seeds_max_boost,
-                self._f.valves.history_seeds_max_boost * (count / max_count),
-            )
-            for sym, count in mention_counts.items()
-            if count > 0
+            sym: max_boost * min(1.0, weight / considered)
+            for sym, weight in ranked[:_HISTORY_SEEDS_MAX]
         }
 
         # ---- SANITIZE: keep only string keys ----
@@ -4669,6 +5439,160 @@ Output only the symbol name.
         specificity = math.log(total / n_blocks) + 1.0
         return max(0.1, min(3.0, specificity))
 
+    def follow_up_referent(
+        self, query: str, messages: Optional[List[dict]], project_id: str
+    ) -> List[str]:
+        """
+        The subject a short follow-up inherits from an earlier question.
+
+        A follow-up such as "and who calls it?" names nothing, so nothing
+        seeds it, and the seed inferencer guessed its subject from the
+        question alone, without the conversation that says what "it" is.
+        Observed in two runs: asked right after a question about
+        _extract_history_seeds, it guessed ConversationStateManager.get and
+        the turn answered about that. The subject is the one the user last
+        named.
+
+        A follow-up is a query of at most _FOLLOW_UP_MAX_WORDS words that
+        opens as a continuation ("and…", "y…") or points back ("it", "eso",
+        "this function"). Shortness alone is not enough: "how is the token
+        budget computed?" is short, names nothing, and starts a new subject.
+        The current message is the last user message and is skipped; the
+        _FOLLOW_UP_LOOKBACK user messages before it are read newest first,
+        so "and what does it return?" after "and who calls it?" still
+        reaches the question that named the subject. Callers ask only once
+        the query itself has seeded nothing.
+
+        Args:
+            query: The current user query.
+            messages: The conversation, current message included.
+            project_id: Current project identifier.
+
+        Returns:
+            The named symbols as seeds (bare when the bare name is unique,
+            qualified otherwise), or [] when this is not a follow-up or no
+            earlier question names one.
+        """
+        # The reference line the plugin splices in for a re-attached file
+        # ("**Pasted_Text_….txt:** _(unchanged — 973 symbols …)_") is ours,
+        # not the user's: counted, it made "¿y quién la llama?" a 20-word
+        # question everywhere the line was not already stripped (live: the
+        # seed inferencer, which then guessed the subject).
+        strip = self._f._commands._REFERENCE_LINE_RE
+        query = strip.sub("", query or "").strip()
+        if (
+            not messages
+            or len(query.split()) > _FOLLOW_UP_MAX_WORDS
+            or not _FOLLOW_UP_MARKER_RE.search(query)
+        ):
+            return []
+        idx = self._f._symbol_index
+        user_texts: List[str] = []
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(p.get("text", ""))
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            user_texts.append(strip.sub("", str(content or "")))
+        for text in reversed(user_texts[:-1][-_FOLLOW_UP_LOOKBACK:]):
+            named = _named_indexed_symbols(text, idx, project_id)
+            if named:
+                seeds = []
+                for qid in named:
+                    bare = qid.split(".")[-1]
+                    unique = len(idx.get_qualified_names_for(bare, project_id)) == 1
+                    seeds.append(bare if unique else qid)
+                return seeds
+        return []
+
+    def _narrow_ambiguous_seeds(
+        self, names: List[str], context: List[str], project_id: str, family: str
+    ) -> List[str]:
+        """
+        Keep a bare seed only where it says which symbol it means.
+
+        A pasted class defines `__init__`, `get` and `plan`, and each became
+        an exact seed. A bare name stands for every symbol that carries it,
+        and every qid of a seed is forced into Block B as directly relevant:
+        live, `__init__` put 62 constructor bodies there (28k tokens against
+        ~6k on other turns, re-prefilled on every call of the turn). A bare
+        name shared by more than _AMBIGUOUS_SEED_MAX symbols is narrowed to
+        the members of the classes the same seeds name, and dropped when
+        none of them has it.
+
+        Args:
+            names: The seeds to narrow.
+            context: The exact seeds, read for the classes they name.
+            project_id: Current project identifier.
+            family: "exact" or "history", for the log.
+
+        Returns:
+            The seeds, ambiguous bare names replaced or removed.
+        """
+        idx = self._f._symbol_index
+        try:
+            classes = idx.get_classes(project_id) or set()
+        except Exception:
+            return names
+        named_classes = [c for c in context if isinstance(c, str) and c in classes]
+        out: List[str] = []
+        narrowed: Dict[str, List[str]] = {}
+        for name in names:
+            if not isinstance(name, str) or "." in name:
+                out.append(name)
+                continue
+            shared_by = len(idx.get_qualified_names_for(name, project_id))
+            if shared_by <= _AMBIGUOUS_SEED_MAX:
+                out.append(name)
+                continue
+            members = [
+                f"{c}.{name}"
+                for c in named_classes
+                if f"{c}.{name}" in set(idx.get_class_members(c, project_id))
+            ]
+            narrowed[name] = members
+            out.extend(m for m in members if m not in out)
+        if narrowed:
+            self._f._log_debug(
+                f"🎯 Seeds ({family}): ambiguous bare names narrowed — "
+                + ", ".join(f"{n} → {m or 'dropped'}" for n, m in narrowed.items())
+            )
+        return out
+
+    def _is_follow_up_shaped(self, query: str) -> bool:
+        """Short and opening as a continuation or pointing back (see follow_up_referent)."""
+        query = self._f._commands._REFERENCE_LINE_RE.sub("", query or "").strip()
+        return len(query.split()) <= _FOLLOW_UP_MAX_WORDS and bool(
+            _FOLLOW_UP_MARKER_RE.search(query)
+        )
+
+    def follow_up_subject(
+        self, query: str, messages: Optional[List[dict]], project_id: str
+    ) -> List[str]:
+        """
+        The qualified ids a follow-up is about, or [] when it is not one.
+
+        follow_up_referent gives seeds, bare where the bare name is unique;
+        a question restated for a planner, or a cache key, wants the ids
+        themselves.
+        """
+        subject: List[str] = []
+        for name in self.follow_up_referent(query, messages, project_id):
+            if "." in name:
+                subject.append(name)
+            else:
+                subject.extend(
+                    sorted(
+                        self._f._symbol_index.get_qualified_names_for(name, project_id)
+                    )
+                )
+        return subject
+
     async def _prepare_seed_symbols(
         self, query: str, project_id: str, messages: Optional[List[dict]]
     ):
@@ -4732,6 +5656,27 @@ Output only the symbol name.
             if (self._f.valves.enable_history_seeds and messages)
             else {}
         )
+        exact_seeds = self._narrow_ambiguous_seeds(
+            list(exact_seeds), exact_seeds, project_id, "exact"
+        )
+        if history_boosts:
+            _kept = self._narrow_ambiguous_seeds(
+                list(history_boosts), exact_seeds, project_id, "history"
+            )
+            history_boosts = {
+                k: history_boosts.get(k, history_boosts.get(k.split(".")[-1], 0.0))
+                for k in _kept
+            }
+        # Partial matches do not count as naming a subject: in "and who
+        # calls it?" the word "calls" matches _extract_calls_from_ast.
+        if not exact_seeds and not tb_seeds:
+            _referent = self.follow_up_referent(query, messages, project_id)
+            if _referent:
+                exact_seeds = list(_referent)
+                self._f._log_debug(
+                    f"🔗 Follow-up: referent carried from an earlier question "
+                    f"→ {_referent}"
+                )
 
         # --- SANITIZACIÓN DE CADA TIPO ---
         # exact_seeds y partial_seeds deben ser listas de strings
@@ -4786,6 +5731,7 @@ Output only the symbol name.
         tb_seeds: List[Tuple[str, float]],
         inferred_seeds: Optional[Dict[str, float]],
         project_id: str,
+        history_boosts: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
         """Resolve every seed to qualified ids with its evidence-strength weight.
 
@@ -4804,6 +5750,9 @@ Output only the symbol name.
             partial:  min(0.6, 0.3 + 0.3 * specificity)
             tb:       the traceback frame's own weight
             inferred: the inferrer's own score (already qid-keyed)
+            history:  the mention share over recent messages, with the
+                      family's total held under _HISTORY_MASS_SHARE of the
+                      explicit seeds' mass
 
         Ambiguous names split their weight across their qids; collisions
         accumulate with the same sum-clamped-to-1.0 rule _register_seeds uses.
@@ -4841,6 +5790,32 @@ Output only the symbol name.
         # ── Step 3: inferred seeds are already qid-keyed with a score ──
         for qid, w in (inferred_seeds or {}).items():
             _add(qid, max(0.0, min(1.0, float(w))))
+
+        # ── Step 4: history seeds, kept below the explicit ones ──
+        # Symbols the conversation has been dwelling on restart the walk too,
+        # so a follow-up that names nothing still lands on them. Their total
+        # mass is held under _HISTORY_MASS_SHARE of everything above; with no
+        # explicit seed at all they keep their full mass.
+        _hist: Dict[str, float] = {}
+        for sym, boost in (history_boosts or {}).items():
+            qids = self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            if not qids:
+                continue
+            share = max(0.0, min(1.0, float(boost))) / len(qids)
+            for qid in qids:
+                _hist[qid] = _hist.get(qid, 0.0) + share
+        if _hist:
+            _explicit = sum(weights.values())
+            _total = sum(_hist.values())
+            _scale = 1.0
+            if _explicit > 0 and _total > _HISTORY_MASS_SHARE * _explicit:
+                _scale = _HISTORY_MASS_SHARE * _explicit / _total
+            for qid, w in _hist.items():
+                _add(qid, w * _scale)
+            self._f._log_debug(
+                f"[PPR] history seeds folded: {len(_hist)} qid(s), "
+                f"mass {_total:.2f}, scale {_scale:.2f}"
+            )
 
         return weights
 
@@ -5649,6 +6624,10 @@ Output only the symbol name.
             )
         if inferred_seeds:
             seed_qids.extend(inferred_seeds.keys())
+        for sym in history_boosts:
+            seed_qids.extend(
+                self._f._symbol_index.get_qualified_names_for(sym, project_id)
+            )
         seed_qids = list(set(seed_qids) & set(all_qids))
 
         # ---- Region: Get or compute PPR scores ----
@@ -5657,9 +6636,15 @@ Output only the symbol name.
         # Evidence-strength weights for the restart vector: the symbol the
         # user literally named restarts with more mass than a partial match
         # or a traceback frame, mirroring _register_seeds' formulas (see
-        # _compute_seed_weights). Folded into the PPR cache key.
+        # _compute_seed_weights). History seeds join at a bounded share of
+        # that mass. Folded into the PPR cache key.
         seed_weights = self._compute_seed_weights(
-            exact_seeds, partial_seeds, tb_seeds, inferred_seeds, project_id
+            exact_seeds,
+            partial_seeds,
+            tb_seeds,
+            inferred_seeds,
+            project_id,
+            history_boosts=history_boosts,
         )
 
         cached_scores = self._get_or_compute_ppr_scores(
@@ -5730,6 +6715,21 @@ Output only the symbol name.
                 inferred_seeds=inferred_seeds,
                 cached_scores=cached_scores,
             )
+
+        # ---- Region: Record which seeds the question itself named ----
+        # Named (exact), from a traceback, carried to a follow-up, or
+        # inferred from the question's words. A pronoun question that named
+        # nothing has none of its own: the inferencer's guess at "it" is
+        # not the question naming something.
+        idx = self._f._symbol_index
+        for name in list(exact_seeds) + [n for n, _ in tb_seeds]:
+            ag.question_seeds.update(idx.get_qualified_names_for(name, project_id))
+        if inferred_seeds and (
+            ag.question_seeds or not self._is_follow_up_shaped(query)
+        ):
+            ag.question_seeds.update(inferred_seeds)
+        for name in history_boosts:
+            ag.history_seeds.update(idx.get_qualified_names_for(name, project_id))
 
         # ---- Region: Store scores if requested ----
         if persist:
@@ -8514,13 +9514,35 @@ class ContextBuilder:
         """Initialize the ContextBuilder with a reference to the parent Filter."""
         self._f = filter_ref
 
-        # Fast-path trigger for inventory / structural queries.
+        # Fast-path trigger for inventory / structural queries: the
+        # project's classes or functions as a whole. A phrase that only
+        # mentions them is not one. "qué funciones" matched "¿a qué
+        # funciones existentes llamará?" in a planning question, on all
+        # four runs that asked it, and Block B became the full inventory
+        # (~17k tokens, re-prefilled on every call of the turn) in place of
+        # the bodies the plan had to build on. Each pattern now needs the
+        # set itself: a verb of existence after "qué/cuáles", an object
+        # after "enumera", the end of the sentence or the project after
+        # "todas las". A question naming a symbol never takes this path
+        # (see build_block_b).
         self._LIST_INTENTS = re.compile(
-            r"\b(?:dame\s+la\s+)?lista\s*(?:de\s+)?(?:clases|funciones)|"
-            r"lístame|listame|enumera|inventario|"
-            r"todas las (clases|funciones)|qué (clases|funciones)|"
-            r"estructura del código|overview|list all|all (classes|functions)|"
-            r"muestra las clases|show classes|list classes",
+            r"\blista\s+(?:de\s+)?(?:las\s+|todas\s+las\s+)?"
+            r"(?:clases|funciones|m[eé]todos)\b"
+            r"|\bl[ií]stame\b"
+            r"|\benumera\s+(?:las\s+|todas\s+las\s+)?(?:clases|funciones|m[eé]todos)\b"
+            r"|\binventario\b"
+            r"|\btodas\s+las\s+(?:clases|funciones)"
+            r"(?=\s*(?:[?.!]|$|del\s+(?:c[oó]digo|proyecto)|que\s+hay\b))"
+            r"|\b(?:qu[eé]|cu[aá]les)\s+(?:son\s+las\s+)?(?:clases|funciones)\s+"
+            r"(?:que\s+)?(?:hay|existen|tiene|contiene|define)\b"
+            r"|\bestructura\s+del\s+c[oó]digo\b"
+            r"|\bmuestra\s+(?:las\s+|todas\s+las\s+)?clases\b"
+            r"|\boverview\s+of\s+the\s+(?:code|project|codebase)\b"
+            r"|\blist\s+(?:all\s+)?(?:the\s+)?(?:classes|functions)\b"
+            r"|\ball\s+(?:the\s+)?(?:classes|functions)"
+            r"(?=\s*(?:[?.!]|$|in\s+the\s+(?:code|project)))"
+            r"|\bwhat\s+(?:classes|functions)\s+(?:are\s+there|exist|does)\b"
+            r"|\bshow\s+(?:all\s+)?(?:the\s+)?classes\b",
             re.IGNORECASE,
         )
         # Fast-path for skeleton/scaffolding queries.
@@ -8767,26 +9789,12 @@ class ContextBuilder:
         # --- 5. Build the static block ---
         parts: List[str] = []
 
-        # 5.-1 User profile (learned preferences). It used to open Block A,
-        #      to survive the head-cap and be inherited by every agentic
-        #      call. It is stashed instead and rendered with the dynamic
-        #      block, which keeps both properties — the cap never fires
-        #      here (107000 tokens against a 70400 prelim) and every
-        #      aligned call carries the dynamic region in its user turn.
-        #
-        #      What it stops doing is sitting at token zero. The rendering
-        #      changes exactly once per session, when a field is
-        #      corroborated twice and promotes out of the provisional tier:
-        #      a line appears at the very top and every one of the 70000
-        #      tokens behind it shifts, so that turn re-prefills the whole
-        #      prompt. One guaranteed full re-processing per session, for a
-        #      change of about 600 characters.
-        #
-        #      Moving it to the END of Block A would not have helped: the
-        #      divergence would still fall inside the system message, and
-        #      llama.cpp only writes checkpoints at message boundaries.
-        #      Volatile content has to leave the system, which is the same
-        #      conclusion Block B reached.
+        # 5.-1 User profile (learned preferences). Stashed and rendered with
+        #      the dynamic block, not at the head of Block A: a promoted
+        #      field would otherwise shift every token behind it and force a
+        #      full re-prefill. Volatile content has to leave the system
+        #      message, as Block B did (checkpoints are at message
+        #      boundaries).
         #      (rendered and stashed above, before the cache returns).
         #     part of the frozen prefix; fixed wording, no per-turn counter).
         if freeze_active and frozen_hash:
@@ -8803,60 +9811,21 @@ class ContextBuilder:
         # WHAT THE ANSWERING MODEL IS TOLD — the whole map, in one place
         # ══════════════════════════════════════════════════════════════
         #
-        # Five separate places write instructions that all land in front of
-        # the same model, and none of them could see the others. That is how
-        # a valve came to ask for a confidence line while the answer
-        # directive forbade one, and how a paragraph about the [Tn] mark
-        # outlived the mark itself. The map lives here, beside the first of
-        # them, and any sixth writer belongs on this list.
+        # Five places write instructions to the same model and none can see
+        # the others; any sixth writer belongs on this list:
         #
         #   WHERE                              WHAT                  CACHED
         #   ---------------------------------- --------------------- ------
         #   1 valves.confidence_prompt          a confidence line     yes
-        #     (this method, just below)         the directive forbids
-        #
-        #   2 this method                       code-review checklist yes
+        #   2 this method                       review checklist,     yes
         #                                       reasoning guidelines
+        #   3 _answer_format_directive          the answer sections   no
+        #   4 _run_pipeline_inner               the Stats block note  no
+        #   5 dynamic_injections                per-turn notes        no
         #
-        #   3 _answer_format_directive          the eight sections,   no
-        #     (AgenticSynthesisComposer)        three rules, ~1.9k
-        #                                       tokens
-        #
-        #   4 _run_pipeline_inner               the Stats block to    no
-        #     ([WORKSPACE NOTE] labels)         copy, and the closing
-        #                                       "add nothing" note
-        #
-        #   5 dynamic_injections                per-turn notes from
-        #     (trailing)                        gates and commands
-        #
-        # CACHED matters more than length. 1 and 2 sit inside Block A, the
-        # KV prefix: changing a character there costs a full re-prefill of
-        # ~70,000 tokens, measured at 517 tok/s — about 135 seconds, once,
-        # on the next turn. 3, 4 and 5 ride in the user turn and are free to
-        # change. Batch any edit to 1 or 2 rather than paying that twice.
-        #
-        # PROPORTION, measured on a real turn: the system prompt is 299,422
-        # characters and 88% of it is the call graph and the skeleton, which
-        # are reference and not instruction. Everything on this list is
-        # about 2% of what the model reads. Trimming instructions is worth
-        # doing for the DECISIONS it removes, not for the tokens.
-        #
-        # ROADMAP, in order of return over risk:
-        #   a. Delete anything here that contradicts the directive, and
-        #      anything describing a mechanism that no longer exists. Free,
-        #      and a contradiction costs more attention than its length.
-        #   b. Give the model words instead of rules wherever it has to
-        #      choose: headings now arrive translated from a table because
-        #      three wordings of "translate them" all failed. The same move
-        #      is available anywhere a rule keeps being broken.
-        #   c. An agentic step that writes the section OUTLINE — one line
-        #      per section — leaving prose to the final model, which is the
-        #      only caller that sees conversation history (2-8 user turns,
-        #      against 1-4 for a step). That would let 3 shrink from ~1.9k
-        #      tokens to a few hundred. Costs one extra generation, ~20s.
-        #   d. NOT the whole answer as a step: it would lose the history the
-        #      final model has, and giving a step that history would break
-        #      the aligned prefix the auxiliary calls depend on.
+        # 1 and 2 sit in Block A, the KV prefix: changing a character there
+        # costs one full re-prefill (~135 s) on the next turn, so batch such
+        # edits. 3-5 ride in the user turn and are free to change.
         #
         # 5.1 Base instructions (completely static)
         if is_code_session and self._f.valves.enable_confidence_scoring:
@@ -9649,25 +10618,12 @@ class ContextBuilder:
 
         for qid in ordered:
             body, bh, lang = resolved[qid]
-            # No docstring line above the body. This tier's contract is the
-            # complete implementation, and the line was one of two things and
-            # never a third: for a symbol documented in source it repeated,
-            # word for word, the docstring sitting two lines below inside the
-            # fence — measured at 12 of the 15 hubs that carried one, 985
-            # bytes of the section; and for a symbol whose docstring was
-            # generated in the background it was the only part of this tier
-            # that could change without the code changing, which is what a
-            # KV prefix cannot afford.
-            #
-            # The tier's own change signal already excludes it: bh is
-            # md5(body), so a docstring arriving moves the rendered text while
-            # the hash that decides ordering reports nothing. The render and
-            # the signal disagreed, and the render was the one that was wrong.
-            #
-            # Nothing is lost from the prompt. Every docstring's first line is
-            # in the Project Skeleton for all 863 symbols, and that section is
-            # cached on a hash that excludes docstrings — so it is the one
-            # place a generated docstring can appear without moving anything.
+            # No docstring line above the body: for a documented symbol it
+            # repeats the docstring inside the fence, and a docstring
+            # generated in the background would change this tier without the
+            # code changing, which the KV prefix cannot afford. Every
+            # docstring's first line is in the Project Skeleton, which is
+            # cached on a hash that excludes docstrings.
             kept_set = set(kept)
             body_with_xrefs = self._inject_tier_xrefs(body, qid, kept_set | {qid})
 
@@ -10803,7 +11759,9 @@ class ContextBuilder:
                 )
                 return skel
 
-        if self._LIST_INTENTS.search(_intent_q):
+        if self._LIST_INTENTS.search(_intent_q) and not _named_indexed_symbols(
+            _intent_q, self._f._symbol_index, project_id
+        ):
             all_qids = self._f._symbol_index.get_all_qualified_names(project_id)
             if all_qids:
                 _inv = await self._format_full_symbol_inventory(all_qids, project_id)
@@ -10841,6 +11799,9 @@ class ContextBuilder:
                 code_action_vector=code_action_vector,
                 use_case=active_use_case,
                 slot_free=slot_free,
+                follow_up_referent=self._f._activation.follow_up_referent(
+                    query, messages, project_id
+                ),
             )
             self._f._log_debug(
                 f"DIAG bbb: <<< infer_seeds → {len(inferred_seeds)} seed(s)"
@@ -11003,13 +11964,26 @@ class ContextBuilder:
         _merit_lod3 = {q for q, s in activated.items() if s >= lod3}
         lod3_sticky: Dict[str, int] = dict(pstate.get("lod3_sticky", {}))
 
+        # Read from the question's own seeds. get_seed_nodes() also holds
+        # the history seeds, and the conversation names what it has been
+        # discussing, which is what the sticky bodies are: every new
+        # question looked like the same focus. Live, "¿Cómo se calcula el
+        # presupuesto de tokens?" after five turns about
+        # _extract_history_seeds was served that body and three sticky
+        # SymbolIndex ones, and none of its own.
+        _own_seeds = set(getattr(ag, "question_seeds", set()) or set())
+        # Read by the carry-over check on the assembled prompt, which has
+        # the served bodies but not the graph.
+        self._f._turn_question_seeds = set(_own_seeds)
+        _focus_switch = False
         if _sticky_ttl > 0:
             # A turn whose activation seeds miss the sticky set entirely is a
             # focus switch: age the carried-over bodies out twice as fast so they
             # do not linger once the conversation has clearly moved on. Seed nodes
             # are already computed for this turn's graph, so this costs nothing.
-            _seeds = set(ag.get_seed_nodes())
-            _decay = 2 if (_seeds and not (_seeds & set(lod3_sticky))) else 1
+            _seeds = _own_seeds or set(ag.get_seed_nodes())
+            _focus_switch = bool(_seeds) and not (_seeds & set(lod3_sticky))
+            _decay = 2 if _focus_switch else 1
             lod3_sticky = {
                 q: ttl - _decay for q, ttl in lod3_sticky.items() if ttl - _decay > 0
             }
@@ -11030,9 +12004,46 @@ class ContextBuilder:
 
             # Floor: keep every live sticky body at the LOD-3 threshold, pulling
             # back in any whose PPR score fell below the activation floor (0.05)
-            # and dropped out of `activated` entirely.
-            for q in lod3_sticky:
+            # and dropped out of `activated` entirely. Not on a focus switch:
+            # the bodies keep their (aged) TTL for a return to the subject,
+            # and are not shown in place of the new one's.
+            if not (_focus_switch and _own_seeds):
+                for q in lod3_sticky:
+                    activated[q] = max(activated.get(q, 0.0), lod3)
+
+        # ------------------------------------------------------------------
+        # Step 8.6: The question's own seeds lead.
+        #
+        # History seeds restart the walk so a follow-up that names nothing
+        # lands on its subject. When the question does name something, a
+        # history seed it did not name stays below LOD-3: its signature is
+        # in the skeleton, its body is the previous subject's. And the
+        # question's own seeds are raised to LOD-3 until _QUESTION_SEED_BODIES
+        # of them hold one: below it, in the skeleton tier, LOD-2 is skipped
+        # and they would show nothing at all.
+        # ------------------------------------------------------------------
+        if _own_seeds:
+            _demoted = sorted(
+                q
+                for q in (set(getattr(ag, "history_seeds", set())) - _own_seeds)
+                if activated.get(q, 0.0) >= lod3
+            )
+            for q in _demoted:
+                activated[q] = min(activated[q], lod3 * 0.99)
+            _have = [q for q in _own_seeds if activated.get(q, 0.0) >= lod3]
+            _ranked = sorted(
+                (q for q in _own_seeds if q not in _have),
+                key=lambda q: (-activated.get(q, 0.0), q),
+            )
+            _raised = _ranked[: max(0, _QUESTION_SEED_BODIES - len(_have))]
+            for q in _raised:
                 activated[q] = max(activated.get(q, 0.0), lod3)
+            if _demoted or _raised:
+                self._f._log_debug(
+                    f"🎯 Block B: the question's own seeds lead — "
+                    f"bodies raised {_raised or '-'}, history seeds kept "
+                    f"below LOD-3 {_demoted or '-'}"
+                )
 
         # ------------------------------------------------------------------
         # Step 9: LOD-2 hysteresis (entry/exit thresholds).
@@ -12534,6 +13545,109 @@ class ControlFlowExtractor:
     # ═══════════════════════════════════════════════════════════════════
 
     @staticmethod
+    def early_exits(
+        source: str,
+    ) -> List[Tuple[int, str, List[str], str, List[str]]]:
+        """
+        The top-level guards of a function that return before a parameter is used.
+
+        A question of the form "why does X have no effect?" is answered, as
+        often as not, by a path on which X is never read: an `if ...:
+        return` near the top of the function that receives it. The code says
+        such a path exists; only running it says whether it is taken. So
+        each exit comes with what can be observed when it is: the fixed text
+        of a log call inside the guard, when there is one.
+
+        Only guards at the top level of the body are read, with no `else`,
+        whose body returns or raises. A parameter counts as skipped when
+        some read of it comes after the guard and the guard's condition does
+        not read it: earlier reads may have run, the later ones do not. In
+        _build_multi_seed_graph, history_boosts labels seeds before the
+        cached-scores return and builds the history graph after it; the
+        second use is the one that would have had an effect.
+
+        Args:
+            source: The function's source.
+
+        Returns:
+            (line within the source, condition, skipped parameters, observable
+            log text or "", the skipped parameters that are also read before
+            the exit) per exit, in source order; [] when the source is not a
+            single function or does not parse.
+        """
+        # ── Step 1: the function and its parameters ──
+        try:
+            tree = ast.parse(textwrap.dedent(source))
+        except SyntaxError:
+            return []
+        if not tree.body or not isinstance(
+            tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            return []
+        fn = tree.body[0]
+        params = [
+            a.arg
+            for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
+            if a.arg not in ("self", "cls")
+        ]
+        if not params:
+            return []
+        reads: Dict[str, List[int]] = {p: [] for p in params}
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in reads
+            ):
+                reads[node.id].append(node.lineno)
+        # ── Step 2: guards that leave, and what they leave unread ──
+        out: List[Tuple[int, str, List[str], str]] = []
+        for stmt in fn.body:
+            if not isinstance(stmt, ast.If) or stmt.orelse:
+                continue
+            guarded = ast.Module(body=stmt.body, type_ignores=[])
+            if not any(
+                isinstance(n, (ast.Return, ast.Raise)) for n in ast.walk(guarded)
+            ):
+                continue
+            in_test = {n.id for n in ast.walk(stmt.test) if isinstance(n, ast.Name)}
+            skipped = [
+                p
+                for p in params
+                if p not in in_test and any(r > stmt.end_lineno for r in reads[p])
+            ]
+            if not skipped:
+                continue
+            # ── Step 3: what a run shows when the exit is taken ──
+            observable = ""
+            for n in ast.walk(guarded):
+                if not isinstance(n, ast.Call) or not n.args:
+                    continue
+                f = n.func
+                fname = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+                if "log" not in fname.lower() and fname not in ("print", "warning"):
+                    continue
+                arg = n.args[0]
+                if isinstance(arg, ast.JoinedStr):
+                    text = "".join(
+                        v.value
+                        for v in arg.values
+                        if isinstance(v, ast.Constant) and isinstance(v.value, str)
+                    )
+                elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    text = arg.value
+                else:
+                    continue
+                text = " ".join(text.split())
+                if len(text) >= 8:
+                    observable = text[:80]
+                    break
+            cond = " ".join(ast.unparse(stmt.test).split())[:100]
+            read_before = [p for p in skipped if any(r < stmt.lineno for r in reads[p])]
+            out.append((stmt.lineno, cond, skipped, observable, read_before))
+        return out
+
+    @staticmethod
     def extract_for_symbol(
         block_content: str,
         symbol: "CodeSymbol",
@@ -13389,6 +14503,20 @@ class StateStore:
                 PRIMARY KEY (project_id, step_key)
             )
         """)
+        # A row also records the code its step read (TestedCode), so an
+        # edit to a body the step read invalidates it. Rows written before
+        # the column existed hold "" and are misses.
+        _step_cache_cols = {
+            r[1]
+            for r in self._f._db_conn.execute(
+                "PRAGMA table_info(agentic_step_cache)"
+            ).fetchall()
+        }
+        if "tested_json" not in _step_cache_cols:
+            self._f._db_conn.execute(
+                "ALTER TABLE agentic_step_cache "
+                "ADD COLUMN tested_json TEXT NOT NULL DEFAULT ''"
+            )
         # --- Competition history (R33: adaptive-strategy input) ---
         # One row per completed hypothesis competition. This is what makes
         # _get_adaptive_strategy actually work: it needs >= 3 records to
@@ -13460,6 +14588,105 @@ class StateStore:
                 PRIMARY KEY (project_id, symbol_name)
             )
         """)
+
+        # --- Pipeline metrics ---
+        # Where a turn's time goes, kept where a query can reach it. Every
+        # study of what to speed up was done by parsing server logs, and the
+        # two largest costs found that way (an inventory served in place of
+        # the code, 62 constructor bodies for a bare `__init__`) were
+        # visible in a column that did not exist: Block B's size per turn.
+        #
+        #   SELECT label, COUNT(*), SUM(seconds) FROM metric_llm_calls
+        #   WHERE turn_started = ? GROUP BY label ORDER BY 3 DESC;
+        #   SELECT question, block_b_chars, bodies_shown, carry_over
+        #   FROM metric_turns ORDER BY turn_started DESC LIMIT 20;
+        #
+        # Rows older than _METRICS_KEEP_DAYS are dropped on start-up.
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS metric_llm_calls (
+                project_id   TEXT NOT NULL,
+                turn_started REAL NOT NULL,
+                ts           REAL NOT NULL,
+                label        TEXT NOT NULL,
+                in_tokens    INTEGER NOT NULL,
+                out_tokens   INTEGER NOT NULL,
+                seconds      REAL NOT NULL,
+                wait_seconds REAL NOT NULL,
+                truncated    INTEGER NOT NULL
+            )
+        """)
+        self._f._db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_metric_llm_calls_turn
+            ON metric_llm_calls (project_id, turn_started)
+        """)
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS metric_turns (
+                project_id     TEXT NOT NULL,
+                turn_started   REAL NOT NULL,
+                ts             REAL NOT NULL,
+                question       TEXT NOT NULL,
+                bodies_shown   INTEGER NOT NULL,
+                block_b_chars  INTEGER NOT NULL,
+                carry_over     INTEGER NOT NULL,
+                backed         INTEGER NOT NULL,
+                structure_hash TEXT NOT NULL
+            )
+        """)
+        # One row per hypothesis a competition forged, dead ones included:
+        # what it claimed, what was settled for and against it, what its
+        # own analysis concluded, where the ranking put it and whether it
+        # won (HypothesisForge._record_rivals). Whether a ranking picks
+        # the right rival can only be judged against the rivals themselves,
+        # and until now those were in a context dump or nowhere.
+        #
+        #   SELECT turn_started, l1_rank, won, status, corroboration,
+        #          predictions_corroborated, predictions_refuted,
+        #          hypothesis, analysis_head
+        #   FROM metric_forge_rivals ORDER BY turn_started DESC, l1_rank;
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS metric_forge_rivals (
+                project_id               TEXT NOT NULL,
+                turn_started             REAL NOT NULL,
+                ts                       REAL NOT NULL,
+                rivals                   INTEGER NOT NULL,
+                l1_rank                  INTEGER NOT NULL,
+                won                      INTEGER NOT NULL,
+                status                   TEXT NOT NULL,
+                cause_of_death           TEXT NOT NULL,
+                corroboration            REAL NOT NULL,
+                predictions_corroborated INTEGER NOT NULL,
+                predictions_refuted      INTEGER NOT NULL,
+                cycles_used              INTEGER NOT NULL,
+                nodes_read               INTEGER NOT NULL,
+                coverage_score           REAL NOT NULL,
+                hypothesis               TEXT NOT NULL,
+                confirmed_claims         TEXT NOT NULL,
+                refuted_claims           TEXT NOT NULL,
+                analysis_head            TEXT NOT NULL
+            )
+        """)
+        # from_cache came after the table: added to one that lacks it.
+        _metric_turn_cols = {
+            r[1]
+            for r in self._f._db_conn.execute(
+                "PRAGMA table_info(metric_turns)"
+            ).fetchall()
+        }
+        if "from_cache" not in _metric_turn_cols:
+            self._f._db_conn.execute(
+                "ALTER TABLE metric_turns "
+                "ADD COLUMN from_cache INTEGER NOT NULL DEFAULT 0"
+            )
+        _metrics_cutoff = time.time() - _METRICS_KEEP_DAYS * 86400
+        self._f._db_conn.execute(
+            "DELETE FROM metric_llm_calls WHERE ts < ?", (_metrics_cutoff,)
+        )
+        self._f._db_conn.execute(
+            "DELETE FROM metric_turns WHERE ts < ?", (_metrics_cutoff,)
+        )
+        # No cutoff for metric_forge_rivals: a few rows per session, and
+        # the decisions it serves need months of them. A database from
+        # before patch 61 keeps its metric_lakatos_shadow table, unused.
 
         self._f._db_conn.commit()
 
@@ -14194,7 +15421,7 @@ class LongTermMemory:
     # ═══════════════════════════════════════════════════════════════════════════
 
     async def find_cached_response(
-        self, query: str, context_hash: str, state: dict
+        self, query: str, context_hash: str, state: dict, subject: str = ""
     ) -> Optional[dict]:
         """
         Search the response cache for a semantically similar query.
@@ -14217,6 +15444,11 @@ class LongTermMemory:
             query: The current user query.
             context_hash: Hash of the context (unused, kept for API compatibility).
             state: The conversation state (unused, kept for API compatibility).
+            subject: For a follow-up, the qids it is about, comma-joined
+                (ActivationEngine.follow_up_subject); "" otherwise. A stored
+                answer is served only for the same subject: "¿y qué
+                devuelve?" asked about two functions is one text and two
+                questions.
 
         Returns:
             Optional[dict]: Cache hit dict or None.
@@ -14295,11 +15527,48 @@ class LongTermMemory:
         # Region: Check code-state staleness
         # ------------------------------------------------------------------
         meta = results["metadatas"][0][0]
-        stored_code_state = meta.get("code_state_hash", "")
-        current_code_state = self._f._activation.compute_code_state_hash(
-            self._f.valves.project_id
-        )
-
+        if (meta.get("subject", "") or "") != subject:
+            self._f._log_debug(
+                f"[RESPONSE-CACHE] miss — matched at {similarity:.3f} but it "
+                f"answered a question about "
+                f"{meta.get('subject', '') or '(no earlier subject)'}, this one "
+                f"is about {subject or '(no earlier subject)'}"
+            )
+            return None
+        # An entry that recorded its basis holds while the signatures and
+        # the bodies it read hold (TestedCode). The block-set hash below
+        # changes whenever any block appears: live, a repeated question
+        # matched at 0.954 and was regenerated (122 s) under unchanged
+        # code. Entries from before the basis keep that gate.
+        _pid = self._f.valves.project_id
+        _tested_json = meta.get("tested_json", "") or ""
+        if _tested_json:
+            try:
+                _recorded = json.loads(_tested_json)
+            except Exception:
+                _recorded = None
+            _sh_now = self._f._symbol_index.compute_structure_hash(_pid) or ""
+            if (
+                not isinstance(_recorded, dict)
+                or meta.get("structure_hash", "") != _sh_now
+                or (
+                    _recorded
+                    and not self._f._tested_code.still_matches(_recorded, _pid, {})
+                )
+            ):
+                await anyio.to_thread.run_sync(
+                    lambda: col.delete(ids=[results["ids"][0][0]])
+                )
+                self._f._log_debug(
+                    f"[RESPONSE-CACHE] miss — matched at {similarity:.3f} but "
+                    f"the signatures or the bodies it was written from have "
+                    f"changed; entry deleted"
+                )
+                return None
+            current_code_state = stored_code_state = ""
+        else:
+            stored_code_state = meta.get("code_state_hash", "")
+            current_code_state = self._f._activation.compute_code_state_hash(_pid)
         if stored_code_state != current_code_state:
             await anyio.to_thread.run_sync(
                 lambda: col.delete(ids=[results["ids"][0][0]])
@@ -14335,6 +15604,23 @@ class LongTermMemory:
         self._f._log_debug(
             f"[RESPONSE-CACHE] hit — {similarity:.3f} against {_stored_q!r}, "
             f"stored {(time.time() - ts) / 60:.0f} min ago, {len(doc)} chars"
+        )
+        # The turn ends here, before the context is assembled, so its
+        # metric row is written here: no bodies, no Block B, from_cache.
+        self._f._record_metric(
+            "turn",
+            (
+                str(self._f.valves.project_id or ""),
+                float(getattr(self._f, "_turn_started_at", 0.0)),
+                time.time(),
+                str(getattr(self._f, "_turn_user_question", "") or query or "")[:300],
+                0,
+                0,
+                0,
+                1,
+                str(meta.get("structure_hash", "") or ""),
+                1,
+            ),
         )
         # Footer and similarity ride along so the delivering path can say
         # what this turn is: an echo of an answer measured earlier, and how
@@ -15752,6 +17038,8 @@ class LongTermMemory:
         code_state_hash: str,
         wait: bool = True,
         footer: str = "",
+        subject: str = "",
+        basis: Optional[dict] = None,
     ) -> None:
         """Store a response in the ChromaDB response cache for future reuse.
 
@@ -15770,13 +17058,27 @@ class LongTermMemory:
         if not wait:
             asyncio.create_task(
                 self._store_response_in_cache_async(
-                    query, response, context_hash, state, code_state_hash, footer
+                    query,
+                    response,
+                    context_hash,
+                    state,
+                    code_state_hash,
+                    footer,
+                    subject,
+                    basis,
                 )
             )
             return
 
         await self._store_response_in_cache_sync(
-            query, response, context_hash, state, code_state_hash, footer
+            query,
+            response,
+            context_hash,
+            state,
+            code_state_hash,
+            footer,
+            subject,
+            basis,
         )
 
     async def _store_response_in_cache_sync(
@@ -15787,6 +17089,8 @@ class LongTermMemory:
         state: dict,
         code_state_hash: str,
         footer: str = "",
+        subject: str = "",
+        basis: Optional[dict] = None,
     ) -> None:
         """
         Synchronously store a response in the ChromaDB response cache.
@@ -15797,6 +17101,13 @@ class LongTermMemory:
             context_hash: Hash of the context (kept for API compatibility).
             state: The conversation state (kept for API compatibility).
             code_state_hash: Hash of the code state for staleness detection.
+            footer: The answer's footer, kept as metadata.
+            subject: For a follow-up, the qids it is about (see
+                find_cached_response).
+            basis: What the answer was written from (MessageAssembler.
+                record_answer_basis); with it, the entry holds while the
+                signatures and the bodies it read hold, not while every
+                block of the session does.
         """
         # ------------------------------------------------------------------
         # Region: Get or recreate the cache collection
@@ -15877,6 +17188,13 @@ class LongTermMemory:
                             "code_state_hash": code_state_hash,
                             "timestamp": time.time(),
                             "footer": (footer or "")[:2000],
+                            "subject": subject or "",
+                            "structure_hash": (basis or {}).get("structure_hash", ""),
+                            "tested_json": (
+                                json.dumps(basis.get("tested_against") or {})
+                                if basis
+                                else ""
+                            ),
                         }
                     ],
                 )
@@ -15907,11 +17225,20 @@ class LongTermMemory:
         state: dict,
         code_state_hash: str,
         footer: str = "",
+        subject: str = "",
+        basis: Optional[dict] = None,
     ) -> None:
         """Background wrapper for response cache storage."""
         try:
             await self._store_response_in_cache_sync(
-                query, response, context_hash, state, code_state_hash, footer
+                query,
+                response,
+                context_hash,
+                state,
+                code_state_hash,
+                footer,
+                subject,
+                basis,
             )
         except Exception as e:
             self._f._log_debug(f"Async response cache store failed: {e}")
@@ -16490,23 +17817,11 @@ class LLMOrchestrator:
             return system_prompt
 
         # A call that does not reason about the codebase gains nothing from
-        # the prefix and pays all of it. Measured: a 133-token prompt
-        # producing 12 tokens took 94 seconds aligned and 0.8 unaligned,
-        # the same call earlier in the same turn before _prelim existed.
-        # Declared by the caller, not inferred from size. The size floor
-        # below was written for exactly this case — its own comment says `a
-        # call that does not reason about the codebase gains nothing from
-        # the prefix and pays all of it` — but it measures the call's own
-        # system plus prompt in characters, and a classifier with a long
-        # instruction block clears it while asking nothing about the code.
-        # Traced through the server: classify_turn reported 46 tokens of
-        # prompt and the server processed 75685, at 90.4 seconds, to decide
-        # whether a message was a question.
-        #
-        # Whether a call reasons about the codebase is a property of the
-        # call, known where it is written. Size is a proxy for it and a bad
-        # one, so the callers that know say so and the floor keeps its
-        # original job for everyone else.
+        # the prefix and pays all of it (a classifier took ~90 s aligned,
+        # under 1 s unaligned). Declared by the caller rather than inferred
+        # from size: a long instruction block clears any size floor while
+        # asking nothing about the code. The floor keeps its job for
+        # everyone else.
         if not reasons_about_code:
             self._note_align("caller needs no code prefix")
             return system_prompt
@@ -16748,30 +18063,19 @@ class LLMOrchestrator:
         elif _think_mode in ("on", "true", "1", "yes"):
             enable_thinking = True
 
-        # Region: uncapped-generation guard — every auxiliary call must carry
-        # a finite n_predict. The shared library treats max_tokens None/0 as
-        # "no limit", and dozens of small call sites (classifiers, one-line
-        # summarisers) rely on EOS alone to stop. That was survivable with
-        # bare 200-token prompts; behind an aligned ~70k prefix a temp-0.1
-        # sampler with no anti-repetition occasionally misses EOS and
-        # free-runs until the HTTP timeout — and timeouts are retryable, so
-        # the identical runaway re-posts. Coerced before the dedup/cache keys
-        # so producer and deduplicated consumers agree on the effective cap.
-        # Explicit positive caps from the call site always win — EXCEPT for
-        # the agentic/scientific-method family below.
+        # Region: uncapped-generation guard — every auxiliary call carries a
+        # finite n_predict. The library treats max_tokens None/0 as "no
+        # limit", and behind a long prefix a low-temperature call can miss
+        # EOS and free-run into the HTTP timeout, which is then retried.
+        # Coerced before the dedup/cache keys. A call site's explicit cap
+        # wins, except for the agentic family below.
         #
-        # Region: agentic unlimited tokens (operator decision). Per the
-        # GOVERNING PRINCIPLES, token caps sized to typical output are
-        # quality-budgets in disguise: a healthy planner hit its cap twice
-        # in one session and every run silently degraded to the fixed
-        # fallback plan. With agentic_unlimited_tokens on, every call whose
-        # label belongs to the scientific-method pipeline runs uncapped —
-        # the anti-runaway story for these calls is the anti-hang backstop
-        # (fires only on a genuinely stuck connection) plus the operator's
-        # sampler-side loop protection, not a token ceiling that can
-        # truncate healthy reasoning. Non-pipeline calls (classifiers,
-        # summarisers) keep the cap: they are not the scientific method and
-        # EOS-reliance there is still the documented runaway risk.
+        # Region: agentic unlimited tokens (operator decision). Token caps
+        # sized to typical output are quality budgets (GOVERNING
+        # PRINCIPLES): with agentic_unlimited_tokens on, scientific-method
+        # calls run uncapped, protected by the anti-hang backstop and the
+        # sampler's loop protection. Classifiers and summarisers keep the
+        # cap.
         _AGENTIC_LABEL_KEYS = (
             "hypoth",
             "crucis",
@@ -16844,25 +18148,12 @@ class LLMOrchestrator:
         )
 
         # ── Drop a skeleton the aligned prefix already carries ─────────────
-        # Two callers paste a project skeleton into their own prompt:
-        # SemanticSeedInferencer ("Project skeleton (signatures only — no
-        # bodies)") and generate_predictions ("Code structure (signatures
-        # only)"). Both are aligned here, so their system IS the invariant,
-        # which contains the complete skeleton — and the copy they attach is
-        # truncated: measured at 9 of 59 classes for the first and 2000
-        # characters for the second, cut alphabetically, so everything from
-        # AgenticSandboxRunner onward is invisible. The prompt then asks for
-        # "the exact identifiers from the skeleton", which for those classes
-        # the model cannot produce; in the run that motivated this, 10 seeds
-        # came back, 0 resolved exactly and 8 were discarded, and the two
-        # survivors named classes only the prefix could have shown.
-        #
-        # So this removes 13569 tokens per run of reprocessing AND widens what
-        # the caller can see from 15% of the project to all of it. Done here
-        # rather than at the callers because only here is it known that
-        # alignment actually happened: when it declines — once in 75 calls,
-        # on the turn with no prefix to inherit — the prompt is left exactly
-        # as it is today and nothing is lost.
+        # Two callers paste a project skeleton into their prompt
+        # (SemanticSeedInferencer, generate_predictions), truncated, while
+        # their aligned system already holds the complete one. Removed
+        # here, where alignment is known to have happened: it saves the
+        # reprocessing and lets the caller see the whole project. When
+        # alignment declines, the prompt is left as it is.
         if system_prompt is not _before_align and prompt:
             try:
                 _sk_hdr = re.compile(r"(?m)^## Classes\b")
@@ -16903,46 +18194,15 @@ class LLMOrchestrator:
                 self._f._log_debug(f"✂️ skeleton dedup skipped: {type(_exc).__name__}")
 
         # ── One system for every aligned call ─────────────────────────────
-        # The aligner produces `prelim + separator + role`, and the role is
-        # a different length for every caller, so a turn sends five or six
-        # system prompts that agree for 280000 characters and then do not.
-        # llama.cpp leaves its checkpoint one token past the end of the
-        # SHORTER of any two, and the longer one branches one token before
-        # it — `against 77365` beside `checkpoint 77366`, four times in one
-        # run, plus three more missing by 22 to 43. Seven full re-prefills,
-        # 628 seconds, all of them inside a single turn where the code
-        # context had not changed at all.
-        #
-        # Same shape as the answer call's, and the same remedy: the role
-        # rides in the user turn, so every aligned call sends byte-identical
-        # system content and the shared prefix runs on through the
-        # `<|im_end|><|im_start|>user` boundary where the checkpoint sits.
-        #
-        # At the HEAD of the prompt, not the tail — the opposite of where
-        # the answer call's workspace goes, and for the same reason. A role
-        # is an instruction about the data that follows it, and it sat
-        # before that data when it was in the system; the answer call's
-        # trailing block is an instruction about what to write next, and it
-        # sat last. Both keep the order they were written for.
-        #
-        # An earlier attempt at this moved the role inside the aligner,
-        # behind its `already aligned` guard, and reached one call of
-        # twelve — the agentic steps build their own prefix and never got
-        # past that guard, so the run proved nothing. Splitting here, on
-        # the single funnel every call passes through, reaches all of them:
-        # a step that already sends the bare prefix has an empty role and
-        # is left exactly as it was.
-        # Cut at the INVARIANT boundary, not at the turn's. Block A and the
-        # hub tier are byte-identical across every turn of a session; Block
-        # B is not, and leaving it in the system makes the system differ
-        # from turn to turn — which costs the first heavy call of each turn
-        # a full re-prefill of 70000 unchanged tokens. Cutting here sends
-        # one system for the whole session, so the checkpoint written at
-        # its boundary survives into the next turn.
-        #
-        # Reading order is preserved exactly: Block B sat between the hub
-        # tier and the role, and it still does — the three simply cross the
-        # message boundary together.
+        # The role rides at the head of the user turn, so every aligned call
+        # sends a byte-identical system prompt and they stop rejecting each
+        # other's KV checkpoints (seven full re-prefills in one turn before
+        # this). Split here, on the funnel every call passes through, so it
+        # reaches all of them.
+        # Cut at the INVARIANT boundary: Block B changes per turn, so leaving
+        # it in the system would cost the first heavy call of each turn a
+        # full re-prefill. Reading order is unchanged — Block B still sits
+        # between the hub tier and the role, across the message boundary.
         try:
             # The invariant describes the SESSION, not the turn, so it is
             # remembered the moment it is published and read from there
@@ -17043,55 +18303,19 @@ class LLMOrchestrator:
             pass
 
         # Region: anti-repetition. Built before the dedup and cache keys
-        # because it changes what the sampler produces — valves are
-        # live-editable in the UI, so two calls with different DRY settings
-        # must not share an inference or a cached response.
+        # because it changes what the sampler produces, and valves are
+        # live-editable.
         #
-        # Two domains, one mechanism. JSON contracts ride a verbatim-repeated
-        # claim into the token cap; long-prose steps ride a verbatim-repeated
-        # BULLET into it ("- Current implementation details of `set_pstate`⏎-
-        # Current implementation details of `get_pstate`⏎- ..." looping until
-        # agentic_step_max_tokens, three times in one run). The loop is the
-        # same failure and DRY is the right tool for both, which is why the
-        # long_dry valve exists alongside the json one: the steps carry no
-        # response_format, so the original gate skipped exactly the calls
-        # that truncate most.
+        # DRY rather than repeat_penalty: code repeats tokens by grammar
+        # (`self`, indentation, fences), and a token penalty pushes the
+        # model away from idiomatic code; DRY penalises repeated SEQUENCES,
+        # which is what a looping claim list or bullet list is. It applies
+        # to long prose steps as well as JSON contracts, since both loop.
         #
-        # Why DRY and not repeat_penalty, which the server can already
-        # raise globally: repeat_penalty punishes TOKENS. Code repeats
-        # tokens as a matter of grammar — `self`, `def`, `return`, the
-        # indent, and the ``` of a fence — so every notch of global
-        # repeat_penalty pushes the model away from idiomatic code and away
-        # from closing a fence it has already opened. DRY punishes repeated
-        # SEQUENCES with a penalty exponential in their length, and
-        # dry_allowed_length draws the line exactly where this domain needs
-        # it: an identifier or a `return False` stays under 8 tokens and is
-        # never touched, while a repeated sentence — the loop's signature —
-        # is. That is what lets the temperature come down for format
-        # adherence without the loop coming back.
-        # models.ini is the single source of truth for the SHAPE of the
-        # sampler — dry_allowed_length, dry_base, dry_penalty_last_n,
-        # repeat_penalty, top_k, min_p, temp. The operator tunes those
-        # for the model they are actually running; a plugin shipping
-        # its own copy makes that file a lie, and the router log proved
-        # it: 80 of 111 calls ran with the server's allowed_length=17
-        # and 31 with a hardcoded 8, from one binary, in one run, with
-        # nothing in our own logs to say which was which.
-        #
-        # The multiplier is overridable because it is the one dimension
-        # models.ini cannot express: a global file has no way to say
-        # 'stronger on JSON contracts than on prose'.
-        #
-        # allowed_length travels with it. Omitting it was the mistake
-        # this block used to make, on the reasoning that llama.cpp fills
-        # an omitted sampler field from its CLI defaults "which is
-        # exactly models.ini" — but a field models.ini never mentions is
-        # filled by llama.cpp's own default, and that default is 2. The
-        # startup log read `dry_allowed_length = 2` while the code was
-        # reasoning as if it were 8, which is the difference between
-        # penalizing a repeated sentence and penalizing every identifier
-        # longer than two tokens. Arming a penalty without stating the
-        # length it starts at is arming it without aiming it.
+        # models.ini owns the sampler's shape; only the multiplier is ours
+        # (JSON contracts want it stronger than prose). allowed_length is
+        # sent with it, because an omitted field falls back to llama.cpp's
+        # own default of 2, which would penalise every identifier.
         _extra_body: Optional[Dict[str, Any]] = None
         if response_format is not None:
             _dry = float(getattr(self._f.valves, "llm_json_dry_multiplier", 0.0) or 0.0)
@@ -17417,6 +18641,20 @@ class LLMOrchestrator:
                             f"(waited {t_acquired - t_start:.3f}s)"
                             f"{' [TRUNCATED]' if result.truncated else ''}"
                         )
+                        self._f._record_metric(
+                            "llm_call",
+                            (
+                                str(self._f.valves.project_id or ""),
+                                float(getattr(self._f, "_turn_started_at", 0.0)),
+                                time.time(),
+                                str(label or "unlabelled"),
+                                int(in_tokens or 0),
+                                int(out_tokens or 0),
+                                round(time.monotonic() - t_start, 3),
+                                round(t_acquired - t_start, 3),
+                                int(bool(result.truncated)),
+                            ),
+                        )
                         # Agent forensics. One hook covers every agent
                         # in the file: all 43 call sites funnel through
                         # here and each already passes a label naming
@@ -17530,58 +18768,28 @@ class LLMOrchestrator:
 # ═══════════════════════════════════════════════════════════════════════════
 # These principles were distilled from measured runs of this pipeline on a
 # --parallel 1 llama.cpp server (log-verified, not theoretical) and they
-# govern every change made below. Read them before touching anything.
+# govern every change made below.
 #
-# THE MAXIM — integrity before time.
-#   The scientific method only works if every executed step runs to
-#   completion. A generation must NEVER be cut before it emits its claims
-#   contract: the structured claims block sits at the very END of a step's
-#   output, so any interruption — by clock, by token cap, or by anything
-#   else — loses exactly the structured part while the prose above the cut
-#   survives. The result is indistinguishable from a step that had nothing
-#   to claim, the verify stage goes evidence-blind, and the corruption is
-#   silent. There is no acceptable percentage of this.
+# THE MAXIM — integrity before time. A step must never be cut before it
+#   emits its claims: they come last, so a cut loses exactly the
+#   structured part and the step reads as one that found nothing.
 #
-# PRINCIPLE 1 — cancelling any step destroys more value than it saves.
-#   Measured: cutting a step saved ~28s and cost ~1.5 quality points
-#   (~0.054 quality/s destroyed), while even the cheapest useful step
-#   produces ~0.10 quality/s. Cancellation is always the worst lever.
-#   Consequence: time budgets are respected by NOT PLANNING or NOT
-#   STARTING non-essential work — never by interrupting work in flight.
+# PRINCIPLE 1 — cancelling a step destroys more than it saves. Time budgets
+#   are kept by not planning or not starting work, never by interrupting it.
 #
-# PRINCIPLE 2 — two kinds of ceilings, only one is legitimate.
-#   ANTI-HANG guards (call_llm's 900s connection backstop, the
-#   pre-planner/planner ceilings at ~2.5-3x a healthy call) only ever
-#   fire on a genuinely stuck call. They protect the single slot and
-#   never touch healthy work: they stay. QUALITY-BUDGETS (wall-clock
-#   deadlines threaded into executors, competition deadlines, token caps
-#   sized to typical output) cut healthy-but-slow work: they were
-#   removed from this pipeline. Before adding any ceiling, classify it.
-#   A ceiling a healthy run can meet is a quality-budget in disguise.
+# PRINCIPLE 2 — anti-hang guards (ceilings a healthy call never meets) stay;
+#   quality budgets (deadlines and token caps a healthy call can meet) cut
+#   healthy work and do not belong here. Classify a ceiling before adding it.
 #
-# PRINCIPLE 3 — conditional insurance is the cheapest quality there is.
-#   The devil's advocate fires rarely (measured freq ~0.10) and costs
-#   ~1s expected per competition, yet it attacks the single most
-#   expensive failure the pipeline can produce: a confident-and-wrong
-#   hypothesis promoted to the final analysis. The tiebreaker behaves
-#   the same way (freq ~0.15). Mechanisms whose cost is conditional and
-#   whose value is asymmetric are never overhead — protect them.
+# PRINCIPLE 3 — conditional insurance is cheap: mechanisms that fire rarely
+#   (devil's advocate, tiebreaker) against an expensive failure are not
+#   overhead.
 #
-# PRINCIPLE 4 — the system self-regulates; trust measured signals only.
-#   The hypothesis competition converges on iteration 1 in the designed
-#   common case (best score >= threshold) and spends extra iterations
-#   only where rivals are genuinely close. Depth is throttled by the
-#   convergence threshold acting on a MEASURED score — never by fixed
-#   step-count rules, estimated-ROI gates, or fitted constants. Raising
-#   hard iteration ceilings is inert; tuning the threshold is the lever.
+# PRINCIPLE 4 — depth is throttled by a measured convergence score, never by
+#   fixed step counts or estimated-ROI gates.
 #
-# PRINCIPLE 5 — the static context is already paid for.
-#   With a stable Block A prefix the KV cache makes the marginal cost of
-#   a turn the dynamic delta plus generation only. Letting a step finish
-#   costs, at the margin, only the extra tokens it generates. Combined
-#   with Principle 1 this means: generosity in completion is cheap,
-#   interruption is expensive. The only real price of generating more is
-#   holding the slot — which is exactly what anti-hang guards cover.
+# PRINCIPLE 5 — with a stable Block A the static context is already paid
+#   for: letting a step finish costs only its extra tokens.
 # ═══════════════════════════════════════════════════════════════════════════
 # QUANTIZATION & CALIBRATION — how model precision tunes this pipeline
 # ═══════════════════════════════════════════════════════════════════════════
@@ -17742,6 +18950,181 @@ class LedgerClaim:
 # Claims are recorded, then checked against the graph, the index and the sandbox.
 # ==========================================================================
 
+# Relation assertions shared by the ledger, the metacognitive engine and the
+# strategy ranker. One definition keeps the three from drifting apart: the
+# ledger once lacked the reads/writes verbs the engine parsed, and only the
+# negative form understood Spanish although hypotheses are written in the
+# language of the question.
+#
+# Each side may be a dotted name, and the group captures its last part:
+# 'A.x calls B.y' yields ('x', 'y'), the bare names every consumer already
+# works with. A plain \w+ stopped at the first dot on the callee side and
+# read that claim as "x calls B": the CLASS, which no call edge reaches, so
+# a true relation was refuted. 65 of 155 relation phrases in two runs' worth
+# of model claims were written that way.
+_RELATION_CALL_RE = re.compile(
+    r"`?(?:\w+\.)*(\w+)`?\s+(?:calls?|invokes?|uses?|reads?|writes?|depends\s+on|"
+    r"llama\s+a|invoca\s+a|usa)\s+`?(?:\w+\.)*(\w+)`?",
+    re.IGNORECASE,
+)
+_RELATION_NEG_RE = re.compile(
+    r"`?(?:\w+\.)*(\w+)`?\s+(?:does\s+not|doesn'?t|never|no\s+longer|"
+    r"cannot|can'?t|no|nunca)\s+"
+    r"(?:calls?|invokes?|uses?|reads?|writes?|depends\s+on|"
+    r"llama\s+a|invoca\s+a|usa)\s+`?(?:\w+\.)*(\w+)`?",
+    re.IGNORECASE,
+)
+
+# Calls that hand a function over by reference or reach it by name, so the
+# call edge a relation would need is never drawn. `getattr` is left out on
+# purpose: it appears in most functions here for plain attribute access, and
+# counting it would excuse nearly every missing edge.
+_DYNAMIC_DISPATCH_CALLS = frozenset(
+    {
+        "partial",
+        "partialmethod",
+        "methodcaller",
+        "eval",
+        "exec",
+        "__import__",
+        "import_module",
+        "run_in_executor",
+        "to_thread",
+        "submit",
+        "apply_async",
+        "add_done_callback",
+        "call_soon",
+        "call_soon_threadsafe",
+        "call_later",
+    }
+)
+# Bounds of the walk over call edges. Edge destinations are bare names, so
+# a common name fans out to every symbol that carries it; skipping wide
+# fan-outs keeps one name such as `get` from making everything reachable.
+_RELATION_MAX_HOPS = 3
+_RELATION_FANOUT_CAP = 3
+_RELATION_NODE_CAP = 200
+
+
+def _relation_edge_status(idx: Any, caller: str, callee: str, project_id: str) -> str:
+    """
+    Classify how a caller relates to a callee in the call graph.
+
+    The graph holds direct edges only and is blind to calls made through a
+    reference, so "no direct edge" is weaker evidence than it sounds. The
+    answer separates what is drawn from what is merely not drawn.
+
+    A class as caller stands for its members.
+
+    Args:
+        idx: The SymbolIndex.
+        caller: Bare name of the caller, already known to the index.
+        callee: Name of the callee; only its bare tail is compared.
+        project_id: Current project identifier.
+
+    Returns:
+        "direct" when a calls, reads or writes edge reaches the callee;
+        "indirect" when a path of at most _RELATION_MAX_HOPS call edges
+        does; "dynamic" when neither exists but the caller hands functions
+        over by reference (_DYNAMIC_DISPATCH_CALLS); "absent" otherwise.
+    """
+    callee_bare = callee.split(".")[-1]
+    start = set(idx.get_qualified_names_for(caller, project_id))
+    # A class does not call anything; its methods do, and "ActivationEngine
+    # calls _prepare_seed_symbols" means one of them does. Read as the class
+    # itself, the relation had no edge and was refuted in the Popperian
+    # regime: live, two hypotheses were hard-killed on it while
+    # ActivationEngine.build_activation_graph made that very call.
+    for cq in list(start):
+        if (idx.get_symbol_meta(cq, project_id) or {}).get("kind") == "class":
+            start.update(idx.get_class_members(cq.split(".")[-1], project_id))
+
+    # ── Step 1: direct edges, collecting where the walk continues ──
+    dynamic = False
+    seen = set(start)
+    frontier: set = set()
+    for cq in start:
+        for e in idx.get_edges_out(cq, project_id):
+            tail = e.dst.split(".")[-1]
+            if tail == callee_bare and e.type in ("calls", "reads", "writes"):
+                return "direct"
+            if e.type != "calls":
+                continue
+            if tail in _DYNAMIC_DISPATCH_CALLS:
+                dynamic = True
+            targets = idx.get_qualified_names_for(tail, project_id)
+            if len(targets) > _RELATION_FANOUT_CAP:
+                continue
+            for tq in targets:
+                if tq not in seen:
+                    seen.add(tq)
+                    frontier.add(tq)
+
+    # ── Step 2: bounded walk over call edges ──
+    for _hop in range(2, _RELATION_MAX_HOPS + 1):
+        if not frontier or len(seen) > _RELATION_NODE_CAP:
+            break
+        nxt: set = set()
+        for sq in frontier:
+            for e in idx.get_edges_out(sq, project_id):
+                if e.type != "calls":
+                    continue
+                tail = e.dst.split(".")[-1]
+                if tail == callee_bare:
+                    return "indirect"
+                targets = idx.get_qualified_names_for(tail, project_id)
+                if len(targets) > _RELATION_FANOUT_CAP:
+                    continue
+                for tq in targets:
+                    if tq not in seen:
+                        seen.add(tq)
+                        nxt.add(tq)
+        frontier = nxt
+    return "dynamic" if dynamic else "absent"
+
+
+_CLAIMS_ONLY_NOTE = (
+    "_(This step returned its claims and no prose. They are listed as the "
+    "step stated them, not as checked facts: a verification entry in this "
+    "workspace, where there is one, says which of them held.)_"
+)
+_CLAIMS_ONLY_MAX_CHARS = 300
+
+
+def _claims_as_workspace_prose(raw_claims: List[Any]) -> str:
+    """
+    Render a step's raw claims as the text of its workspace entry.
+
+    Used when a step answered with its claims block and nothing else, so
+    that the entry the next step reads is not empty.
+
+    Args:
+        raw_claims: The claim objects parsed from the step's JSON tail.
+
+    Returns:
+        A note and one bullet per claim that carries text, or "" when no
+        claim does.
+    """
+    # ── Step 1: one bullet per claim, with the symbols it cites ──
+    lines: List[str] = []
+    for _c in raw_claims:
+        if not isinstance(_c, dict):
+            continue
+        _text = " ".join(str(_c.get("claim", "") or "").split())
+        if not _text:
+            continue
+        _qids = _c.get("qids") or []
+        _cited = (
+            ", ".join(str(_q) for _q in _qids[:4]) if isinstance(_qids, list) else ""
+        )
+        lines.append(
+            f"- {_text[:_CLAIMS_ONLY_MAX_CHARS]}" + (f" [{_cited}]" if _cited else "")
+        )
+    # ── Step 2: nothing to show stays nothing ──
+    if not lines:
+        return ""
+    return _CLAIMS_ONLY_NOTE + "\n" + "\n".join(lines)
+
 
 class AgenticEvidenceLedger:
     """
@@ -17832,9 +19215,11 @@ class AgenticEvidenceLedger:
         """
         Parse the claims tail of a completed step and validate citations.
 
-        Mutates step.output (strips the JSON tail so digests stay prose),
-        appends validated LedgerClaim objects to the ledger, and returns
-        the step's control signals for the orchestrator.
+        Mutates step.output (strips the JSON tail so digests stay prose;
+        a step that wrote nothing but the tail gets its claims listed
+        instead, so its workspace entry is not empty), appends validated
+        LedgerClaim objects to the ledger, and returns the step's control
+        signals for the orchestrator.
 
         Args:
             step: A step with status "done" whose output may end in a
@@ -17982,6 +19367,15 @@ class AgenticEvidenceLedger:
         if not isinstance(_all_claims, list):
             _all_claims = []
         raw_claims = _all_claims[:_MAX_CLAIMS_PER_STEP]
+        # Stripping the tail keeps digests prose, and leaves nothing at all
+        # when the tail was the whole output. The workspace then shows
+        # "Step 1 — investigate [done]" over an empty line: the next step is
+        # told the investigation happened and is shown none of what it
+        # found. Measured over two runs, 19 of 21 analyze steps were built
+        # on such an entry. The claims are what the step found, so they
+        # stand in for the prose it did not write.
+        if not step.output.strip():
+            step.output = _claims_as_workspace_prose(raw_claims)
         # The cut, said out loud. The contract asks for at most this many,
         # so a step that exceeds it has ignored the contract — and the
         # claims that fall off are the tail of the list, which is not the
@@ -18076,6 +19470,12 @@ class AgenticEvidenceLedger:
                 # the claim.
                 subject=_subject or (qids[0] if qids else ""),
             )
+            if claim.subject:
+                _subj = self._canonical_qid(claim.subject, project_id)
+                if _subj and _subj in (
+                    self._f._symbol_index.get_all_qualified_names(project_id) or set()
+                ):
+                    claim.subject = _subj
             _known_here = self._known_names(project_id)
             _known_bare = {_q.rsplit(".", 1)[-1] for _q in _known_here}
             for qid in claim.qids:
@@ -18094,27 +19494,12 @@ class AgenticEvidenceLedger:
                     _canon in _known_here or _canon.rsplit(".", 1)[-1] in _known_bare
                 ):
                     claim.valid_qids.append(_canon)
-                    # The symbol exists — under a different parent than the
-                    # one cited. The resolver's last pass matches on the
-                    # bare tail and ignores any class prefix, which is what
-                    # rescues a camelCase or miscased spelling and is worth
-                    # keeping. It also silently accepts an invented parent:
-                    # one turn asserted `AgenticToolBroker._note_body_shown
-                    # is called by …`, and the evidence pass had already
-                    # REFUTED that such a method exists — the symbol is
-                    # module-level. The relation was true of
-                    # `_note_body_shown` and false of the method named, and
-                    # the claim sealed `structural`, settled, on a subject
-                    # that does not exist.
-                    #
-                    # Reported, not rejected. A cited parent can differ
-                    # legitimately when a method is inherited — `Child.run`
-                    # for a `run` defined on the parent is a correct
-                    # attribution and the index holds only the parent's
-                    # form. Telling those apart needs the class hierarchy,
-                    # which this check does not have, and a wrong rejection
-                    # costs a true claim. A run with this line in it says
-                    # how often it happens and which shape it takes.
+                    # The symbol exists under a different parent than the one
+                    # cited. The resolver's bare-tail pass rescues miscased
+                    # spellings but also accepts an invented parent, so the
+                    # mismatch is reported. Not rejected: an inherited method
+                    # cited on the child class is a correct attribution, and
+                    # telling the two apart needs the class hierarchy.
                     try:
                         _cited_parent = qid.rsplit(".", 1)[0] if "." in qid else ""
                         _canon_parent = (
@@ -18664,12 +20049,29 @@ class AgenticEvidenceLedger:
         """
         try:
             _si = self._f._symbol_index
-            return _resolve_symbol_name(
+            # A step that sees "**Pasted_Text_….txt:**" in the question
+            # cites `Pasted_Text_….txt.ActivationEngine.run`. Kept as
+            # written, the name never matched a body shown, and live every
+            # claim of a turn read "asserted unread" (0%) while the same
+            # claims were checked against code.
+            qid = _CITED_FILE_PREFIX_RE.sub("", qid)
+            _found = _resolve_symbol_name(
                 qid,
                 lambda n: _si.find_blocks(n, project_id),
                 lambda n: _si.get_qualified_names_for(n, project_id),
                 lambda: _si.get_all_qualified_names(project_id),
             )
+            # The resolver echoes a name it cannot match. A citation with a
+            # module or path in front (`context_manager.Class.method`) still
+            # names an indexed symbol: the longest indexed tail is it.
+            _known = _si.get_all_qualified_names(project_id) or set()
+            if _found not in _known and qid.count(".") >= 2:
+                _parts = qid.split(".")
+                for _i in range(1, len(_parts) - 1):
+                    _tail = ".".join(_parts[_i:])
+                    if _tail in _known:
+                        return _tail
+            return _found
         except Exception:
             return ""
 
@@ -18772,10 +20174,7 @@ class AgenticEvidenceLedger:
 
     # ── Call-relation validation (#9) ────────────────────────────────────
 
-    _CALL_RELATION_RE = re.compile(
-        r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|depends on)\s+`?(\w+)`?",
-        re.IGNORECASE,
-    )
+    _CALL_RELATION_RE = _RELATION_CALL_RE
     # EC-5 (external coherence): negation-aware relation assertions.
     # The positive regex is polarity-blind — on 'X never calls Y' its
     # caller group grabs 'never', fabricating a bogus relation that the
@@ -18784,13 +20183,7 @@ class AgenticEvidenceLedger:
     # with proper polarity (absence in the graph CONFIRMS the claim,
     # presence refutes it) and their spans are masked before the
     # positive pass. English and Spanish forms.
-    _NEG_RELATION_RE = re.compile(
-        r"`?(\w+)`?\s+(?:does\s+not|doesn'?t|never|no\s+longer|"
-        r"cannot|can'?t|no|nunca)\s+"
-        r"(?:calls?|invokes?|uses?|depends\s+on|llama\s+a|"
-        r"invoca\s+a|usa)\s+`?(\w+)`?",
-        re.IGNORECASE,
-    )
+    _NEG_RELATION_RE = _RELATION_NEG_RE
 
     def _known_names(self, project_id: str) -> set:
         """Every name the index knows, qualified and bare.
@@ -18847,7 +20240,10 @@ class AgenticEvidenceLedger:
             project_id: Current project identifier.
 
         Returns:
-            List of "A_calls_B" keys whose edge does NOT exist.
+            List of "A_calls_B" keys whose edge does NOT exist: no direct
+            edge, no path through other calls, and no sign that the caller
+            hands functions over by reference. A relation that is only not
+            drawn is left out, neither valid nor invalid.
         """
         invalid: List[str] = []
         try:
@@ -18897,18 +20293,25 @@ class AgenticEvidenceLedger:
                     caller, project_id
                 )
                 callee_bare = callee.split(".")[-1]
-                verified = False
-                _edge_count = 0
-                for cq in caller_qids:
-                    c_edges = self._f._symbol_index.get_edges_out(cq, project_id)
-                    _edge_count += len(c_edges)
-                    if any(
-                        e.dst.split(".")[-1] == callee_bare
-                        and e.type in ("calls", "reads", "writes")
-                        for e in c_edges
-                    ):
-                        verified = True
-                        break
+                _status = _relation_edge_status(
+                    self._f._symbol_index, caller, callee, project_id
+                )
+                _edge_count = sum(
+                    len(self._f._symbol_index.get_edges_out(cq, project_id))
+                    for cq in caller_qids
+                )
+                if _status in ("indirect", "dynamic"):
+                    # The direct edge is not drawn, but the caller reaches
+                    # the callee through other calls or hands functions
+                    # over by reference: the relation cannot be called
+                    # false.
+                    self._f._log_debug(
+                        f"🔗 DIAG relation: '{caller} calls {callee}' "
+                        f"{_status.upper()} — no direct edge from "
+                        f"{sorted(caller_qids)}; not counted either way"
+                    )
+                    continue
+                verified = _status == "direct"
                 if not verified:
                     # A class is not a destination a call relation can have.
                     # Such a claim is not false, it is unevaluable, and
@@ -19504,6 +20907,18 @@ class AgenticEvidenceVerifier:
             if not (1 <= n <= len(claims)):
                 continue
             claim = claims[n - 1]
+            # A body that does not settle a STRUCTURAL claim says nothing
+            # against the check that did: live, a default-value check
+            # confirmed 0.2 against its declaration and this turned it into
+            # "read but unresolved", and the turn reported 0%. A behavioural
+            # claim is still downgraded: a call edge is no proof of what the
+            # code does.
+            if (
+                verdict == "indeterminate"
+                and claim.claim_kind == "structural"
+                and claim.verification in ("confirmed", "refuted")
+            ):
+                continue
             claim.verification = mapping[verdict]
             claim.evidence_type = "code"
             claim.verification_detail = (
@@ -19543,6 +20958,7 @@ class AgenticStaticVerifier:
         "counts",
         "graph_absence",
         "counts_listed",
+        "default_value",
     )
 
     _CHECKS_CONTRACT = (
@@ -19706,6 +21122,22 @@ class AgenticStaticVerifier:
             )
 
         # Region: deterministic execution + verdict stamping
+        # A default value is written in the code, so a claim about one is
+        # settled by reading it. Live, an answer's conclusion rested on "the
+        # default of multi_seed_weight_historical is about 0.05": the code
+        # declares 0.2, the claim stayed "read but unresolved", and the
+        # number travelled into the next two answers.
+        _defaults = self._default_value_checks(claims)
+        if _defaults:
+            checks = list(checks) + _defaults
+            mode += f" + {len(_defaults)} default-value check(s)"
+            self._f._log_debug(
+                f"🤖 Verify: {len(_defaults)} default-value check(s) generated — "
+                + "; ".join(
+                    f"C{c['claim']}:{c['src']}={c['value']}" for c in _defaults[:5]
+                )
+            )
+
         results = [self._execute(ch, project_id) for ch in checks]
         self._apply_verdicts(claims, checks, results)
         step.output = self._render_report(checks, results, mode)
@@ -19804,10 +21236,122 @@ class AgenticStaticVerifier:
     async def _elicit_checks(
         self, claims: List[LedgerClaim], aligned_prefix: str
     ) -> Optional[List[Dict[str, Any]]]:
-        """One aligned JSON-contract call; None on any failure (→ fallback)."""
+        """
+        Typed checks for the claims; None on failure (→ fallback).
+
+        The model's only job here is to turn prose into checks, and a claim
+        that reads "A calls B", "A is called by B" or "A exists" already is
+        one. Live, every one of the 88 checks the model wrote in a run was
+        of those three kinds, at 92 s for 11 calls. Such claims are
+        formalized here (_formalize_plain_claims); the model sees only the
+        rest, and is not called when nothing is left.
+        """
+        fixed, open_ids = self._formalize_plain_claims(claims)
+        if fixed:
+            self._f._log_debug(
+                f"🤖 Verify: {len(fixed)} of {len(claims)} claim(s) formalized "
+                f"without the model" + ("" if open_ids else " — no model call")
+            )
+        if not open_ids:
+            return self._select_checks(fixed, len(claims)) or None
+        elicited = await self._elicit_checks_llm(claims, aligned_prefix, open_ids)
+        if elicited is None:
+            if not fixed:
+                return None
+            # The model failed on the rest: those get the deterministic
+            # fallback, renumbered to their place among all the claims.
+            elicited = self._fallback_checks([claims[i - 1] for i in open_ids])
+            for check in elicited:
+                check["claim"] = open_ids[int(check["claim"]) - 1]
+        return self._select_checks(fixed + elicited, len(claims)) or None
+
+    def _formalize_plain_claims(
+        self, claims: List[LedgerClaim]
+    ) -> Tuple[List[Dict[str, Any]], List[int]]:
+        """
+        Checks for the claims whose whole text is one call or existence fact.
+
+        A claim that opens with the call ("A calls B to keep string keys",
+        "A is called only by B, during seed preparation") gets the check
+        for that call: it is the check the model writes for it, and the
+        rest of the sentence is what the evidence step reads the body for.
+        Claims in the field are sentences, not bare facts; requiring the
+        whole text to be the fact matched none of 88 in a run. An existence
+        claim must still be the whole text. The check's src must be a
+        symbol the claim cites, the same anchor the model's checks are
+        held to; a callee written through a receiver (self._f._x) is
+        taken by its name.
+
+        Returns:
+            (checks, numbers of the claims left to the model), 1-based.
+        """
+        exists_re = MetacognitiveReasoningEngine._EXISTENCE_CLAIM_RE
+        fixed: List[Dict[str, Any]] = []
+        open_ids: List[int] = []
+        for n, claim in enumerate(claims, 1):
+            text = (claim.text or "").strip()
+            cited = set(claim.qids or [])
+            bare = {q.rsplit(".", 1)[-1] for q in cited}
+
+            def _anchored(name: str) -> bool:
+                return name in cited or name.rsplit(".", 1)[-1] in bare
+
+            def _named(written: str) -> str:
+                written = written.rstrip(".")
+                return (
+                    written.rsplit(".", 1)[-1]
+                    if written.startswith(("self.", "cls."))
+                    else written
+                )
+
+            def _is_symbol(written: str) -> bool:
+                # "calls nothing else", "calls it twice": a plain word is
+                # not a callee.
+                return bool(re.search(r"[_.A-Z]", written))
+
+            check: Optional[Dict[str, Any]] = None
+            m = _LEADING_CALLS_CLAIM_RE.match(text)
+            if m and _anchored(m.group("a")) and _is_symbol(m.group("b")):
+                check = {"claim": n, "kind": "calls", "src": m.group("a")}
+                check["dst"] = _named(m.group("b"))
+            else:
+                m = _LEADING_CALLED_BY_CLAIM_RE.match(text)
+                if m and _anchored(m.group("a")) and _is_symbol(m.group("b")):
+                    check = {"claim": n, "kind": "called_by", "src": m.group("a")}
+                    check["dst"] = _named(m.group("b"))
+                else:
+                    m = exists_re.match(text)
+                    if m and _anchored(m.group(1)):
+                        check = {"claim": n, "kind": "exists", "src": m.group(1)}
+            # A claim that speaks of no call at all ("X returns an empty
+            # dict when…") has one structural fact to check: that its
+            # subject exists. That is the check the model writes for it (36
+            # of 88 in a run), and what it says about behaviour is the
+            # evidence step's to read. A claim with a call anywhere in it
+            # still goes to the model, which can tell who calls whom.
+            if check is None and not _CALL_WORD_RE.search(text):
+                subject = (claim.valid_qids or claim.qids or [""])[0]
+                if subject:
+                    check = {"claim": n, "kind": "exists", "src": subject}
+            if check is None:
+                open_ids.append(n)
+            else:
+                fixed.append(check)
+        return fixed, open_ids
+
+    async def _elicit_checks_llm(
+        self,
+        claims: List[LedgerClaim],
+        aligned_prefix: str,
+        numbered: Optional[List[int]] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """One aligned JSON-contract call over the claims `numbered` lists (all
+        by default), keeping their numbers; None on any failure."""
+        _ids = numbered or list(range(1, len(claims) + 1))
         block = "\n".join(
-            f"{n}. {c.text} (cites: {', '.join(c.qids) or '—'})"
-            for n, c in enumerate(claims, 1)
+            f"{n}. {claims[n - 1].text} "
+            f"(cites: {', '.join(claims[n - 1].qids) or '—'})"
+            for n in _ids
         )
         prompt = self._CHECKS_CONTRACT.replace("{claims_block}", block)
         try:
@@ -20098,6 +21642,127 @@ class AgenticStaticVerifier:
         return out
 
     @classmethod
+    def _default_value_checks(cls, claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
+        """
+        One check per claim that states the default value of a named setting.
+
+        Read from the claim's own words ("the default of X is N", "X
+        defaults to N", "el valor por defecto de X es N"); "approximately"
+        and its kin are kept, because a claim hedged that way is still
+        refuted by a declaration three times larger.
+        """
+        out: List[Dict[str, Any]] = []
+        for n, claim in enumerate(claims, 1):
+            for m in _DEFAULT_VALUE_CLAIM_RE.finditer(claim.text or ""):
+                name = m.group("a") or m.group("b") or m.group("c") or m.group("d")
+                value = m.group("va") or m.group("vb") or m.group("vc") or m.group("vd")
+                # A prose word is not a setting: live, "X is declared with a
+                # default value of 0.2" checked a setting named `declared`,
+                # found none and left a true claim unresolved.
+                if name and not _CODE_TOKEN_RE.fullmatch(name):
+                    continue
+                if name and value:
+                    out.append(
+                        {
+                            "claim": n,
+                            "kind": "default_value",
+                            "src": name.rsplit(".", 1)[-1],
+                            "value": value.strip("`\"'"),
+                            "approx": bool(_APPROX_WORD_RE.search(m.group(0))),
+                        }
+                    )
+                    break
+        return out
+
+    def _declared_default(self, name: str, project_id: str) -> Optional[str]:
+        """
+        The default the indexed source declares for `name`, as written.
+
+        Looks for `name = <literal>`, `name: T = <literal>` and `name: T =
+        Field(default=<literal>, ...)` at the start of a line in the live
+        blocks. None when there is no such declaration, or when two of
+        them disagree: which one a claim means cannot be told.
+        """
+        found = self._default_declarations(name, project_id)
+        return next(iter(found)) if len(found) == 1 else None
+
+    def _default_declarations(self, name: str, project_id: str) -> Dict[str, str]:
+        """
+        Each default the live blocks declare for `name`, with its text.
+
+        The text names the class the declaration sits in, when it sits in
+        one: told only the value, an answer placed `Field(default=0.2)` in
+        the class the claim happened to cite.
+        """
+        try:
+            state = self._f._conversation_state_manager.get(project_id)
+        except Exception:
+            return {}
+        pattern = re.compile(
+            r"(?m)^[ \t]*" + re.escape(name) + r"[ \t]*(?::[^=\n]+)?=[ \t]*"
+            r"(?:Field\(\s*(?:default\s*=\s*)?)?"
+            r"(?P<v>-?\d+(?:\.\d+)?|True|False|None|\"[^\"\n]*\"|'[^'\n]*')"
+        )
+        found: Dict[str, str] = {}
+        for blk in state.active_blocks.values():
+            if getattr(blk, "obsolete", False):
+                continue
+            _content = getattr(blk, "content", "") or ""
+            for m in pattern.finditer(_content):
+                _text = " ".join(m.group(0).split())
+                _owner = _enclosing_classes(
+                    _content, m.start(), len(m.group(0)) - len(m.group(0).lstrip())
+                )
+                if _owner:
+                    _text = f"{_text} (in class {_owner})"
+                found.setdefault(m.group("v").strip("\"'"), _text)
+        return found
+
+    def declared_default_answer(self, question: str, project_id: str) -> str:
+        """
+        The code's answer to "what is the default of X", when it has one.
+
+        A default is written in a declaration, and a class's attributes are
+        not symbols: asked for one, the steps were shown the outline of
+        `Valves`, asked twice for its body, ran out of insertions, and the
+        answer said 0.15 where the code declares 0.2. Read here from the
+        declaration, when the question names that setting and nothing else
+        and the live blocks declare one default for it.
+
+        Returns:
+            The declaration as a step's output, or "".
+        """
+        names = {
+            (m.group("a") or m.group("b")).rsplit(".", 1)[-1]
+            for m in _DEFAULT_QUESTION_RE.finditer(question or "")
+        }
+        if len(names) != 1:
+            return ""
+        name = next(iter(names))
+        # Another name in the question is something else it asks about, and
+        # this answer would stand in for the step that looks into it.
+        others = {
+            tok.strip("`").rsplit(".", 1)[-1]
+            for tok in _CODE_TOKEN_RE.findall(
+                CommandRouter._REFERENCE_LINE_RE.sub("", question or "")
+            )
+        } - {name}
+        if others:
+            return ""
+        found = self._default_declarations(name, project_id)
+        if len(found) != 1:
+            return ""
+        value, text = next(iter(found.items()))
+        self._f._log_debug(
+            f"🧭 Index answer: default of {name} — {value}, read from its "
+            f"declaration, no step needed to find it"
+        )
+        return (
+            f"Default of `{name}`, read from its declaration in the code: "
+            f"`{value}`.\nDeclared as: `{text}`"
+        )
+
+    @classmethod
     def _graph_absence_checks(cls, claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
         """Checks for claims that reason FROM a symbol's absence in the graph.
 
@@ -20254,6 +21919,28 @@ class AgenticStaticVerifier:
                     return "confirmed", f"'{src_n}' exists in the index"
                 return "refuted", f"'{src_n}' is not in the index"
 
+            if kind == "default_value":
+                declared = self._declared_default(src_n, project_id)
+                claimed = str(check.get("value", ""))
+                if declared is None:
+                    return (
+                        "unverifiable",
+                        f"no single declaration of '{src_n}' with a literal "
+                        f"default in the indexed code",
+                    )
+                try:
+                    _d, _c = float(declared), float(claimed)
+                    _tol = 0.15 * abs(_d) if check.get("approx") else 1e-9
+                    same = abs(_d - _c) <= _tol
+                except ValueError:
+                    same = declared == claimed
+                if same:
+                    return "confirmed", f"the code declares {src_n} = {declared}"
+                return (
+                    "refuted",
+                    f"the code declares {src_n} = {declared}, not {claimed}",
+                )
+
             if kind == "counts_listed":
                 _n = int(check.get("n", -1))
                 _listed = int(check.get("listed", -1))
@@ -20385,9 +22072,115 @@ class AgenticStaticVerifier:
                 if not qid:
                     return "unverifiable", f"caller '{src_n}' unknown"
                 bare_dst = dst_n.split(".")[-1]
+                _dispatch: Set[str] = set()
                 for ed in self._f._symbol_index.get_edges_out(qid, project_id):
                     if getattr(ed, "dst", "") in (dst_n, bare_dst):
                         return "confirmed", f"{qid} → {bare_dst} edge present"
+                    _tail = str(getattr(ed, "dst", "")).split(".")[-1]
+                    if (
+                        getattr(ed, "type", "") == "calls"
+                        and _tail in _DYNAMIC_DISPATCH_CALLS
+                    ):
+                        _dispatch.add(_tail)
+                # No direct edge. The verdict stays "unsupported" in every
+                # case below, so nothing downstream counts differently; what
+                # changes is the reason given, because the three cases ask
+                # the reader for different things. The classification is
+                # _relation_edge_status, the same one the ledger and the
+                # metacognitive engine rule with: this check kept a matcher
+                # of its own, and reported a function handed to an executor
+                # in the same words as a relation that does not exist.
+                _status = _relation_edge_status(
+                    self._f._symbol_index, qid, dst_n, project_id
+                )
+                if _status == "direct":
+                    return "confirmed", f"{qid} → {bare_dst} edge present"
+                # "The graph cannot see it" is an auxiliary hypothesis, and
+                # it is the one a step reaches for by itself whenever a
+                # check goes against it. It is tested here instead of being
+                # granted or denied: if the caller dispatches functions, its
+                # body either passes this callee to one of those calls or
+                # it does not. Found, the relation is confirmed for what it
+                # is, a hand-over and not a direct call.
+                #
+                # The belt is consulted only under its own regime. Where the
+                # graph can be taken at its word there is nothing to absorb.
+                _belt = getattr(self._f, "_protective_belt", None)
+                _tried: List[AuxiliaryHypothesis] = []
+                if (
+                    _belt is not None
+                    and EpistemicRegime.for_edge_status(_status)
+                    is EpistemicRegime.LAKATOSIAN_PROTECTIVE_BELT
+                ):
+                    _tried = _belt.absorb_missing_call_edge(
+                        qid, dst_n, project_id, _dispatch
+                    )
+                _kept = next((_a for _a in _tried if _a.is_progressive), None)
+                _aux = next(
+                    (_a for _a in _tried if _a.name == "by_reference_dispatch"),
+                    None,
+                )
+                if _kept is not None and _kept.name == "by_reference_dispatch":
+                    return (
+                        "confirmed",
+                        f"{qid} hands {bare_dst} over by reference: "
+                        f"`{_kept.evidence}` — executed through that "
+                        f"call, not called directly, so no call edge is "
+                        f"drawn",
+                    )
+                if _kept is not None:
+                    return (
+                        "confirmed",
+                        f"{qid} reaches {bare_dst} indirectly: "
+                        f"{_kept.evidence} — not a direct call, so no "
+                        f"{qid} → {bare_dst} edge is drawn",
+                    )
+                if _status == "indirect":
+                    # Edge destinations are bare names, so the path ends at
+                    # a NAME. When several symbols carry it the path may end
+                    # at another one, and the detail has to say so: 'get'
+                    # and 'add' are reached from almost anywhere.
+                    _namesakes = len(
+                        self._f._symbol_index.get_qualified_names_for(
+                            bare_dst, project_id
+                        )
+                    )
+                    _which = (
+                        f" ({_namesakes} symbols are named {bare_dst}, so the "
+                        f"path may end at a different one)"
+                        if _namesakes > 1
+                        else ""
+                    )
+                    return (
+                        "unsupported",
+                        f"no direct {qid} → {bare_dst} edge; a path of at "
+                        f"most {_RELATION_MAX_HOPS} call edges reaches a "
+                        f"symbol named {bare_dst}{_which} — if the relation "
+                        f"holds it is indirect, and the bodies on the way "
+                        f"are what settles it",
+                    )
+                if _status == "dynamic":
+                    _via = (
+                        " (" + ", ".join(sorted(_dispatch)) + ")" if _dispatch else ""
+                    )
+                    if _aux is not None and _aux.corroborated is False:
+                        return (
+                            "unsupported",
+                            f"no {qid} → {bare_dst} edge recorded; {qid} "
+                            f"hands callables over by reference{_via}, but "
+                            f"its body does not pass {bare_dst} to any of "
+                            f"them, so the hand-over does not explain the "
+                            f"missing edge",
+                        )
+                    return (
+                        "unsupported",
+                        f"no {qid} → {bare_dst} edge recorded, and {qid} "
+                        f"hands callables over by reference{_via} — a "
+                        f"function passed as an argument draws no edge, so "
+                        f"this neither confirms nor refutes the relation; "
+                        f"the body of {qid} settles it, and if {bare_dst} "
+                        f"is passed rather than called, say so",
+                    )
                 return (
                     "unsupported",
                     f"no {qid} → {bare_dst} edge recorded (static graph "
@@ -22096,22 +23889,9 @@ if __name__ == "__main__":
         )
 
         # ── Step 2: ask which half is wrong, and get both back ──
-        # _llm_orchestrator, which is what the other forty-five call sites
-        # use. Writing self._f._llm here raised AttributeError on the first
-        # real repair and on every outline call, and both were caught by
-        # their own guards — so the turn carried on, reported the failing
-        # test unrepaired, and the only trace was one line in the log.
-        # `prompt`, not `user_prompt`. Two names were invented for this one
-        # call in two consecutive patches — first the orchestrator's, then
-        # its parameter's — and both times the guard around it swallowed the
-        # error and the turn carried on. A name is worth one grep before it
-        # is worth a run.
-        # Guarded here, not only by the pass that calls this. The pass wraps
-        # the whole loop, so an exception on the first pair aborted the
-        # second as well — a turn with two design_tests steps lost the
-        # repair of one because the other's call failed. compose_outline
-        # has carried its own guard since it was written; this did not, and
-        # the asymmetry was invisible until both were exercised.
+        # _llm_orchestrator and `prompt`, the names every other call site
+        # uses. Guarded here as well as by the pass that calls this, so one
+        # pair's failure does not abort the repair of the next.
         try:
             _resp = await self._f._llm_orchestrator.call_llm(
                 system_prompt=aligned_prefix,
@@ -22389,7 +24169,11 @@ class AgenticPreplanner:
         'chosen framing relies on>", ...], '
         '"difficulty": "<low|medium|high>", '
         '"question_type": "<exploratory|confirmatory|descriptive|'
-        'mechanism|generative>", "ask": ""}\n\n'
+        'mechanism|generative>", "language": "<es|en|...>", "ask": ""}\n\n'
+        "language is the two-letter code of the language the USER's own "
+        "words in the request are written in: not the identifiers, code or "
+        "pasted output in it, and not the context above. Empty when the "
+        "request is only names.\n\n"
         "difficulty grades how much investigative work the CHOSEN framing "
         "needs — judge the work, not the topic: low = a single clear "
         "framing answerable by direct lookup or explanation of code already "
@@ -22748,6 +24532,24 @@ class AgenticPreplanner:
         # S18: the FINAL type (post-override) feeds the serial
         # record writer and the type-keyed EC-9 gate.
         self._f._preplanner_question_type = question_type
+        # The language it read the request in, kept with the turn it was
+        # read on so a turn without a pre-planner never inherits one. It
+        # settles only what the question's own words leave open
+        # (Filter._answer_language).
+        _read_lang = str(data.get("language", "") or "").strip().lower()
+        _code = re.fullmatch(r"([a-z]{2})(?:[-_][a-z]{2})?", _read_lang)
+        self._f._preplanner_language = (
+            getattr(self._f, "_turn_started_at", 0.0),
+            (
+                _code.group(1)
+                if _code
+                else (
+                    "es"
+                    if _read_lang.startswith(("span", "espa", "cast"))
+                    else "en" if _read_lang.startswith(("engl", "ingl")) else ""
+                )
+            ),
+        )
         self.last_stats = {
             "used": True,
             "framings": n_framings,
@@ -23499,6 +25301,59 @@ class AgenticPlanner:
     # 2. Plan construction
     # ──────────────────────────────────────────────────────────────────────
 
+    def _ensure_hypothesize_step(
+        self, steps: List["AgenticStep"], question: str, reason: str
+    ) -> bool:
+        """
+        Insert a hypothesize step when the plan has none and must have one.
+
+        A directive in the planner's prompt is not an invariant: the planner
+        can and does omit a step it was told to schedule. Inserted BEFORE
+        the first verify/analyze step, not at len-1 (R15): when the planner
+        emitted the analyze mid-list (observed live: a descriptive plan
+        whose sids ran 1,3,4,2), len-1 put the hypothesize after a verify,
+        and only the order-normalization sort rescued it — coupling this
+        guard to agentic_enforce_step_order. Anchoring on the first
+        hypothesize-consuming step makes the placement correct on its own.
+        Falls back to len-1 only if no such step exists.
+
+        Args:
+            steps: The parsed plan, changed in place.
+            question: The turn's question, for the step goal.
+            reason: Why the plan must carry the step, for the log.
+
+        Returns:
+            True when a step was inserted.
+        """
+        # ── Step 1: nothing to do when the plan already forges ──
+        if not steps or any(s.kind == "hypothesize" for s in steps):
+            return False
+        # ── Step 2: anchor before the first step that consumes it ──
+        _rank = {
+            "verify_dynamic": 0,
+            "verify_regression": 1,
+            "verify": 2,
+            "analyze": 3,
+        }
+        _anchor = next(
+            (i for i, s in enumerate(steps) if s.kind in _rank),
+            len(steps) - 1,
+        )
+        steps.insert(
+            _anchor,
+            AgenticStep(
+                id=max(s.id for s in steps) + 1,
+                goal=("Enumerate competing hypotheses for: " + question[:160]),
+                kind="hypothesize",
+            ),
+        )
+        self._f._log_debug(
+            f"🤖 Planner: {reason} — hypothesize missing from the "
+            f"planner output, inserted at position {_anchor} "
+            f"(parser enforcement)"
+        )
+        return True
+
     async def plan(
         self,
         question: str,
@@ -23772,6 +25627,29 @@ class AgenticPlanner:
 
         # Region: parse-or-fallback
         steps = self._parse(response, question, max_steps)
+        # An EXPLORATORY question (something is wrong, no cause proposed)
+        # is told it REQUIRES a hypothesize step, and the valve says it
+        # must have one; until now only the prompt said so. 'full' already
+        # enforced it in _parse. A CONFIRMATORY question is told to
+        # schedule one too, and omitted it in all five such turns of two
+        # runs; it is logged, not enforced, because a forge costs several
+        # times the acts and a yes/no check may not need rivals.
+        _prof_live = str(
+            getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
+        ).lower()
+        if _prof_live == "auto" and steps:
+            if question_type == "exploratory" and getattr(
+                self._f.valves, "agentic_exploratory_requires_hypothesis", True
+            ):
+                self._ensure_hypothesize_step(steps, question, "EXPLORATORY question")
+            elif question_type == "confirmatory" and not any(
+                s.kind == "hypothesize" for s in steps
+            ):
+                self._f._log_debug(
+                    "🤖 Planner: CONFIRMATORY question planned without the "
+                    "hypothesize step its shape asks for — the user's claim "
+                    "will not be tested against rivals"
+                )
         # Planner-level clarification (mulling's framing pause): honored only
         # when the planner produced NO usable steps — if it planned anyway,
         # the plan wins and the ask is logged and ignored (anti-overtrigger).
@@ -24006,41 +25884,8 @@ class AgenticPlanner:
         _prof = str(
             getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
         ).lower()
-        if _prof == "full" and not any(s.kind == "hypothesize" for s in steps):
-            # R15: insert BEFORE the first verify/analyze step, not at
-            # len-1. The old position assumed the last step is the analyze;
-            # when the planner emitted the analyze mid-list (observed live:
-            # a descriptive plan whose sids ran 1,3,4,2), len-1 dropped the
-            # hypothesize after a verify, and only the order-normalization
-            # sort rescued it — silently coupling this guard to
-            # agentic_enforce_step_order. Anchoring on the first
-            # hypothesize-consuming step makes the placement correct on its
-            # own, independent of that valve. Falls back to len-1 only if no
-            # such step exists (which cannot happen once analyze-last ran
-            # above, but stays defensive).
-            _rank = {
-                "verify_dynamic": 0,
-                "verify_regression": 1,
-                "verify": 2,
-                "analyze": 3,
-            }
-            _anchor = next(
-                (i for i, s in enumerate(steps) if s.kind in _rank),
-                len(steps) - 1,
-            )
-            steps.insert(
-                _anchor,
-                AgenticStep(
-                    id=max(s.id for s in steps) + 1,
-                    goal=("Enumerate competing hypotheses for: " + question[:160]),
-                    kind="hypothesize",
-                ),
-            )
-            self._f._log_debug(
-                "🤖 Planner: profile FULL — hypothesize missing from the "
-                f"planner output, inserted at position {_anchor} "
-                f"(parser enforcement)"
-            )
+        if _prof == "full":
+            self._ensure_hypothesize_step(steps, question, "profile FULL")
 
         # Region: '!test' — an explicit request for execution, INSERTED
         # ------------------------------------------------------------------
@@ -24118,14 +25963,101 @@ _AGENTIC_SCAFFOLD_MARKERS: Tuple[str, ...] = (
 # asserted — auto-injecting every contract of every touched symbol
 # would inflate EC-4 corroboration for any hypothesis near
 # well-annotated code, so that failure mode is designed out.
+# The return shape is anchored at both ends: 'X returns T' and nothing
+# else. A trailing condition ('returns None when empty') or a described
+# value ('returns a list of tokens') says more than an annotation can
+# settle, so those never reach the checker. The name may be dotted
+# ('Class.method') to pick one class out of several homonyms.
 _CONTRACT_RETURN_RE = re.compile(
-    r"(?:return type of\s+)?`?(\w+)`?\s+returns?\s+" r"(?:type\s+)?`?'?(\w+)'?`?",
+    r"(?:return type of\s+)?`?([\w.]+)`?\s+returns?\s+"
+    r"(?:(?:an?|the)\s+)?(?:type\s+)?`?'?(\w+)'?`?\s*[.!]?$",
     re.IGNORECASE,
 )
 _CONTRACT_ASSERT_RE = re.compile(
-    r"`?(\w+)`?\s+asserts?\s+(?:that\s+)?(.+)",
+    r"`?([\w.]+)`?\s+asserts?\s+(?:that\s+)?(.+)",
     re.IGNORECASE,
 )
+# Concrete types whose annotations a return claim may be compared with.
+# Anything else (a protocol, a supertype, a project class) can be
+# satisfied by a subtype the annotation does not name, so it abstains.
+_CONTRACT_CONCRETE_TYPES = frozenset(
+    {
+        "none",
+        "int",
+        "bool",
+        "float",
+        "complex",
+        "str",
+        "bytes",
+        "bytearray",
+        "list",
+        "dict",
+        "set",
+        "frozenset",
+        "tuple",
+    }
+)
+# bool is an int and an int satisfies a float, so these never contradict
+# one another.
+_CONTRACT_NUMERIC_TYPES = frozenset({"int", "bool", "float", "complex"})
+
+
+def _annotation_alternatives(node: ast.AST) -> Optional[set]:
+    """
+    Return the lower-cased top-level types a return annotation allows.
+
+    `List[int]` is {"list"}, `Optional[int]` is {"int", "none"} and
+    `int | str` is {"int", "str"}: only the outermost type counts, so a
+    parameter such as the `int` in `List[int]` never stands for the
+    return value itself.
+
+    Args:
+        node: The annotation expression of a function definition.
+
+    Returns:
+        The set of alternatives, or None when the shape is not one this
+        reads (the caller then abstains).
+    """
+    if isinstance(node, ast.Constant):
+        if node.value is None:
+            return {"none"}
+        if isinstance(node.value, str):
+            try:
+                return _annotation_alternatives(ast.parse(node.value, mode="eval").body)
+            except SyntaxError:
+                return None
+        return None
+    if isinstance(node, ast.Name):
+        return {node.id.lower()}
+    if isinstance(node, ast.Attribute):
+        return {node.attr.lower()}
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        _left = _annotation_alternatives(node.left)
+        _right = _annotation_alternatives(node.right)
+        if _left is None or _right is None:
+            return None
+        return _left | _right
+    if isinstance(node, ast.Subscript):
+        _base = _annotation_alternatives(node.value)
+        if _base is None:
+            return None
+        _elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+        if _base == {"optional"}:
+            _inner = _annotation_alternatives(_elts[0])
+            return None if _inner is None else _inner | {"none"}
+        if _base == {"annotated"}:
+            return _annotation_alternatives(_elts[0])
+        if _base == {"union"}:
+            _out: set = set()
+            for _e in _elts:
+                _alt = _annotation_alternatives(_e)
+                if _alt is None:
+                    return None
+                _out |= _alt
+            return _out
+        return _base
+    return None
+
 
 # S5 (instrumentation): risk-adjacent vocabulary the EC-10 pattern
 # does NOT match. Surveillance only — when a screened-out candidate
@@ -24197,11 +26129,16 @@ _TEST_DEF_RE = re.compile(r"(?m)^[ \t]*(?:async[ \t]+)?def[ \t]+(test_\w+)[ \t]*
 
 class AgenticStepCache:
     """
-    SQLite-backed cache of step results keyed by (kind, normalized goal),
-    valid only for the structure_hash it was produced under — the same
-    invalidation discipline as the docstring cache. Debugging is iterative:
-    the same investigation repeated across neighbouring turns becomes free,
-    and an edit to the code invalidates automatically.
+    SQLite-backed cache of step results keyed by (kind, normalized goal).
+
+    A cached step is a verdict about code, and holds for the code it was
+    reached on (TestedCode). A row is served only while two things are as
+    they were when the step ran: the structure_hash, which covers names and
+    signatures across the project, and the fingerprint of every body the
+    step read or named. The structure_hash alone missed the edit that
+    matters most: debugging is diagnose, fix the body, ask again, and a
+    fix inside a body changes no signature, so the second question was
+    answered from the first run, refuted claims included.
     """
 
     def __init__(self, filter_ref: "Filter") -> None:
@@ -24253,7 +26190,9 @@ class AgenticStepCache:
         """
         Return {"output", "digest", "claims_json"} on a hit, else None.
 
-        A row written under a different structure_hash is a miss (stale).
+        A row written under a different structure_hash is a miss (stale),
+        and so is one whose recorded code has changed or cannot be read, or
+        that recorded nothing (rows older than the record).
         The SELECT runs through StateStore._db_read so it is serialized with
         the writer worker under _db_global_lock — the same discipline every
         other _db_conn consumer follows — instead of touching the shared
@@ -24265,8 +26204,8 @@ class AgenticStepCache:
         try:
             row = await self._f._state_store._db_read(
                 lambda: self._f._db_conn.execute(
-                    "SELECT structure_hash, output, digest, claims_json "
-                    "FROM agentic_step_cache "
+                    "SELECT structure_hash, output, digest, claims_json, "
+                    "tested_json FROM agentic_step_cache "
                     "WHERE project_id = ? AND step_key = ?",
                     (project_id, step_key),
                 ).fetchone()
@@ -24276,7 +26215,43 @@ class AgenticStepCache:
             return None
         if not row or row[0] != structure_hash:
             return None
+        try:
+            recorded = json.loads(row[4] or "")["tested_against"]
+        except Exception:
+            return None
+        now: Dict[str, str] = {}
+        if recorded and not self._f._tested_code.still_matches(
+            recorded, project_id, now
+        ):
+            changed = [n for n, fp in recorded.items() if now.get(n) != fp]
+            self._f._log_debug(
+                f"🤖 StepCache: {step.kind} '{step.goal[:60]}' not served — "
+                f"code it read has changed or cannot be read: "
+                f"{', '.join(changed[:4])}"
+            )
+            return None
         return {"output": row[1], "digest": row[2], "claims_json": row[3]}
+
+    def _code_read_by(self, step: AgenticStep, project_id: str) -> List[str]:
+        """
+        The indexed symbols a step's result depends on.
+
+        Every body shown this turn up to now, which is more than the step
+        read when an earlier step expanded a body of its own, and every
+        symbol its output names. Too many names only costs hits; too few
+        serves a step about code that has changed.
+        """
+        idx = self._f._symbol_index
+        try:
+            qualified = idx.get_all_qualified_names(project_id) or set()
+        except Exception:
+            return []
+        shown = getattr(self._f, "_bodies_seen_this_turn", None) or set()
+        names = [n for n in sorted(shown) if n in qualified]
+        for qid in _named_indexed_symbols(step.output, idx, project_id):
+            if qid not in names:
+                names.append(qid)
+        return names
 
     async def put(
         self,
@@ -24297,6 +26272,11 @@ class AgenticStepCache:
         """
         if self._f._db_conn is None or not structure_hash:
             return
+        # Fingerprinted now, when the step has just read the code: a name
+        # whose code cannot be read is left out, and is covered by the
+        # structure_hash alone.
+        names = self._code_read_by(step, project_id)
+        tested = self._f._tested_code.fingerprint(names, project_id)
         row = (
             project_id,
             self.step_key(step),
@@ -24307,14 +26287,15 @@ class AgenticStepCache:
             step.digest,
             claims_json,
             time.time(),
+            json.dumps({"tested_against": tested}),
         )
 
         def _write(row: tuple = row) -> None:
             self._f._db_conn.execute(
                 "INSERT OR REPLACE INTO agentic_step_cache "
                 "(project_id, step_key, structure_hash, kind, goal, output, "
-                "digest, claims_json, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "digest, claims_json, updated_at, tested_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row,
             )
             self._f._db_conn.commit()
@@ -24573,8 +26554,12 @@ class AgenticToolBroker:
         body = CodeBlockManager.extract_symbol_body(block, qid)
         if not body:
             return f"[EXPAND: body of '{qid}' not extractable]"
-        # The model is about to read this body; record that it did.
-        _note_body_shown(self._f, qid)
+        # Read before any truncation below: an exit is found on the whole
+        # function or not at all.
+        _exits_note = self._early_exits_note(qid, body, project_id)
+        # The model is about to read this body; record that it did. The
+        # body lands in the prompt of the step that asked and nowhere else.
+        _note_body_shown(self._f, qid, step_local=True)
         _cap = int(
             getattr(self._f.valves, "agentic_expand_max_chars", self._MAX_BODY_CHARS)
         )
@@ -24620,7 +26605,92 @@ class AgenticToolBroker:
                     f"missing region, or state that the tail of {qid} was not "
                     f"inspected — do NOT guess its remaining calls.]"
                 )
-        return f"### Body of {qid}\n```\n{body}\n```"
+        return f"### Body of {qid}\n```\n{body}\n```" + _exits_note
+
+    # A question names what it suspects in words, and a parameter names it
+    # in parts of an identifier: the two meet on a shared 5-letter prefix
+    # ("history" and "historial", "seeds" and "seed_weights").
+    _EXIT_TERM_PREFIX = 5
+    _EXITS_PER_BODY = 3
+
+    def _early_exits_note(self, qid: str, body: str, project_id: str) -> str:
+        """
+        Exits of this body that skip a parameter the question is about.
+
+        Shown only on an exploratory turn (something is wrong and no cause
+        is named), and only for parameters whose name shares a word stem
+        with the question: a guard such as `if not items: return` sits at
+        the top of a third of the functions in a large codebase, and listing
+        all of them would bury the one that answers. Observed live: asked
+        why history seeds had no effect, the pipeline verified that
+        `_build_multi_seed_graph` returns early on cached scores and still
+        named a different cause, because nothing tied that early return to
+        the parameter the question was about. Run, that exit was taken 95
+        times; its log line is what the observable here points to.
+
+        Returns:
+            Lines to append after the body, or "".
+        """
+        # ── Step 1: an exploratory turn, and the words it is about ──
+        agentic = getattr(self._f, "_agentic", None)
+        if agentic is None:
+            return ""
+        try:
+            if agentic._question_type_or_code_action(project_id) != "exploratory":
+                return ""
+        except Exception:
+            return ""
+        question = str(getattr(agentic, "_turn_question", "") or "").lower()
+        k = self._EXIT_TERM_PREFIX
+        stems = {w[:k] for w in re.findall(r"[a-záéíóúñ]{%d,}" % k, question)}
+        if not stems:
+            return ""
+        # ── Step 2: the exits, kept to the parameters the question names ──
+        lines: List[str] = []
+        exits = ControlFlowExtractor.early_exits(body)
+        for _line, cond, skipped, observable, read_before in exits:
+            about = [
+                p
+                for p in skipped
+                if any(
+                    part[:k] in stems for part in p.lower().split("_") if len(part) >= k
+                )
+            ]
+            if not about:
+                continue
+            names = ", ".join(f"`{p}`" for p in about)
+            # The exit skips the later reads, not the earlier ones. Live,
+            # history_boosts was read before `if cached_scores is not None:
+            # return`, through the seeds the cached scores were computed
+            # from, and two answers named the exit as the reason history
+            # had no effect when its effect was already in what it returned.
+            earlier = [p for p in about if p in read_before]
+            lines.append(
+                f"- if `{cond}`, {qid} returns early and skips the code below "
+                f"that reads {names}"
+                + (f' — when taken, it logs: "{observable}"' if observable else "")
+                + (
+                    "; "
+                    + ", ".join(f"`{p}`" for p in earlier)
+                    + " is also read before this exit, so its effect may "
+                    "already be in what the early return hands back"
+                    if earlier
+                    else ""
+                )
+            )
+            self._f._log_debug(
+                f"🚪 Early exit in {qid}: if {cond} → skips {', '.join(about)}"
+                + (f" (observable: {observable[:60]!r})" if observable else "")
+            )
+            if len(lines) >= self._EXITS_PER_BODY:
+                break
+        if not lines:
+            return ""
+        return (
+            "\nEarly exits that skip what the question is about (read from "
+            "the code; whether they are taken at run time, the code alone "
+            "cannot say — the log text is how to check):\n" + "\n".join(lines)
+        )
 
     def _edges(self, sym: str, project_id: str, incoming: bool) -> str:
         """Call-graph neighbours; CALLERS uses the bare name (edge dst is
@@ -25511,17 +27581,13 @@ class AgenticStepExecutor:
 
         # ── Step 2: expand within a declared budget ──
         budget = int(getattr(self._f.valves, "agentic_preload_focus_max_chars", 32000))
-        # Block B renders its bodies before any step runs and registers each
-        # one, so a focus symbol already in view needs no second copy. Turn 3
-        # of the 29 July run spent 14551 of 32000 characters re-serving a body
-        # the model was already reading, while two symbols it had asked for by
-        # name went unserved and drew twelve claims from their signatures.
-        #
-        # Matched on the qualified name only: the set also holds bare tails
-        # for the unread-citation counter, which wants to err towards "shown",
-        # and erring that way here would silence a same-named method on a
-        # different class.
-        _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
+        # Block B registers each body it renders, so a focus symbol already
+        # in view is not served twice. Matched on the qualified name, so a
+        # same-named method elsewhere is never silenced. "In view" means in
+        # THIS step's prompt: bodies an earlier step fetched with EXPAND are
+        # not carried over (each step is its own call), so they do not
+        # count.
+        _in_view = getattr(self._f, "_bodies_in_shared_context", None) or set()
         served, skipped, used, already = [], [], 0, []
         partial: List[str] = []
         # The round's slots are for bodies that will be served. A symbol
@@ -25539,8 +27605,8 @@ class AgenticStepExecutor:
         # bodies came to 7441 characters and one came to 16252, so counting
         # symbols never governed the size anyway. What was strangling it
         # was spending slots on nothing.
-        _already_all = [_s for _s in names if _s in _seen]
-        _fetchable = [_s for _s in names if _s not in _seen]
+        _already_all = [_s for _s in names if _s in _in_view]
+        _fetchable = [_s for _s in names if _s not in _in_view]
         already.extend(_already_all)
         for sym in _fetchable[:_MAX_TOOLS_PER_ROUND]:
             body = broker.resolve("EXPAND", sym, project_id)
@@ -25942,13 +28008,12 @@ class AgenticSynthesisComposer:
     # ──────────────────────────────────────────────────────────────────────
 
     _OUTLINE_CONTRACT = (
-        "The investigation is finished. Below is its workspace. Say, in ONE "
-        "line each, what belongs in each of these sections of the answer "
-        "about to be written:\n\n{sections}\n\n"
+        "The investigation is finished; its question and workspace are "
+        "above. Say, in ONE line each, what belongs in each of these "
+        "sections of the answer about to be written:\n\n{sections}\n\n"
         "Write each line in {langname}. Name the finding, not the topic: "
-        '"the empty-string guard returns before the loop" and not "how the '
-        'guard works". A section this turn has nothing for gets the single '
-        "word SKIP.\n\n"
+        "what the code does, not which part of it the section is about. A "
+        "section this turn has nothing for gets the single word SKIP.\n\n"
         # No Tests section any more: the sandbox verifies against the real
         # body and Stats reports it, so nothing runnable belongs in the
         # answer. Code carries whatever code the turn has, tests included
@@ -25959,6 +28024,74 @@ class AgenticSynthesisComposer:
         "Return ONLY the section names and their lines, one per line, in "
         "the order given. No prose, no preamble, no code."
     )
+
+    def _outline_workspace(
+        self,
+        plan: "AgenticPlan",
+        question: str,
+        ledger: Optional["AgenticEvidenceLedger"],
+    ) -> str:
+        """
+        What the outline call reads: the question and the turn's findings.
+
+        The outline decides what each section of the answer says, and its
+        prompt said "below is its workspace" over nothing: the aligned
+        prefix carries the code, not the question or the findings. Live, it
+        wrote a conclusion about an unrelated loop over a turn whose every
+        claim was about the symbol asked for, and once reused its own
+        example sentence as a finding. The final model followed it.
+
+        The same material the final answer is given (render), compact: the
+        synthesis, the claims with whether code settled them, and the two
+        findings that reach no step digest.
+        """
+        out = [f"QUESTION: {' '.join(str(question or '').split())[:600]}", ""]
+        _synth = next(
+            (
+                s.output
+                for s in reversed(plan.steps)
+                if s.kind == "analyze" and s.status == "done" and s.output
+            ),
+            "",
+        )
+        _tail = _synth.rfind('{"claims"')
+        if _tail > 0:
+            _synth = _synth[:_tail].rstrip().rstrip("`").rstrip()
+        if _synth.strip():
+            out += [
+                "SYNTHESIS:",
+                _close_dangling_fence(_demote_headings(_synth)[:_OUTLINE_SYNTH_CHARS]),
+                "",
+            ]
+        _listing = str(
+            getattr(getattr(self._f, "_agentic", None), "_graph_listing", "") or ""
+        )
+        if _listing:
+            out += ["READ DIRECTLY FROM THE CODE INDEX:", _listing, ""]
+        _unestablished = getattr(self._f, "_serial_unestablished", None) or []
+        if _unestablished:
+            out.append(
+                "HYPOTHESIS COMPETITION: NO CAUSE ESTABLISHED. Tested, none "
+                "established:"
+            )
+            out += [f"- {' '.join(h.split())[:200]}" for h in _unestablished[:4]]
+            out.append("")
+        _claims = list(getattr(ledger, "claims", None) or [])
+        if _claims:
+            out.append("CLAIMS (✓ settled against code, ✗ refuted, ? not settled):")
+            for _c in _claims[:_OUTLINE_MAX_CLAIMS]:
+                try:
+                    _b = ledger.bucket_of(_c)
+                except Exception:
+                    _b = ""
+                _mark = (
+                    "✗"
+                    if _c.verification == "refuted"
+                    else "✓" if _b in ("hard", "structural") else "?"
+                )
+                out.append(f"- {_mark} {' '.join((_c.text or '').split())[:220]}")
+            out.append("")
+        return "\n".join(out) + "\n"
 
     async def compose_outline(
         self,
@@ -25999,10 +28132,12 @@ class AgenticSynthesisComposer:
             already works.
         """
         _names = {"es": "Spanish", "en": "English"}.get(lang, "English")
+        _workspace = self._outline_workspace(plan, question, ledger)
         try:
             _resp = await self._f._llm_orchestrator.call_llm(
                 system_prompt=aligned_prefix,
-                prompt=self._OUTLINE_CONTRACT.format(
+                prompt=_workspace
+                + self._OUTLINE_CONTRACT.format(
                     sections="\n".join(f"- {x}" for x in sections),
                     langname=_names,
                 ),
@@ -26176,6 +28311,23 @@ class AgenticSynthesisComposer:
                 "full directive stands"
             )
             return ""
+        # The outline steers every section of the answer, so an outline
+        # about code the turn never touched steers the whole answer away
+        # from the question: live, one named `mark_completed` and
+        # `_docstring_generation_loop` over a turn whose every claim was
+        # about `_prepare_seed_symbols`. When it names code and none of it
+        # is in the workspace, the full directive stands instead.
+        _named_code = _outline_identifiers(
+            "\n".join(_l for _l in _kept if not _heads(_l))
+        )
+        _ws_code = _outline_identifiers(_workspace)
+        if _named_code and _ws_code and not (_named_code & _ws_code):
+            self._f._log_debug(
+                f"🤖 Outline: names only code this turn did not touch "
+                f"({', '.join(sorted(_named_code)[:4])}) — discarded, the "
+                f"full directive stands"
+            )
+            return ""
         self._f._log_debug(
             f"🤖 Outline: {_named - _skip} section(s) planned in {_names}, "
             f"{_skip} skipped and dropped ({len(_resp or '')} chars)"
@@ -26259,31 +28411,16 @@ class AgenticSynthesisComposer:
             f'question: "{question}".',
             "",
         ]
-        # Degenerate workspace guard: when NO claim could be tied to indexed
-        # symbols, the investigated names likely do not exist in this
-        # codebase (observed live: a ghost symbol produced 3/3 invalid
-        # claims and the main model fell back to parroting the ingestion
-        # ack). Say so explicitly so the answer is honest instead of hollow.
-        # Empty-ledger abstention: the pipeline ran investigative steps but
-        # produced NO verifiable claim at all (observed live: an EXPAND
-        # returned a truncated body, the investigate step gave up, the
-        # ledger stayed empty, and the synthesis hallucinated the method's
-        # calls to fill the void). Distinct from the degenerate case above:
-        # there claims existed but cited ghosts; here there is no evidence
-        # whatsoever. Only fires when investigative work was actually
-        # attempted (done steps beyond a lone terminal analyze) so a
-        # trivially-simple turn is unaffected. Pipeline-level sibling of the
-        # P18 abstention.
+        # Degenerate workspace guard: no claim could be tied to indexed
+        # symbols, so the investigated names probably do not exist here.
+        # Say so, rather than give a hollow answer.
+        # Empty-ledger abstention: investigative steps ran and produced no
+        # verifiable claim at all, and the synthesis would fill the void.
+        # Fires only when investigative work was attempted.
         #
-        # Architecture turns are exempt: a design/architecture question is
-        # often GENERATIVE ("how would you structure X?") and legitimately
-        # produces no citable claims about existing code — it proposes new
-        # structure rather than asserting facts about symbols. Abstaining
-        # there would suppress a valid design answer. Impact questions ("what
-        # breaks if I move X?") still produce claims and remain covered; only
-        # the generative case, flagged by the ARCHITECTURE use case, is
-        # exempted. The abstention must fire on retrieval FAILURE, not on the
-        # generative NATURE of the question.
+        # Architecture turns are exempt: a generative design question
+        # legitimately makes no claims about existing code. The abstention
+        # is for retrieval failure, not for the nature of the question.
         _use_case = ""
         _asked_for_artifact = False
         if project_id:
@@ -26334,24 +28471,17 @@ class AgenticSynthesisComposer:
                 "contents.",
             )
         # Degenerate workspace guard: when NO claim could be tied to indexed
-        # symbols, the investigated names likely do not exist in this
-        # codebase (observed live P17: a ghost symbol _consume_stream produced
-        # 2/2 invalid claims and the main model, handed those very claims as
-        # workspace material, fabricated an implementation from them despite a
-        # "do not fabricate" warning). The earlier design inserted a warning
-        # but STILL listed the invalid claims and their digests below it —
-        # handing the model the fabricable material and asking it not to use
-        # it. That is self-defeating: a plausible-looking analysis of a ghost
-        # is exactly what a terse instruction cannot override.
-        #
-        # Instead, when every citation is invalid, the workspace carries ONLY
-        # the abstention — no step digests, no claim text — so there is no
-        # ghost analysis for the model to copy. The model still has Block A
-        # (the real indexed code) to answer from; it simply is not shown the
-        # fabricated material. The code decides WHAT the model sees (bounds);
-        # the model writes within it (proposes). This is a structural remedy,
-        # not another textual plea.
-        if _all_citations_invalid:
+        # symbols, the workspace carries ONLY the abstention — no digests,
+        # no claim text. Listing the invalid claims under a warning handed
+        # the model the material to fabricate from. Block A, the real code,
+        # is still there to answer from.
+        # Unless the index answered the question itself: then a claim citing
+        # the setting it asked about (not a symbol) is not a ghost, and
+        # abstaining told the reader the setting was not in the code while
+        # its declaration had just been read.
+        if _all_citations_invalid and not str(
+            getattr(getattr(self._f, "_agentic", None), "_graph_listing", "") or ""
+        ):
             _ghost_syms = sorted(
                 {q for c in ledger.claims for q in (c.invalid_qids or [])}
             )
@@ -26442,6 +28572,29 @@ class AgenticSynthesisComposer:
                 "(No synthesis step completed — answer from the code "
                 "context above plus the verified evidence below.)"
             )
+            lines.append("")
+        # Two findings that reach no step digest, and step digests never
+        # enter this prompt (R34): the answer read from the index, and a
+        # competition that established no cause. Stated as findings inside
+        # the fence, not as instructions after the section list: an
+        # instruction placed there was copied into the answer as section
+        # content, and the conclusion picked an unrelated mechanism.
+        _listing = str(
+            getattr(getattr(self._f, "_agentic", None), "_graph_listing", "") or ""
+        )
+        if _listing:
+            lines.append("Read directly from the code index:")
+            lines.append(_listing)
+            lines.append("")
+        _unestablished = getattr(self._f, "_serial_unestablished", None) or []
+        if _unestablished:
+            lines.append(
+                "Hypothesis competition: NO CAUSE ESTABLISHED. These candidate "
+                "mechanisms were tested and none was established; what was "
+                "confirmed about them is that the code they name exists, which "
+                "makes none of them the cause:"
+            )
+            lines += [f"- {' '.join(h.split())[:300]}" for h in _unestablished[:4]]
             lines.append("")
         for s in plan.steps:
             if s.status != "done":
@@ -26609,28 +28762,11 @@ class AgenticSynthesisComposer:
             "intent or environment); in every other case, answer, flagging "
             "any assumption you had to make."
         )
-        # The directive is data-driven: 'ok'/'bad' come from the
-        # ledger's own tally (already read above), and the code
-        # section is offered only when a step actually pulled code
-        # into the workspace — asking for it otherwise invites a
-        # fabricated snippet.
-        # A fence is not enough. Any fence anywhere opened this section, and
-        # design_tests ALWAYS carries fences — its tests live in them — so
-        # Code opened on every turn that planned one, with nothing of its
-        # own to hold. The model found an open section and filled it with
-        # what it had: one answer shipped the same seven test functions
-        # under Code and again under Tests, and Code held no implementation
-        # at all. A block that defines only test_* functions is the Tests
-        # section's content, not this one's.
-        # ANY fenced code opens the section, tests included. The exclusion
-        # of test_* functions existed to keep them out of Code while a
-        # Tests section held them; that section is gone, so a turn whose
-        # only code IS tests — "design tests for X", where the tests are
-        # exactly what was asked for — had nowhere to put them and would
-        # have described them in prose instead.
-        #
-        # Measured on the old rule: a block of five test_* functions and a
-        # run_all_tests left Code closed.
+        # The directive is data-driven: 'ok'/'bad' come from the ledger's
+        # tally, and the code section is offered only when a step actually
+        # put code in the workspace (otherwise it invites a fabricated
+        # snippet). Any fenced code counts, tests included, since there is
+        # no separate tests section.
         _has_code = _plan_has_code(plan)
         # Resolved here, where there IS a self, and handed down. The
         # directive is a @staticmethod and every piece of turn state it
@@ -26727,7 +28863,7 @@ class AgenticSynthesisComposer:
             _asked_for_artifact,
             _has_tests,
             _had_repair,
-            _question_language(question),
+            self._f._answer_language(question),
             getattr(self._f, "_answer_outline", "") or "",
             str(getattr(self._f, "_preplanner_question_type", "") or ""),
             str(getattr(self._f, "_serial_contradicted", "") or ""),
@@ -26743,42 +28879,20 @@ class AgenticSynthesisComposer:
     # FIVE RULES FOR WRITING ANYTHING THE ANSWERING MODEL READS
     # ══════════════════════════════════════════════════════════════════
     #
-    # Each was paid for. They are here rather than in a document because
-    # the next person to add a paragraph to this method will be reading
-    # this method.
+    # Lessons this directive paid for:
     #
-    # 1. ANECDOTES GO IN COMMENTS. "Measured: two blocks died on NameError"
-    #    is for whoever weakens the rule later, not for the model, which
-    #    needs the rule and not its history. Ten per cent of this directive
-    #    was anecdote before they were moved out.
+    # 1. Anecdotes go in comments; the model needs the rule, not its history.
+    # 2. Give words, not rules, wherever the model would choose (a table of
+    #    translated headings works where "translate the headings" failed;
+    #    a section to skip is dropped before emission, not marked SKIP).
+    # 3. Data as labelled lists, prose as prose, never interleaved, or the
+    #    block is copied verbatim as section content.
+    # 4. The instruction nearest the point of action wins; repeat a rule
+    #    where it gets broken.
+    # 5. A rule that fails twice is replaced, not reworded.
     #
-    # 2. GIVE WORDS, NOT RULES, WHEREVER THE MODEL WOULD CHOOSE. "Translate
-    #    the headings" failed in three wordings across three runs; a table
-    #    of translated headings has not failed. Sections marked SKIP were
-    #    handed over with "omit anything marked SKIP" and an answer wrote
-    #    the heading and the word; dropped before emission, there is
-    #    nothing to omit. A rule the model must apply is a rule it can
-    #    misapply.
-    #
-    # 3. DATA AS LABELLED LISTS, PROSE AS PROSE, NEVER INTERLEAVED. Five
-    #    gap types each wrapped their own list in a sentence of guidance,
-    #    and an answer reproduced the whole block verbatim under the
-    #    heading — read in sequence under a section title, that is what
-    #    section content looks like.
-    #
-    # 4. THE INSTRUCTION NEAREST THE POINT OF ACTION WINS. "Copy verbatim"
-    #    sitting closest to the list beat "translate" three paragraphs
-    #    above it. The no-repeat rule lives in the header AND again in the
-    #    closing note, because that is where it gets broken.
-    #
-    # 5. A RULE THAT FAILS TWICE IS REPLACED, NOT REWORDED. Rewording is
-    #    what produced the four-paragraph header that the model stopped
-    #    reading halfway through. Ask what would remove the decision.
-    #
-    # BUDGET: the outline mode runs about 190 tokens and the long mode
-    # about 1,300. The long mode is the fallback, so it may be thorough;
-    # the outline mode is the one that runs, and anything added there is
-    # added to every turn. test_directive_budget guards both.
+    # BUDGET: outline mode ~190 tokens (it runs every turn), long mode
+    # ~1,300 (the fallback). test_directive_budget guards both.
     #
     @staticmethod
     def _answer_format_directive(
@@ -26882,31 +28996,12 @@ class AgenticSynthesisComposer:
         _rivals = [_r for _r in (rival_accounts or []) if _r.get("hypothesis")]
 
         # ── Step 1: the opening section, and the invariant second ──
-        # Only the FIRST heading varies. "the single mechanism you hold
-        # responsible" is exactly what a diagnosis needs and says nothing
-        # for a plan or a structural question, and it was the one line in
-        # this method written in a single register for every kind of turn.
-        # The second section does not vary: "what the evidence shows"
-        # asks for the same thing in all five cases, and the confidence
-        # line already reports how much of it was settled against code.
-        #
-        # Scaffolding shares programming's opening on purpose. It is not a
-        # kind of work but a request about output FORMAT — the user asked
-        # for the mold — and the system already answers that by serving a
-        # skeleton. Changing the answer's shape as well would be deciding
-        # the same thing twice.
-        #
-        # An empty or unrecognised use_case falls back to the diagnostic
-        # opening, which is the previous behaviour exactly.
-        # The HEADING is fixed at "Conclusion" and the use case chooses
-        # what belongs UNDER it. Measured: with the heading itself varying,
-        # one turn in six renamed it — "Most likely explanation" came back
-        # as "La afirmación es correcta" — because an instruction to render
-        # a label in another language is read as licence to paraphrase, and
-        # a paraphrased heading is a heading the reader cannot find twice
-        # in the same place. A fixed name is also what makes the rest of
-        # the answer legible as its development rather than as a list of
-        # peers: the reader learns one landmark, not five.
+        # Only the FIRST section's body varies with the use case; its
+        # HEADING is always "Conclusion", because a heading that varies
+        # gets paraphrased and the reader cannot find it twice in the same
+        # place. Scaffolding shares programming's opening: it is a request
+        # about output format, already answered by serving a skeleton. An
+        # unknown use_case falls back to the diagnostic opening.
         _bodies = {
             UseCase.ARCHITECTURE: (
                 "the relation that answers the question, named concretely "
@@ -27122,33 +29217,11 @@ class AgenticSynthesisComposer:
             "order. Write each in your own prose — this is a shape to "
             "fill, never a template to copy:",
             "",
-            # One instruction where four used to stack. They overlapped, and
-            # the last one to arrive won: adding "reproduce each one exactly
-            # where it appears" for the rules put COPY nearest the list, and
-            # the next run came back with every heading in English over
-            # Spanish prose — a model resolving two mandates by taking the
-            # closer one. Translated headings and verbatim rules are not in
-            # tension, but only if one sentence says which is which.
-            # Two rules where there were three. The third said "keep each
-            # heading's level as written" and existed because two sections
-            # were `##` and six were bold; the model promoted all eight and
-            # erased the distinction. Every heading is `##` now, so there is
-            # no level to preserve and no rule needed to preserve it — a
-            # distinction the model will not hold is a distinction better
-            # not drawn.
-            #
-            # ORDER MATTERS. Copying comes first and translating last,
-            # because the instruction nearest the list is the one applied to
-            # it: with "copy verbatim" sitting closest, a run came back with
-            # every heading left in English over Spanish prose.
-            # Short on purpose. The long form carried a measured anecdote
-            # per rule and ran to four paragraphs; across one run the model
-            # kept the early rules and dropped the late ones — two answers
-            # came back with English headings over Spanish prose, one
-            # repeated How to proceed, and three omitted Conclusion. The
-            # rules did not need better arguments, they needed to fit in
-            # view. The heading/dash rule is gone entirely: headings no
-            # longer carry a dash, so there is nothing left to get wrong.
+            # One instruction, two rules, in this order: copy the rules
+            # verbatim, translate the headings. The instruction nearest the
+            # list is the one applied to it, so translating comes last.
+            # Every heading is `##`, so there is no level to preserve. Short
+            # on purpose: a longer form lost its later rules.
             "Four rules, all of them:",
             "",
             # Same wording as the outline mode's copy. Two modes stating one
@@ -27161,52 +29234,21 @@ class AgenticSynthesisComposer:
             "that follows. A section without its rule above it is a section "
             "written wrong.",
             "",
-            # Anchored to the QUESTION, not to "the language you are
-            # answering in". That phrasing was circular: it told the model
-            # to translate into whatever language it had already decided on,
-            # and the instruction it was reading is in English. Two answers
-            # came back with Spanish prose under English headings — the body
-            # translated, the titles copied — which is the shape of a model
-            # obeying both readings at once.
-            # No translation rule any more. The headings below arrive in
-            # the reader's language already, chosen from a table, so there
-            # is nothing left to translate and nothing left to get wrong.
-            # Three wordings were tried and measured — stated once, stated
-            # three times, anchored to the reader's own question — and
-            # answers still came back with English headings over Spanish
-            # prose. The rule was replaced rather than rewritten a fourth
-            # time: the reliable way to have a model use a word is to give
-            # it the word.
+            # No translation rule: the headings below arrive in the reader's
+            # language, chosen from a table. Three wordings of a translation
+            # rule all failed; the reliable way to have a model use a word is
+            # to give it the word.
             "2. WRITE EACH HEADING EXACTLY AS IT APPEARS, letter for "
             "letter. They are already in the right language; do not "
             "translate them, do not reword them, and never replace one "
             "with what you found.",
             "",
-            # "three answers in one run left it out" was in the text the
-            # model reads. It does not need the history, it needs the rule;
-            # the history belongs here, where whoever weakens this rule can
-            # see what it cost.
-            #
-            # The ordering half was added later, from the outline mode,
-            # because the two modes had drifted apart and only one of them
-            # was defended. Measured over twenty turns of two runs: with
-            # the outline mode's anchor and seeded opening, one defect in
-            # eleven; on this path, four in seven — a 1,801-character code
-            # preamble ahead of the first section, a 51,756-character loop
-            # that had to be stopped by hand, one answer repeating two
-            # sections and one closing on Código. Same model, same run,
-            # same questions; the difference was which directive it got.
-            #
-            # Named from _H and not hardcoded: this path always opens on
-            # Conclusion — _opening below is built from _H["conclusion"] —
-            # so the rule and the list cannot disagree, and the reader's
-            # language is already resolved.
-            #
-            # No completeness clause here, unlike the outline mode's rule
-            # 3. This path already carries one in the closing paragraph
-            # ("This list is CLOSED and each heading appears exactly
-            # ONCE"), and a rule stated twice in one directive is a rule
-            # the model gets to choose between.
+            # The history behind this rule belongs here, not in the text the
+            # model reads. The ordering half keeps this fallback path in
+            # line with the outline mode, which had far fewer order defects.
+            # Named from _H, so the rule and the list cannot disagree. No
+            # completeness clause: the closing paragraph already has one,
+            # and a rule stated twice is a rule the model chooses between.
             f"3. Start with {_H['conclusion']} — it is the FIRST section, "
             "and the sections follow in the order listed. It is the only "
             "section always required.",
@@ -27389,34 +29431,14 @@ class AgenticSynthesisComposer:
                 "without the other.",
             ]
         # ── Step 4.5: the tests, when a design_tests step wrote some ──
-        # Only for design_tests. Its output is written to be KEPT and run
-        # again against the implementation, so the reader wants the code.
-        # A verify_dynamic harness is the opposite: a throwaway probe built
-        # against fake valves and a symbol torn out of its module, existing
-        # only to settle one claim. Pasting one of those under the answer —
-        # which is what happened, below the Stats block, for want of a
-        # section that said where tests go — hands the reader something
-        # that looks committable and is not. Measured, the harnesses in one
-        # run ran 417, 1189 and 1822 tokens; four of them would outweigh
-        # the answer they belong to.
-        # THE TESTS SECTION IS GONE, and it is not a formatting decision.
-        # A block in the reader's browser runs in Pyodide with nothing but
-        # itself, so to execute at all it needs a COPY of the subject —
-        # which means a green result says the copy passes, not the project.
-        # And if the model transcribes the function as it believes it
-        # should be, the tests go green on code that does not exist.
-        #
-        # Measured across four answers: every block died on NameError
-        # because the copy was omitted (0/6, 0/6, 0/5, 0/5), while the same
-        # turns verified fine in the sandbox — which composes the REAL
-        # symbol body from the index and repairs what fails. One went 5/6,
-        # was repaired, and came back 6/6 against actual code.
-        #
-        # Verification stays where it is real and is reported in Stats as
-        # "N test run, N passed". A green tick that means nothing is the
-        # same failure as a confidence figure adjusted upward: it buys
-        # trust it cannot pay for. has_tests is kept in the signature and
-        # ignored here, since callers still compute it.
+        # Only for design_tests, whose output is meant to be kept and run
+        # again; a verify_dynamic harness is a throwaway probe and does not
+        # belong under the answer.
+        # There is no tests section: a block in the reader's browser runs
+        # in Pyodide on a COPY of the subject, so a green result proves the
+        # copy, not the project. Verification stays in the sandbox, which
+        # composes the real body from the index, and is reported in Stats.
+        # has_tests is kept in the signature and ignored here.
 
         out.append(_GROUP_BREAK)
 
@@ -28262,6 +30284,7 @@ class AgenticOrchestrator:
                 await self._f._hypothesis_forge._record_serial_competition(
                     _dossiers, _winner, project_id
                 )
+                self._f._hypothesis_forge._record_rivals(_dossiers, _winner)
                 # The record is rendered NOW, while the dossiers are
                 # in hand, and stashed for the outlet to append to
                 # the final answer. Pipeline→user channel: it never
@@ -28321,11 +30344,10 @@ class AgenticOrchestrator:
                         "🏁 Conclusion: no hypothesis beat the null "
                         "— cause not identified with confidence"
                     )
-                    step.output = (step.output or "") + (
-                        f"\n\n**Serial verdict**: no hypothesis "
-                        f"beat the default explanation. "
-                        f"({_note})"
-                    )
+                    self._f._serial_unestablished = [
+                        d.hypothesis for d in _plausible if d.hypothesis
+                    ]
+                    step.output = (step.output or "") + _NO_CAUSE_VERDICT + f"({_note})"
                 return True
             else:
                 # Parallel retirement, step one: zero plausible no
@@ -28334,6 +30356,7 @@ class AgenticOrchestrator:
                 # reported honestly with the measured causes from
                 # the sealed dossiers (empty pool + failed
                 # generation reports zero sealed, same shape).
+                self._f._hypothesis_forge._record_rivals(_dossiers, None)
                 _causes = "; ".join(
                     f"'{d.hypothesis[:40]}' " f"({d.cause_of_death or 'died'})"
                     for d in _dossiers[:4]
@@ -28392,11 +30415,16 @@ class AgenticOrchestrator:
                     if _dead_plan
                     else ""
                 )
+                if _dossiers:
+                    self._f._serial_unestablished = [
+                        d.hypothesis for d in _dossiers if d.hypothesis
+                    ]
                 step.output = (step.output or "") + (
                     "\n\n**Serial verdict**: every forged "
                     "hypothesis was refuted or unfounded."
                     + (f" {_causes}" if _causes else "")
                     + _next
+                    + (_NO_CAUSE_VERDICT if _dossiers else "")
                 )
             return True
         # Parallel retirement, step two: with the serial method
@@ -28837,6 +30865,31 @@ class AgenticOrchestrator:
             return _close_dangling_fence(tail)
         return _close_dangling_fence(
             self._f._tokens.truncate_text_to_tokens(text, budget)
+        )
+
+    def _with_named_relation(self, workspace: str) -> str:
+        """
+        Put the index's verdict on the question's own relation above the workspace.
+
+        It goes first and is marked as read from the code, so a step reading
+        the workspace knows it is not one more note by an earlier step.
+        """
+        listing = getattr(self, "_graph_listing", "")
+        if listing:
+            workspace = (
+                "## Index answer to what the question asks\n"
+                f"{listing}\n"
+                "Read from the code index, not written by any step.\n\n" + workspace
+            )
+        statement = getattr(self, "_named_relation", "")
+        if not statement:
+            return workspace
+        return (
+            "## Index verdict on the relation the question names\n"
+            f"{statement}\n"
+            "Read from the code index and the source, not written by any step. "
+            "A conclusion that contradicts it must quote the line of code "
+            "that does.\n\n" + workspace
         )
 
     def _workspace_budget(self) -> int:
@@ -29549,22 +31602,11 @@ class AgenticOrchestrator:
         for _pos, _s in enumerate(plan.steps, start=1):
             _s.display_no = _pos
 
-        # Region: sequential execution — cache, tools, control signals
-        # No ledger reset here, and none may return. The per-run reset (and
-        # the continuation-gated restore that agentic_ledger_persist builds
-        # on top of it) happens once at the top of this function; this spot
-        # used to carry the OLDER generation of the same #11 fix, an
-        # unconditional reset() that survived the restore-aware block
-        # landing upstream and wiped the freshly restored claims before a
-        # single step ran. Net effect: the persist feature was dead on
-        # arrival — continuation turns logged "restored N ledger claim(s)"
-        # and then executed on an empty ledger, verify and synthesis never
-        # saw the prior turn's evidence, and the end-of-run snapshot could
-        # only ever hold one turn, so the multi-turn accumulation the valve
-        # promises never happened. Nothing between the top-of-run
-        # reset/restore and this point touches the ledger (pre-planner,
-        # planner and display_no stamping are claim-free), so there is
-        # nothing here to clear.
+        # Region: sequential execution — cache, tools, control signals.
+        # No ledger reset here, and none may return: the per-run reset and
+        # the continuation restore (agentic_ledger_persist) happen once at
+        # the top of this function, and a second reset here wiped the
+        # restored claims before any step ran.
         structure_hash = ""
         try:
             structure_hash = (
@@ -29590,6 +31632,34 @@ class AgenticOrchestrator:
         # refutation. One reset per pipeline run, here, fixes the
         # accumulation for every step-order combination.
         self._dyn._harness_suspects = []
+        # The relation the question itself names, settled from the index
+        # once per run and shown to every step (_with_named_relation).
+        try:
+            self._named_relation = self._f._meta_reasoning.settle_named_relation(
+                question, project_id
+            )
+        except Exception as _nr_err:
+            self._named_relation = ""
+            self._f._log_debug(f"🧭 Named relation: not settled ({_nr_err})")
+        # A question the index answers in full (who calls X, what X calls)
+        # is answered from it: the first investigate step takes the listing
+        # as its output instead of rebuilding it from bodies.
+        self._graph_listing = ""
+        self._graph_listing_used = False
+        if not self._named_relation:
+            try:
+                self._graph_listing = self._f._meta_reasoning.list_named_relation(
+                    question, project_id
+                )
+            except Exception as _gl_err:
+                self._f._log_debug(f"🧭 Index answer: not listed ({_gl_err})")
+        if not self._named_relation and not self._graph_listing:
+            try:
+                self._graph_listing = self._verifier.declared_default_answer(
+                    question, project_id
+                )
+            except Exception as _dd_err:
+                self._f._log_debug(f"🧭 Index answer: default not read ({_dd_err})")
         idx = 0
         # Region: budget policy — skip-before-start, essentials always run
         while idx < len(plan.steps):
@@ -29620,25 +31690,11 @@ class AgenticOrchestrator:
 
             # -- a step does not re-investigate what is already settled ----
             #
-            # The planner writes every step from the question, before any
-            # evidence exists, so two investigations can be handed
-            # overlapping goals and the second cannot learn that the first
-            # answered it. One turn planned `identify the guard` and `trace
-            # every consumer` as separate steps; step 1 returned `called
-            # from exactly three rendering paths`, named all three, at
-            # confidence 1.0, and the call graph verified it. Step 2's goal
-            # was that sentence. With its work done and its one remaining
-            # question out of reach, it restated step 1's answer six times
-            # verbatim until the token ceiling stopped it.
-            #
-            # Focus symbols already carrying a settled claim are dropped
-            # from the step, so its round is spent on what is left. The
-            # step still runs: its goal is prose and may cover ground the
-            # symbols do not name, and a step that reports nothing new is
-            # cheap where one that re-derives everything is not. Only when
-            # the plan named symbols and every one of them is settled does
-            # this say so, and the emptied focus is itself the finding —
-            # it means the planner wrote the same step twice.
+            # The planner writes every step before any evidence exists, so
+            # two steps can share a goal. Focus symbols that already carry a
+            # settled claim are dropped from the step; the step still runs
+            # on what is left. A plan whose named symbols are all settled is
+            # itself the finding: the planner wrote the same step twice.
             if (
                 step.kind == "investigate"
                 and step.symbols
@@ -29927,6 +31983,27 @@ class AgenticOrchestrator:
                 idx += 1
                 continue
 
+            # -- an investigation the index has already done ---------------
+            if (
+                step.kind == "investigate"
+                and getattr(self, "_graph_listing", "")
+                and not getattr(self, "_graph_listing_used", False)
+            ):
+                self._graph_listing_used = True
+                step.output = self._graph_listing
+                step.digest = self._digest(step.output)
+                step.status = "done"
+                self._f._log_debug(
+                    f"🤖 Agentic step {step.display_no} (investigate): answered "
+                    f"from the code index, no LLM call"
+                )
+                await self._f._emit_status(
+                    f"🤖 Agentic step {step.display_no}/{len(plan.steps)} "
+                    f"(investigate): from the code index"
+                )
+                idx += 1
+                continue
+
             # -- cache lookup (invalidated by structure_hash mismatch) -----
             if use_cache:
                 hit = await self._cache.get(project_id, structure_hash, step)
@@ -29948,26 +32025,11 @@ class AgenticOrchestrator:
                         f"🤖 Agentic step {step.display_no}/"
                         f"{len(plan.steps)} ({step.kind}): from cache"
                     )
-                    # Observed live: a cache-hit hypothesize step skipped
-                    # the ENTIRE competition (this branch continues before
-                    # the executor branch where _maybe_compete lives), so
-                    # rivals restored from cache were never competed,
-                    # charter and convergence included — a silent quality
-                    # asymmetry between cached and fresh turns. The
-                    # restored claims are exactly what the competition
-                    # consumes; run it here. Its own convergence gate
-                    # keeps the cost low when a winner dominates.
-                    # GATE FIX (cache-hit path): the serial method
-                    # must reach the forge on a cached hypothesize
-                    # step REGARDLESS of compete_on_cached_hypothesize
-                    # — that valve governs the retired parallel
-                    # competition, not the forge. Without this, a
-                    # cache hit with the parallel valve off would
-                    # silently skip the serial method entirely (its
-                    # own _maybe_compete gate keeps cost bounded).
-                    # Parallel excision: only the serial valve
-                    # matters now — compete_on_cached_hypothesize
-                    # guarded the removed parallel competition.
+                    # A cached hypothesize step still runs the competition:
+                    # this branch continues before the executor branch, so
+                    # without it cached and fresh turns would differ. Only
+                    # the serial valve matters (the parallel competition was
+                    # removed); the forge's own gate keeps the cost bounded.
                     if step.kind == "hypothesize" and bool(
                         self._f.valves.agentic_serial_method
                     ):
@@ -30016,12 +32078,14 @@ class AgenticOrchestrator:
                 f"🤖 Agentic step {step.display_no}/{len(plan.steps)} "
                 f"({step.kind}): {step.goal[:60]}"
             )
-            workspace = self._render_workspace(
-                plan.steps,
-                budget=self._workspace_budget(),
-                estimate=getattr(self._f._tokens, "estimate_code_tokens", None),
-                shorten=getattr(self._f._tokens, "truncate_text_to_tokens", None),
-                note=self._f._log_debug,
+            workspace = self._with_named_relation(
+                self._render_workspace(
+                    plan.steps,
+                    budget=self._workspace_budget(),
+                    estimate=getattr(self._f._tokens, "estimate_code_tokens", None),
+                    shorten=getattr(self._f._tokens, "truncate_text_to_tokens", None),
+                    note=self._f._log_debug,
+                )
             )
             await self._executor.run(
                 step,
@@ -30334,31 +32398,15 @@ class AgenticOrchestrator:
                 )
 
             # -- early exit: hard evidence steps are never skipped ---------
-            # Evidence gate: skipping the rest of the plan on a step's own
-            # say-so requires that its claims survived citation validation —
-            # at least one claim whose cited qids all resolved against the
-            # SymbolIndex, and no claim with a structurally invalid citation
-            # or a refuted call relation (the same invalidity predicate the
-            # difficulty gate uses). A fabricated identifier anywhere in the
-            # step is exactly the confabulation signal this ledger exists to
-            # catch — measured live: a step-1 early exit citing a
-            # non-existent symbol skipped the two steps that would have
-            # corrected it. A resolution with no claims at all keeps running
-            # too: an exit that skips verification must be backed.
+            # Evidence gate: an early exit on a step's own say-so needs at
+            # least one claim whose citations all resolved, and no invalid
+            # citation or refuted call relation; a resolution with no claims
+            # keeps the plan running.
             #
-            # Truncation is a separate, structural veto. A step that hit
-            # agentic_step_max_tokens stopped mid-sentence: its reasoning is
-            # incomplete BY CONSTRUCTION, whatever it says about itself.
-            # Before claims-tail recovery (0024) such a step simply had no
-            # tail, so control stayed at the defaults and the plan carried
-            # on — truncation vetoed the early exit by accident. Recovery
-            # removed the accident: it re-asks for the tail and the model
-            # dutifully fills in "resolved": true over an analysis it never
-            # finished. Measured live (19:37): step 1 was cut off mid-
-            # sentence, recovered 8 claims, and exited at confidence 0.85,
-            # skipping the hypothesize and analyze steps that existed to
-            # challenge it. Recovering EVIDENCE is the point; inheriting a
-            # self-assessment made over a severed reasoning chain is not.
+            # Truncation is a separate veto: a step cut at
+            # agentic_step_max_tokens did not finish its reasoning, and the
+            # claims-tail recovery would otherwise let it declare "resolved"
+            # over an analysis it never completed.
             if getattr(step, "truncated", False) and control.get("resolved"):
                 self._f._log_debug(
                     f"🤖 Agentic: early-exit vetoed at step {step.id} — the "
@@ -30425,25 +32473,11 @@ class AgenticOrchestrator:
 
             # -- ASK_USER: stateless clarification short-circuit -----------
             # A step reporting a genuine ambiguity ends the pipeline early
-            # and surfaces the question as this turn's answer. Stateless by
-            # design: no plan is persisted and no resume machinery exists —
-            # the user's reply is simply a fresh turn with more context.
-            # Gated by a valve and a minimum question length so a stray
-            # token cannot hijack the turn.
-            #
-            # Two guards added after a live miss: an investigate step,
-            # reciting the Block A 'critical reasoning guidelines' as its
-            # own reasoning ('verify observed vs expected before calling it
-            # a bug'), had that prose parsed into control['ask'] and killed
-            # a 7-step full-profile plan at step 2. (1) Under plan_profile
-            # FULL the operator has explicitly demanded the complete method
-            # run — an ask-user short-circuit silently defeats that
-            # guarantee, so it is suppressed and the pipeline proceeds.
-            # (2) A verify/analyze step near the end asking for
-            # clarification is almost always this recitation failure, not a
-            # real up-front ambiguity; the genuine ask belongs to the first
-            # step or two, so the short-circuit only honours an ask from an
-            # early step.
+            # and surfaces the question as the answer. Stateless: the user's
+            # reply is a fresh turn. Gated by a valve and a minimum length.
+            # Not under plan_profile FULL (the operator demanded the whole
+            # method), and only from an early step: a late step "asking" is
+            # almost always reciting the guidelines, not a real ambiguity.
             _prof = str(
                 getattr(self._f.valves, "agentic_plan_profile", "auto") or "auto"
             ).lower()
@@ -30510,22 +32544,11 @@ class AgenticOrchestrator:
         # closing it is this. One extra call, only when something is missing,
         # and only over what is missing.
         _unchecked = [c for c in self._ledger.claims if not c.verification]
-        # The forge verifies inside its cycles — graph, contract check and
-        # the in-cycle evidence ruling — and its competition has already
-        # selected by the time control reaches here, so a sweep after it
-        # can no longer inform anything: it earns its place only when the
-        # scientific method did not run. And it is guarded in full,
-        # because on its first live run an unguarded failure here took
-        # down everything behind it — the generative evaluation and the
-        # synthesis format directive — which is a worse outcome than any
-        # number of unchecked claims.
-        # The forge rules on its own consequences inside each cycle, before
-        # the verdict that seals a dossier, so the sweep cannot and need not
-        # inform selection. What is left for it afterwards is the terminal
-        # analyze step's claims, emitted after the last evidence pass — the
-        # synthesis a reader acts on. Standing down for forge plans left
-        # exactly those uncovered: three claims in each forge turn of the
-        # 29 July run, against none in the turn that had no forge.
+        # The forge rules on its own consequences inside each cycle, so the
+        # sweep is not for selection. It covers what comes after the last
+        # evidence pass: the terminal analyze step's claims. Guarded in full,
+        # because a failure here must not take down the synthesis behind
+        # it.
         if _unchecked and getattr(self._f.valves, "agentic_closing_verify", True):
             try:
                 _sweep = AgenticStep(
@@ -30783,7 +32806,7 @@ class AgenticOrchestrator:
         self._f._answer_outline = ""
         if self._f.valves.agentic_outline_step:
             try:
-                _lang = _question_language(question)
+                _lang = self._f._answer_language(question)
                 _HH = _SECTION_HEADINGS.get(_lang) or _SECTION_HEADINGS["en"]
                 # Only the sections this turn HAS something for. All eight
                 # were offered unconditionally, and the outline named one
@@ -30863,28 +32886,11 @@ class AgenticOrchestrator:
                 _keys += ["evidence", "gaps"]
                 _secs = [f"## **{_HH[_k]}**" for _k in _keys]
                 # Conclusion, How to proceed, Código, Evidence and Gaps are
-                # NOT skippable. Measured twice, the same shape both times.
-                # An answer came back with no Código section at all — the
-                # outline had marked it SKIP — and the code landed above the
-                # first rule, outside every section, because there was
-                # nowhere else for it to go. Then two answers of one run came
-                # back opening on Código, with no Conclusion and no How to
-                # proceed: the outline had dropped both, and the prose that
-                # belonged in them was written under Código anyway, one
-                # answer saying what the fix was and where to put the tests
-                # beneath a heading that promises source.
-                #
-                # The two are here for the same reason Código is, not because
-                # the pipeline always has something for them. Conclusion is
-                # the section the long directive calls the only one always
-                # required, and How to proceed is the one the reader acts on.
-                # A turn with little to say in either writes a short one; a
-                # turn with nothing writes the placeholder below. Neither is
-                # worse than the content arriving under the wrong heading.
-                # Código is protected only when it was offered. Protecting
-                # a section absent from the list is not merely dead — it is
-                # the instruction that turned "no code this turn" from a
-                # heading withheld into a heading the model had to fill.
+                # never skippable: when the outline dropped one, its content
+                # landed under the wrong heading. A section with little to
+                # say writes a short one, or the placeholder below.
+                # Código is protected only when it was offered; protecting an
+                # absent section forces the model to invent code for it.
                 _never = [
                     f"## **{_HH['conclusion']}**",
                     f"## **{_HH['proceed']}**",
@@ -30966,14 +32972,18 @@ class AgenticOrchestrator:
                         f"🤖 Agentic wave step {wstep.display_no} ({wstep.kind}): "
                         f"{wstep.goal[:60]}"
                     )
-                    workspace = self._render_workspace(
-                        plan.steps,
-                        budget=self._workspace_budget(),
-                        estimate=getattr(self._f._tokens, "estimate_code_tokens", None),
-                        shorten=getattr(
-                            self._f._tokens, "truncate_text_to_tokens", None
-                        ),
-                        note=self._f._log_debug,
+                    workspace = self._with_named_relation(
+                        self._render_workspace(
+                            plan.steps,
+                            budget=self._workspace_budget(),
+                            estimate=getattr(
+                                self._f._tokens, "estimate_code_tokens", None
+                            ),
+                            shorten=getattr(
+                                self._f._tokens, "truncate_text_to_tokens", None
+                            ),
+                            note=self._f._log_debug,
+                        )
                     )
                     await self._executor.run(
                         wstep,
@@ -31044,6 +33054,9 @@ class AgenticOrchestrator:
             # 'complementary' makes the answer partial, not wrong.
             _rel = getattr(self._f, "_serial_rival_relations", None) or []
             _cov["rivals_independent"] = sum(1 for _r in _rel if _r == "independent")
+            _cov["winner_share"] = float(
+                getattr(self._f, "_serial_winner_share", 0.0) or 0.0
+            )
             _cov["rivals_complementary"] = sum(
                 1 for _r in _rel if _r == "complementary"
             )
@@ -31118,7 +33131,8 @@ class AgenticOrchestrator:
                     _cov.get("structural", 0) or 0
                 )
                 _t_ind = int(_cov.get("rivals_independent", 0) or 0)
-                _t_pct = int(round(100 * (_t_ok / _t_all) / (1 + _t_ind)))
+                _t_share = _confidence_share(_cov)
+                _t_pct = int(round(100 * (_t_ok / _t_all) * _t_share))
                 _t_open = []
                 for _k, _w in (
                     ("read", "read but unresolved"),
@@ -31128,6 +33142,8 @@ class AgenticOrchestrator:
                     _n_k = int(_cov.get(_k, 0) or 0)
                     if _n_k:
                         _t_open.append(f"{_n_k} {_w}")
+                if getattr(self._f, "_serial_unestablished", None):
+                    _t_open.append("no cause established")
                 if _t_ind:
                     # Whether another pass would help. A turn reported
                     # 24% and the person asked for more investigation,
@@ -31167,11 +33183,7 @@ class AgenticOrchestrator:
                         f"{_t_ind} rival hypothes"
                         + ("es" if _t_ind > 1 else "is")
                         + " the evidence did not rule out, "
-                        + (
-                            f"dividing the figure by {1 + _t_ind}"
-                            if _t_ind > 1
-                            else "halving the figure"
-                        )
+                        + _confidence_share_words(_cov)
                         + _why
                     )
                 # ── How the turn was read, and what it actually did ──
@@ -31268,6 +33280,12 @@ class AgenticOrchestrator:
                                 f"{_n_acc} account{'' if _n_acc == 1 else 's'} "
                                 f"forged, {len(_riv)} survived"
                             )
+                        elif getattr(self._f, "_serial_unestablished", None):
+                            _n_un = len(self._f._serial_unestablished)
+                            _eff.append(
+                                f"{_n_un} account{'' if _n_un == 1 else 's'} "
+                                f"forged, none established"
+                            )
                         elif _cov.get("had_hypothesize"):
                             # The plan CARRIED a hypothesize step and nothing
                             # came out of it — a different fact from "the
@@ -31329,22 +33347,10 @@ class AgenticOrchestrator:
                 if _turn_no > 0:
                     _axes.insert(0, f"[Turn: {_turn_no}]")
 
-                # Stashed for the outlet, which rebuilds the whole footer
-                # rather than trusting the copy the model made of it.
-                # A heading of its own, like every other section. The four
-                # lines are an account of how the turn was produced, and
-                # unlabelled at the foot of an answer they read as debris
-                # rather than as a section the reader can choose to read.
-                # It travels INSIDE _reading so the outlet re-emits it with
-                # the rest and the footer pattern strips the old one; a
-                # heading left outside would be orphaned above a freshly
-                # appended block.
-                # The heading goes on whenever a footer is emitted at all,
-                # not only when an axis survived. The confidence figure is
-                # as measured as the three axes, and with the axes gone it
-                # was handed over bare while the instruction still asked for
-                # a rule and a "Stats section" — a section the reader was
-                # told to expect and given nothing to head it with.
+                # Stashed for the outlet, which rebuilds the footer rather
+                # than trusting the model's copy. The heading travels inside
+                # _reading, so the outlet re-emits it with the rest, and it
+                # goes on whenever a footer is emitted at all.
                 _reading = (
                     ("## **Stats**\n" + "\n".join(_axes) + "\n")
                     if _axes
@@ -31388,24 +33394,12 @@ class AgenticOrchestrator:
                 # in one place. The outlet still prepends its own mark for
                 # the stored history, which the reader never sees.
                 # ── Held rewrites, when the conversation has any ──
-                # Placed BEFORE the Stats note so the tail of the prompt
-                # keeps the shape that fixed section order: the Stats note
-                # and then the seeded opening, adjacent to generation.
-                #
-                # Emitted only when patches exist, which is most turns of
-                # most sessions never. A note nobody needs is an artifact
-                # near the answer template, and this file has measured what
-                # those cost: a quoted block wearing "##" got copied, and
-                # bare labels in a list got promoted back to headings. So:
-                # no headings, no fenced code, nothing shaped like a block
-                # to reproduce — names and one sentence each.
-                #
-                # It explains rather than lists because a list alone taught
-                # the wrong thing: shown only "P2", the pipeline spent an
-                # investigate step hunting a symbol called P2 in the index,
-                # and the answer said the guard "is already in the
-                # function" when it is held OUT of the source. What the
-                # identifiers mean has to travel with them.
+                # Placed before the Stats note, so the tail of the prompt
+                # keeps the shape that fixed section order. Emitted only
+                # when patches exist. No headings or fences (block-shaped
+                # notes get copied); names with one sentence each, since a
+                # bare list of identifiers was taken for symbols to look
+                # up.
                 try:
                     _held = self._f._commands._patches_for_chat(project_id)
                 except Exception:
@@ -31564,42 +33558,13 @@ class AgenticOrchestrator:
                     f"🔴 Pre-mortem: {_mode} ({_b}/{_t} claims cite "
                     f"unverified symbols)"
                 )
-        # The opening, seeded in the last position of the prompt. The most
-        # recent 2,233 characters the model reads are the Stats note, which
-        # governs the LAST section of the answer; the first thing it has to
-        # decide — which section opens — is governed 4,800 characters back.
-        # One turn opened on the evidence section and closed on the
-        # conclusion, the whole sequence reversed, and the reversal is a
-        # first-token decision: nothing had been generated yet for length
-        # or fatigue to act on. This is the nearest thing to a prefill that
-        # does not depend on the host forwarding an assistant turn.
-        #
-        # The trailing slot has burned this file once: a note placed here
-        # was COPIED into every answer of a run rather than obeyed. That
-        # failure does not apply to this one, and the reason is worth
-        # stating — what it asks the model to reproduce is exactly what the
-        # answer has to open with, so copying it IS obeying it. The two
-        # outcomes coincide, which is the only shape of instruction that
-        # belongs in the position guaranteed to be read last.
-        #
-        # Emitted on BOTH directive paths. It used to be guarded on the
-        # outline alone, so the turns that fell back to the long directive
-        # — a third of them, whenever compose_outline names no section and
-        # its result is discarded — got neither this nor the order anchor,
-        # while the outline turns got both. The defect rate split with it:
-        # one in eleven where the two defences landed, four in seven where
-        # neither did. The fallback path is not a rarer path, it is the
-        # unprotected one.
-        #
-        # Derived from _H rather than from the directive's own opening
-        # line, because that line carries a trailing description — "##
-        # **Conclusión** — the single mechanism you hold responsible..." —
-        # and seeding it whole would ask the model to open by copying the
-        # brief. The language is resolved here rather than reused from the
-        # outline block above: those locals live inside that block's `if`
-        # and `try`, so reading them here would raise on any turn where the
-        # outline step is off or failed early — precisely the turns this
-        # is for.
+        # The opening heading, seeded last in the prompt: which section
+        # opens is a first-token decision, and the instruction for it was
+        # thousands of characters back. Copying this line IS obeying it,
+        # which is the only kind of instruction safe in the last slot.
+        # Emitted on both directive paths (the fallback path is where the
+        # order defects were). Built from _H rather than from the outline's
+        # locals, which do not exist when the outline step failed.
         # ── Step 1: the outline's own first heading, when there is one ──
         _open_line = ""
         _seed_from = ""
@@ -31623,7 +33588,7 @@ class AgenticOrchestrator:
         if not _open_line:
             try:
                 _open_line = "## **%s**" % (
-                    _SECTION_HEADINGS[_question_language(question)]["conclusion"]
+                    _SECTION_HEADINGS[self._f._answer_language(question)]["conclusion"]
                 )
                 _seed_from = "long directive"
             except Exception as _e_seed:
@@ -31667,26 +33632,10 @@ class AgenticOrchestrator:
             )
             self._f._log_debug(f"[ANSWER-SEED] {_open_line!r} from the {_seed_from}")
         dynamic_injections.append(("trailing", _workspace))
-        # The note that used to sit here is gone, and where it sat is why.
-        # It was a trailing injection, a slot this file chooses so that
-        # "the ask-and-stop instruction becomes the last thing the model
-        # reads before generating" — and the note landed after even that,
-        # taking the highest-salience position in the whole prompt for a
-        # disclaimer.
-        #
-        # The model did not obey it, it COPIED it: every answer in a run
-        # ended with the note reproduced underneath the actual reply. A
-        # Nothing replaces it, because the caption already existed in
-        # the right place: the findings block opens with "Internal
-        # pre-computed findings ... for the question", fenced inside
-        # <agentic_findings>. The note restated that from outside, in
-        # the one position guaranteed to be read last.
-        #
-        # This file had already learned the lesson and written it down
-        # a few lines below, after the main model transcribed an entire
-        # workspace into its answer: "the remedy is form, not stronger
-        # wording". A trailing disclaimer is stronger wording. The fence
-        # is the form.
+        # No trailing disclaimer here: a note in the last slot was copied
+        # into every answer rather than obeyed. The findings block's own
+        # <agentic_findings> fence already says what it is; the remedy is
+        # form, not stronger wording.
         # Region: per-run telemetry — one greppable JSON line per pipeline
         # run (grep 'AGENTIC-RUN'), the calibration companion of the
         # [METACOG-SHADOW]/[REPLAN-SHADOW] lines.
@@ -32302,9 +34251,24 @@ class CommandRouter:
         if not history_text.strip():
             return None
 
-        # ── Step 2: Delegate the full decision to the LLM ──
-        hist = history_text[-8000:]
+        # ── Step 2: a message that only asks asserts nothing to contradict ──
+        # The classifier is asked whether the message conflicts with
+        # something asserted earlier; a message whose every sentence is a
+        # question asserts nothing, so the answer is known before the call.
+        # Live, every turn of a seven-question session paid this call
+        # (1-2 s on the turn's critical path, beside the cache lookup) to
+        # learn "false".
         new_msg = last_user["content"]
+        _asked = self._REFERENCE_LINE_RE.sub("", str(new_msg or "")).strip()
+        _sentences = [s for s in re.split(r"(?<=[.!?])\s+|\n+", _asked) if s.strip()]
+        if _sentences and all(s.rstrip().endswith("?") for s in _sentences):
+            self._f._log_debug(
+                "Contradiction check skipped — the message only asks, so it "
+                "asserts nothing that could contradict the history"
+            )
+            return None
+        # ── Step 3: Delegate the full decision to the LLM ──
+        hist = history_text[-8000:]
         return await self._detect_contradictions_with_llm(hist, new_msg, project_id)
 
     async def _detect_contradictions_with_llm(
@@ -32460,31 +34424,16 @@ class CommandRouter:
 
         return self._SYMBOL_TOKEN_RE.sub(_mask, query), n_masked
 
-    # Synthetic reference lines generated by this plugin: the merge
-    # splice ("**name:** _(unchanged — N symbols already indexed in the
-    # SymbolGraph; ...)_") and the silent-ingestion stub ("_[N symbols
-    # indexed in the SymbolGraph; ...]_"). Anchored to our own generated
-    # phrasing so legitimate user prose about the SymbolGraph is
-    # untouched. Lines the plugin itself splices into the user turn.
-    # Every consumer of a user message strips these before reading it:
-    # they are OUR text riding inside the user's, and downstream they
-    # are read as if the user had written them.
-    #
-    # Matching the MARK, not the prose. The previous pattern required
-    # the literal run "symbols indexed in the SymbolGraph" / "symbols
-    # already indexed in the SymbolGraph", and the reference line reads
-    # "781 symbols from this file are already indexed in the
-    # SymbolGraph" — six words in between, so it never matched and rode
-    # into the agentic question, the planner, and every step prompt
-    # (live: step 1's goal was "dame el diff que acabas de aplicar
-    # **Pasted_Text_1784329887…"). Both stubs are generated here, a few
-    # hundred lines apart, and drifted the moment one was reworded — so
-    # the pattern now keys on the two invariants each generator actually
-    # emits, and the harness pins the generators against it so the next
-    # reword cannot silently reopen this.
+    # Lines the plugin itself splices into the user turn: the merge splice
+    # of a re-attached file and the silent-ingestion stub. Every consumer of
+    # a user message strips them, since downstream they read as the user's
+    # words. Keyed on the marks each generator emits, not on its prose, so
+    # a reworded stub cannot slip through; the harness pins the generators
+    # against this pattern.
     _REFERENCE_LINE_RE = re.compile(
         r"^.*(?:"
         r"indexed in the SymbolGraph"  # both stubs carry this
+        r"|_\(attached file — contents below; no code symbols"  # unindexed
         r"|The code is internally available"  # _build_user_stub, para 1
         r"|If THIS message contains no question"  # _build_user_stub, para 3
         r").*$",
@@ -32592,25 +34541,12 @@ class CommandRouter:
         # --------------------------------------------------------------
         # Region: structural certainty — no prose means no question
         # --------------------------------------------------------------
-        # El código acota, el modelo propone dentro de límites. Whether
-        # a message is a REQUEST is a pragmatic judgement and belongs to
-        # the LLM. Whether it contains any natural language at all is a
-        # fact, already established deterministically by
-        # _extract_text_for_classification: when it returns the marker,
-        # every fenced block, every indented run and every synthetic
-        # reference line has been stripped and NOTHING remained. A
-        # message with no prose cannot ask a question — there is nothing
-        # to ask it with.
-        #
-        # Asking the LLM anyway does not merely waste a call; it
-        # produces a WRONG answer, because the model is not shown the
-        # paste. It is shown the marker, under a rule that says
-        # "is_code_only: true only if the message is a bare code paste"
-        # — and the marker is not a bare code paste, it is a marker.
-        # Measured live (17-jul 20:51): a pure paste with no
-        # accompanying text classified as code_only=False,
-        # has_request=True, intent=explain, and silent ingestion never
-        # fired for a message that was nothing but code.
+        # El código acota, el modelo propone dentro de límites. Whether a
+        # message is a request is the LLM's judgement; whether it contains
+        # any prose is a fact. When _extract_text_for_classification returns
+        # the marker, nothing but code remained, and a message with no
+        # prose asks nothing. Asking the LLM would also answer wrongly: it
+        # is shown the marker, not the paste.
         if cleaned == self.CODE_ONLY_MARKER:
             default["is_code_only"] = True
             default["has_request"] = False
@@ -36506,6 +38442,15 @@ class PatchApplier:
         return True
 
 
+# A fenced block whose opening line carries trailing spaces after the
+# language ("```python  "). OpenWebUI's editor ends every line of a paste
+# with two spaces (a markdown line break), the opening fence included, and
+# the code_block_pattern valve's default wants the newline right after the
+# language: such a paste was found to hold 0 blocks, then read whole as
+# code, and indexed 0 symbols. Same groups as the valve's pattern.
+_FENCE_TRAILING_WS_RE = re.compile(r"```(\w*)[ \t]+\r?\n(.*?)```", re.DOTALL)
+
+
 class CodeBlockManager:
     """
     Extract, classify, and manage code blocks throughout the conversation lifecycle.
@@ -36824,7 +38769,15 @@ class CodeBlockManager:
         # WARNING: dropping a block is unexpected behaviour, so it must leave a
         # trace even when it is protecting the process.
         _max_block = self._f.valves.max_extractable_block_chars
-        for match in self._f.code_pattern.finditer(content):
+        # The valve's pattern first; then fences it missed because their
+        # opening line ends in spaces (_FENCE_TRAILING_WS_RE), unless they
+        # fall inside a block already taken.
+        _fence_matches = list(self._f.code_pattern.finditer(content))
+        for _m in _FENCE_TRAILING_WS_RE.finditer(content):
+            if not any(_k.start() <= _m.start() < _k.end() for _k in _fence_matches):
+                _fence_matches.append(_m)
+        _fence_matches.sort(key=lambda _k: _k.start())
+        for match in _fence_matches:
             lang = match.group(1) or "text"
             code = match.group(2).strip()
 
@@ -37816,7 +39769,544 @@ class CodeBlockManager:
 # ==========================================================================
 # METACOGNITIVE REASONING
 # Structural evidence, named epistemic strategies, and hypothesis competition.
+#
+# The epistemology is hybrid and the rule is one line:
+#   Popper where the instrument is reliable, Lakatos where it is not.
+# EpistemicRegime names the two sides and decides between them;
+# MetacognitiveReasoningEngine rules under the first, ProtectiveBelt
+# under the second.
+#
+# What is never revised by evidence is EPISTEMIC_HARD_CORE, below. Each
+# rule names the audit that shows the instrument still deserves it.
 # ==========================================================================
+
+
+@dataclass(frozen=True)
+class HardCoreRule:
+    """
+    One rule of the hard core: what no evidence inside a turn may revise.
+
+    A hard core protected by convention is only as good as the convention,
+    and calling something core is the easiest way to stop anyone checking
+    it. So every rule names its audit: a check, run outside the turn
+    (epistemic_audit.py, before a release), that compares what the rule
+    lets the instrument decide with what the source says. A rule whose
+    audit starts failing is no longer core; it is a bug.
+
+    Attributes:
+        name: Stable identifier, also the audit check's name.
+        statement: The rule, as one sentence.
+        guarded_by: What the audit measures to keep the rule honest.
+    """
+
+    name: str
+    statement: str
+    guarded_by: str
+
+
+# Bumped whenever a rule is added, removed or reworded.
+EPISTEMIC_HARD_CORE_VERSION = 2
+
+EPISTEMIC_HARD_CORE: Tuple[HardCoreRule, ...] = (
+    HardCoreRule(
+        name="instrument_reads_the_code",
+        statement=(
+            "The index the plugin builds from a file says what the file "
+            "says: every class, method and function under its qualified "
+            "id, with its kind and its lines, and every direct call. Every "
+            "other rule rests on this one."
+        ),
+        guarded_by=(
+            "the plugin's own extraction and indexing of a file, with and "
+            "without a file path, against the file's syntax tree"
+        ),
+    ),
+    HardCoreRule(
+        name="index_over_model",
+        statement=(
+            "What the code index records outranks what any model says "
+            "about the code; a model's claim is evidence only once the "
+            "index or the source settles it."
+        ),
+        guarded_by=(
+            "relation claims sampled from the source, ruled on by the "
+            "engine: no verdict may contradict the source"
+        ),
+    ),
+    HardCoreRule(
+        name="abstention_is_not_confirmation",
+        statement=(
+            "A claim the instrument cannot decide is None, and None never "
+            "counts as True: naming a symbol that exists confirms nothing "
+            "said about it."
+        ),
+        guarded_by="behavioural claims about existing symbols must come back None",
+    ),
+    HardCoreRule(
+        name="popper_where_reliable",
+        statement=(
+            "Where the graph can be taken at its word (a direct edge, or no "
+            "edge, no path and no hand-over), it confirms or refutes, and a "
+            "refutation is final for the code it was checked against."
+        ),
+        guarded_by=(
+            "positive and negative call claims, including callers that "
+            "share a name with other methods: zero wrong verdicts"
+        ),
+    ),
+    HardCoreRule(
+        name="lakatos_where_not",
+        statement=(
+            "Where the graph cannot see the relation (indirect, or handed "
+            "over by reference), it may not refute; an auxiliary hypothesis "
+            "keeps the claim only if the fact it predicts is found."
+        ),
+        guarded_by=(
+            "functions handed to a dispatching call are confirmed by the "
+            "belt; a callee not handed over is not"
+        ),
+    ),
+    HardCoreRule(
+        name="refutation_relative_to_tested_code",
+        statement=(
+            "A refutation holds for the code it was tested against: it is "
+            "retired when that code changes and kept when other code does."
+        ),
+        guarded_by=(
+            "graveyard burials across body edits inside and outside what "
+            "they were tested against, with and without a file path"
+        ),
+    ),
+    HardCoreRule(
+        name="exploratory_questions_forge",
+        statement=(
+            "A question where something is wrong and no cause is proposed "
+            "is answered through competing hypotheses, not a single "
+            "asserted cause."
+        ),
+        guarded_by=(
+            "a planner output without hypothesize, for an exploratory "
+            "question under the auto profile, gets one inserted"
+        ),
+    ),
+)
+
+
+class EpistemicRegime(str, Enum):
+    """
+    Which philosophy of science rules on evidence that goes against a claim.
+
+    One question decides it: can the instrument be trusted at this point?
+
+    POPPERIAN_FALSIFICATION: the instrument is reliable here, so what it
+    reports stands. An edge the graph draws confirms; an edge missing from
+    a caller the graph sees whole refutes; one refuted critical claim,
+    checked with enough coverage, kills a hypothesis. Owner:
+    MetacognitiveReasoningEngine (_relation_in_graph, is_falsified).
+
+    LAKATOSIAN_PROTECTIVE_BELT: the instrument is not reliable here. Too
+    little of the hypothesis was checked, or the relation is of a kind the
+    graph does not draw. The evidence is not allowed to refute. It is
+    redirected to an auxiliary hypothesis, which must predict a new fact
+    and have it found; until then the claim is neither confirmed nor
+    refuted. Owner: ProtectiveBelt.
+    """
+
+    POPPERIAN_FALSIFICATION = "popperian_falsification"
+    LAKATOSIAN_PROTECTIVE_BELT = "lakatosian_protective_belt"
+
+    @classmethod
+    def for_edge_status(cls, status: str) -> "EpistemicRegime":
+        """
+        Regime for a call-graph reading.
+
+        Args:
+            status: What _relation_edge_status returned.
+
+        Returns:
+            Popperian for "direct" and "absent", where the graph can be
+            taken at its word; Lakatosian for "indirect" and "dynamic",
+            where the missing edge is one the graph would not have drawn.
+        """
+        if status in ("direct", "absent"):
+            return cls.POPPERIAN_FALSIFICATION
+        return cls.LAKATOSIAN_PROTECTIVE_BELT
+
+    @classmethod
+    def for_coverage(cls, coverage_is_sufficient: bool) -> "EpistemicRegime":
+        """
+        Regime for a refuted critical claim.
+
+        Args:
+            coverage_is_sufficient: Whether enough of the hypothesis was
+                checked for a refutation to be trusted.
+
+        Returns:
+            Popperian when it was (the refutation kills), Lakatosian when
+            it was not (the refutation is held as a penalty).
+        """
+        if coverage_is_sufficient:
+            return cls.POPPERIAN_FALSIFICATION
+        return cls.LAKATOSIAN_PROTECTIVE_BELT
+
+
+class AuxiliaryStanding(str, Enum):
+    """
+    Where an auxiliary hypothesis stands once its prediction was looked for.
+
+    PROGRESSIVE: the predicted fact was found. AD_HOC: it was looked for
+    and not found, so the adjustment only explains the anomaly away.
+    UNTESTED: the prediction is stated but could not be checked; that is a
+    pending test, not a patch, and it must not be counted as either.
+    """
+
+    PROGRESSIVE = "progressive"
+    AD_HOC = "ad_hoc"
+    UNTESTED = "untested"
+
+
+@dataclass
+class AuxiliaryHypothesis:
+    """
+    One adjustment of the protective belt, with the prediction that tests it.
+
+    In a research programme (Lakatos) a claim the evidence goes against may
+    be kept by changing an auxiliary assumption instead of the claim: "the
+    graph shows no call edge" is answered with "the callee is handed over
+    by reference, and the graph draws no edge for that". Such a change is
+    legitimate only when it predicts something new that is then observed.
+    One that predicts nothing checkable, or whose prediction fails, only
+    explains the anomaly away: it is ad hoc.
+
+    Attributes:
+        name: Which adjustment this is (the ProtectiveBelt method that
+            proposes it, without the "propose_" prefix).
+        rescues: The claim the adjustment keeps alive.
+        assumption: The auxiliary assumption being introduced.
+        prediction: What must be observed if the assumption is true.
+        corroborated: True when the prediction was observed, False when it
+            was looked for and not found, None when it could not be tested.
+        evidence: The observation that corroborated it, when there is one.
+    """
+
+    name: str
+    rescues: str
+    assumption: str
+    prediction: str
+    corroborated: Optional[bool] = None
+    evidence: str = ""
+
+    @property
+    def standing(self) -> AuxiliaryStanding:
+        """Progressive, ad hoc or untested, from the outcome of the test."""
+        if self.corroborated is True:
+            return AuxiliaryStanding.PROGRESSIVE
+        if self.corroborated is False:
+            return AuxiliaryStanding.AD_HOC
+        return AuxiliaryStanding.UNTESTED
+
+    @property
+    def is_progressive(self) -> bool:
+        """True when the adjustment earned its keep: its prediction held."""
+        return self.standing is AuxiliaryStanding.PROGRESSIVE
+
+
+class ProtectiveBelt:
+    """
+    The auxiliary hypotheses allowed to absorb an anomaly, each with its test.
+
+    The belt is where a refutation is redirected before it reaches a claim:
+    the instrument was blind there, the edge is not of the kind the graph
+    draws. Left unchecked, that is how any claim survives any evidence. So
+    every adjustment offered here is an AuxiliaryHypothesis that states the
+    new fact it predicts and looks for it in the code. A caller keeps the
+    claim only when the adjustment is progressive.
+
+    It rules only under EpistemicRegime.LAKATOSIAN_PROTECTIVE_BELT, that
+    is, where the instrument cannot be taken at its word. Where it can,
+    the evidence stands and nothing here is consulted.
+
+    Deterministic and free of model calls, like the engine it sits beside:
+    the prediction is read from source, never asked of the model.
+    """
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        self._f = filter_ref
+
+    def absorb_missing_call_edge(
+        self,
+        caller_qid: str,
+        callee: str,
+        project_id: str,
+        dispatches: Optional[Set[str]] = None,
+    ) -> List[AuxiliaryHypothesis]:
+        """
+        Offer the auxiliary hypotheses that can answer a missing call edge.
+
+        They are tried in order and the first progressive one ends the
+        search: an adjustment that fails is replaced by the next, which is
+        how a belt is meant to be revised. The hand-over by reference goes
+        first and only when the caller dispatches functions at all; the
+        indirect path follows.
+
+        Args:
+            caller_qid: Qualified id of the caller.
+            callee: Name of the callee.
+            project_id: Current project identifier.
+            dispatches: The dispatching calls the caller makes, when known.
+
+        Returns:
+            Every hypothesis tried, in order. The caller keeps the claim
+            only if one of them is progressive.
+        """
+        # ── Step 1: try the adjustments in order ──
+        tried: List[AuxiliaryHypothesis] = []
+        proposals = []
+        if dispatches:
+            proposals.append(self.propose_by_reference_dispatch)
+        proposals.append(self.propose_indirect_call_path)
+        for propose in proposals:
+            aux = propose(caller_qid, callee, project_id)
+            tried.append(aux)
+            self._f._log_debug(
+                f"🛡️ [BELT] {aux.name}: '{aux.assumption}' is "
+                f"{aux.standing.value.upper()}"
+                + (f" — {aux.evidence}" if aux.evidence else "")
+            )
+            if aux.is_progressive:
+                break
+        return tried
+
+    @staticmethod
+    def _name_of(node: ast.AST) -> str:
+        """Bare name an expression refers to, or "" when it is not a name."""
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return getattr(node, "id", "")
+
+    def propose_by_reference_dispatch(
+        self, caller_qid: str, callee: str, project_id: str
+    ) -> AuxiliaryHypothesis:
+        """
+        Test "the caller hands the callee over by reference".
+
+        This is the adjustment that answers a missing call edge. It
+        predicts that the caller's body passes the callee, by name, as an
+        argument to a call that dispatches a function
+        (_DYNAMIC_DISPATCH_CALLS: submit, to_thread, partial…). The body is
+        parsed and looked through for exactly that.
+
+        Args:
+            caller_qid: Qualified id of the caller.
+            callee: Name of the callee; only its bare tail is compared.
+            project_id: Current project identifier.
+
+        Returns:
+            The hypothesis with its outcome. `corroborated` is None when the
+            body is unavailable or does not parse, so an unreadable body is
+            never taken for a failed prediction.
+        """
+        # ── Step 1: state the adjustment and what it predicts ──
+        callee_bare = callee.split(".")[-1]
+        aux = AuxiliaryHypothesis(
+            name="by_reference_dispatch",
+            rescues=f"{caller_qid} calls {callee_bare}",
+            assumption=(
+                f"{caller_qid} hands {callee_bare} over by reference, which "
+                f"draws no call edge"
+            ),
+            prediction=(
+                f"the body of {caller_qid} passes {callee_bare} as an "
+                f"argument to a dispatching call"
+            ),
+        )
+        # ── Step 2: read the caller's body ──
+        # No body, or one that does not parse: untested, not failed.
+        tree = self._body_tree(caller_qid, project_id)
+        if tree is None:
+            return aux
+        target = self._one_symbol_named(callee, project_id)
+        # ── Step 3: look for the predicted fact ──
+        aux.corroborated = False
+        named_uncertainly = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if self._name_of(node.func) not in _DYNAMIC_DISPATCH_CALLS:
+                continue
+            for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                if self._name_of(arg) != callee_bare:
+                    continue
+                if target and self._names_symbol(arg, tree, target, project_id):
+                    aux.corroborated = True
+                    aux.evidence = " ".join(ast.unparse(node).split())[:140]
+                    return aux
+                named_uncertainly = True
+        # The name is passed, but it cannot be tied to this callee.
+        if named_uncertainly:
+            aux.corroborated = None
+        return aux
+
+    def propose_indirect_call_path(
+        self, caller_qid: str, callee: str, project_id: str
+    ) -> AuxiliaryHypothesis:
+        """
+        Test "the caller reaches the callee through other calls".
+
+        It predicts a chain of at most _RELATION_MAX_HOPS calls from the
+        caller to the callee in which every call can be tied to one symbol
+        (_names_symbol), read from the body that makes it. Call edges only
+        suggest where to look: their destinations are bare names, and a
+        chain accepted on names alone ran `extract_code_blocks → process`
+        into ActiveCodeUpdater.process, where the body calls a local
+        function of that name. A chain that exists only on names leaves
+        the hypothesis untested, never corroborated.
+
+        Args:
+            caller_qid: Qualified id of the caller.
+            callee: Name of the callee, qualified or bare.
+            project_id: Current project identifier.
+
+        Returns:
+            The hypothesis with its outcome; the evidence is the chain.
+        """
+        # ── Step 1: state the adjustment and what it predicts ──
+        idx = self._f._symbol_index
+        callee_bare = callee.split(".")[-1]
+        aux = AuxiliaryHypothesis(
+            name="indirect_call_path",
+            rescues=f"{caller_qid} calls {callee_bare}",
+            assumption=f"{caller_qid} reaches {callee_bare} through other calls",
+            prediction=(
+                f"a chain of at most {_RELATION_MAX_HOPS} calls leads from "
+                f"{caller_qid} to {callee_bare}, each one tied to a single "
+                f"symbol by the body that makes it"
+            ),
+        )
+        try:
+            # ── Step 2: the callee must be one known symbol ──
+            target = self._one_symbol_named(callee, project_id)
+            if not target:
+                return aux
+            # ── Step 3: walk the call edges, reading each body on the way ──
+            # A node is "certain" when every call on the way to it was tied
+            # to its symbol by the body that makes the call.
+            parent: Dict[str, Optional[str]] = {caller_qid: None}
+            certain: Dict[str, bool] = {caller_qid: True}
+            frontier = [caller_qid]
+            named_uncertainly = False
+            for _hop in range(_RELATION_MAX_HOPS):
+                nxt: List[str] = []
+                for src in frontier:
+                    tree = self._body_tree(src, project_id) if certain[src] else None
+                    for edge in idx.get_edges_out(src, project_id):
+                        if getattr(edge, "type", "") != "calls":
+                            continue
+                        tail = str(getattr(edge, "dst", "")).split(".")[-1]
+                        resolved = idx.get_qualified_names_for(tail, project_id)
+                        if len(resolved) > _RELATION_FANOUT_CAP:
+                            continue
+                        for qid in resolved:
+                            tied = (
+                                tree is not None
+                                and len(resolved) == 1
+                                and self._calls_symbol(tree, qid, project_id)
+                            )
+                            if qid == target:
+                                if tied:
+                                    chain = [target, src]
+                                    while parent[chain[-1]] is not None:
+                                        chain.append(parent[chain[-1]])
+                                    aux.corroborated = True
+                                    aux.evidence = " → ".join(reversed(chain))
+                                    return aux
+                                named_uncertainly = True
+                                continue
+                            if qid not in parent and len(parent) < _RELATION_NODE_CAP:
+                                parent[qid] = src
+                                certain[qid] = tied
+                                nxt.append(qid)
+                frontier = nxt
+                if not frontier:
+                    break
+            # ── Step 4: no certain chain; say whether one could exist ──
+            aux.corroborated = None if named_uncertainly else False
+        except Exception:
+            # An index that cannot be walked leaves the prediction untested.
+            aux.corroborated = None
+        return aux
+
+    # ── Reading a body: what the predictions are checked against ──
+
+    def _body_tree(self, qid: str, project_id: str) -> Optional[ast.AST]:
+        """Parsed body of a symbol from its first live block, or None."""
+        try:
+            state = self._f._conversation_state_manager.get(project_id)
+            for bh in self._f._symbol_index.find_blocks(qid, project_id):
+                blk = state.active_blocks.get(bh)
+                if blk and not blk.obsolete:
+                    body = CodeBlockManager.extract_symbol_body(blk, qid)
+                    return ast.parse(textwrap.dedent(body)) if body else None
+        except Exception:
+            return None
+        return None
+
+    def _one_symbol_named(self, name: str, project_id: str) -> str:
+        """
+        The single indexed symbol a name stands for, or "".
+
+        Empty when the name is unknown or when several symbols carry its
+        bare tail: nothing read from a body can then say which is meant.
+        """
+        idx = self._f._symbol_index
+        bare = name.split(".")[-1]
+        if bare not in (idx.get_all_names(project_id) or set()):
+            return ""
+        namesakes = idx.get_qualified_names_for(bare, project_id)
+        return next(iter(namesakes)) if len(namesakes) == 1 else ""
+
+    def _names_symbol(
+        self, node: ast.AST, tree: ast.AST, target: str, project_id: str
+    ) -> bool:
+        """
+        Whether an expression in a body can be tied to the symbol `target`.
+
+        `target` is already the only indexed symbol of its name. An
+        attribute access with that name (`self.x`, `obj.x`) is tied to it.
+        A bare name is tied to it only when the target is a module-level
+        function and the body does not bind the name itself: a method is
+        never reached by a bare name, and a local def or variable of the
+        same name is a different thing.
+        """
+        bare = target.split(".")[-1]
+        if isinstance(node, ast.Attribute):
+            return node.attr == bare
+        if not isinstance(node, ast.Name) or node.id != bare:
+            return False
+        if self._f._symbol_index.get_parent_symbol(target, project_id):
+            return False
+        root = tree.body[0] if getattr(tree, "body", None) else tree
+        for sub in ast.walk(tree):
+            if sub is root:
+                continue
+            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if sub.name == bare:
+                    return False
+            elif isinstance(sub, ast.arg) and sub.arg == bare:
+                return False
+            elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                if sub.id == bare:
+                    return False
+        return True
+
+    def _calls_symbol(self, tree: ast.AST, target: str, project_id: str) -> bool:
+        """Whether a body contains a call that can be tied to `target`."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and self._names_symbol(
+                node.func, tree, target, project_id
+            ):
+                return True
+        return False
 
 
 class MetacognitiveReasoningEngine:
@@ -37849,6 +40339,50 @@ class MetacognitiveReasoningEngine:
     The LLM never evaluates itself. The SymbolGraph is the ground truth
     mirror. All metacognitive signals are derived from deterministic
     structural data — never from LLM introspection.
+
+    The epistemology is hybrid: Popper where the instrument is reliable,
+    Lakatos where it is not (EpistemicRegime). This engine is the Popperian
+    side. A verdict from _claim_verdict stands, and is_falsified kills a
+    hypothesis on one refuted critical claim, because both rule only where
+    the graph can be taken at its word. Where it cannot, they abstain and
+    the evidence goes to ProtectiveBelt, the Lakatosian side.
+
+    Structure of the system, in the terms of a research programme:
+
+    Core — what is not given up to save a hypothesis. Structural facts
+    measured from the SymbolIndex outrank what the model says about the
+    code, and a verdict is tri-state: None (abstain) never confirms. The
+    AgenticEvidenceLedger records the claims; _claim_verdict and
+    _relation_in_graph own the verdicts. When the index itself is wrong the
+    instrument is repaired rather than the hypothesis excused:
+    Filter._audit_index_versions reports a class indexed in several
+    versions.
+
+    Protective belt — what absorbs an anomaly before it reaches the core.
+    The coverage guard in is_falsified turns a hard kill into a penalty when
+    too little of a hypothesis was checked; a relation the graph merely does
+    not draw (reached indirectly, or handed over by reference) abstains
+    through _relation_edge_status instead of refuting; the harness-suspect
+    pool behind agentic_retry_router reads a refuted claim on a suspect qid
+    as evidence about the experiment; EpistemicStrategies.peer_review_hypothesis
+    argues against a hypothesis and delimit_scope states what it does not
+    cover. Where an adjustment can be tested it is: ProtectiveBelt offers
+    each one as an AuxiliaryHypothesis carrying the new fact it predicts,
+    progressive when that fact is found in the code and ad hoc otherwise.
+
+    Positive heuristic — what to investigate next. HypothesisForge walks
+    _INVESTIGATION_LADDER (symbols, callers, callees, writers, contracts),
+    ordered by the cost of being wrong, through _select_investigation;
+    EpistemicStrategies.design_critical_experiment and
+    find_experimentum_crucis pick the observation that can decide.
+
+    Negative heuristic — what not to repeat. _select_investigation skips the
+    rungs already walked, so cycle N never re-treads cycle N-1's ground, and
+    HypothesisForge._get_adaptive_strategy turns the history of past
+    competitions into constraints for the next one.
+
+    This describes the shape of the system. It does not make the index or
+    any guard exempt from correction.
     """
 
     # Relation regexes used by gather_evidence, which runs on the forge's
@@ -37861,16 +40395,16 @@ class MetacognitiveReasoningEngine:
     # positive form matches 'X calls Y'; the negated form matches
     # 'X never calls Y' (English and Spanish), whose refutation is the
     # edge EXISTING.
-    _CALL_RELATION_RE = re.compile(
-        r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|reads?|writes?|depends on)"
-        r"\s+`?(\w+)`?",
-        re.IGNORECASE,
-    )
-    _NEG_RELATION_RE = re.compile(
-        r"`?(\w+)`?\s+(?:does\s+not|doesn'?t|never|no\s+longer|"
-        r"cannot|can'?t|no|nunca)\s+"
-        r"(?:calls?|invokes?|uses?|reads?|writes?|depends\s+on|"
-        r"llama\s+a|invoca\s+a|usa)\s+`?(\w+)`?",
+    _CALL_RELATION_RE = _RELATION_CALL_RE
+    _NEG_RELATION_RE = _RELATION_NEG_RE
+    # A claim whose whole content is that a named symbol exists. It is the
+    # only shape the symbol index can confirm on its own; any other claim
+    # that merely names a symbol asserts something the index cannot see.
+    _EXISTENCE_CLAIM_RE = re.compile(
+        r"^(?:the\s+)?(?:(?:class|function|method|symbol|helper)\s+)?"
+        r"`?([A-Za-z_][\w.]*)`?\s+"
+        r"(?:exists?|existe|is\s+(?:defined|declared|present|implemented)"
+        r"(?:\s+in\s+[\w./`]+)?)\s*[.!]?$",
         re.IGNORECASE,
     )
 
@@ -37893,24 +40427,12 @@ class MetacognitiveReasoningEngine:
         mark_stale_for_symbol intentionally omitted — path staleness is
         managed by the main activation pipeline, not by evidence gathering.
         """
-        _EMPTY = StaticEvidence(
-            symbols_found={},
-            call_relations_valid={},
-            recent_changes=[],
-            entry_points_mentioned=[],
-            objective_score=0.5,
-        )
-
+        # ── Step 1: index and conversation state ──
+        # The state is absent on the first turn of a project. Symbols and
+        # call relations come from the SymbolIndex alone, so only the
+        # recent-changes step below depends on it.
         all_names = self._f._symbol_index.get_all_names(project_id)
         state = self._f._conversation_state_manager.get(project_id)
-
-        # Guard: state may be None on first turn or fresh project
-        if state is None:
-            self._f._log_debug(
-                "gather_evidence: state is None for project_id="
-                f"'{project_id}' — returning empty evidence"
-            )
-            return _EMPTY
 
         words = set(re.findall(r"\b\w+\b", hypothesis))
         mentioned = all_names.intersection(words)
@@ -37935,29 +40457,41 @@ class MetacognitiveReasoningEngine:
         # EC-4's corroboration count like any other verified check.
         call_relations_valid = {}
         _masked = hypothesis
+        # Keys stay bare, as every consumer reads them; the ruling uses the
+        # caller as the hypothesis wrote it (_relation_caller).
         for _m in self._NEG_RELATION_RE.finditer(hypothesis):
             _ncaller, _ncallee = _m.group(1), _m.group(2)
-            _present = self._relation_in_graph(_ncaller, _ncallee, project_id)
+            _present = self._relation_in_graph(
+                self._relation_caller(_m.group(0), _ncaller, project_id),
+                _ncallee,
+                project_id,
+            )
             _masked = _masked.replace(_m.group(0), " ")
             if _present is None:
                 continue
             call_relations_valid[f"{_ncaller}_not_calls_{_ncallee}"] = not _present
-        call_patterns = self._CALL_RELATION_RE.findall(_masked)
-        for caller, callee in call_patterns:
-            verified = self._relation_in_graph(caller, callee, project_id)
+        for _m in self._CALL_RELATION_RE.finditer(_masked):
+            caller, callee = _m.group(1), _m.group(2)
+            verified = self._relation_in_graph(
+                self._relation_caller(_m.group(0), caller, project_id),
+                callee,
+                project_id,
+            )
             if verified is None:
                 continue
             call_relations_valid[f"{caller}_calls_{callee}"] = verified
 
+        # ── Step 2: recent changes (needs the conversation state) ──
         now = time.time()
         recent_window = 3600
         recent_changes = []
-        for name in mentioned:
-            for bh in self._f._symbol_index.find_blocks(name, project_id):
-                block = state.active_blocks.get(bh)
-                if block is not None and (now - block.timestamp) < recent_window:
-                    recent_changes.append(name)
-                    break
+        if state is not None:
+            for name in mentioned:
+                for bh in self._f._symbol_index.find_blocks(name, project_id):
+                    block = state.active_blocks.get(bh)
+                    if block is not None and (now - block.timestamp) < recent_window:
+                        recent_changes.append(name)
+                        break
 
         all_views = self._f._path_index.get_all(project_id)
         entry_points_mentioned = [
@@ -37967,14 +40501,18 @@ class MetacognitiveReasoningEngine:
         # Side-effect free: read path memberships without marking stale.
         # mark_stale_for_symbol is intentionally omitted — gather_evidence
         # is called N×M times per competition and must not degrade PathIndex.
-        verifiable = len(symbols_found) + len(call_relations_valid)
+        # ── Step 3: objective score from the checks that can fail ──
+        # symbols_found holds only names drawn from the index, so every
+        # entry is True by construction and cannot count as a verified
+        # assertion. Folding them in pulled the score towards 1.0 whatever
+        # the call relations said; only relations can be refuted here.
+        verifiable = len(call_relations_valid)
         if verifiable == 0:
             objective_score = 0.5
         else:
-            verified_true = sum(1 for v in symbols_found.values() if v) + sum(
-                1 for v in call_relations_valid.values() if v
+            objective_score = (
+                sum(1 for v in call_relations_valid.values() if v) / verifiable
             )
-            objective_score = verified_true / verifiable
 
         return StaticEvidence(
             symbols_found=symbols_found,
@@ -38067,6 +40605,222 @@ class MetacognitiveReasoningEngine:
         except Exception:
             return False
 
+    def settle_named_relation(self, question: str, project_id: str) -> str:
+        """
+        What the index says about the call relation a question names.
+
+        A question such as "does A run B?" names its own claim. That claim
+        is settled here from the index and the source, before any step
+        writes about it, under the regime the instrument allows: a direct
+        edge, or no edge, no path and no hand-over, is read as it stands
+        (Popper); a relation the graph cannot draw goes to ProtectiveBelt,
+        whose answer counts only when the fact it predicts is found
+        (Lakatos). Observed live: every piece of a turn got this right —
+        the forge's winner and the belt both said A hands B to an executor
+        — and the final step still concluded "A does not run B", because
+        three workspace entries repeated an investigate step that had
+        listed the other calls and left that one out. A fact the index
+        holds should not have to win a vote against restatements.
+
+        Only a question that names exactly two indexed callables is
+        settled, first as caller and second as callee; anything else
+        returns "".
+
+        Args:
+            question: The user's question.
+            project_id: Current project identifier.
+
+        Returns:
+            One sentence stating what the index shows, or "".
+        """
+        # ── Step 1: the two symbols the question names ──
+        idx = self._f._symbol_index
+        named = _named_indexed_symbols(question, idx, project_id)
+        if len(named) != 2:
+            return ""
+        caller, callee = named
+        bare = callee.split(".")[-1]
+        # ── Step 2: read the graph under the regime it allows ──
+        status = _relation_edge_status(idx, caller, callee, project_id)
+        if status == "direct":
+            statement = f"{caller} calls {callee} directly: the index records the edge."
+        elif status == "absent":
+            statement = (
+                f"{caller} does not reach {callee}: there is no call edge, no "
+                f"chain of at most {_RELATION_MAX_HOPS} calls and no hand-over "
+                f"by reference in the index."
+            )
+        else:
+            # ── Step 3: the graph cannot draw it; the belt must find it ──
+            dispatches = {
+                str(getattr(e, "dst", "")).split(".")[-1]
+                for e in idx.get_edges_out(caller, project_id)
+                if getattr(e, "type", "") == "calls"
+                and str(getattr(e, "dst", "")).split(".")[-1] in _DYNAMIC_DISPATCH_CALLS
+            }
+            belt = getattr(self._f, "_protective_belt", None)
+            tried = (
+                belt.absorb_missing_call_edge(caller, callee, project_id, dispatches)
+                if belt is not None
+                else []
+            )
+            kept = next((a for a in tried if a.is_progressive), None)
+            if kept is not None and kept.name == "by_reference_dispatch":
+                statement = (
+                    f"{caller} does not call {callee} directly; it hands it "
+                    f"over by reference — `{kept.evidence}` — so {bare} runs "
+                    f"when that call executes it."
+                )
+            elif kept is not None:
+                statement = (
+                    f"{caller} reaches {callee} through other calls, not "
+                    f"directly: {kept.evidence}."
+                )
+            else:
+                statement = (
+                    f"The index cannot settle whether {caller} reaches "
+                    f"{callee} ({status}); only the bodies can."
+                )
+        self._f._log_debug(
+            f"🧭 Named relation: {caller} → {callee}: {status} — {statement[:160]}"
+        )
+        return statement
+
+    def list_named_relation(self, question: str, project_id: str) -> str:
+        """
+        The index's answer to "who calls X" or "what does X call", when it has one.
+
+        The call graph answers these questions in full, and a step asked to
+        answer them reads bodies to reconstruct what the index already
+        lists. Live, "¿y quién la llama?" spent two steps and 103 s doing
+        that. Answered here, from the index, when the answer is certain:
+
+        - the question asks for the callers or the callees of exactly one
+          indexed symbol (a follow-up's subject included, as the pipeline
+          question carries it);
+        - for callers, the symbol's bare name is its own: edges in are
+          keyed by bare name, so callers of a `get` would be callers of
+          every `get`, dict.get included.
+
+        Direct calls only, as the index records them; a function handed to
+        another by reference is not an edge, and the text says so.
+
+        Returns:
+            The listing as a step's output, or "".
+        """
+        # ── Step 1: a relation question about one symbol ──
+        text = question or ""
+        if _CALLERS_QUESTION_RE.search(text):
+            incoming = True
+        elif _CALLEES_QUESTION_RE.search(text):
+            incoming = False
+        else:
+            return ""
+        idx = self._f._symbol_index
+        named = _named_indexed_symbols(text, idx, project_id)
+        if len(named) != 1:
+            return ""
+        qid = named[0]
+        bare = qid.split(".")[-1]
+        # ── Step 2: the listing, where the index is exact ──
+        if incoming:
+            if (
+                len(idx.get_qualified_names_for(bare, project_id)) != 1
+                or bare in _COMMON_METHOD_NAMES
+            ):
+                return ""
+            callers = sorted(
+                {
+                    str(getattr(e, "src", ""))
+                    for e in idx.get_edges_in(bare, project_id)
+                    if getattr(e, "type", "calls") == "calls"
+                }
+                - {""}
+            )
+            head = f"Callers of {qid}, read from the code index"
+            items = callers
+        else:
+            known = idx.get_all_qualified_names(project_id) or set()
+            items = []
+            for e in idx.get_edges_out(qid, project_id):
+                if getattr(e, "type", "calls") != "calls":
+                    continue
+                dst = str(getattr(e, "dst", ""))
+                resolved = (
+                    {dst}
+                    if dst in known
+                    else idx.get_qualified_names_for(dst.split(".")[-1], project_id)
+                    & known
+                )
+                if len(resolved) == 1:
+                    items.append(next(iter(resolved)))
+                elif resolved:
+                    items.append(f"{dst} (one of {len(resolved)} indexed namesakes)")
+            items = sorted(set(items))
+            head = f"Calls made by {qid} to indexed code, read from the code index"
+        if not items:
+            statement = f"{head}: none."
+        else:
+            by_class: Dict[str, List[str]] = {}
+            for item in items:
+                name = item.split(" ")[0]
+                if " " in item:
+                    owner = "(name shared by several classes)"
+                else:
+                    owner = name.split(".")[0] if "." in name else "(module level)"
+                by_class.setdefault(owner, []).append(item)
+            lines = [f"{head} ({len(items)}):"]
+            for owner in sorted(by_class):
+                members = by_class[owner]
+                shown = ", ".join(f"`{m}`" for m in members[:_RELATION_LIST_PER_CLASS])
+                more = len(members) - _RELATION_LIST_PER_CLASS
+                lines.append(
+                    f"- {owner}: {shown}" + (f" and {more} more" if more > 0 else "")
+                )
+            statement = "\n".join(lines)
+        statement += (
+            "\nDirect calls only. A function handed over by reference "
+            "(executor.submit(f), callbacks) is not an edge and is not listed."
+        )
+        self._f._log_debug(
+            f"🧭 Index answer: {'callers' if incoming else 'callees'} of {qid} "
+            f"— {len(items)} listed, no step needed to find them"
+        )
+        return statement
+
+    def _relation_caller(self, written: str, bare: str, project_id: str) -> str:
+        """
+        The caller of a relation as the claim wrote it, when that is precise.
+
+        The relation patterns capture bare names, and a bare caller stands
+        for every method of that name: 'ActivationEngine.__init__ never
+        calls init_cache' was ruled on with every __init__ in the project,
+        one of which does call it, and was refuted. When the text names the
+        caller as Class.method and the index holds that qualified id, it is
+        returned instead, so only that method's edges are read.
+
+        Args:
+            written: The text the relation pattern matched.
+            bare: The bare caller the pattern captured.
+            project_id: Current project identifier.
+
+        Returns:
+            The qualified id when the text and the index agree on one,
+            otherwise `bare`.
+        """
+        _lead = re.match(r"`?((?:\w+\.)*\w+)", written)
+        if not _lead or "." not in _lead.group(1):
+            return bare
+        _parts = _lead.group(1).split(".")
+        if _parts[-1] != bare:
+            return bare
+        _qid = ".".join(_parts[-2:])
+        try:
+            _known = self._f._symbol_index.get_all_qualified_names(project_id) or set()
+        except Exception:
+            return bare
+        return _qid if _qid in _known else bare
+
     def _relation_in_graph(
         self,
         caller: str,
@@ -38079,7 +40833,11 @@ class MetacognitiveReasoningEngine:
         Returns None when either endpoint is not a known symbol (a local
         variable, a stdlib name, an invented identifier the qid path
         already covers): an unresolvable relation must ABSTAIN, not guess.
-        Otherwise True/False against the live edge graph.
+        It also abstains when no direct edge exists but the caller reaches
+        the callee through other calls or hands functions over by
+        reference: the graph draws direct calls only, so it cannot refute
+        a relation it may simply not see. Otherwise True/False against the
+        live edge graph.
 
         The caller's bare name is resolved to every qualified id that
         carries it before edges are read: the relation regex captures bare
@@ -38096,18 +40854,26 @@ class MetacognitiveReasoningEngine:
         """
         idx = self._f._symbol_index
         all_names = idx.get_all_names(project_id)
-        if caller not in all_names or callee not in all_names:
+        known_caller = caller in all_names or (
+            "." in caller and caller in (idx.get_all_qualified_names(project_id) or ())
+        )
+        if not known_caller or callee not in all_names:
             return None
-        callee_bare = callee.split(".")[-1]
-        for cq in idx.get_qualified_names_for(caller, project_id):
-            for e in idx.get_edges_out(cq, project_id):
-                if e.dst.split(".")[-1] == callee_bare and e.type in (
-                    "calls",
-                    "reads",
-                    "writes",
-                ):
-                    return True
-        return False
+        status = _relation_edge_status(idx, caller, callee, project_id)
+        # The graph refutes only where it can be trusted. An edge that is
+        # merely not drawn (indirect, or handed over by reference) belongs
+        # to the protective belt, and this method abstains on it rather
+        # than consult the belt. On purpose: here a by-reference hand-over
+        # read as "A calls B" would also refute "A never calls B", which is
+        # a claim about direct calls and may well be true. The static
+        # verifier and settle_named_relation consult the belt, where the
+        # detail can say "handed over, not called".
+        if (
+            EpistemicRegime.for_edge_status(status)
+            is EpistemicRegime.LAKATOSIAN_PROTECTIVE_BELT
+        ):
+            return None
+        return status == "direct"
 
     def _claim_verdict(
         self,
@@ -38139,7 +40905,16 @@ class MetacognitiveReasoningEngine:
         that fails decides False immediately; confirmations only win when
         nothing refuted):
 
-        1. Relations, parsed with the same _CALL_RELATION_RE that
+        1. Negated relations first ('A does not call B', 'A never calls
+           B'), with _NEG_RELATION_RE: a present edge refutes, an absent
+           one confirms, and an edge the graph cannot rule on (indirect, or
+           handed over by reference) abstains. Their spans are then masked,
+           as gather_evidence masks them, because the positive pattern
+           read the negation word as the caller ('not calls B') and the
+           claim fell through as undecidable. A negative claim is the most
+           plainly falsifiable form a claim can take, and the forge's
+           prompt invites it.
+           Relations, parsed with the same _CALL_RELATION_RE that
            gather_evidence uses to WRITE the keys: the evidence dict is
            consulted first (relations the hypothesis itself asserted),
            then — because design claims outrun their hypothesis — the
@@ -38149,6 +40924,10 @@ class MetacognitiveReasoningEngine:
         2. Symbols, matched on word boundaries against
            evidence.symbols_found, longest first, so a claim naming
            `build_block_a` cannot be answered by an unrelated `block`.
+           A missing symbol refutes. A present one confirms only a claim
+           that says nothing beyond its existence: naming a real symbol
+           while asserting what it does is abstention, because the index
+           holds names, not behaviour.
 
         The why string names the deciding fact so is_falsified can
         surface it verbatim in the falsification reason.
@@ -38159,15 +40938,41 @@ class MetacognitiveReasoningEngine:
         # edge graph; refutation short-circuits, confirmations accumulate ──
         _relations = {k.lower(): v for k, v in evidence.call_relations_valid.items()}
         _confirmed_why = ""
-        for caller, callee in self._CALL_RELATION_RE.findall(claim):
-            key = f"{caller}_calls_{callee}".lower()
-            verdict: Optional[bool] = None
+        _masked = claim
+        for _m in self._NEG_RELATION_RE.finditer(claim):
+            _ncaller, _ncallee = _m.group(1), _m.group(2)
+            _masked = _masked.replace(_m.group(0), " ")
+            key = f"{_ncaller}_not_calls_{_ncallee}".lower()
+            _qcaller = self._relation_caller(_m.group(0), _ncaller, project_id)
+            verdict = None
             source = ""
-            if key in _relations:
+            if key in _relations and _qcaller == _ncaller:
                 verdict = _relations[key]
                 source = "evidence"
             elif project_id:
-                verdict = self._relation_in_graph(caller, callee, project_id)
+                _present = self._relation_in_graph(_qcaller, _ncallee, project_id)
+                verdict = None if _present is None else not _present
+                source = "SymbolGraph"
+            if verdict is False:
+                return False, (
+                    f"{_ncaller} does call {_ncallee}: the edge is in {source}"
+                )
+            if verdict is True:
+                _confirmed_why = (
+                    f"no {_ncaller} → {_ncallee} edge, direct or reachable, "
+                    f"in {source}"
+                )
+        for _m in self._CALL_RELATION_RE.finditer(_masked):
+            caller, callee = _m.group(1), _m.group(2)
+            key = f"{caller}_calls_{callee}".lower()
+            _qcaller = self._relation_caller(_m.group(0), caller, project_id)
+            verdict: Optional[bool] = None
+            source = ""
+            if key in _relations and _qcaller == caller:
+                verdict = _relations[key]
+                source = "evidence"
+            elif project_id:
+                verdict = self._relation_in_graph(_qcaller, callee, project_id)
                 source = "SymbolGraph"
             if verdict is False:
                 return False, f"relation '{key}' does not exist in {source}"
@@ -38176,15 +40981,50 @@ class MetacognitiveReasoningEngine:
 
         # ── Step 2: symbols — the key is the short side; require a whole
         # word so substrings of longer identifiers cannot answer ──
+        _named: List[str] = []
         for symbol in sorted(evidence.symbols_found, key=len, reverse=True):
             if re.search(rf"\b{re.escape(symbol.lower())}\b", claim_lower):
                 if not evidence.symbols_found[symbol]:
                     return False, f"symbol '{symbol}' not found in SymbolGraph"
-                if not _confirmed_why:
-                    _confirmed_why = f"symbol '{symbol}' found in SymbolGraph"
+                _named.append(symbol)
 
         if _confirmed_why:
             return True, _confirmed_why
+
+        # ── Step 3: existence-only claims ──
+        # A symbol that exists says nothing about what a claim asserts of
+        # it, so naming one is not confirmation: 'parse returns a list'
+        # would otherwise be settled by the mere presence of `parse`, and
+        # the contract check and the evidence judge would never see it.
+        # Only a claim that says nothing beyond existence is confirmed here.
+        _existence = self._EXISTENCE_CLAIM_RE.match(claim.strip())
+        if _existence:
+            # A qualified name is confirmed only as written: the bare tail
+            # existing somewhere confirmed 'ActivationEngine._claim_verdict
+            # exists' through MetacognitiveReasoningEngine._claim_verdict.
+            # A qualifier the index cannot place (a module, a paste's
+            # synthetic prefix) abstains.
+            _written = _existence.group(1)
+            _tail = _written.split(".")[-1]
+            if "." in _written:
+                _qid = ".".join(_written.split(".")[-2:])
+                try:
+                    _known = (
+                        self._f._symbol_index.get_all_qualified_names(project_id)
+                        if project_id
+                        else set()
+                    ) or set()
+                except Exception:
+                    _known = set()
+                if _qid in _known:
+                    return True, f"symbol '{_qid}' found in SymbolGraph"
+            elif evidence.symbols_found.get(_tail):
+                return True, f"symbol '{_tail}' found in SymbolGraph"
+        if _named:
+            return (
+                None,
+                f"names {', '.join(_named[:3])} but asserts nothing the graph decides",
+            )
         return None, "no checkable content"
 
     def _claim_verified(
@@ -38211,6 +41051,11 @@ class MetacognitiveReasoningEngine:
     ) -> Tuple[bool, Optional[str]]:
         """
         Popperian asymmetric falsification with coverage guard.
+
+        The guard is the switch between the two regimes. With enough of the
+        hypothesis checked the refutation is trusted and kills
+        (EpistemicRegime.POPPERIAN_FALSIFICATION); with too little it is
+        held as a penalty (EpistemicRegime.LAKATOSIAN_PROTECTIVE_BELT).
 
         Verdicts come from _claim_verdict — the single owner of claim
         matching. The previous implementation kept its own duplicated
@@ -38240,6 +41085,12 @@ class MetacognitiveReasoningEngine:
             Symmetric ratio > 0.5 → falsified.
 
         Returns (falsified, reason_string).
+
+        Every refuted critical claim is logged with a [COVERAGE-GUARD] line,
+        whether it ends in a hard kill or is downgraded to a penalty, with
+        the coverage and the minimum it was held against. Only the
+        downgrades used to be visible, so there was no way to see which
+        kills went through at what coverage, or how often the guard decides.
         """
         _coverage_guard_active = (
             self._f.valves.enable_coverage_guard_for_falsification
@@ -38268,6 +41119,17 @@ class MetacognitiveReasoningEngine:
             if verdict is not False:
                 continue
             reason = f"Critical claim falsified: '{claim}' — {why}"
+            _min_cov = self._f.valves.min_coverage_for_falsification
+            _guard_on = self._f.valves.enable_coverage_guard_for_falsification
+            _regime = EpistemicRegime.for_coverage(not _coverage_guard_active)
+            self._f._log_debug(
+                "[COVERAGE-GUARD] "
+                + ("downgraded to a penalty" if _coverage_guard_active else "hard kill")
+                + f": coverage={coverage_score:.2f}, minimum={_min_cov:.2f}, "
+                + f"guard={'on' if _guard_on else 'off'}, "
+                + f"regime={_regime.value}; "
+                + f"claim '{claim[:120]}' — {why}"
+            )
             if _coverage_guard_active:
                 self._f._log_debug(
                     f"is_falsified: coverage guard active "
@@ -38316,15 +41178,34 @@ class MetacognitiveReasoningEngine:
         confirms), False (contradicts), None (not a contract claim,
         symbol not in the expanded bodies, or a body too truncated to
         parse — abstention never counts as confirmation).
+
+        A return claim is read only when it is exactly 'X returns T' with
+        T a concrete type name. The annotation is compared at its top
+        level, so `List[int]` is a list and does not confirm 'returns
+        int'; `Optional[int]` allows int but does not settle it; a
+        supertype (`Sequence`) or an overlapping numeric type abstains
+        rather than refutes. Homonyms across classes abstain unless they
+        agree, and a dotted name ('Class.method') selects one class.
         """
         # ── Step 1: classify the claim shape ──
         _mret = _CONTRACT_RETURN_RE.match(claim.strip())
         _masrt = None if _mret else _CONTRACT_ASSERT_RE.match(claim.strip())
         if not _mret and not _masrt:
             return None
-        # ── Step 2: locate the function in the expanded bodies ──
-        _fname = (_mret or _masrt).group(1)
-        _fn = None
+        if _mret:
+            # A word that is not a type name ('a', 'the', 'result', a
+            # literal such as True) is a description, not a contract.
+            _want = _mret.group(2)
+            if _want in ("True", "False") or not (
+                _want.lower() in _CONTRACT_CONCRETE_TYPES
+                or (_want[:1].isupper() and any(c.islower() for c in _want))
+            ):
+                return None
+        # ── Step 2: collect every function the name can mean ──
+        _owner, _, _fname = (_mret or _masrt).group(1).rpartition(".")
+        _owner = _owner.split(".")[-1]
+        _def_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+        _candidates: List[ast.AST] = []
         for _body in expanded_bodies:
             try:
                 _tree = ast.parse(textwrap.dedent(_body))
@@ -38333,47 +41214,59 @@ class MetacognitiveReasoningEngine:
                 # unparseable body abstains, never guesses.
                 continue
             for _node in ast.walk(_tree):
-                if (
-                    isinstance(
-                        _node,
-                        (ast.FunctionDef, ast.AsyncFunctionDef),
-                    )
-                    and _node.name == _fname
-                ):
-                    _fn = _node
-                    break
-            if _fn is not None:
-                break
-        if _fn is None:
+                if _owner:
+                    if isinstance(_node, ast.ClassDef) and _node.name == _owner:
+                        _candidates.extend(
+                            _m
+                            for _m in _node.body
+                            if isinstance(_m, _def_types) and _m.name == _fname
+                        )
+                elif isinstance(_node, _def_types) and _node.name == _fname:
+                    _candidates.append(_node)
+        if not _candidates:
             return None
-        # ── Step 3: verdict against the contract ──
-        if _mret:
-            _want = _mret.group(2)
-            _ann = _fn.returns
-            if _ann is None:
-                return None
-            _names = (
-                {n.id for n in ast.walk(_ann) if isinstance(n, ast.Name)}
-                | {n.attr for n in ast.walk(_ann) if isinstance(n, ast.Attribute)}
-                | {str(n.value) for n in ast.walk(_ann) if isinstance(n, ast.Constant)}
-            )
-            return _want in _names
-        # assert shape: the named identifiers of the predicate must
-        # appear in some assert of the function; asserts existing but
-        # none matching refutes; no asserts at all refutes too (the
-        # claim said the function asserts — it does not).
-        _pred_ids = set(re.findall(r"[A-Za-z_]\w*", _masrt.group(2)))
-        _pred_ids -= {"is", "not", "None", "and", "or", "that"}
-        _asserts = [n for n in ast.walk(_fn) if isinstance(n, ast.Assert)]
-        if not _asserts:
+
+        # ── Step 3: verdict against the contract, one per candidate ──
+        def _judge(_fn: ast.AST) -> Optional[bool]:
+            if _mret:
+                _ann = _fn.returns
+                if _ann is None:
+                    return None
+                _alts = _annotation_alternatives(_ann)
+                if _alts is None:
+                    return None
+                _w = _want.lower()
+                if _w in _alts:
+                    # The annotation allows it; only an annotation that
+                    # allows nothing else makes it the contract.
+                    return True if _alts == {_w} else None
+                if not (_alts | {_w}) <= _CONTRACT_CONCRETE_TYPES:
+                    # A supertype or protocol may still be satisfied.
+                    return None
+                if _w in _CONTRACT_NUMERIC_TYPES and _alts & _CONTRACT_NUMERIC_TYPES:
+                    return None
+                return False
+            # assert shape: the named identifiers of the predicate must
+            # appear in some assert of the function; asserts existing but
+            # none matching refutes; no asserts at all refutes too (the
+            # claim said the function asserts — it does not).
+            _pred_ids = set(re.findall(r"[A-Za-z_]\w*", _masrt.group(2)))
+            _pred_ids -= {"is", "not", "None", "and", "or", "that"}
+            _asserts = [n for n in ast.walk(_fn) if isinstance(n, ast.Assert)]
+            if not _asserts:
+                return False
+            for _a in _asserts:
+                _aids = {n.id for n in ast.walk(_a) if isinstance(n, ast.Name)} | {
+                    n.attr for n in ast.walk(_a) if isinstance(n, ast.Attribute)
+                }
+                if _pred_ids & _aids:
+                    return True
             return False
-        for _a in _asserts:
-            _aids = {n.id for n in ast.walk(_a) if isinstance(n, ast.Name)} | {
-                n.attr for n in ast.walk(_a) if isinstance(n, ast.Attribute)
-            }
-            if _pred_ids & _aids:
-                return True
-        return False
+
+        # Homonyms in different classes can disagree; only an unanimous
+        # verdict stands.
+        _verdicts = {_judge(_c) for _c in _candidates}
+        return _verdicts.pop() if len(_verdicts) == 1 else None
 
     # ═══════════════════════════════════════════════════════════════════════
     # 6. Peer review
@@ -39099,6 +41992,175 @@ class EpistemicStrategies:
         return out
 
 
+class TestedCode:
+    """
+    What a stored verdict was tested against, and whether that code still stands.
+
+    A verdict about code holds for the code it was reached on and for no
+    other: a refutation in the graveyard, a step result in AgenticStepCache,
+    and anything else the plugin keeps between turns about what a body
+    does. That is Popper with the instrument made explicit. A verdict
+    records, per symbol name, a fingerprint of the code behind the name; it
+    holds while every fingerprint is the same, so a change to a body it
+    read retires it and a change anywhere else does not.
+
+    The instrument says when it cannot read. A symbol whose code cannot be
+    located gets no fingerprint at all: a hash of its name alone never
+    changes, and would keep the verdict in force through any edit. That
+    happened to every top-level class and module-level function of a file
+    with a path, whose qualified ids carry the module ('context_manager.
+    Filter') while the lookups here qualified without it. Where it cannot
+    read, the caller falls back to a coarser test of its own.
+    """
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        self._f = filter_ref
+
+    def fingerprint(self, names: List[str], project_id: str) -> Dict[str, str]:
+        """
+        Fingerprint, per name, of the code behind it.
+
+        A name stands for every indexed symbol it can mean: itself when it
+        is a qualified id, every namesake when it is bare. The fingerprint
+        hashes their qualified ids and code (a class: its members and their
+        signatures, see _text), so it changes when a body changes, when a
+        namesake appears or disappears, and when a name that meant nothing
+        starts meaning something ("absent" is a fingerprint too).
+
+        Args:
+            names: Symbol names or qualified ids.
+            project_id: Current project identifier.
+
+        Returns:
+            {name: 16-hex fingerprint}, without the names whose code could
+            not be read. Empty when the index is not available.
+        """
+        # ── Step 1: the index, and each block's lines read once ──
+        try:
+            idx = self._f._symbol_index
+            state = self._f._conversation_state_manager.get(project_id)
+            qualified = idx.get_all_qualified_names(project_id) or set()
+        except Exception:
+            return {}
+        block_lines: Dict[str, List[str]] = {}
+        out: Dict[str, str] = {}
+        # ── Step 2: one fingerprint per name, none for what cannot be read ──
+        for name in names:
+            try:
+                # get_qualified_names_for hands back an unknown name as
+                # itself; only ids the index holds are code to read.
+                if name in qualified:
+                    qids = [name]
+                else:
+                    resolved = idx.get_qualified_names_for(
+                        name.split(".")[-1], project_id
+                    )
+                    qids = sorted(q for q in resolved if q in qualified)
+                h = hashlib.sha256()
+                if not qids:
+                    h.update(b"\x00absent")
+                for qid in qids:
+                    text = self._text(qid, project_id, state, block_lines)
+                    if not text:
+                        raise LookupError(qid)
+                    h.update(qid.encode("utf-8") + b"\x1f")
+                    h.update(text.encode("utf-8") + b"\x1e")
+                out[name] = h.hexdigest()[:16]
+            except Exception:
+                continue
+        return out
+
+    def still_matches(
+        self, recorded: Dict[str, str], project_id: str, seen: Dict[str, str]
+    ) -> bool:
+        """
+        Whether every recorded fingerprint is the one the code has now.
+
+        A name that cannot be read now does not match: the instrument
+        cannot say the code is unchanged.
+
+        Args:
+            recorded: {name: fingerprint} as stored with the verdict.
+            project_id: Current project identifier.
+            seen: Fingerprints already taken in this pass, by name; filled
+                as a side effect so many verdicts share one reading.
+        """
+        missing = [n for n in recorded if n not in seen]
+        if missing:
+            seen.update(self.fingerprint(missing, project_id))
+        return all(seen.get(n) == fp for n, fp in recorded.items())
+
+    def _text(
+        self,
+        qid: str,
+        project_id: str,
+        state: Any,
+        block_lines: Dict[str, List[str]],
+    ) -> str:
+        """
+        The text a symbol's fingerprint is taken over.
+
+        A function or method contributes its source. A class contributes
+        its shape: its members and their signatures. Its source would be
+        every method body it holds, so a fix anywhere in a class of three
+        thousand lines would retire every verdict that merely named the
+        class. The members a verdict actually read are recorded on their
+        own and keep their bodies in the fingerprint.
+
+        A class is recognised by its kind, not by its members: a method
+        named like a class would otherwise take that class's shape. Members
+        are found by the class's bare name, because that is how methods
+        record their parent; two classes of the same name in different
+        files share one set of member ids in the index, so they share a
+        shape here too.
+
+        Returns:
+            The text to hash; "" when the symbol cannot be located.
+        """
+        idx = self._f._symbol_index
+        meta = idx.get_symbol_meta(qid, project_id) or {}
+        if meta.get("kind") == "class":
+            members = idx.get_class_members(qid.split(".")[-1], project_id)
+            return "class\x1f" + "\x1e".join(
+                f"{m}\x1f{idx.get_signature(m, project_id) or ''}" for m in members
+            )
+        return self._source(qid, project_id, state, block_lines)
+
+    def _source(
+        self,
+        qid: str,
+        project_id: str,
+        state: Any,
+        block_lines: Dict[str, List[str]],
+    ) -> str:
+        """
+        Source lines of one symbol, sliced from its first live block.
+
+        Read by line range from the block's own symbol list. Unlike
+        CodeBlockManager.extract_symbol_body this never falls back to the
+        whole block: a fingerprint of the whole block would change with
+        any edit to it and retire every verdict that touched it. Symbols
+        are matched by qualify_symbol, file path included, the way the
+        index named them.
+
+        Returns:
+            The symbol's source, or "" when it cannot be located.
+        """
+        for bh in self._f._symbol_index.find_blocks(qid, project_id):
+            blk = state.active_blocks.get(bh)
+            if not blk or getattr(blk, "obsolete", False):
+                continue
+            for sym in getattr(blk, "symbols", None) or []:
+                if qualify_symbol(sym) != qid:
+                    continue
+                if not (sym.line_start and sym.line_end):
+                    return ""
+                if bh not in block_lines:
+                    block_lines[bh] = blk.content.split("\n")
+                return "\n".join(block_lines[bh][sym.line_start - 1 : sym.line_end])
+        return ""
+
+
 class HypothesisForge:
     """Forge competing explanations, judge them, and remember the dead ones.
 
@@ -39125,11 +42187,7 @@ class HypothesisForge:
     # positive form matches 'X calls Y'; the negated form matches
     # 'X never calls Y' (English and Spanish), whose refutation is the
     # edge EXISTING.
-    _CALL_RELATION_RE = re.compile(
-        r"`?(\w+)`?\s+(?:calls?|invokes?|uses?|reads?|writes?|depends on)"
-        r"\s+`?(\w+)`?",
-        re.IGNORECASE,
-    )
+    _CALL_RELATION_RE = _RELATION_CALL_RE
 
     # The investigation ladder. Each rung pulls a different slice of
     # the call tree into view, so cycle N never re-treads cycle N-1's
@@ -39725,6 +42783,11 @@ class HypothesisForge:
         # also the honest measure of how much of the call tree this
         # hypothesis was actually tested against.
         _expanded_qids: Set[str] = set()
+        # Every derived consequence the experiment decided, by outcome and
+        # across cycles, normalised so that one restated in a later cycle
+        # is counted once.
+        _predictions_corroborated: Set[str] = set()
+        _predictions_refuted: Set[str] = set()
         # Hypothetico-deductive cycle: predictions deduced at the END
         # of cycle N are structural consequences the hypothesis has
         # NOT yet been credited for. Cycle N+1 probes them, so a
@@ -39733,6 +42796,14 @@ class HypothesisForge:
         # hypothesis was built from. Empty on cycle 1 by
         # construction — nothing has been deduced yet.
         _predictions: List[str] = []
+        # What the hypothesis predicts depends on the hypothesis alone
+        # (generate_predictions reads nothing else), so it is deduced once
+        # and each cycle probes what is still open. Live, one hypothesis
+        # deduced the same two predictions on cycles 1, 2 and 3, paying a
+        # call for each and sending both back to be checked again after
+        # the index had already ruled on them.
+        _deduced: List[str] = []
+        _deduced_once = False
         _resolvable_prev = -1
         _cycles_max = int(self._f.valves.agentic_serial_cycles_max)
         _eff_c = getattr(self._f, "_agentic_effort_override", None)
@@ -40152,10 +43223,12 @@ class HypothesisForge:
                     _undecided_txt.append(_c)
                 if _v is True:
                     _conf_n += 1
+                    _predictions_corroborated.add(_prediction_key(_c))
                     if len(_dossier.confirmed_claims) < 8:
                         _dossier.confirmed_claims.append(_c)
                 elif _v is False:
                     _ref_n += 1
+                    _predictions_refuted.add(_prediction_key(_c))
                     if len(_dossier.refuted_claims) < 8:
                         _dossier.refuted_claims.append(_c)
                 elif len(_dossier.unresolved_claims) < 8:
@@ -40194,6 +43267,7 @@ class HypothesisForge:
                     if _r is True:
                         _conf_n += 1
                         _ev_conf += 1
+                        _predictions_corroborated.add(_prediction_key(_txt))
                         if len(_dossier.confirmed_claims) < 8:
                             _dossier.confirmed_claims.append(_txt)
                         if _txt in _dossier.unresolved_claims:
@@ -40201,6 +43275,7 @@ class HypothesisForge:
                     elif _r is False:
                         _ref_n += 1
                         _ev_ref += 1
+                        _predictions_refuted.add(_prediction_key(_txt))
                         if len(_dossier.refuted_claims) < 8:
                             _dossier.refuted_claims.append(_txt)
                         if _txt in _dossier.unresolved_claims:
@@ -40215,6 +43290,8 @@ class HypothesisForge:
                     )
             _dossier.confirmed_checks = _n_conf_e
             _dossier.refuted_checks = _n_ref_e
+            _dossier.predictions_corroborated = len(_predictions_corroborated)
+            _dossier.predictions_refuted = len(_predictions_refuted)
             _dossier.refuted_symbol_checks = sum(
                 1 for v in evidence.symbols_found.values() if not v
             )
@@ -40296,11 +43373,20 @@ class HypothesisForge:
                     "— say so rather than explaining it away), and what "
                     "remains open. Do not introduce new claims here; "
                     "they cannot be tested this cycle.\n"
-                    "ONE SHORT PARAGRAPH FOR EACH of those three, and "
-                    "then stop. A verdict you have already interpreted is "
-                    "not interpreted better by being interpreted again: "
-                    "the results above are at most ten lines, and reading "
-                    "them takes less room than reciting them."
+                    "ONE SHORT PARAGRAPH FOR EACH of those three. A "
+                    "verdict you have already interpreted is not "
+                    "interpreted better by being interpreted again: the "
+                    "results above are at most ten lines, and reading "
+                    "them takes less room than reciting them.\n"
+                    "Then end with exactly one of these lines:\n"
+                    "VERDICT: ESTABLISHED — a CONFIRMED result is the step "
+                    "the hypothesis's cause rests on (the behaviour it "
+                    "explains), not only that the code it names exists or "
+                    "calls what it calls.\n"
+                    "VERDICT: NOT ESTABLISHED — the results fit the "
+                    "hypothesis, but none of them confirms the step its "
+                    "cause rests on.\n"
+                    "VERDICT: REFUTED — a result contradicts that step."
                 )
                 try:
                     _an = await self._f._llm_orchestrator.call_llm(
@@ -40382,6 +43468,21 @@ class HypothesisForge:
             # which one produced the verdict.
             _dossier.nodes_read = len(_expanded_qids)
             _dossier.nodes_expanded = sorted(_expanded_qids)[:40]
+            # What this cycle's verdict was tested against. Relations and
+            # named symbols first: they are what refutes. Bodies read only
+            # to look around come after, and are the first to be cut.
+            _tested: List[str] = list(_dossier.tested_against)
+            for _rk in evidence.call_relations_valid:
+                _sep = "_not_calls_" if "_not_calls_" in _rk else "_calls_"
+                _ra, _, _rb = _rk.partition(_sep)
+                _tested.extend([_ra, _rb])
+            _tested.extend(evidence.symbols_found)
+            # A neighbourhood read by a rung is keyed "<rung>:<symbol>"; the
+            # symbol is what can be fingerprinted.
+            _tested.extend(sorted({_k.rsplit(":", 1)[-1] for _k in _expanded_qids}))
+            _dossier.tested_against = list(dict.fromkeys(_n for _n in _tested if _n))[
+                :_TESTED_AGAINST_MAX
+            ]
             await self._f._emit_status(
                 f"⚖️ Verdict (cycle {_cycle}){_strat_tag}: {_verdict}"
                 + (f" ({_cause})" if _cause else "")
@@ -40446,23 +43547,29 @@ class HypothesisForge:
             # handler let an orphan @staticmethod report itself as a
             # routine skip for several runs before anyone noticed.
             _pred_call = None
-            try:
-                _pred_call = self._f._epistemic.generate_predictions(
-                    hyp_text, project_id
-                )
-            except TypeError as _e_bind:
-                self._f._log_debug(
-                    f"🔴 BUG: generate_predictions could not be called "
-                    f"({_e_bind}) — the deductive half of the cycle "
-                    f"did not run"
-                )
-            _predictions = []
-            if _pred_call is not None:
+            if not _deduced_once:
                 try:
-                    _predictions = await _pred_call
+                    _pred_call = self._f._epistemic.generate_predictions(
+                        hyp_text, project_id
+                    )
+                except TypeError as _e_bind:
+                    self._f._log_debug(
+                        f"🔴 BUG: generate_predictions could not be called "
+                        f"({_e_bind}) — the deductive half of the cycle "
+                        f"did not run"
+                    )
+            if _pred_call is not None:
+                _deduced_once = True
+                try:
+                    _deduced = list(await _pred_call or [])
                 except Exception as _e_pred:
-                    _predictions = []
+                    _deduced = []
                     self._f._log_debug(f"forge predictions: skipped ({_e_pred})")
+            # Only what no cycle has settled yet goes back to be probed: a
+            # prediction the index already confirmed or refuted is a
+            # result, and asking again buys the same answer.
+            _settled = _predictions_corroborated | _predictions_refuted
+            _predictions = [p for p in _deduced if _prediction_key(p) not in _settled]
             if _predictions:
                 if "deduction" not in _dossier.strategy_trace:
                     _dossier.strategy_trace.append("deduction")
@@ -40470,6 +43577,17 @@ class HypothesisForge:
                     f"forge deduction c{_cycle}: "
                     f"{len(_predictions)} prediction(s) to probe "
                     f"next cycle — {_predictions[:2]}"
+                    + (
+                        f" ({len(_deduced) - len(_predictions)} already "
+                        f"settled, not probed again)"
+                        if len(_predictions) < len(_deduced)
+                        else ""
+                    )
+                )
+            elif _deduced:
+                self._f._log_debug(
+                    f"forge deduction c{_cycle}: all {len(_deduced)} "
+                    f"prediction(s) already settled — none probed again"
                 )
         # ── Step 8: seal; bury the dead ──
         # The dossier records what it never looked at, in two
@@ -40529,6 +43647,8 @@ class HypothesisForge:
                 "cause_of_death": _dossier.cause_of_death,
                 "cycles_used": _dossier.cycles_used,
                 "corroboration": round(_dossier.corroboration, 3),
+                "predictions_corroborated": _dossier.predictions_corroborated,
+                "predictions_refuted": _dossier.predictions_refuted,
                 "coverage_score": round(_dossier.coverage_score, 3),
                 "confirmed_claims": _dossier.confirmed_claims,
                 "refuted_claims": _dossier.refuted_claims,
@@ -40538,6 +43658,7 @@ class HypothesisForge:
                 "nodes_expanded": _dossier.nodes_expanded,
                 "blind_spots": _dossier.blind_spots,
                 "analysis": _dossier.analysis[:1200],
+                "analysis_verdict": _analysis_verdict(_dossier.analysis),
             },
         )
         self._f._log_debug(
@@ -40546,7 +43667,9 @@ class HypothesisForge:
             f"({_dossier.cycles_used} cycle(s), "
             f"status={_dossier.status}"
             + (f"/{_dossier.cause_of_death}" if _dossier.cause_of_death else "")
-            + ")"
+            + f"; predictions {_dossier.predictions_corroborated} corroborated, "
+            f"{_dossier.predictions_refuted} refuted; "
+            f"corroboration={_dossier.corroboration:.2f})"
         )
         if _dossier.status == "dead":
             await self._bury_hypothesis(_dossier, project_id)
@@ -40567,7 +43690,9 @@ class HypothesisForge:
             for _r in cls._HYP_CODE_REF_RE.findall(text or ""):
                 if "." in _r and _r.rsplit(".", 1)[-1].lower() in cls._HYP_FILE_TAILS:
                     continue
-                _out.add(_r)
+                # The pasted file's name in front of a symbol, as claims
+                # cite it too (_CITED_FILE_PREFIX_RE): the symbol is named.
+                _out.add(_CITED_FILE_PREFIX_RE.sub("", _r))
             return _out
         except Exception:
             return set()
@@ -41104,6 +44229,49 @@ class HypothesisForge:
                 -d.confirmed_checks,
             )
         )
+        # Where Layer 1 put each rival, for the per-rival record
+        # (_record_rivals): later layers reorder nothing, they only remove.
+        self._l1_ranks = {id(d): n for n, d in enumerate(_pool, 1)}
+        # ── Step 1b: a rival its own analysis did not establish cannot win ──
+        # Corroboration counts the consequences the graph confirmed, and
+        # those are mostly the mechanism's skeleton: the code it names
+        # exists and calls what it calls. Over seven live competitions
+        # every accepted winner was false against the code, and in most of
+        # them the forge's own analysis had said so ("compatible but they
+        # do not prove it", "refuted by the index itself") while the
+        # dossier stayed plausible. A rival whose analysis concluded NOT
+        # ESTABLISHED or REFUTED stays a survivor, and is not a winner;
+        # with none left there is no winner, which is the null bar's
+        # honest terminal. A rival whose analysis gave no verdict is
+        # judged as before.
+        _verdicts = {id(d): _analysis_verdict(d.analysis) for d in _pool}
+        _held = [d for d in _pool if _verdicts[id(d)] in ("not_established", "refuted")]
+        if _held:
+            _held_ids = {id(d) for d in _held}
+            self._f._log_debug(
+                f"judge: {len(_held)} of {len(_pool)} rival(s) not eligible "
+                f"to win — their own analysis concluded "
+                + ", ".join(
+                    f"{_verdicts[id(d)].replace('_', ' ')} ('{d.hypothesis[:40]}')"
+                    for d in _held
+                )
+            )
+            _eligible = [d for d in _pool if id(d) not in _held_ids]
+            if not _eligible:
+                _n_ref = sum(1 for d in _held if _verdicts[id(d)] == "refuted")
+                _note = (
+                    f"no winner: no rival's own analysis established its "
+                    f"cause ({len(_held) - _n_ref} not established, "
+                    f"{_n_ref} refuted)"
+                )
+                _plan_items = [c for c in _pool[0].unresolved_claims[:3] if c.strip()]
+                if _plan_items:
+                    _note += (
+                        " | to decide this, the next investigation "
+                        "should check: " + "; ".join(f"'{c[:80]}'" for c in _plan_items)
+                    )
+                return None, _note
+            _pool = _eligible
         _eps = float(getattr(self._f.valves, "agentic_parsimony_epsilon", 0.05))
         _top = _pool[0].corroboration
         _tied = [d for d in _pool if _top - d.corroboration <= _eps]
@@ -41278,26 +44446,12 @@ class HypothesisForge:
             f"; rungs never walked: {', '.join(_unw_note)}" if _unw_note else ""
         )
         # ── Surviving rivals ──
-        # A winner is chosen, but the accounts it beat do not stop
-        # being corroborated. Complex bugs often have more than one
-        # real cause, and until now every rival vanished at this
-        # point: the status said how MANY survived, never which.
-        #
-        # The two audiences get different things, and the split is
-        # R34, not squeamishness. The NOTE reaches the final model,
-        # so it carries numbers only — rival prose in the prompt is
-        # what teaches a model to recite the competition instead of
-        # answering. The STATUS reaches the person reading the chat
-        # and never enters a prompt, so it can name the rival in
-        # full. That is where the multi-cause signal belongs anyway:
-        # the reader is the one who can recognise that two surviving
-        # accounts are both true of their own system.
-        # The subject test used to reach the winner only. A rival never
-        # faced it, and a surviving rival is not decorative: it becomes the
-        # independent-rival count that divides the reported confidence. One
-        # turn published a 100% header beside a 50% footer because the
-        # account that halved it named two functions that do not exist and
-        # was never asked whether anyone had opened them.
+        # A winner is chosen, and the accounts it beat stay visible: complex
+        # bugs often have more than one cause. The NOTE reaches the final
+        # model and carries numbers only (R34); the STATUS reaches the
+        # reader and names the rival in full.
+        # Rivals face the subject test too: a surviving rival divides the
+        # reported confidence, so it must be about code someone opened.
         _rivals = []
         for _d in _pool:
             if _d is _winner or _d.status != "plausible":
@@ -41342,6 +44496,23 @@ class HypothesisForge:
             # whether the presented account is the right one, and it was
             # visible only here.
             self._f._serial_rival_relations = list(_rel_labels)
+            # The winner's share of the corroboration it and the independent
+            # survivors hold. The confidence line divided evenly among
+            # them, as if the competition had measured nothing: a winner at
+            # 0.92 against a survivor at 0.77 was reported as one of two
+            # equals. The share keeps the judgement visible and uses what
+            # was measured.
+            _indep_corr = [
+                max(0.0, float(d.corroboration))
+                for d in _rivals[:3]
+                if d.relation_to_winner == "independent"
+            ]
+            _own_corr = max(0.0, float(_winner.corroboration))
+            self._f._serial_winner_share = (
+                _own_corr / (_own_corr + sum(_indep_corr))
+                if _indep_corr and _own_corr + sum(_indep_corr) > 0
+                else 0.0
+            )
             # Why each survived, beside what it is. "stalled" and "budget"
             # mean the cycles ran out; anything else means the evidence
             # weighed it and did not choose. The reader needs the
@@ -41529,27 +44700,12 @@ class HypothesisForge:
         the keyword, and just as wrong. `Class.method` keeps its class:
         that prefix identifies, a receiver does not.
         """
-        # Every name the index holds, which is the only test that is not a
-        # guess. The shape rules below let `NOT`, `The`, `When` and `e.g`
-        # through — English capitalised at a sentence start, or carrying a
-        # dot — and they cannot be told from `Filter` by shape alone. They
-        # can be told apart by asking the index, which knows one and not
-        # the other. Local variables go the same way: `_conf`, `_total`,
-        # `_hard` are real identifiers in the prose and not symbols, and
-        # two dossiers sharing `_total` share nothing.
-        #
-        # Measured on the 19:10 competition: the three dossiers went from
-        # sets half-full of prose to three to five indexed symbols each,
-        # and the pair the shape rules scored 0.14 — two accounts of one
-        # mechanism — came back 0.40.
-        #
-        # Empty index means no filter rather than an empty answer: a
-        # project still indexing must not silently make every dossier
-        # look unrelated to every other.
-        # Straight from the index rather than through the ledger's
-        # _known_names: that helper lives on AgenticEvidenceLedger and this
-        # engine is not one, so calling it would have raised on the first
-        # competition of the first run.
+        # Every name the index holds: the only test that is not a guess.
+        # Shape rules let capitalised English and local variables through;
+        # the index tells them from symbols. An empty index means no filter,
+        # so a project still indexing does not make every dossier look
+        # unrelated. Read from the index directly: _known_names lives on the
+        # ledger, not on this engine.
         _known: Set[str] = set()
         if project_id:
             try:
@@ -41604,6 +44760,16 @@ class HypothesisForge:
                           may be true of one bug, and discarding
                           the rival may discard half the fix.
         'independent'   — disjoint and unconnected.
+        ''              — one of them names no indexed symbol: nothing
+                          to compare, so nothing is concluded.
+
+        Connected means an edge between their distinct symbols, or a
+        caller both reach within two calls. Live, an account about
+        _extract_history_seeds and one about _build_multi_seed_graph were
+        ruled independent because neither calls the other; both run under
+        build_activation_graph, one feeding the other, and the answer's
+        confidence was halved for an "alternative" that was an earlier
+        stage of the same path.
 
         Deliberately NOT a fusion: P(A and B) never exceeds either
         conjunct, so no composite is scored — the classification
@@ -41615,7 +44781,7 @@ class HypothesisForge:
         _a = self._dossier_symbols(winner, project_id)
         _b = self._dossier_symbols(rival, project_id)
         if not _a or not _b:
-            return "independent", 0.0
+            return "", 0.0
         _inter = _a & _b
         _overlap = len(_inter) / len(_a | _b)
         # ── Step 2: high overlap = same mechanism ──
@@ -41637,7 +44803,40 @@ class HypothesisForge:
                         return "complementary", _overlap
                 except Exception:
                     continue
+        # ── Step 4: a caller both are reached from ──
+        _up_a = self._callers_within(_only_a, project_id)
+        if _up_a and _up_a & self._callers_within(_only_b, project_id):
+            return "complementary", _overlap
         return "independent", _overlap
+
+    def _callers_within(self, qids: List[str], project_id: str) -> Set[str]:
+        """
+        The symbols themselves and what calls them, two calls up.
+
+        Names shared with builtin types are not followed: their edges in
+        are everybody's.
+        """
+        idx = self._f._symbol_index
+        # Compared by bare name: a dossier's symbols are tokens from prose,
+        # qualified or not, and the edges' sources are qualified ids.
+        seen: Set[str] = {q.rsplit(".", 1)[-1] for q in qids}
+        frontier = list(seen)
+        for _ in range(_RIVAL_SHARED_CALLER_DEPTH):
+            nxt: List[str] = []
+            for bare in frontier:
+                if bare in _COMMON_METHOD_NAMES:
+                    continue
+                try:
+                    edges = idx.get_edges_in(bare, project_id)
+                except Exception:
+                    continue
+                for e in edges:
+                    src = str(getattr(e, "src", "")).rsplit(".", 1)[-1]
+                    if src and src not in seen:
+                        seen.add(src)
+                        nxt.append(src)
+            frontier = nxt
+        return seen - _COMMON_METHOD_NAMES
 
     @staticmethod
     def _render_investigation_record(
@@ -41833,10 +45032,22 @@ class HypothesisForge:
             # hypothesis AND what it left unsettled — the fecundity
             # compass. Old rows (a bare list) are read tolerantly by
             # _load_graveyard.
+            # The fingerprint of the code the verdict was tested against
+            # goes with it; _refutation_still_holds compares it with the
+            # code of the day before excluding the mechanism again. Names
+            # whose code could not be read are listed, so that part of the
+            # burial is held to the structure hash instead.
+            _tested = self._f._tested_code.fingerprint(
+                dossier.tested_against, project_id
+            )
             _refuted = _json.dumps(
                 {
                     "refuted": dossier.refuted_claims[:6],
                     "unexplored": dossier.unresolved_claims[:6],
+                    "tested_against": _tested,
+                    "unreadable": [
+                        n for n in dossier.tested_against if n not in _tested
+                    ],
                 }
             )
             _row = (
@@ -41895,43 +45106,172 @@ class HypothesisForge:
         limit: int = 12,
     ) -> List[Tuple[str, str, List[str]]]:
         """
-        Load (hypothesis, cause, unexplored) for the CURRENT era.
+        Load (hypothesis, cause, unexplored) for the burials that still hold.
 
-        The structure-hash filter is the retirement mechanism: a death
-        recorded against code that has since changed is not returned —
-        the mechanism could be true now, so it must be forgeable again.
+        A death recorded against code that has since changed is not
+        returned: the mechanism could be true now, so it must be forgeable
+        again. Which change counts is _refutation_still_holds's to decide.
+        It used to be the project's structure hash alone, which covers
+        names and signatures and not bodies: a fix inside a body left every
+        burial in force, and adding any function anywhere retired them all.
         Newest first, bounded, corrupt rows skipped, failures return
         empty (the forge merely loses cross-run exclusions). Consumed
         by informed generation (next patch in the series).
         """
-        # Region: era-filtered read (S7: refuted_json is tolerant —
-        # pre-S7 rows hold a bare list, S7 rows a dict with the
-        # unexplored ground; both shapes parse, corrupt rows yield
-        # an empty compass, never a skipped exclusion)
+        # Region: read every burial of the project, keep those that hold
+        # (S7: refuted_json is tolerant — pre-S7 rows hold a bare list, S7
+        # rows a dict with the unexplored ground; both shapes parse,
+        # corrupt rows yield an empty compass, never a skipped exclusion).
+        # The table keeps 40 rows per project, so reading them all is
+        # bounded.
         try:
             import json as _json
 
             _rows = self._f._db_conn.execute(
-                "SELECT hypothesis, cause, refuted_json FROM "
+                "SELECT hypothesis, cause, refuted_json, structure_hash FROM "
                 "hypothesis_graveyard "
-                "WHERE project_id = ? AND structure_hash = ? "
-                "ORDER BY created_at DESC LIMIT ?",
-                (project_id, structure_hash, limit),
+                "WHERE project_id = ? "
+                "ORDER BY created_at DESC",
+                (project_id,),
             ).fetchall()
             _out: List[Tuple[str, str, List[str]]] = []
+            _fingerprints: Dict[str, str] = {}
+            _retired = 0
             for _r in _rows:
-                _unexp: List[str] = []
+                _payload: Any = None
                 try:
-                    _p = _json.loads(_r[2])
-                    if isinstance(_p, dict):
-                        _unexp = [str(u) for u in (_p.get("unexplored") or [])][:6]
+                    _payload = _json.loads(_r[2])
                 except Exception:
-                    _unexp = []
+                    _payload = None
+                if not self._refutation_still_holds(
+                    _payload,
+                    str(_r[3] or ""),
+                    structure_hash,
+                    project_id,
+                    _fingerprints,
+                ):
+                    _retired += 1
+                    continue
+                if len(_out) >= limit:
+                    continue
+                _unexp: List[str] = []
+                if isinstance(_payload, dict):
+                    _unexp = [str(u) for u in (_payload.get("unexplored") or [])][:6]
                 _out.append((str(_r[0]), str(_r[1]), _unexp))
+            if _retired:
+                self._f._log_debug(
+                    f"🪦 graveyard: {_retired} burial(s) retired — the code "
+                    f"they were tested against has changed; {len(_out)} "
+                    f"still hold"
+                )
             return _out
         except Exception as _e:
             self._f._log_debug(f"_load_graveyard: skipped ({_e!r})")
             return []
+
+    def _record_rivals(
+        self,
+        dossiers: List["HypothesisDossier"],
+        winner: Optional["HypothesisDossier"],
+    ) -> None:
+        """
+        Keep every rival of a competition as it was judged, one row each.
+
+        The record a ranking is audited against: for each hypothesis, what
+        it claimed, the predictions settled for and against it, how its
+        own analysis opens, where Layer 1 ranked it and whether it won. A
+        rival the judgment itself buried (the null bar) keeps the rank it
+        was given, with the status and cause it ended with; one that died
+        in the forge was never ranked and has rank 0.
+        Replayed from the context dumps of nine live rivals, that is what
+        showed a hypothesis whose own analysis began "The hypothesis is
+        wrong" sealed plausible and ranked first. Reports only; decides
+        nothing, and never raises.
+
+        Args:
+            dossiers: Every dossier the forge sealed, dead ones included.
+            winner: The dossier the judgment accepted, or None.
+        """
+        try:
+            ranks = getattr(self, "_l1_ranks", {}) or {}
+            now = time.time()
+            for d in dossiers:
+                self._f._record_metric(
+                    "forge_rival",
+                    (
+                        str(self._f.valves.project_id or ""),
+                        float(getattr(self._f, "_turn_started_at", 0.0)),
+                        now,
+                        len(dossiers),
+                        int(ranks.get(id(d), 0)),
+                        int(winner is not None and d is winner),
+                        str(d.status),
+                        str(d.cause_of_death or ""),
+                        round(float(d.corroboration), 3),
+                        int(d.predictions_corroborated),
+                        int(d.predictions_refuted),
+                        int(d.cycles_used),
+                        int(d.nodes_read),
+                        round(float(d.coverage_score), 3),
+                        str(d.hypothesis)[:_RIVAL_TEXT_CHARS],
+                        "\n".join(str(c) for c in d.confirmed_claims)[
+                            :_RIVAL_CLAIMS_CHARS
+                        ],
+                        "\n".join(str(c) for c in d.refuted_claims)[
+                            :_RIVAL_CLAIMS_CHARS
+                        ],
+                        (
+                            (f"[{_analysis_verdict(d.analysis)}] ")
+                            if _analysis_verdict(d.analysis)
+                            else ""
+                        )
+                        + " ".join(str(d.analysis or "").split())[:_RIVAL_TEXT_CHARS],
+                    ),
+                )
+        except Exception as _e:
+            self._f._log_debug(f"_record_rivals: skipped ({_e!r})")
+        finally:
+            self._l1_ranks = {}
+
+    def _refutation_still_holds(
+        self,
+        payload: Any,
+        row_structure_hash: str,
+        structure_hash: str,
+        project_id: str,
+        fingerprints: Dict[str, str],
+    ) -> bool:
+        """
+        Whether a burial still holds for the code as it is now.
+
+        A refutation is Popperian: final, but only for the code it was
+        tested against (TestedCode). A burial that recorded that code holds
+        while every symbol in it has the same fingerprint, so a change to a
+        body it read retires it and a change anywhere else does not. A
+        burial that recorded nothing (older rows, and hypotheses screened
+        out before any body was read) falls back to the project's structure
+        hash, and so does the part of a burial whose code could not be read
+        when it was made.
+
+        Args:
+            payload: The parsed refuted_json of the row, or None.
+            row_structure_hash: The structure hash stored with the row.
+            structure_hash: The project's structure hash now.
+            project_id: Current project identifier.
+            fingerprints: Fingerprints already computed in this load, by
+                symbol name; filled as a side effect.
+
+        Returns:
+            True when the burial should still exclude its mechanism.
+        """
+        # ── Step 1: what the burial recorded ──
+        recorded = payload.get("tested_against") if isinstance(payload, dict) else None
+        if not isinstance(recorded, dict) or not recorded:
+            return row_structure_hash == structure_hash
+        if payload.get("unreadable") and row_structure_hash != structure_hash:
+            return False
+        # ── Step 2: compare it with the code of the day ──
+        return self._f._tested_code.still_matches(recorded, project_id, fingerprints)
 
     def _get_adaptive_strategy(self, project_id: str) -> Dict[str, Any]:
         """
@@ -43996,6 +47336,17 @@ class EnrichmentTasks:
     # 5. Parallel checks (contradiction, cache, duplicate)
     # ═══════════════════════════════════════════════════════════════════════════
 
+    def _follow_up_cache_subject(
+        self, query: str, messages: Optional[List[dict]], project_id: str
+    ) -> str:
+        """The subject a follow-up's cached answer is filed under; "" if none."""
+        try:
+            return ",".join(
+                self._f._activation.follow_up_subject(query, messages, project_id)
+            )
+        except Exception:
+            return ""
+
     async def parallel_context_checks(
         self,
         messages: list,
@@ -44012,6 +47363,18 @@ class EnrichmentTasks:
         detection in parallel. Returns (contradiction_warning, cached_response,
         duplicate_match). All three can be None.
         """
+        # The user's words for this turn, for the metric row. The pipeline's
+        # copy is only refreshed when the pipeline runs: on the fast path
+        # the row carried the previous turn's question.
+        self._f._turn_user_question = self._f._commands._REFERENCE_LINE_RE.sub(
+            "", query or ""
+        ).strip()
+        # What the chat has been written in so far, for a question whose
+        # own words do not say (Filter._answer_language).
+        try:
+            self._f._turn_chat_language = self._f._chat_language(messages)
+        except Exception:
+            self._f._turn_chat_language = ""
         tasks = [
             (
                 self._f._commands._detect_contradictions(
@@ -44024,7 +47387,12 @@ class EnrichmentTasks:
                 else asyncio.sleep(0, result=None)
             ),
             (
-                self._f._ltm.find_cached_response(query, context_hash, state)
+                self._f._ltm.find_cached_response(
+                    query,
+                    context_hash,
+                    state,
+                    subject=self._follow_up_cache_subject(query, messages, project_id),
+                )
                 if (
                     self._f.valves.enable_response_cache
                     and HAS_SENTENCE
@@ -45598,53 +48966,17 @@ class ActiveCodeUpdater:
                 extracted_blocks = [k[2] for k in _kept]
 
         # ── Step 3.6: an assistant block may not rewrite indexed source ──
-        # The stub gate above catches a quoted signature. It does not catch
-        # the other shape, which is a complete and confident function body
-        # the model wrote from memory to illustrate a symbol the index
-        # already holds. One run answered four questions that way and every
-        # body was wrong — a double `// 4`, a `_floor` that is never bound,
-        # a `pstate.get('measured_confidence')` where the real code reads
-        # `self._agentic_coverage` — and each was indexed: docstrings
-        # harvested, data-flow edges extracted from a `path/to/` filename
-        # the model invented, CodePathViews invalidated, the edge count
-        # climbing 7081 → 7091 over four turns.
+        # The other shape the stub gate does not catch: a complete function
+        # body the model wrote from memory for a symbol the index already
+        # holds. Indexed, a wrong body becomes "hard evidence" for later
+        # turns. A block is dropped only when EVERY symbol in it is already
+        # indexed; one adding a new symbol indexes in full.
         #
-        # That is worse than a wrong answer. The index is where hard
-        # evidence comes from, so a later turn can quote those lines and
-        # the verifier will call them settled against real code.
-        #
-        # A block is dropped only when EVERY symbol in it is already
-        # indexed: the assistant is then restating, and the user's paste is
-        # authoritative over the model's recollection of it. A block adding
-        # any genuinely new symbol still indexes in full, which is what the
-        # diff-against-index path needs to keep working.
-        # project_id was read from a name this function never had: the
-        # NameError was caught by the except below and the whole guard
-        # became a no-op that logged once a turn and let every restated
-        # body through. It ran that way for every run since it was added.
-        # A turn that ASKED for a change is the one exception. Everything
-        # above is about the model restating a body from memory to
-        # illustrate it, and the evidence for that is a run of four
-        # explanatory answers whose bodies were all wrong. A restatement
-        # and a proposed change look identical — both write a symbol the
-        # index already holds, and both differ from it, the restatement
-        # because it is wrong and the change because it is a change — so
-        # the content cannot tell them apart. The question can.
-        #
-        # code_action comes from classify_turn and is read, not computed
-        # here. The timing works out: this guard runs in Step 0 of the
-        # inlet and classification of the CURRENT turn happens after, so
-        # what pstate holds now is the classification of the turn that
-        # produced the answer being processed. Measured on one run —
-        # "Modifica _close_dangling_fence" and "Modifica también
-        # _repair_truncated_json" both classified `modify`, "gracias"
-        # classified `explain`, and the four historical answers that
-        # motivated this guard were explanations.
-        #
-        # Anything other than `modify` blocks, including a missing or
-        # failed classification: the fail-safe default is `explain`, and
-        # the safe side of this decision is the one that protects the
-        # index.
+        # Except when the turn asked for a change: a restatement and a
+        # proposed change look identical, and only the question tells them
+        # apart. code_action is the classification of the turn that
+        # produced this answer (classification of the current turn runs
+        # later); anything but `modify`, including a missing one, blocks.
         _asked_for_a_change = False
         if role == "assistant" and project_id:
             try:
@@ -45666,37 +48998,13 @@ class ActiveCodeUpdater:
                 _indexed = set(
                     self._f._symbol_index.get_all_qualified_names(project_id)
                 )
-                # "Source" means a PASTED FILE, not the index at large.
-                # get_all_qualified_names returns everything, including
-                # what the assistant wrote on earlier turns, so a symbol
-                # the model invented two turns ago made its own newer
-                # version look like a restatement of a file that never
-                # held it. Measured: "_normalize_qid" — a function this
-                # project does not contain — was dropped as already held
-                # from source, and a later block lost six test functions
-                # the same way, the ones a repair had just fixed among
-                # them.
-                #
-                # This prevents new cases; it does not clean old ones.
-                # An index that ran with the bug holds whatever the
-                # assistant wrote — measured on one project: three
-                # references to "_normalize_qid", a function it does not
-                # contain, sitting in the call graph and counting toward
-                # centrality like any other symbol. "/forget last" drops
-                # the block that introduced them, and "/clean" lists the
-                # inactive ones.
-                #
-                # generated_by_assistant on the OWNING BLOCK is the
-                # distinction, not the presence of a file path. The first
-                # attempt used get_file_for_symbol, on the theory that only
-                # pasted code carries a path — but an assistant block gets
-                # one too: extract_file_path_for_block infers it from the
-                # surrounding prose, and a reply that mentions
-                # context_manager.py hands its own blocks that name.
-                #
-                # Measured after that fix shipped: nine symbols still
-                # dropped as "already held from source", all of them test
-                # classes the model had just written.
+                # "Source" means a PASTED FILE, not the index at large: the
+                # index also holds what the assistant wrote earlier, so an
+                # invented symbol would make its own newer version look like
+                # a restatement. The owning block's generated_by_assistant
+                # flag is the distinction, not a file path (assistant blocks
+                # get one inferred from prose). Prevents new cases only;
+                # "/forget last" and "/clean" remove old ones.
                 _from_file = set()
                 try:
                     _st = self._f._conversation_state_manager.get(project_id)
@@ -45773,31 +49081,13 @@ class ActiveCodeUpdater:
                 )
 
         # ── Step 3.7: assistant test scaffolding is not project code ──
-        # Step 3.6 drops a block only when EVERY symbol in it is already
-        # indexed, which is right for a restated body and wrong for a test
-        # suite: a `TestQualifySymbolName` with ten methods is all new
-        # names, so it passes and indexes in full.
-        #
-        # Measured on this project, whose source contains not one `def
-        # test_`: 89 test functions and 4 test classes among 900 indexed
-        # symbols, roughly a tenth of the map, all of them written by the
-        # model in earlier answers. They are not inert. They ride in Block
-        # A's class list, so the model reads its own past inventions as
-        # project structure and writes them again — which is why every
-        # [TESTS-SHOWN] line reports 0 of N: the names it shows come from
-        # the map, not from the harness the sandbox ran. They were seen
-        # arriving as PPR seeds. And a claim citing one of them passes
-        # citation validation, so a fabricated symbol can settle a
-        # fabricated claim against "code".
-        #
-        # Symbol level rather than block level: an answer commonly shows
-        # the real function and its tests in one block, and the function
-        # belongs in the index. A block left with nothing but tests is
-        # dropped whole.
-        #
-        # Like Step 3.6, this prevents new cases and cleans none: an index
-        # that already ran without it holds what the assistant wrote, and
-        # "/forget last" or "/clean" is how those go.
+        # Test code the model wrote is not project structure. Step 3.6 keeps
+        # a block whose symbols are all new, which lets a model-written test
+        # suite into the index: it then rides in Block A, is read back as
+        # the project, and a claim citing it passes citation validation.
+        # Filtered per symbol, since an answer often shows the real function
+        # and its tests in one block; a block left with only tests is
+        # dropped. Prevents new cases only ("/forget last", "/clean").
         if role == "assistant" and new_blocks_pending:
             try:
                 _kept3 = []
@@ -46875,29 +50165,17 @@ class ActiveCodeUpdater:
 
 
 # ── System-prompt injection ordering contract ────────────────────────────
-# Two axes that a single priority tag used to conflate:
+# Two axes a single priority tag used to conflate:
 #
-#   BUDGET  — which injections survive when the token budget is tight.
-#             _INJECTION_PRIORITY ranks them; _INJECTION_KEEP_UNDER_PRESSURE
-#             are truncated rather than dropped.
-#   POSITION — where an injection is rendered. This decides whether the KV
-#             prefix holds. The preliminary system prompt is assembled BEFORE
-#             the agentic pipeline runs, and llama.cpp reuses a checkpoint
-#             only when the incoming prompt matches it exactly up to that
-#             position. So anything appended AFTER prelim_system was built
-#             must render AFTER everything that was in it — then
-#             final == prelim + tail, a clean prefix extension, and the
-#             auxiliary calls' checkpoint (75321 tokens in the observed run)
-#             restores for the main call too. Injecting the agentic workspace
-#             at "high" slotted it into the MIDDLE of the ordering, diverging
-#             the prefix at the insertion point and forcing a full ~77k-token
-#             re-prefill on every code turn — 475 s of the 612 s that one run
-#             spent prefilling.
+#   BUDGET   — which injections survive a tight budget (_INJECTION_PRIORITY;
+#              _INJECTION_KEEP_UNDER_PRESSURE are truncated, not dropped).
+#   POSITION — where an injection renders. Anything appended after
+#              prelim_system was built must render after all of it, so the
+#              final prompt is prelim + tail and the KV checkpoint holds.
 #
-# "trailing" resolves the conflict: it ranks alongside "high" for budget
-# purposes, so the workspace is never quietly dropped, while rendering last
-# so the prefix survives. Recency also favours it — the findings land next to
-# the point of generation rather than 60k tokens upstream.
+# "trailing" ranks with "high" for budget, so the workspace is never
+# dropped, and renders last, so the prefix survives and the findings sit
+# next to the point of generation.
 _INJECTION_PRIORITY = {
     "critical": 0,
     "high": 1,
@@ -47140,9 +50418,18 @@ class SystemPromptBuilder:
                 _m.group(1)
                 for _m in re.finditer(r"(?m)^# `([^`]+)`", prelim_system or "")
             ]
+            # A body the question seeded is the question's own even when
+            # its name is not among the question's words: "why do history
+            # seeds have no effect?" names no symbol, and a follow-up names
+            # its subject in an earlier message. Judged by words alone, both
+            # were reported as carry-over while Block B was serving exactly
+            # the bodies raised for them, and their answers were kept out
+            # of the response cache.
+            _own = getattr(self._f, "_turn_question_seeds", None) or set()
             if (
                 _q
                 and _served
+                and not any(_n in _own for _n in _served)
                 and not any(
                     _n.rsplit(".", 1)[-1].lower() in _q
                     or _n.split(".", 1)[0].lower() in _q
@@ -47155,6 +50442,9 @@ class SystemPromptBuilder:
                     f"the section is carry-over activation and the answer "
                     f"will be written from it"
                 )
+                # Read by MessageAssembler.record_answer_basis: an answer
+                # written from carry-over is not one to serve again.
+                self._f._block_b_carry_over = True
         except Exception as _e_bb:
             self._f._log_debug(
                 f"Block B question check failed " f"({type(_e_bb).__name__}: {_e_bb})"
@@ -48039,30 +51329,13 @@ class SystemPromptBuilder:
         parts = [p for p in [static_block, hub_tier, dynamic_block] if p.strip()]
         prelim_system = separator.join(parts)
 
-        # Where the invariant part of the turn ends. Block A and the hub
-        # tier are the same 70360 tokens on every turn of a session — 96%
-        # of the system prompt — and Block B is the 3000 to 7800 that
-        # follow and change with the question.
-        #
-        # llama.cpp writes its context checkpoints at message boundaries,
-        # which is why they land at `system end + 1` and nowhere else. The
-        # end of the hub tier is not a boundary: it sits inside the system
-        # message, a couple of thousand tokens before it closes. So there
-        # is never a checkpoint there, and a turn whose Block B differs has
-        # nothing to resume from — the KV of Block A is still in the slot,
-        # intact and unusable, and 70360 unchanged tokens are re-processed
-        # because 3000 changed ones came after them.
-        #
-        # Stashed so the callers can cut here and send only this as the
-        # system, which makes the boundary a message boundary and puts the
-        # checkpoint where it has to be.
-        # One caveat worth naming: the user's own system prompt is appended
-        # AFTER the dynamic block below, so it sits in the volatile region
-        # and travels with it. It is empty in the deployment this was
-        # measured on (`User instructions (tail): ~0 tokens`), and moving it
-        # keeps its reading position; a deployment that puts a long standing
-        # instruction there would find it in the user turn instead of the
-        # system, which is a change of role and worth knowing about.
+        # Where the invariant part of the turn ends. Block A and the hub tier
+        # are identical on every turn (~96% of the system prompt); Block B
+        # follows and changes with the question. llama.cpp checkpoints only
+        # at message boundaries, so the callers cut here and send only this
+        # as the system, making the boundary a message boundary.
+        # Caveat: the user's own system prompt is appended after the dynamic
+        # block, so it travels in the user turn, not the system.
         _stable = [p for p in [static_block, hub_tier] if p.strip()]
         self._f._prelim_stable_this_turn = (
             separator.join(_stable) + separator if _stable else ""
@@ -49056,37 +52329,40 @@ class MessageAssembler:
         # user_content when the stripped form came back empty.
         # ------------------------------------------------------------------
         # ------------------------------------------------------------------
-        # Region: agentic pipeline gate — the single entry point
-        # The pipeline is the de-facto reasoning path. This gate fires for
-        # every code turn; the fast path (non-code chatter, continuations)
-        # falls through to the direct answer below. There is no
-        # agentic_trigger valve any more and no length threshold: a short
-        # code question is still a code question. is_code_session is read
-        # from the unified per-turn classifier (already cached, no extra
-        # call).
+        # Region: agentic pipeline gate — the single entry point. Every code
+        # turn goes through the pipeline; non-code chatter falls through to
+        # the direct answer. is_code_session comes from the cached per-turn
+        # classifier.
         #
-        # The pipeline question is capped at 2000 chars here: user_question
-        # has code spans stripped, but the fallback is raw user_content,
-        # which can be a 1.5MB paste. An uncapped value would run the
-        # architecture regex and len() over the whole blob and inflate the
-        # planner / per-step / synthesis prompts downstream. The code itself
-        # reaches the pipeline through Block A/B.
-        #
-        # A silent non-fire is a defect, so every blocking condition names
-        # itself in the log.
-        #
-        # Reference-line diet: when OpenWebUI re-attaches the ingested file
-        # on later turns, merge_pasted_files replaces it with the synthetic
-        # stub ("**name:** _(unchanged — N symbols already indexed…)_"),
-        # which rides inside the user message and — without this strip —
-        # inside the pipeline question, polluting the planner, every step
-        # prompt, the synthesis, and the workspace header verbatim (observed
-        # in production dumps). Same _REFERENCE_LINE_RE diet the classifier
-        # and seed-extraction consumers already apply.
+        # The question is capped at 2000 chars (the fallback is the raw
+        # message, which can be a whole paste) and stripped of the synthetic
+        # reference line of a re-attached file (_REFERENCE_LINE_RE), which
+        # would otherwise reach every prompt. Every blocking condition logs
+        # itself: a silent non-fire is a defect.
         # ------------------------------------------------------------------
         _agentic_question = self._f._commands._REFERENCE_LINE_RE.sub(
             "", (user_question or "").strip() or user_content.strip()
         ).strip()[:2000]
+        # A follow-up ("¿y quién la llama?") names its subject in an earlier
+        # question, and the preplanner, the planner and every step read
+        # this question alone. Live, with the activation already seeded on
+        # the right subject, the preplanner chose "identify the callers of
+        # ConversationStateManager.get" and the turn answered about that.
+        try:
+            _subject = self._f._activation.follow_up_subject(
+                _agentic_question, messages, project_id
+            )
+        except Exception:
+            _subject = []
+        if _subject:
+            _agentic_question = (
+                f"{_agentic_question}\n\n(Follow-up: the subject is "
+                + ", ".join(f"`{q}`" for q in _subject)
+                + ", named in an earlier question.)"
+            )
+            self._f._log_debug(
+                f"🔗 Follow-up: pipeline question carries its subject → {_subject}"
+            )
         # Per-TURN code verdict from the unified classifier. is_code_session
         # is sticky by design (classify_session returns True for the whole
         # session once active blocks exist — correct for LTM and code-aware
@@ -49911,28 +53187,12 @@ class MessageAssembler:
                 final_system = "## User instructions\n" + base_content.strip()
 
         # ── The junction, on the third route ──────────────────────────────
-        # _PREFIX_ROLE_SEPARATOR's own comment records this bug one route
-        # earlier: two places built the prefix/tail junction differently and
-        # it cost about ten minutes a run. It was fixed for the auxiliary
-        # calls and the agentic step sites. The answer call is the third
-        # route and was never included.
-        #
-        # Traced on the 16:11 run. Twelve auxiliary calls of one turn each
-        # created a checkpoint at exactly 72630 — the length of prelim plus
-        # the separator, which is where they stop resembling each other. The
-        # answer call arrived needing 72628, the length of prelim alone,
-        # because its system continues with the workspace and never carries
-        # the separator. Two tokens short of the only checkpoint there is,
-        # and a recurrent model cannot rewind two tokens: 88 seconds of
-        # re-prefill, every turn, on all four turns of both runs measured.
-        #
-        # Spliced rather than computed. Which injections the prelim happened
-        # to hold is not tracked here, and guessing the boundary would move
-        # the junction somewhere new and break the auxiliary route as well —
-        # the exact failure the constant was introduced to end. startswith
-        # asks the question directly instead: when the final prompt really
-        # does begin with the preliminary one, the junction is at that
-        # length and nowhere else.
+        # The answer call is the third route that builds the prefix/tail
+        # junction (_PREFIX_ROLE_SEPARATOR). Its system continued with the
+        # workspace and never carried the separator, so it arrived two
+        # tokens short of the auxiliary calls' checkpoint: a full re-prefill
+        # every turn. Spliced, not computed: when the final prompt begins
+        # with the preliminary one, the junction is at that length.
         try:
             _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
             if (
@@ -50006,87 +53266,31 @@ class MessageAssembler:
             final_system = final_system + "\n\n" + pending_summary
 
         # ── The answer call's system is the auxiliary calls' system ───────
-        # Read off the server's own prompt logs, which is the only place
-        # this was visible. An agentic step sends `prelim + separator` as
-        # its whole system and nothing else; the chat template trims the
-        # separator's trailing newlines because they sit at the end of the
-        # message, so what reaches the model ends `…activated)_\n\n\n---`.
-        # The answer call sends the same 280499 characters and then 11944
-        # more — the workspace, the answer shape, the turn mark, the
-        # confidence line — so nothing is trimmed and the two prompts part
-        # company exactly at those two newlines, at 95.8% of the way in.
+        # The trailing block rides in the user turn, after the question, so
+        # this call's system prompt is byte-identical to every aligned
+        # step's. Otherwise the chat template trims the separator off the
+        # steps' system but not this one, the prompts diverge one token
+        # before llama.cpp's checkpoint, and every answer pays a full
+        # re-prefill (~90 s). After the question because the last thing
+        # read is the thing obeyed.
         #
-        # llama.cpp creates its checkpoint one token past the end of the
-        # auxiliary system, on its `<|im_end|>`. The answer call branches
-        # one token before it — `checking checkpoint with [72752] against
-        # 72751`, four times in one run — and a recurrent model cannot
-        # rewind one token any more than seventy thousand. That is the
-        # whole of the 90-second re-prefill on every answer.
-        #
-        # Moving the tail into the user turn makes the two systems
-        # byte-identical, so both are trimmed the same way and the shared
-        # prefix runs on through `<|im_end|>\n<|im_start|>user\n` — about
-        # four tokens past the checkpoint rather than one short of it.
-        #
-        # Appended after the question, not before it. This file's own
-        # argument for the trailing slot is that the last thing read before
-        # generating is the thing obeyed; the tail keeps that position, and
-        # a workspace placed ahead of the question would read more like
-        # something the person wrote, which is the failure the block's own
-        # `NEVER reproduce this` line already exists to prevent.
-        #
-        # ON CHANGING THE MODEL. The BUG above was caused by a chat
-        # template — Qwen's trims trailing whitespace off a message, so the
-        # separator survived in one route and not the other. This FIX does
-        # not depend on that and must not be simplified away on the
-        # assumption that it does: it makes the two system prompts the same
-        # string BEFORE any template sees them, so whatever a template does
-        # to one it does to the other. Identity survives a template change;
-        # it was the asymmetry that never did.
-        #
-        # Two things a different model can still move, neither of them here:
-        #
-        #   The margin. llama.cpp puts its checkpoint one token past the end
-        #   of the system, and the shared prefix now runs on through the
-        #   `<|im_end|>\n<|im_start|>user\n` boundary — about four tokens on
-        #   Qwen, so three to spare. A template that separates roles in one
-        #   token leaves none, and a template that inserts anything between
-        #   the system and the first user turn — a tools block, a system-side
-        #   thinking tag — cuts the shared prefix before the checkpoint and
-        #   the re-prefill returns.
-        #
-        #   The symptom, which is silent. Nothing here fails loudly if the
-        #   margin is lost; the answer call simply costs 90 seconds again.
-        #   `⏱️ Answer call` is the number that says so: ~15s means the
-        #   checkpoint is being reached, ~110s means it is not, and the
-        #   server's `checking checkpoint with [N] against M` names by how
-        #   much. Measured on Qwen: [72753] against 72757, four tokens of
-        #   margin, prefill 2572 tokens of 75326.
+        # Model-independent: the fix is string identity before any template
+        # runs. What a new template can still break is the margin (the
+        # shared prefix runs about four tokens past the checkpoint; a
+        # one-token role separator, or anything inserted between system and
+        # first user turn, loses it). The symptom is silent: `⏱️ Answer
+        # call` at ~15 s means the checkpoint is reached, ~110 s means not.
         try:
             _pre = getattr(self._f, "_prelim_system_this_turn", "") or ""
             _pre_full = _pre + _PREFIX_ROLE_SEPARATOR if _pre else ""
             _stab = getattr(self._f, "_prelim_stable_this_turn", "") or ""
-            # Gate on the STABLE half, falling back to the full prelim —
-            # the same cascade call_llm and the agentic step sites already
-            # use. This route kept the stricter gate and paid for it: the
-            # full prelim carries the dynamic region, and on a turn that
-            # ingests a paste that region is rebuilt between the moment the
-            # prelim is stashed and the moment this assembles, so
-            # startswith(_pre_full) failed and the whole cut was skipped.
-            # Measured: three paste turns in one run shipped 313k, 315k and
-            # 348k-char systems where the other six shipped 283,722 — each
-            # a fresh prefix and a full ~85k-token reprocess, about 150
-            # seconds apiece. The cut never needed more than _stab: the
-            # inflated systems started with those exact 283,722 bytes.
-            # ORDER MATTERS, and it is the opposite of call_llm's. There the
-            # whole tail just moves; here the split point decides POSITION:
-            # cutting at _pre_full sends Block B in front of the question and
-            # the workspace behind it, the two places they already occupied.
-            # Cutting at _stab sends both behind. So _pre_full is tried first
-            # and keeps every turn that works today byte-for-byte unchanged;
-            # _stab is the rescue for the turns where _pre_full no longer
-            # matches, and it accepts Block B moving rather than paying a
-            # full reprocess to keep it where it was.
+            # Gate on the STABLE half, falling back to the full prelim, as
+            # call_llm does. On a paste turn the dynamic region is rebuilt
+            # between stashing the prelim and assembling here, so a gate on
+            # the full prelim fails and the turn pays a full reprocess.
+            # ORDER: _pre_full first (Block B before the question, the
+            # workspace after, as today); _stab is the rescue when _pre_full
+            # no longer matches, accepting that Block B moves.
             _cut = ""
             if _pre_full and final_system.startswith(_pre_full):
                 _cut = _pre_full
@@ -50244,6 +53448,8 @@ class MessageAssembler:
                 )
             self._f._log_debug("─" * 60)
 
+        self.record_answer_basis(project_id, len(dynamic_block or ""))
+
         # ── Context dump (evolution tracking) ─────────────────────────
         if self._f.valves.enable_context_dump:
             try:
@@ -50258,6 +53464,57 @@ class MessageAssembler:
                 self._f._log_debug(f"Context dump scheduling failed: {_dump_err}")
 
         return messages
+
+    def record_answer_basis(self, project_id: str, block_b_chars: int = 0) -> None:
+        """
+        Record what this turn's answer is about to be written from.
+
+        Stored in pstate["answer_basis"] and read on the next inlet, when
+        process_prev_assistant_turn files the finished answer in the
+        response cache. By then the per-turn sets have been reset, so the
+        record is taken here, after the pipeline and Block B, the last
+        point that knows them.
+
+        - structure_hash: names and signatures across the project.
+        - tested_against: TestedCode fingerprints of every body shown
+          this turn, so the cached answer holds while those bodies do.
+        - backed: False when Block B served none of the question's own
+          bodies (the carry-over WARNING). Such an answer is written from
+          the previous subject, and serving it again would repeat it.
+        """
+        try:
+            idx = self._f._symbol_index
+            qualified = idx.get_all_qualified_names(project_id) or set()
+            shown = sorted(
+                n
+                for n in (getattr(self._f, "_bodies_seen_this_turn", None) or set())
+                if n in qualified
+            )
+            _basis = {
+                "structure_hash": idx.compute_structure_hash(project_id) or "",
+                "tested_against": self._f._tested_code.fingerprint(shown, project_id),
+                "backed": not getattr(self._f, "_block_b_carry_over", False),
+            }
+            self._f._project_state_manager.get_pstate(project_id)[
+                "answer_basis"
+            ] = _basis
+            self._f._record_metric(
+                "turn",
+                (
+                    project_id,
+                    float(getattr(self._f, "_turn_started_at", 0.0)),
+                    time.time(),
+                    str(getattr(self._f, "_turn_user_question", "") or "")[:300],
+                    len(shown),
+                    int(block_b_chars),
+                    int(getattr(self._f, "_block_b_carry_over", False)),
+                    int(_basis["backed"]),
+                    _basis["structure_hash"],
+                    0,
+                ),
+            )
+        except Exception as _e_basis:
+            self._f._log_debug(f"answer basis: not recorded ({_e_basis!r})")
 
 
 class ContextAssembler:
@@ -53405,6 +56662,27 @@ class SemanticSeedInferencer:
         re.IGNORECASE,
     )
 
+    # Request verbs that usually describe behaviour to build or reshape
+    # rather than a symbol the user points at. Matched on word boundaries,
+    # so 'address' does not read as 'add' nor 'remove' as 'move', and in
+    # both languages the project's users write in.
+    _INFER_KEYWORDS_RE = re.compile(
+        r"\b(?:"
+        r"(?:re-?)?implement(?:s|ed|ing|ation)?|implementa(?:r|ndo|do|ci[oó]n)?|"
+        r"(?:re-?)?creat(?:e|es|ed|ing|ion)|crea(?:r|ndo|do|ci[oó]n)?|"
+        r"add(?:s|ed|ing)?|a[ñn]ad(?:e|ir|iendo|ido)|agrega(?:r|ndo|do)?|"
+        r"architect(?:ure|ures|ural)?|arquitecturas?|"
+        r"(?:re-?)?design(?:s|ed|ing)?|dise[ñn](?:a|ar|os?|ando|ado)|"
+        r"refactor(?:s|ed|ing)?|refactoriz(?:a|ar|ando|aci[oó]n)|"
+        r"(?:re-?)?structur(?:e|es|ed|ing)|estructur(?:as?|ar|ando|aci[oó]n)|"
+        r"(?:re-?)?organi[sz](?:e|es|ed|ing)|organiz(?:a|ar|ando|aci[oó]n)|"
+        r"split(?:s|ting)?|divid(?:e|ir|iendo)|separ(?:a|ar|ando)|"
+        r"mov(?:e|es|ed|ing)|mueve|mover|moviendo|"
+        r"extract(?:s|ed|ing|ion)?|extra(?:e|er|yendo)|extracci[oó]n"
+        r")\b",
+        re.IGNORECASE,
+    )
+
     # ------------------------------------------------------------------
     # Region: Initialization
     # ------------------------------------------------------------------
@@ -53449,6 +56727,10 @@ class SemanticSeedInferencer:
         Decide whether to spend an LLM call on seed inference.
 
         Uses a cascade: heuristic reinforcement, CrossEncoder, and LLM fallback.
+        The CrossEncoder margin is read in both directions: a wide margin
+        decides (a literal-only verdict only when the query names an indexed
+        symbol), a narrow one defers to the LLM, and in between the keyword
+        heuristic decides.
 
         Args:
             query: The user's query.
@@ -53478,24 +56760,9 @@ class SemanticSeedInferencer:
         # ------------------------------------------------------------------
         # Step 2: Heuristic reinforcement with keyword detection.
         # ------------------------------------------------------------------
-        content_lower = query.lower()
-        infer_keywords = [
-            "implement",
-            "create",
-            "add",
-            "architecture",
-            "design",
-            "refactor",
-            "structure",
-            "organize",
-            "split",
-            "move",
-            "extract",
-        ]
         h_weight = self._f.valves.heuristic_reinforcement_weight
-        heuristic_boost = (
-            0.2 if any(kw in content_lower for kw in infer_keywords) else 0.0
-        )
+        has_infer_keyword = bool(self._INFER_KEYWORDS_RE.search(query))
+        heuristic_boost = 0.2 if has_infer_keyword else 0.0
         if use_case in (UseCase.ARCHITECTURE, UseCase.REFACTORING):
             heuristic_boost += 0.15
         heuristic_boost *= h_weight
@@ -53522,19 +56789,35 @@ class SemanticSeedInferencer:
                 scores_reinforced[0] += heuristic_boost
 
                 diff = scores_reinforced[0] - scores_reinforced[1]
+                margin = abs(diff)
                 CE_CONFIDENCE_THRESHOLD = self._f.valves.seed_infer_ce_threshold
                 LLM_FALLBACK_THRESHOLD = self._f.valves.seed_infer_llm_threshold
 
-                if diff >= CE_CONFIDENCE_THRESHOLD:
-                    result = scores_reinforced[0] > scores_reinforced[1]
+                if margin >= CE_CONFIDENCE_THRESHOLD:
+                    if diff > 0:
+                        self._f._log_debug(
+                            f"_should_infer: CE confident (diff={diff:.2f}) → True"
+                        )
+                        return True
+                    # The CE reads the query as literal-only. That is credible
+                    # only when the query names an indexed symbol; with none
+                    # to seed from, the LLM decides.
+                    if self._query_names_indexed_symbol(query_stripped, project_id):
+                        self._f._log_debug(
+                            f"_should_infer: CE confident (diff={diff:.2f}) → False"
+                        )
+                        return False
                     self._f._log_debug(
-                        f"_should_infer: CE confident (diff={diff:.2f}) → {result}"
+                        f"_should_infer: CE says literal-only (diff={diff:.2f}) but the "
+                        "query names no indexed symbol, using LLM"
                     )
-                    return result
+                    return await self._should_infer_with_llm(
+                        query, scores_reinforced, use_case, project_id
+                    )
 
-                elif diff < LLM_FALLBACK_THRESHOLD:
+                if margin < LLM_FALLBACK_THRESHOLD:
                     self._f._log_debug(
-                        f"_should_infer: CE uncertain (diff={diff:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
+                        f"_should_infer: CE uncertain (|diff|={margin:.2f} < {LLM_FALLBACK_THRESHOLD:.2f}), "
                         "using LLM"
                     )
                     return await self._should_infer_with_llm(
@@ -53546,11 +56829,29 @@ class SemanticSeedInferencer:
         # ------------------------------------------------------------------
         # Step 4: Heuristic fallback (middle zone or no CE).
         # ------------------------------------------------------------------
-        if any(kw in query.lower() for kw in infer_keywords):
+        if has_infer_keyword:
             return True
         if use_case in (UseCase.ARCHITECTURE, UseCase.REFACTORING):
             return True
         return False
+
+    def _query_names_indexed_symbol(self, query: str, project_id: str) -> bool:
+        """
+        Return True if the query contains the exact name of an indexed symbol.
+
+        Words shorter than four characters are ignored: names such as `get`
+        or `run` collide with ordinary words and would make almost any query
+        look as if it named a symbol.
+
+        Args:
+            query: The query text, with pasted code already stripped.
+            project_id: Current project identifier.
+
+        Returns:
+            True if at least one word of the query is an indexed bare name.
+        """
+        words = {w for w in re.findall(r"\w+", query or "") if len(w) >= 4}
+        return bool(words & self._f._symbol_index.get_all_names(project_id))
 
     # ------------------------------------------------------------------
     # Region: LLM Fallback for Seed Inference Decision
@@ -53838,6 +57139,7 @@ class SemanticSeedInferencer:
         code_action_vector: dict,
         use_case: str,
         slot_free: bool = True,
+        follow_up_referent: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         """
         Return {qualified_id: seed_score} of symbols the LLM judges relevant.
@@ -53855,6 +57157,9 @@ class SemanticSeedInferencer:
             use_case: Detected use case.
             slot_free: False on a cold start, where each auxiliary LLM
                 call would pay the model load. Not a llama.cpp slot.
+            follow_up_referent: The subject a short follow-up inherits
+                (ActivationEngine.follow_up_referent); seeded without the
+                LLM when the query names nothing itself.
 
         Returns:
             Dictionary mapping qualified symbol ids to seed scores.
@@ -53878,6 +57183,22 @@ class SemanticSeedInferencer:
 
         # ── Step 2: Fast path — literal exact resolution (no LLM) ──
         direct_seeds = self._resolve_literal_seeds(query, project_id)
+        # Asking the model about a follow-up means asking it to resolve "it"
+        # without the conversation that says what "it" is.
+        if not direct_seeds and follow_up_referent:
+            idx = self._f._symbol_index
+            carried: Dict[str, float] = {}
+            for name in follow_up_referent:
+                for qid in idx.get_qualified_names_for(name.split(".")[-1], project_id):
+                    if "." not in name or qid == name:
+                        carried[qid] = 1.0
+            if carried:
+                self._f._log_debug(
+                    f"SemanticSeedInferencer: follow-up seeded with the "
+                    f"referent of an earlier question, LLM skipped → "
+                    f"{sorted(carried)[:8]}"
+                )
+                return carried
         if direct_seeds:
             sample = sorted(direct_seeds)[:8]
             ellipsis = "..." if len(direct_seeds) > 8 else ""
@@ -54309,47 +57630,6 @@ class InletOrchestrator:
             )
             _n += 1
         return _n
-
-    def mark_previous_answer(self, messages: list) -> None:
-        """Add the turn mark to the previous answer if the model omitted it.
-
-        The mark is asked for in the trailing injection, which reaches the
-        model before it writes, and a mark the model writes reaches the
-        reader. A model that ignores the instruction would leave the turn
-        unreferenceable, so the mark is added here when the answer is read
-        back on the following turn — inlet edits persist, which is why the
-        commands work and why the outlet's version of this does not.
-
-        The number is that answer's own turn, which is one less than the
-        turn now being handled.
-        """
-        # ── Step 1: the previous answer, and the turn it belonged to ──
-        try:
-            _msgs = messages or []
-            _users = sum(
-                1 for _m in _msgs if isinstance(_m, dict) and _m.get("role") == "user"
-            )
-            _prev_turn = _users - 1
-            if _prev_turn < 1:
-                return
-            for _m in reversed(_msgs):
-                if not isinstance(_m, dict):
-                    continue
-                if _m.get("role") != "assistant":
-                    continue
-                _c = _m.get("content")
-                if not isinstance(_c, str) or not _c.strip():
-                    return
-                if _c.lstrip().startswith("[T"):
-                    return
-                _m["content"] = f"[T{_prev_turn}]\n\n{_c.lstrip()}"
-                self._f._log_debug(
-                    f"inlet: previous answer had no turn mark — added "
-                    f"[T{_prev_turn}]"
-                )
-                return
-        except Exception:
-            return
 
     async def inlet_extract_user_info(
         self,
@@ -55017,26 +58297,11 @@ class InletOrchestrator:
                 last_assistant["content"] = _repaired
 
         # ------------------------------------------------------------------
-        # Region: drop a degenerate previous answer before it propagates
-        #
-        # _output_is_degenerate already guards every call_llm makes, but the
-        # FINAL answer is not one of those — OpenWebUI generates it from the
-        # messages inlet returns — so the one output the reader actually
-        # reads had nothing watching it. Measured: one turn looped and
-        # emitted 49,267 tokens, eight verbatim copies of its own answer
-        # including eight Stats blocks. Compression ratio 0.0504 against a
-        # 0.13 threshold and 0.2958 for a healthy answer of the same
-        # conversation — a factor of six, not a borderline call.
-        #
-        # The damage is not the bad turn, which is already spent. It is the
-        # three turns after it: that answer re-entered history and took the
-        # user turn from 69,148 bytes to 223,796, three times over, roughly
-        # 38,000 tokens of repetition displacing real code and heading for
-        # LTM and the index.
-        #
-        # Truncated to the first copy rather than dropped: the opening of a
-        # looped answer is usually sound and the reader saw it, so keeping
-        # it preserves the thread while the repetition stops here.
+        # Region: drop a degenerate previous answer before it propagates.
+        # The final answer is generated by the host, so _output_is_degenerate
+        # never saw it; a looped answer re-entering history multiplies the
+        # next turns' size. Truncated to its first copy, which the reader
+        # already saw and which is usually sound.
         # ------------------------------------------------------------------
         if self._f.valves.enable_degeneracy_retry and len(assistant_content) > 1500:
             _degen = _output_is_degenerate(assistant_content)
@@ -55226,15 +58491,41 @@ class InletOrchestrator:
                     _cached_footer = _extract_answer_footer(
                         self._f._coerce_message_content(last_assistant.get("content"))
                     )
-                    await self._f._ltm.store_response_in_cache(
-                        prompt_user.get("content", ""),
-                        assistant_content,
-                        context_hash,
-                        state,
-                        code_state_hash,
-                        wait=False,
-                        footer=_cached_footer,
-                    )
+                    # A follow-up is filed under its subject, read from the
+                    # conversation up to the question it answered.
+                    try:
+                        _cache_subject = ",".join(
+                            self._f._activation.follow_up_subject(
+                                self._f._coerce_message_content(
+                                    prompt_user.get("content", "")
+                                ),
+                                history_through_assistant,
+                                project_id,
+                            )
+                        )
+                    except Exception:
+                        _cache_subject = ""
+                    # Recorded by the previous inlet (MessageAssembler.
+                    # record_answer_basis), consumed once.
+                    _basis = pstate.pop("answer_basis", None) or {}
+                    if _basis and not _basis.get("backed", True):
+                        self._f._log_debug(
+                            "[RESPONSE-CACHE] not stored — Block B served "
+                            "none of the question's own bodies, so the "
+                            "answer was written from the previous subject"
+                        )
+                    else:
+                        await self._f._ltm.store_response_in_cache(
+                            prompt_user.get("content", ""),
+                            assistant_content,
+                            context_hash,
+                            state,
+                            code_state_hash,
+                            wait=False,
+                            footer=_cached_footer,
+                            subject=_cache_subject,
+                            basis=_basis,
+                        )
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 9. File handling
@@ -55408,7 +58699,12 @@ class InletOrchestrator:
         return symbols, lang
 
     def _format_pasted_file(
-        self, name: str, content: str, is_code: bool, fence_lang: str
+        self,
+        name: str,
+        content: str,
+        is_code: bool,
+        fence_lang: str,
+        indexed: bool = True,
     ) -> str:
         """Render one attachment as a labelled block for the message text.
 
@@ -55430,6 +58726,9 @@ class InletOrchestrator:
             content: The file's text content.
             is_code: Whether to fence the content as code.
             fence_lang: Fence language tag (may be "").
+            indexed: Whether symbols were extracted from it. The header
+                said they were for every attachment, prose and failed
+                parses included, and the model believed it.
 
         Returns:
             The header line plus the optionally fenced content.
@@ -55449,6 +58748,9 @@ class InletOrchestrator:
         _header = (
             f"**{name}:** _(attached file — contents below; symbols are "
             f"indexed in the SymbolGraph)_"
+            if indexed
+            else f"**{name}:** _(attached file — contents below; no code "
+            f"symbols were extracted from it)_"
         )
         if not is_code:
             return f"{_header}\n{body_text}"
@@ -55547,19 +58849,50 @@ class InletOrchestrator:
                 continue
 
             is_code, fence_lang = await self._resolve_pasted_fence(name, content)
-            merged_text.append(
-                self._format_pasted_file(name, content, is_code, fence_lang)
-            )
-
+            # A long message pasted into the chat arrives as a .txt file: a
+            # question in prose with the code between fences. Parsed whole
+            # as Python it yields nothing; fenced whole, the question
+            # becomes code. Live, "¿Qué hace esta clase?" with the class
+            # above it was answered with "the class does not exist in the
+            # current code". The code between the fences is what is
+            # parsed, and the file is shown as written. Only when the file
+            # as given yields nothing: a source file carries fences in its
+            # own strings and docstrings, and reading those first parsed a
+            # few fragments of it and showed it unfenced, which took the
+            # first turn off silent ingestion.
+            fenced: List[Tuple[str, str]] = []
+            raw_code = content
+            symbols: List[Any] = []
+            lang = ""
             if is_code:
                 symbols, lang = await self._extract_symbols_from_raw(
                     content, name, fence_lang
                 )
+            if not symbols and "```" in content:
+                fenced = _PASTED_FENCE_RE.findall(content)
+            if fenced:
+                raw_code = "\n\n".join(code for _lg, code in fenced)
+                if not fence_lang:
+                    fence_lang = next((lg.lower() for lg, _c in fenced if lg), "")
+                symbols, lang = await self._extract_symbols_from_raw(
+                    raw_code, name, fence_lang
+                )
+            merged_text.append(
+                self._format_pasted_file(
+                    name,
+                    content,
+                    is_code and not fenced,
+                    fence_lang,
+                    indexed=bool(symbols),
+                )
+            )
+
+            if is_code or fenced:
                 if symbols:
                     merged_file_blocks.append(
                         {
                             "file_path": name,
-                            "raw_code": content,
+                            "raw_code": raw_code,
                             "symbols": symbols,
                             "language": lang,
                         }
@@ -56226,24 +59559,11 @@ class Valves(BaseModel):
         description="Inject full bodies of top‑N hubs as a cacheable tier between Block A and Block B.",
     )
 
-    # THE HUB TIER IS INSIDE THE INVARIANT PREFIX AND THE FREEZE DOES NOT
-    # COVER IT. Measured on one run: the tier went from ~6,256 to ~6,595
-    # tokens between turn 2 and turn 3, the invariant moved by 1,679 chars,
-    # and llama.cpp re-prefilled 88,273 tokens in 122 seconds — while the
-    # Block A freeze sat there logging "holding frozen map", because it
-    # protects the architecture map and not these bodies.
-    #
-    # The churn is ordinary: the model writes code in an answer, it gets
-    # indexed, centrality shifts, and one symbol enters or leaves the top
-    # N. Nothing is broken; the damper simply stops short of the part that
-    # moves most often.
-    #
-    # Not changed here because both directions cost something. Freezing the
-    # tier with the map keeps the prefix stable and lets the model read a
-    # body the project no longer has. Leaving it as is pays ~122s whenever
-    # centrality reorders. The valve to reach for first is
-    # block_a_freeze_count_all_changes, which would make a tier change
-    # count against the freeze budget rather than pass through it.
+    # The hub tier is inside the invariant prefix and the Block A freeze
+    # does not cover it: when centrality reorders the top N, the prefix
+    # moves and the next call re-prefills (~120 s). Left as is because
+    # freezing it would show bodies the project may no longer have. The
+    # valve to reach for is block_a_freeze_count_all_changes.
     hub_bodies_tier_top_n: int = Field(
         default=16,
         ge=1,
@@ -56770,10 +60090,10 @@ class Valves(BaseModel):
     agentic_step_cache: bool = Field(
         default=True,
         description=(
-            "Cache step results in SQLite keyed by (kind, goal) and the "
-            "structure_hash they were produced under; a code edit "
-            "invalidates automatically. Repeated investigations across "
-            "neighbouring turns become free."
+            "Cache step results in SQLite keyed by (kind, goal). A result "
+            "is served while the project's signatures and the bodies the "
+            "step read are unchanged; an edit to either invalidates it. "
+            "Repeated investigations across neighbouring turns become free."
         ),
     )
 
@@ -58778,6 +62098,19 @@ class Valves(BaseModel):
         ),
     )
 
+    outlet_emit_probe: bool = Field(
+        default=False,
+        description=(
+            "Diagnostic. After each answer the outlet appends a short "
+            "labelled block through the event emitter, and the next inlet "
+            "logs whether the host returned it in the history ([EMIT-PROBE] "
+            "lines). It settles whether the plugin can put the measured "
+            "Stats block in front of the reader itself, which outlet edits "
+            "to the message body cannot. Leave off in normal use: the block "
+            "is visible to the reader."
+        ),
+    )
+
     outlet_expand_intercept_enabled: bool = Field(default=True)
 
     outlet_expand_intercept_max_symbols: int = Field(default=0, ge=0)
@@ -59241,6 +62574,8 @@ class Filter:
         self._patcher = PatchApplier(self)
         self._activation = ActivationEngine(self)
         self._meta_reasoning = MetacognitiveReasoningEngine(self)
+        self._tested_code = TestedCode(self)
+        self._protective_belt = ProtectiveBelt(self)
         self._epistemic = EpistemicStrategies(self)
         self._hypothesis_forge = HypothesisForge(self)
         self._agentic = AgenticOrchestrator(self)
@@ -59499,8 +62834,13 @@ class Filter:
         # against the graph, and what a body RETURNS is not an edge, so
         # such claims land as unresolved and nobody looks again.
         self._bodies_seen_this_turn: Set[str] = set()
-        # Distinct bodies rendered this turn. Not len() of the set above,
-        # which holds two lookup keys per body; see _note_body_shown.
+        # The subset rendered into the context every step shares (hub tier
+        # and Block B), by qualified name. A body fetched by EXPAND is in
+        # the set above and not in this one; see _note_body_shown.
+        self._bodies_in_shared_context: Set[str] = set()
+        # Distinct bodies rendered this turn. Not len() of
+        # _bodies_seen_this_turn, which holds two lookup keys per body; see
+        # _note_body_shown.
         self._bodies_shown_count: int = 0
         # The Stats block as handed to the answering model, one line per
         # entry. Written when the workspace note is built, read once by the
@@ -59530,6 +62870,120 @@ class Filter:
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. Logging utilities
     # ═══════════════════════════════════════════════════════════════════════════
+
+    def _answer_language(self, question: str) -> str:
+        """
+        The language to head the answer in.
+
+        The question's own, when its words leave no doubt
+        (_language_evidence). When they do not, whoever has more to go on:
+
+        - a question with no words of either language ("SeedCache.get →
+          callers?") says nothing itself: the chat's earlier messages
+          decide, then the pre-planner's reading, then the project's last
+          settled question;
+        - a question with one Spanish word among English ones is read by
+          the pre-planner, which has the sentence and not a word list;
+          then the chat, then the count as it stands.
+
+        English only when none of them says.
+        """
+        try:
+            es, en = _language_scores(question)
+            lang = _language_evidence(question)
+            turn = getattr(self, "_turn_started_at", 0.0)
+            read = getattr(self, "_preplanner_language", (0.0, ""))
+            llm = read[1] if read[0] == turn else ""
+            chat = str(getattr(self, "_turn_chat_language", "") or "")
+            pstate = self._project_state_manager.get_pstate(
+                str(self.valves.project_id or "")
+            )
+            last = str(pstate.get("answer_language") or "")
+            if lang:
+                why = "the question's own words"
+            elif not es and not en:
+                lang, why = next(
+                    (v, w)
+                    for v, w in (
+                        (chat, "the chat's earlier messages"),
+                        (llm, "the pre-planner's reading"),
+                        (last, "the project's last settled question"),
+                        ("en", "nothing says"),
+                    )
+                    if v
+                )
+            else:
+                lang, why = next(
+                    (v, w)
+                    for v, w in (
+                        (llm, "the pre-planner's reading"),
+                        (chat, "the chat's earlier messages"),
+                        ("en" if en > es else "", "the count as it stands"),
+                        (last, "the project's last settled question"),
+                        ("en", "nothing says"),
+                    )
+                    if v
+                )
+            if lang not in _SECTION_HEADINGS:
+                lang, why = "en", f"no headings for {lang!r}"
+            if why in ("the question's own words", "the pre-planner's reading"):
+                pstate["answer_language"] = lang
+            if getattr(self, "_answer_language_logged", None) != (turn, lang, why):
+                self._answer_language_logged = (turn, lang, why)
+                self._log_debug(
+                    f"🌐 Answer language: {lang} — {why} (question: {es} "
+                    f"Spanish / {en} English word(s); pre-planner: "
+                    f"{llm or '—'}; chat: {chat or '—'}; project: {last or '—'})"
+                )
+            return lang
+        except Exception:
+            return _question_language(question)
+
+    def _chat_language(self, messages: list) -> str:
+        """
+        The language this chat's earlier user messages were written in.
+
+        Each of the last _CHAT_LANGUAGE_MESSAGES that says (_language_evidence)
+        has one vote; a tie goes to the most recent. The current message is
+        not counted: it is what this is asked about.
+        """
+        votes: List[str] = []
+        for msg in reversed((messages or [])[:-1]):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(p.get("text", "")) for p in content if isinstance(p, dict)
+                )
+            vote = _language_evidence(str(content or "")[:_CHAT_LANGUAGE_CHARS])
+            if vote:
+                votes.append(vote)
+            if len(votes) >= _CHAT_LANGUAGE_MESSAGES:
+                break
+        if not votes:
+            return ""
+        es, en = votes.count("es"), votes.count("en")
+        return votes[0] if es == en else ("es" if es > en else "en")
+
+    def _record_metric(self, table: str, row: tuple) -> None:
+        """
+        Queue one row of pipeline metrics (StateStore.init_db, metric_*).
+
+        Written by the database worker like every other write. Never
+        raises and never waits: a full queue drops the row, because a
+        measurement must not slow down what it measures.
+        """
+        try:
+            sql = _METRIC_INSERTS[table]
+
+            def _write(sql: str = sql, row: tuple = row) -> None:
+                self._db_conn.execute(sql, row)
+                self._db_conn.commit()
+
+            self._db_write_queue.put_nowait((_write, (), {}))
+        except Exception:
+            pass
 
     def _record_agent_act(
         self,
@@ -59595,7 +63049,7 @@ class Filter:
         line = f"{'=' * left}{title_text}{'=' * right}"
         print(f"[CodeAware] {line}")
 
-    async def _emit_message(self, content: str) -> None:
+    async def _emit_message(self, content: str, emitter: Any = None) -> bool:
         """
         Append content to the assistant message via __event_emitter__.
 
@@ -59613,21 +63067,120 @@ class Filter:
 
         Args:
             content: Markdown appended to the end of the answer.
+            emitter: The emitter to use instead of the one the inlet stored.
+                The outlet passes its own, because the stored one is cleared
+                when the inlet ends and, with two turns overlapping, may
+                belong to a different message.
+
+        Returns:
+            True if the event was sent; False if there was nothing to send,
+            no emitter, or the host refused it.
         """
         # Nothing to append is not an append: an empty string still fires
         # the event, and the caller wraps it in two horizontal rules — a
         # fenced-off nothing at the end of the answer.
         if not (content or "").strip():
-            return
-        if not self._event_emitter:
-            return
+            return False
+        _emit = emitter or self._event_emitter
+        if not _emit:
+            return False
         try:
-            await self._event_emitter({"type": "message", "data": {"content": content}})
+            await _emit({"type": "message", "data": {"content": content}})
         except Exception as _e_em:
             self._log_debug(
                 f"emit_message failed ({type(_e_em).__name__}: {_e_em}) — "
                 f"the answer stands without the appended block"
             )
+            return False
+        return True
+
+    async def _emit_outlet_probe(self, emitter: Any) -> None:
+        """
+        Append a labelled probe block through the event emitter.
+
+        The measured footer cannot be corrected by editing the outlet body,
+        and the one channel that does reach the reader, _emit_message, has no
+        caller. Before the footer moves onto it, three things have to be
+        known, and this settles them in one turn: that the emitter reaches
+        the outlet, that the block is visible to the reader, and whether the
+        host returns it in the history the next inlet receives (see
+        _check_emit_probe_in_history).
+
+        The block carries the measured Stats lines when a pipeline ran, so it
+        also shows what a plugin-side footer would say beside what the model
+        copied. Does nothing unless valves.outlet_emit_probe is set. Never
+        raises.
+
+        Args:
+            emitter: The outlet's own __event_emitter__, or None.
+        """
+        if not self.valves.outlet_emit_probe:
+            return
+        if not emitter:
+            self._log_debug(
+                "[EMIT-PROBE] the outlet received no __event_emitter__ — "
+                "nothing was appended, and a footer cannot be emitted from "
+                "here on this host"
+            )
+            return
+        _lines = list(getattr(self, "_measured_stats_lines", None) or [])
+        _block = (
+            f"\n\n---\n\n{_EMIT_PROBE_MARK} appended by the plugin after the answer"
+        )
+        if _lines:
+            _block += ", measured:\n" + "\n".join(_lines)
+        _block += "\n\n---"
+        if not await self._emit_message(_block, emitter=emitter):
+            self._log_debug(
+                "[EMIT-PROBE] the emitter refused the block (see the "
+                "emit_message line above); nothing to look for next turn"
+            )
+            return
+        self._emit_probe_pending = True
+        self._log_debug(
+            f"[EMIT-PROBE] appended {len(_block)} chars through the event "
+            f"emitter ({'with' if _lines else 'without'} measured Stats lines)"
+        )
+
+    def _check_emit_probe_in_history(self, body: dict) -> None:
+        """
+        Report whether the block the outlet probe appended came back.
+
+        Runs at the top of the next inlet, on the history the host hands
+        over, which is what the model reads. If the block is there, a footer
+        appended by the plugin becomes part of the history and the next turn
+        has to cope with it (see _strip_answer_footer); if it is not, the
+        reader saw text the model never will. Reports once per probe.
+
+        Never raises: a diagnostic must not be the reason a turn fails.
+        """
+        if not getattr(self, "_emit_probe_pending", False):
+            return
+        self._emit_probe_pending = False
+        try:
+            _last = next(
+                (
+                    m
+                    for m in reversed(body.get("messages") or [])
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None:
+                self._log_debug("[EMIT-PROBE] no assistant message in the history")
+                return
+            _content = _last.get("content")
+            _found = isinstance(_content, str) and _EMIT_PROBE_MARK in _content
+            self._log_debug(
+                "[EMIT-PROBE] the appended block "
+                + (
+                    "IS in the history the next turn receives"
+                    if _found
+                    else "is NOT in the history the next turn receives"
+                )
+            )
+        except Exception as _e_ep:
+            self._log_debug(f"[EMIT-PROBE] history check skipped ({_e_ep!r})")
 
     async def _emit_status(self, description: str, done: bool = False) -> None:
         """
@@ -59880,6 +63433,27 @@ class Filter:
                     f"Raise block_summary_max_source_tokens above max_code_block_tokens."
                 )
 
+        # ------------------------------------------------------------------
+        # 8c. Dynamic verification: the turn cap against one step's quota
+        # ------------------------------------------------------------------
+        # The turn cap is meant to bind across steps, so it sits well below
+        # agentic_dynamic_max_targets * agentic_max_steps and must stay
+        # there. Below the quota of a SINGLE step it cuts the first
+        # verify_dynamic step short of what that step is allowed to test.
+        if hasattr(v, "agentic_dynamic_max_per_turn") and hasattr(
+            v, "agentic_dynamic_max_targets"
+        ):
+            if v.agentic_dynamic_max_per_turn < v.agentic_dynamic_max_targets:
+                warnings.append(
+                    f"agentic_dynamic_max_per_turn "
+                    f"({v.agentic_dynamic_max_per_turn}) < "
+                    f"agentic_dynamic_max_targets "
+                    f"({v.agentic_dynamic_max_targets}): the turn cap cuts "
+                    f"the first verify_dynamic step short of its own quota. "
+                    f"Raise agentic_dynamic_max_per_turn to at least the "
+                    f"per-step cap."
+                )
+
         # Log all warnings
         for w in warnings:
             self._log_debug(f"⚠️ VALVE COHERENCE: {w}")
@@ -60076,6 +63650,11 @@ class Filter:
             # made it, and a later question must not inherit it.
             self._agentic_effort_override = None
             self._bodies_seen_this_turn = set()
+            self._bodies_in_shared_context = set()
+            self._block_b_carry_over = False
+            self._turn_question_seeds = set()
+            # Groups this turn's metric rows (_record_metric).
+            self._turn_started_at = time.time()
             self._bodies_shown_count = 0
             self._measured_stats_lines = []
             # Read and cleared together, at the one point every turn
@@ -60110,6 +63689,7 @@ class Filter:
             # turn by the answer's confidence line. Without this, a turn whose
             # competition left no survivor is divided by the previous turn's.
             self._serial_rival_relations = []
+            self._serial_winner_share = 0.0
             self._serial_rival_causes = []
             self._serial_rival_accounts = []
             self._measured_reading_lines = ""
@@ -60138,6 +63718,7 @@ class Filter:
             self._serial_contradicted = ""
             self._serial_winner_corroboration = None
             self._serial_eliminated_accounts = []
+            self._serial_unestablished = []
             _lf = getattr(self, "_llm_failures_this_turn", None) or {}
             if _lf.get("count"):
                 self._log_debug(
@@ -60201,6 +63782,9 @@ class Filter:
                     f"⌨️ Content shape: {_flat_n} message(s) arrived as part "
                     f"lists and were flattened before any read"
                 )
+            # The block the outlet probe appended last turn, if any, is
+            # looked for before anything edits the history.
+            self._check_emit_probe_in_history(body)
 
             # A MONOTONIC counter, not a count of user messages. Counting the
             # messages OpenWebUI happens to send makes the turn number a
@@ -60434,27 +64018,11 @@ class Filter:
             # 🔥 STATE MANAGEMENT Silent ingestion (Modo B: large
             # code-only paste)
             # ----------------------------------------------------------
-            # Region: the optional mode cannot veto the main path.
-            # Silent ingestion is an OPTIMISATION — it indexes a bare
-            # paste without spending a reasoning turn on it. But it sits
-            # at line ~307 of a 732-line inlet, so anything it raises
-            # takes the remaining 58% with it: build_block_a,
-            # build_block_b, the window manager, the whole assembly. The
-            # turn then reaches the model with no code context at all
-            # and answers from memory, which reads to the user as a
-            # fast, confidently wrong reply.
-            #
-            # Measured live (17-jul 20:03-20:22, every single turn): a
-            # TypeError in the detector — one missing argument at its
-            # call site — silenced a plugin whose index was fully intact
-            # underneath (781 symbols, 6281 edges, 699 docstrings all
-            # harvested seconds earlier in the same inlet).
-            #
-            # A detector that cannot decide is not a reason to skip
-            # assembly; it is a reason to take the normal path, which is
-            # what a False verdict means anyway. The failure is logged
-            # loudly, once per turn, so a broken detector stays visible
-            # instead of quietly degrading every future turn.
+            # Region: the optional mode cannot veto the main path. Silent
+            # ingestion is an optimisation; if its detector raises, the turn
+            # takes the normal path (what a False verdict means anyway)
+            # instead of losing assembly and answering without code. The
+            # failure is logged loudly, once per turn.
             _is_code_only = False
             if (
                 self.valves.enable_silent_ingestion
@@ -60622,35 +64190,15 @@ class Filter:
 
                         # -- invalidate, but only if there is something to
                         #    invalidate ------------------------------------
-                        # A paste arriving is not the same fact as the code
-                        # having changed. The index has already been updated
-                        # above, so the structure hash here is the new one, and
-                        # the hash the cached Block A was built for is the head
-                        # of its stored cache key. When they agree, everything
-                        # below would tear down state that is still exactly
-                        # right and rebuild it into a render that is not
-                        # byte-stable across rebuilds — measured at 74597
-                        # tokens and 85.8 s for a file whose 59 classes were
-                        # byte-identical to the previous ingestion's.
-                        #
-                        # Nothing is lost by leaving it alone. build_block_a
-                        # compares this same hash itself and rebuilds on a
-                        # mismatch; it recomputes centrality in place when the
-                        # tag on the stored scores has moved; the skeleton tier
-                        # keys itself the same way. This path was overriding
-                        # three mechanisms that already work.
-                        #
-                        # The freeze is broken on the same condition, for the
-                        # same reason: a window pinned to a structure that has
-                        # not changed is still pinned to the right one.
-                        #
-                        # What stays behind: docstrings harvested from the new
-                        # paste land in the index but not in the cached
-                        # skeleton until the structure moves. That is the trade
-                        # the freeze already makes on every turn it is active,
-                        # and the bodies themselves are unaffected — the hub
-                        # tier is rebuilt from the index each turn and has no
-                        # cache here to go stale.
+                        # A paste is not the same fact as the code changing.
+                        # When the new structure hash equals the cached Block
+                        # A's, everything below would rebuild a state that is
+                        # still right (and not byte-stable: ~86 s for an
+                        # unchanged file). build_block_a, centrality and the
+                        # skeleton tier already rebuild on a real change. The
+                        # freeze is kept on the same condition. Cost: new
+                        # docstrings reach the skeleton only when the
+                        # structure moves.
                         _current_hash = self._symbol_index.compute_structure_hash(
                             project_id
                         )
@@ -60765,23 +64313,11 @@ class Filter:
                         messages, response
                     )
 
-                    # An ingestion turn used to leave the host a prompt of 589
-                    # bytes with no system message at all. On this model that
-                    # is not merely a small prompt: the slot ends the turn
-                    # holding a prefix that shares nothing with the ~74k-token
-                    # one the next turn needs, and since the recurrent state
-                    # can only be restored at a checkpoint, the next real
-                    # question pays a full re-prefill. Measured at 74050
-                    # tokens / 83.7 s, once per chat, across 145 ingestions in
-                    # eighteen days.
-                    #
-                    # The invariant is exactly what every aligned call sends as
-                    # its system, byte for byte, so handing it to this call
-                    # ends the turn with the slot holding the prefix the next
-                    # turn will ask for. Empty on a project's first ingestion,
-                    # and empty right after a real re-index — both cases where
-                    # there is no valid prefix to keep, and where this
-                    # correctly does nothing.
+                    # An ingestion turn sends the invariant as its system, so
+                    # the slot ends the turn holding the prefix the next turn
+                    # needs; otherwise the next question pays a full
+                    # re-prefill. Empty on a first ingestion or right after a
+                    # re-index, when there is no prefix worth keeping.
                     _inv = getattr(self, "_prefix_invariant", "") or ""
                     if _inv and not any(m.get("role") == "system" for m in messages):
                         messages.insert(0, {"role": "system", "content": _inv})
@@ -60964,41 +64500,16 @@ class Filter:
             _inlet_timing("Step 6/6: Assemble context and final messages", step_start)
 
             if cached_response:
-                # A cached answer is delivered exactly like a command's,
-                # through the one path that reaches the reader. The idiom
-                # this replaces — drop the question, append the answer as an
-                # assistant message, then call ensure_last_message_is_user —
-                # is the one _deliver_command_response was written to
-                # retire, and its docstring says why: that helper truncates
-                # everything after the LAST USER message, so it deleted the
-                # answer it had just been handed.
-                #
-                # For commands the damage was a reply about the wrong thing.
-                # Here it was worse, because what survived the truncation
-                # was the conversation up to the PREVIOUS user message, and
-                # in a fresh chat that is the ingestion turn, whose content
-                # is emptied once it stops being current. The host received
-                # a single blank user turn and was asked to continue it:
-                # 69 bytes of prompt, no system, no question, no answer.
-                # Reproduced twice in one session, and only visible at all
-                # because the response cache needs the same question under
-                # an unchanged code state — which is precisely what asking
-                # again in a new chat produces.
-                #
-                # The echo costs one generation, so a cache hit is cheap
-                # rather than free. A cached answer nobody receives is worth
-                # less than that.
-                # The Stats block, rebuilt and labelled. A cached answer
-                # arrives footerless by design, so without this the reader
-                # gets a turn with no block at all and no way to tell it
-                # apart from a measured one — which is the worse of the two,
-                # since the figures are absent rather than wrong.
-                #
-                # The three lines added here are true of THIS turn: nothing
-                # was re-checked, the question matched at a measured
-                # similarity, and the block below belongs to the turn that
-                # first answered it. The original labels follow verbatim,
-                # under a heading that has already said whose they are.
+                # A cached answer is delivered like a command's, through
+                # _deliver_command_response: the older idiom truncated after
+                # the last user message and deleted the answer it had just
+                # added. The echo costs one generation, so a hit is cheap,
+                # not free.
+                # The Stats block, rebuilt and labelled: a cached answer has
+                # no footer of its own. The added lines are true of this
+                # turn (nothing re-checked, the similarity it matched at);
+                # the original labels follow under a heading saying whose
+                # they are.
                 _cached_text = cached_response["response"]
                 try:
                     _cf = (cached_response.get("footer") or "").strip()
@@ -61090,45 +64601,16 @@ class Filter:
             return body
 
         except Exception as _inlet_err:
-            # Region: fail-open safety net. This try/finally had no
-            # except at all — the outlet has had one for ages — so any
-            # exception raised by the six steps escaped Filter.inlet
-            # into the host and KILLED the user's turn. The shared
-            # library raises typed errors after exhausting retries
-            # (LLMTimeoutError, LLMHTTPError, LLMEmptyResponseError),
-            # call_llm re-raises them by design, and most auxiliary call
-            # sites hold no try of their own: one failed enrichment call
-            # was enough. The production incident that exposed it: a
-            # change_summary in the prologue free-ran into the HTTP
-            # timeout three times (retries), then its final
-            # LLMTimeoutError sailed through process_prev_assistant_turn
-            # and aborted the turn the user had by then been awaiting
-            # for 45 minutes. Context enrichment must never outrank the
-            # message it exists to enrich: log loudly (logger.warning is
-            # not gated by the debug valve; _log_debug is) and hand the
-            # body onward, at worst partially assembled — a degraded
-            # turn instead of a dead one. CancelledError subclasses
-            # BaseException and rightly bypasses this net.
+            # Region: fail-open safety net. An exception from the inlet
+            # steps must not kill the user's turn: log it loudly (not
+            # through the debug valve) and pass the body on, degraded at
+            # worst. CancelledError is a BaseException and bypasses this.
             #
-            # Region: emergency lean before surrendering the body.
-            # "Fail-open" is only open if what passes through can
-            # actually be served. When the failure lands BEFORE the
-            # assembly steps — anywhere in the six inlet phases —
-            # body["messages"] still holds the raw paste, and handing
-            # that to a 131k-context server is not a degraded turn, it
-            # is the same dead turn with the diagnosis thrown away.
-            # Measured live: a TypeError in the silent-ingestion gate
-            # produced "request (425350 tokens) exceeds the available
-            # context size", and the user saw a context-size error
-            # rather than anything pointing at the real exception two
-            # lines above it in the log.
-            #
-            # ensure_compressed_user_messages is the right tool for this
-            # last-ditch attempt: it is pure state + string work (no
-            # LLM, no GPU, no await), it is the same function the
-            # healthy path uses, and it degrades to a no-op when there
-            # is nothing to stub. Wrapped in its own try because a
-            # fail-open path that can itself raise is not a safety net.
+            # Region: emergency lean before surrendering the body. A failure
+            # before assembly leaves the raw paste in body["messages"], which
+            # would exceed the server's context and hide the real error.
+            # ensure_compressed_user_messages is pure state and string work,
+            # the same function the healthy path uses, and has its own try.
             import traceback
 
             logger.warning(
@@ -61283,6 +64765,9 @@ class Filter:
                 _n = int(_cov.get(_key, 0) or 0)
                 if _n:
                     _open.append(f"{_n} {_word}")
+            # Same words as the pipeline's line (_serial_unestablished).
+            if getattr(self, "_serial_unestablished", None):
+                _open.append("no cause established")
             # ── Step 2b: the selection the evidence did not settle ──
             # A uniform prior over the accounts that were NOT discriminated:
             # with one independent survivor the presented account is one of
@@ -61291,7 +64776,7 @@ class Filter:
             # weight so it can be argued with.
             _indep = int(_cov.get("rivals_independent", 0) or 0)
             _compl = int(_cov.get("rivals_complementary", 0) or 0)
-            _conf = (_settled / _total) / (1 + _indep)
+            _conf = (_settled / _total) * _confidence_share(_cov)
             if _indep:
                 _open.append(
                     # Same wording and same arithmetic as the pipeline's
@@ -61301,11 +64786,7 @@ class Filter:
                     f"{_indep} rival hypothes"
                     + ("es" if _indep > 1 else "is")
                     + " the evidence did not rule out, "
-                    + (
-                        f"dividing the figure by {1 + _indep}"
-                        if _indep > 1
-                        else "halving the figure"
-                    )
+                    + _confidence_share_words(_cov)
                 )
             if _compl:
                 _open.append(
@@ -62018,7 +65499,12 @@ class Filter:
         except Exception as _e_mark:
             self._log_debug(f"outlet: turn mark skipped ({_e_mark!r})")
 
-    async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    async def outlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__: Any = None,
+    ) -> dict:
         """
         Post-process the request after the LLM has generated its response.
 
@@ -62033,6 +65519,12 @@ class Filter:
         sent the next turn before this one finished), the relaunch is skipped
         so background LLM calls never contend with the active turn's critical
         path for the single llama.cpp slot.
+
+        The host hands `__event_emitter__` only to a handler whose signature
+        names it, and the outlet's did not, so nothing here could append to
+        the message. It is used for the emit probe and kept in a local: the
+        instance attribute the inlet stores is cleared when the inlet ends
+        and, with two turns overlapping, may belong to the other message.
         """
         # Captured before any await: if an inlet pauses between here and the
         # relaunch at the tail, the epoch comparison detects it and the
@@ -62200,6 +65692,7 @@ class Filter:
         self._audit_stats_fidelity(body)
         self._audit_gap_promotion(body)
         self._audit_index_versions()
+        await self._emit_outlet_probe(__event_emitter__)
 
         # ------------------------------------------------------------------
         # Region: defensive pre-try defaults
