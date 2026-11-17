@@ -701,6 +701,217 @@ def _account_outline_body(accounts: Optional[List[dict]], kind: str, lang: str) 
     return "; ".join(_parts) + "."
 
 
+# The gaps section's line, per language. Built from the ledger rather than
+# asked of the outline step: what was left unverified is a count the
+# pipeline holds, and the placeholder that stood in when the step wrote
+# SKIP was an instruction the final model copied into the answer verbatim.
+_GAPS_WORDS: Dict[str, Dict[str, str]] = {
+    "en": {
+        "none": (
+            "Every claim this turn made was checked against the code; "
+            "nothing was left unverified."
+        ),
+        "open": "{n} claim(s) were not settled against the code",
+        "unop": "{n} claim(s) had nothing in the code to check them against",
+        "asked": (
+            "the question names {names}, and this turn never read its code"
+        ),
+    },
+    "es": {
+        "none": (
+            "Todo lo que este turno afirmó se comprobó contra el código; no "
+            "quedó nada sin verificar."
+        ),
+        "open": "{n} afirmación(es) no quedaron comprobadas contra el código",
+        "unop": (
+            "{n} afirmación(es) no tenían nada en el código con qué "
+            "comprobarlas"
+        ),
+        "asked": (
+            "la pregunta nombra {names}, y este turno no llegó a leer su código"
+        ),
+    },
+}
+_GAPS_CLAIM_CHARS = 110
+
+# The proceed line on a turn that wrote no code, when the outline step's
+# own line only sent the reader to check code the turn had already read:
+# four of six answers in round 4 did ("Consult the call graph…", "Confirm
+# that start launches…"), above a confidence line of 100%.
+_RECHECK_PROCEED_BODIES: Dict[str, Dict[str, str]] = {
+    "en": {
+        "open": (
+            "What is left is to settle what the answer lists as not "
+            "verified; everything else it states was read in the code."
+        ),
+        "none": (
+            "Nothing is left to check: everything this answer states was "
+            "read in the code."
+        ),
+    },
+    "es": {
+        "open": (
+            "Lo que queda es resolver lo que la respuesta da como no "
+            "verificado; todo lo demás que afirma se leyó en el código."
+        ),
+        "none": (
+            "No queda nada por comprobar: todo lo que afirma esta respuesta "
+            "se leyó en el código."
+        ),
+    },
+}
+# A line whose first word sends the reader to read or check code.
+_RECHECK_LINE_RE = re.compile(
+    r"^\W*(?:consult|confirm|verific|verify|revis|review|expand|comprob|"
+    r"check|inspect|inspeccion|examin|look\s+at|lee[rd]?\b|read\b|abr[ae]\b|"
+    r"open\b|mir[ae]\b)",
+    re.I,
+)
+
+
+def _gaps_outline_body(
+    open_claims: List[str],
+    n_unoperationalizable: int,
+    asked_unread: List[str],
+    lang: str,
+) -> str:
+    """The gaps section's line, stated from what the ledger left open.
+
+    `open_claims` are the texts of claims no check settled, in ledger order;
+    up to two are quoted so the section names WHAT is open, not just how
+    much. Always returns a line: "nothing was left open" is a finding, and
+    an empty body is what let the placeholder in.
+    """
+    _w = _GAPS_WORDS.get(lang) or _GAPS_WORDS["en"]
+    # ── Step 1: the parts that have something to report ──
+    _parts: List[str] = []
+    if open_claims:
+        _quoted = [
+            "«" + _t[:_GAPS_CLAIM_CHARS].rstrip(" .,;:") + (
+                "…" if len(_t) > _GAPS_CLAIM_CHARS else ""
+            ) + "»"
+            for _t in (" ".join(str(_c).split()) for _c in open_claims[:2])
+            if _t
+        ]
+        _parts.append(
+            _w["open"].format(n=len(open_claims))
+            + (": " + "; ".join(_quoted) if _quoted else "")
+        )
+    if n_unoperationalizable:
+        _parts.append(_w["unop"].format(n=n_unoperationalizable))
+    if asked_unread:
+        _parts.append(_w["asked"].format(names=", ".join(asked_unread[:4])))
+    # ── Step 2: one sentence, or the explicit nothing ──
+    if not _parts:
+        return _w["none"]
+    _line = "; ".join(_parts)
+    return _line[:1].upper() + _line[1:] + "."
+
+
+# Lines the final prompt hands the model as instruction, which an answer in
+# the history must not carry: the next turn reads its own history as the
+# example of what an answer looks like, and copies it.
+_WORKSPACE_NOTE_MARK = "[WORKSPACE NOTE — not part of your answer]"
+_DIRECTIVE_ECHO_PREFIXES: Tuple[str, ...] = (
+    "That block goes in your answer ONCE",
+    "Your answer begins with these two lines",
+    "The line under each heading says what this turn established",
+    "The line under each heading is a summary of that section",
+)
+_ANSWER_HEADING_RE = re.compile(r"^##\s+\*\*[^*\n]+\*\*\s*$")
+
+
+def _placeholder_lines() -> Set[str]:
+    """Every fixed section line the outline can hand the model, any language."""
+    _out: Set[str] = set()
+    for _table in (_SECTION_FALLBACK_BODIES,):
+        for _bodies in _table.values():
+            _out.update(_v.strip() for _v in _bodies.values())
+    for _table in (_GENERATIVE_PROCEED_BODY, _GENERATIVE_EVIDENCE_BODY):
+        _out.update(_v.strip() for _v in _table.values())
+    return {_l for _l in _out if _l}
+
+
+def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
+    """Remove from a past answer what the prompt said was not answer.
+
+    Three things, each measured in one chat: a workspace note copied whole,
+    with its label; the outline's placeholder line written as the body of a
+    section; and an answer that finished its sections and started them
+    again, twenty times over. Left in the history, each was copied by the
+    next turns, which is how one bad answer became four.
+
+    Fenced code is left untouched, since this project's answers quote its
+    own prompts. Only whole lines match, so prose that mentions a note is
+    kept. Returns the text and what was removed; the text unchanged on any
+    failure.
+    """
+    _counts = {"notes": 0, "echoes": 0, "placeholders": 0, "repeat": 0}
+    try:
+        if not isinstance(text, str) or not text:
+            return text, _counts
+        _ph = _placeholder_lines()
+        _lines = text.split("\n")
+        # ── Step 1: cut where the first heading comes round again ──
+        _first = ""
+        _fence = False
+        _cut = len(_lines)
+        for _i, _l in enumerate(_lines):
+            if _l.lstrip().startswith("```"):
+                _fence = not _fence
+                continue
+            if _fence or not _ANSWER_HEADING_RE.match(_l.strip()):
+                continue
+            if not _first:
+                _first = _l.strip()
+            elif _l.strip() == _first:
+                _cut = _i
+                _counts["repeat"] = 1
+                break
+        _lines = _lines[:_cut]
+        # ── Step 2: drop notes, echoed directives and placeholders ──
+        _kept: List[str] = []
+        _fence = False
+        _in_note = False
+        for _l in _lines:
+            _st = _l.strip()
+            if _st.startswith("```"):
+                _fence = not _fence
+                _in_note = False
+                _kept.append(_l)
+                continue
+            if _fence:
+                _kept.append(_l)
+                continue
+            if _st == _WORKSPACE_NOTE_MARK:
+                _in_note = True
+                _counts["notes"] += 1
+                continue
+            if _in_note:
+                # A note runs until the answer's own structure resumes.
+                if _st.startswith("## ") or _st == "---":
+                    _in_note = False
+                else:
+                    continue
+            if _st.startswith(_DIRECTIVE_ECHO_PREFIXES):
+                _counts["echoes"] += 1
+                continue
+            if _st in _ph:
+                _counts["placeholders"] += 1
+                continue
+            _kept.append(_l)
+        # ── Step 3: tidy what the removals left behind ──
+        _out = re.sub(r"\n{3,}", "\n\n", "\n".join(_kept)).rstrip()
+        if _counts["repeat"]:
+            # The rule that opened the repeated cycle is left dangling.
+            _out = re.sub(r"(?:\n*---\s*)+$", "", _out).rstrip()
+        if not any(_counts.values()):
+            return text, _counts
+        return (_out or text), _counts
+    except Exception:
+        return text, {"notes": 0, "echoes": 0, "placeholders": 0, "repeat": 0}
+
+
 # Function words, which appear in ordinary prose and almost never inside an
 # identifier. Counting them beats looking for accents: "¿Qué hace
 # SymbolIndex.compute_structure_hash?" has one accented word and six English
@@ -1153,7 +1364,9 @@ _NEVER_VERB = (
 )
 _NEVER_UPDATED_CLAIM_RES = (
     re.compile(
-        r"\bnever\s+" + _NEVER_VERB + r"s?\b[^.;]{0,80}?`?(?P<name>"
+        r"\b(?:never|(?:does|do)\s+not|doesn't|don't)\s+"
+        + _NEVER_VERB
+        + r"s?\b[^.;]{0,80}?`?(?P<name>"
         + _VARIABLE_NAME
         + r")`?",
         re.I,
@@ -4541,19 +4754,30 @@ _LEADING_CALLED_BY_CLAIM_RE = re.compile(
 
 # Relation questions the index answers in full (MetacognitiveReasoning-
 # Engine.list_named_relation). "¿Qué llama a X?" asks for callers; the
-# callees form needs "a qué": "¿A qué llama X?".
+# callees form needs "a qué": "¿A qué llama X?". The kind of code asked
+# for may be coordinated — "¿Qué funciones o métodos llaman a X?" — and
+# the single-noun form missed it: round 4 rebuilt that listing from bodies
+# and named two of the four callers.
+_RELATION_NOUN = r"(?:funci[oó]n(?:es)?|m[eé]todos?|c[oó]digo|clases?)"
+_RELATION_NOUNS = (
+    _RELATION_NOUN + r"(?:\s*,\s*" + _RELATION_NOUN + r"|\s+[oyu]\s+"
+    + _RELATION_NOUN + r")*"
+)
 _CALLERS_QUESTION_RE = re.compile(
     r"\bqui[eé]n(?:es)?\s+(?:la\s+|lo\s+|le\s+|las\s+|los\s+)?(?:llaman?|usan?)\b"
-    r"|\bqu[eé]\s+(?:funciones\s+|m[eé]todos\s+|c[oó]digo\s+)?llaman?\s+a\b"
+    r"|\bqu[eé]\s+(?:" + _RELATION_NOUNS + r"\s+)?llaman?\s+a\b"
     r"|\bdesde\s+d[oó]nde\s+se\s+(?:llama|usa|invoca)\b"
+    r"|\bdesde\s+qu[eé]\s+" + _RELATION_NOUNS + r"\s+se\s+(?:llama|usa|invoca)\b"
     r"|\bd[oó]nde\s+se\s+(?:llama|usa|invoca)\b"
     r"|\b(?:who|what)\s+calls\b|\bcallers\s+of\b"
+    r"|\b(?:which|what)\s+(?:functions?|methods?)(?:\s+(?:or|and)\s+"
+    r"(?:functions?|methods?))?\s+call\b"
     r"|\bwhere\s+is\s+\S+\s+(?:called|used)\b",
     re.IGNORECASE,
 )
 _CALLEES_QUESTION_RE = re.compile(
-    r"\ba\s+qu[eé]\s+(?:funciones\s+|m[eé]todos\s+)?llama\b"
-    r"|\bqu[eé]\s+(?:funciones|m[eé]todos)\s+(?:llama|usa)\b"
+    r"\ba\s+qu[eé]\s+(?:" + _RELATION_NOUNS + r"\s+)?llama\b"
+    r"|\bqu[eé]\s+" + _RELATION_NOUNS + r"\s+(?:llama|usa)\b"
     r"|\bwhat\s+does\s+\S+\s+call\b|\bcallees\s+of\b",
     re.IGNORECASE,
 )
@@ -19303,6 +19527,67 @@ _RELATION_FANOUT_CAP = 3
 _RELATION_NODE_CAP = 200
 
 
+# A call relation asserted over several symbols at once: "X is called by A
+# and B", "X calls A, B and C", "A and B call X" (and the Spanish forms).
+_CONJ_SYM = r"`?[A-Za-z_][\w.]*`?"
+_CONJ_LIST = (
+    _CONJ_SYM + r"(?:\s*,\s*" + _CONJ_SYM + r")*,?\s+(?:and|y|&)\s+(?:also\s+)?"
+    + _CONJ_SYM
+)
+_CONJ_PASSIVE_RE = re.compile(
+    r"(?P<x>" + _CONJ_SYM + r")\s+(?:is|are|es|son)\s+(?:only\s+|directly\s+)*"
+    r"(?:called|invoked|used|llamad[oa]s?|invocad[oa]s?)\s+(?:only\s+|directly\s+)*"
+    r"(?:by|from|por|desde)\s+(?:both\s+)?(?P<list>" + _CONJ_LIST + r")",
+    re.I,
+)
+_CONJ_ACTIVE_RE = re.compile(
+    r"(?P<x>" + _CONJ_SYM + r")\s+(?:directly\s+)?"
+    r"(?:calls|invokes|llama\s+a|invoca\s+a)"
+    r"\s+(?:both\s+)?(?P<list>" + _CONJ_LIST + r")",
+    re.I,
+)
+_CONJ_SUBJECTS_RE = re.compile(
+    r"(?:\bboth\s+)?(?P<list>" + _CONJ_LIST + r")\s+(?:both\s+)?"
+    r"(?:call|invoke|llaman\s+a|invocan\s+a)\s+(?P<x>" + _CONJ_SYM + r")",
+    re.I,
+)
+
+
+def _conjoined_call_pairs(
+    text: str, resolve: Callable[[str], str]
+) -> List[Tuple[str, str]]:
+    """The (caller, callee) pairs a conjoined call claim asserts, or [].
+
+    `resolve` maps a written name to the indexed one, or "" when the index
+    does not hold it. Only names the index holds count, so "X calls A and
+    returns None" asserts nothing about a symbol named "returns"; fewer
+    than two resolved names in the list is not a conjunction. Never raises.
+    """
+    try:
+        _text = str(text or "")
+        for _re, _passive in (
+            (_CONJ_PASSIVE_RE, True),
+            (_CONJ_ACTIVE_RE, False),
+            (_CONJ_SUBJECTS_RE, True),
+        ):
+            _m = _re.search(_text)
+            if not _m:
+                continue
+            _x = resolve(_m.group("x").strip("`.,"))
+            _names = [
+                resolve(_n.strip("`.,"))
+                for _n in re.findall(_CONJ_SYM, _m.group("list"))
+                if _n.strip("`").lower() not in ("and", "y", "also", "both")
+            ]
+            _names = list(dict.fromkeys(_n for _n in _names if _n))
+            if not _x or len(_names) < 2:
+                continue
+            return [(_n, _x) if _passive else (_x, _n) for _n in _names]
+    except Exception:
+        return []
+    return []
+
+
 def _relation_edge_status(idx: Any, caller: str, callee: str, project_id: str) -> str:
     """
     Classify how a caller relates to a callee in the call graph.
@@ -19421,6 +19706,211 @@ def _claims_as_workspace_prose(raw_claims: List[Any]) -> str:
     if not lines:
         return ""
     return _CLAIMS_ONLY_NOTE + "\n" + "\n".join(lines)
+
+
+# What two claims must share to be one assertion. The signature the entry
+# dedupe used — subject plus cited qids — is shared by every claim about a
+# method that cites only that method, and steps label nearly every claim
+# structural: one turn kept 6 of 17 distinct facts, and the premise its
+# answer rested on was among the eleven dropped, so no check ever saw it.
+_RESTATEMENT_CODE_RE = re.compile(
+    r"`[^`\n]+`|'[^'\n]+'|\"[^\"\n]+\"|\b\d+(?:\.\d+)?\b"
+    r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+)
+_RESTATEMENT_WORD_RE = re.compile(r"[a-záéíóúüñ]{4,}")
+_RESTATEMENT_STOPWORDS = frozenset(
+    "that this with from into when only each every then than their which "
+    "what does have been being were will would could should about after "
+    "before because between inside within without other another also just "
+    "para cuando sólo solo cada entonces porque entre dentro sobre desde "
+    "hasta pero como este esta estos estas".split()
+)
+_PASSIVE_CALL_RE = re.compile(
+    r"\b(?:is|are|gets|being)\s+(?:only\s+)?(?:called|invoked|used)\s+"
+    r"(?:only\s+)?(?:from|by)\b|\b(?:llamad|invocad)[oa]s?\s+(?:sólo\s+)?"
+    r"(?:desde|por)\b",
+    re.I,
+)
+_RESTATEMENT_CODE_MIN = 0.6
+_RESTATEMENT_WORDS_MIN = 0.4
+_RESTATEMENT_WORDS_ONLY_MIN = 0.5
+
+
+def _restatement_signature(
+    text: str, subject: str, qids: List[str]
+) -> Tuple[Set[str], Set[str], Tuple[str, ...]]:
+    """What a claim asserts, beyond the symbols it is about.
+
+    Three parts: the code tokens it names (identifiers with an underscore
+    or a dot, quoted strings, numbers), its content words, and the order of
+    the first two cited symbols, reversed for a passive "called by". The
+    cited symbols themselves are left out of the first two: every claim in
+    the comparison shares them, so they say nothing about which fact it is.
+    """
+    # ── Step 1: the names every compared claim shares ──
+    _own: Set[str] = set()
+    for _q in list(qids or []) + [subject or ""]:
+        _q = str(_q).casefold()
+        if _q:
+            _own.update({_q, _q.rsplit(".", 1)[-1]})
+    _text = str(text or "")
+    # ── Step 2: code tokens and content words, without them ──
+    _code: Set[str] = set()
+    for _t in _RESTATEMENT_CODE_RE.findall(_text):
+        _quoted = _t[:1] in "`'\""
+        _t = _t.strip("`'\"").casefold()
+        if not _t or _t in _own or _t.rsplit(".", 1)[-1] in _own:
+            continue
+        if (
+            _quoted
+            or "_" in _t
+            or "." in _t
+            or _t[:1].isdigit()
+            or _t in ("none", "true", "false")
+        ):
+            _code.add(_t)
+    _words = {
+        _w
+        for _w in _RESTATEMENT_WORD_RE.findall(_text.casefold())
+        if _w not in _RESTATEMENT_STOPWORDS and _w not in _own
+    }
+    # ── Step 3: which cited symbol acts on which ──
+    _pos: List[Tuple[int, str]] = []
+    _low = _text.casefold()
+    for _q in dict.fromkeys(str(_q) for _q in (qids or []) if _q):
+        _tail = _q.rsplit(".", 1)[-1].casefold()
+        _m = re.search(r"(?<![\w])" + re.escape(_tail) + r"(?![\w])", _low)
+        if _m:
+            _pos.append((_m.start(), _q))
+    _order = tuple(_q for _, _q in sorted(_pos)[:2])
+    if len(_order) == 2 and _PASSIVE_CALL_RE.search(_text):
+        _order = _order[::-1]
+    return _code, _words, (_order if len(_order) == 2 else ())
+
+
+def _is_restatement(
+    a: Tuple[Set[str], Set[str], Tuple[str, ...]],
+    b: Tuple[Set[str], Set[str], Tuple[str, ...]],
+) -> bool:
+    """Whether two claim signatures (_restatement_signature) are one fact.
+
+    Code tokens decide when either claim names any, with the wording as a
+    second condition; a claim that names none is compared on wording alone.
+    A call stated in opposite directions is never the same fact.
+    """
+    _ca, _wa, _da = a
+    _cb, _wb, _db = b
+    if _da and _db and _da != _db:
+        return False
+    _wj = len(_wa & _wb) / max(1, len(_wa | _wb))
+    if _ca or _cb:
+        return (
+            len(_ca & _cb) / len(_ca | _cb) >= _RESTATEMENT_CODE_MIN
+            and _wj >= _RESTATEMENT_WORDS_MIN
+        )
+    return _wj >= _RESTATEMENT_WORDS_ONLY_MIN
+
+
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\S")
+
+
+def _answer_shape(answer: str, outline: str) -> Tuple[int, int, int]:
+    """How an answer used its outline: (seed lines, copied whole, list items).
+
+    A seed line is an outline line that is not a heading; it counts as
+    copied when it appears in the answer whole, spacing aside. List items
+    are counted outside code fences. Never raises.
+    """
+    try:
+        _seeds = [
+            " ".join(_l.split())
+            for _l in str(outline or "").split("\n")
+            if _l.strip() and not _l.lstrip().startswith("#")
+        ]
+        _flat = " ".join(str(answer or "").split())
+        _copied = sum(1 for _l in _seeds if len(_l) >= 20 and _l in _flat)
+        _items = 0
+        _fence = False
+        for _l in str(answer or "").split("\n"):
+            if _l.lstrip().startswith("```"):
+                _fence = not _fence
+            elif not _fence and _LIST_ITEM_RE.match(_l):
+                _items += 1
+        return len(_seeds), _copied, _items
+    except Exception:
+        return 0, 0, 0
+
+
+_REFUTED_HEAD = (
+    "Refuted against the code — where anything above rests on one of these, "
+    "the code wins and that part does not hold:"
+)
+_REFUTED_MAX = 6
+_BULLET_QIDS_RE = re.compile(r"\s\[([^\[\]\n]+)\]\s*$")
+
+
+def _refuted_lines(claims: List[Any]) -> List[str]:
+    """The block naming this turn's refuted claims, or [] when there are none.
+
+    Placed straight after the synthesis because the synthesis is written
+    before the checks run: a premise it states is refuted three sections
+    further down, and the model followed the synthesis.
+    """
+    _rows: List[str] = []
+    for _c in claims or []:
+        if getattr(_c, "verification", "") != "refuted":
+            continue
+        _t = " ".join(str(getattr(_c, "text", "") or "").split())[:220]
+        _d = " ".join(str(getattr(_c, "verification_detail", "") or "").split())
+        _rows.append(f"- ✗ {_t}" + (f" — {_d[:160]}" if _d else ""))
+        if len(_rows) >= _REFUTED_MAX:
+            break
+    return [_REFUTED_HEAD] + _rows if _rows else []
+
+
+def _mark_refuted_bullets(text: str, claims: List[Any]) -> Tuple[str, int]:
+    """Mark the synthesis bullets the code refuted. Returns (text, marked).
+
+    A claims-only synthesis (_claims_as_workspace_prose) lists the step's
+    claims as written, before any check ran. A bullet is marked when it is
+    a refuted claim, or restates one (_is_restatement) — the ledger keeps
+    one of a pair of restatements, and the other is still listed here.
+    """
+    _refuted = [
+        _c for _c in claims or [] if getattr(_c, "verification", "") == "refuted"
+    ]
+    if not _refuted or not text:
+        return text, 0
+    _known = [
+        (
+            " ".join(str(_c.text or "").casefold().split()),
+            _restatement_signature(
+                _c.text,
+                _c.subject or ((_c.valid_qids or _c.qids or [""])[0]),
+                list(_c.valid_qids or _c.qids or []),
+            ),
+        )
+        for _c in _refuted
+    ]
+    _lines = text.split("\n")
+    _n = 0
+    for _i, _l in enumerate(_lines):
+        if not _l.startswith("- ") or _l.startswith("- ✗"):
+            continue
+        _body = _l[2:]
+        _m = _BULLET_QIDS_RE.search(_body)
+        _qids = [_q.strip() for _q in _m.group(1).split(",")] if _m else []
+        _bare = _body[: _m.start()] if _m else _body
+        _norm = " ".join(_bare.casefold().split())
+        _sig = _restatement_signature(_bare, _qids[0] if _qids else "", _qids)
+        if any(
+            (len(_norm) >= 40 and _t.startswith(_norm.rstrip(". ")))
+            or (_qids and _is_restatement(_s, _sig))
+            for _t, _s in _known
+        ):
+            _lines[_i] = "- ✗ REFUTED: " + _body
+            _n += 1
+    return "\n".join(_lines), _n
 
 
 class AgenticEvidenceLedger:
@@ -19820,12 +20310,22 @@ class AgenticEvidenceLedger:
             # fourteen claims — each stated once in English by an investigate
             # step and once in Spanish by the analyze step after it. Text
             # normalisation cannot see that; this can.
+            # Same subject and qids is necessary, not sufficient: every
+            # claim about a method citing only that method shares them, so
+            # the wording has to say the same thing too (_is_restatement).
             if claim.claim_kind == "structural" and claim.subject:
                 _sig = (claim.subject, tuple(sorted(claim.valid_qids)))
+                _mine = _restatement_signature(
+                    claim.text, claim.subject, claim.valid_qids
+                )
                 _dupe = any(
                     _c.claim_kind == "structural"
                     and _c.subject == claim.subject
                     and tuple(sorted(_c.valid_qids)) == _sig[1]
+                    and _is_restatement(
+                        _restatement_signature(_c.text, _c.subject, _c.valid_qids),
+                        _mine,
+                    )
                     for _c in self.claims
                 )
                 if _dupe:
@@ -21288,8 +21788,16 @@ class AgenticEvidenceVerifier:
         self,
         claims: List["LedgerClaim"],
         verdicts: Dict[int, Tuple[str, str]],
+        project_id: str = "",
     ) -> int:
-        """Stamp the ledger and report how many claims were settled."""
+        """Stamp the ledger and report how many claims were settled.
+
+        A "supported" verdict on a call relation asserted over several
+        symbols stands only when the index has every one of those calls as
+        a direct edge (_unsettled_conjunction). The judge reads one body,
+        and one body settles one part of "X is called by A and B": live,
+        that claim was confirmed from B's body while A reaches X only
+        through B, and the answer named A as a direct caller."""
         # ── Step 1: map the judge's vocabulary onto the ledger's ──
         mapping = {
             "supported": "confirmed",
@@ -21302,11 +21810,20 @@ class AgenticEvidenceVerifier:
                 continue
             claim = claims[n - 1]
             _ruled = {"supported": True, "contradicted": False}.get(verdict)
+            _short = (
+                self._unsettled_conjunction(claim, project_id)
+                if verdict == "supported"
+                else []
+            )
             claim.observe(
                 EvidenceObservation(
                     instrument="judge",
                     family=EvidenceFamily.QUOTED_READING,
-                    scope=EvidenceScope.PROPOSITION,
+                    # One body read against a claim about several calls is
+                    # a component of it: it can refute, not confirm.
+                    scope=(
+                        EvidenceScope.COMPONENT if _short else EvidenceScope.PROPOSITION
+                    ),
                     verdict=_ruled,
                     regime=(
                         EpistemicRegime.POPPERIAN_FALSIFICATION
@@ -21316,6 +21833,21 @@ class AgenticEvidenceVerifier:
                     detail=f"'{quote}'"[:_OBSERVATION_DETAIL_CHARS],
                 )
             )
+            if _short:
+                claim.verification = "unsupported"
+                claim.evidence_type = "code"
+                claim.verification_detail = (
+                    f"body of {claim.subject} read: '{quote}' — it settles one "
+                    f"part; the index does not draw "
+                    + "; ".join(_short)
+                    + " as a direct call"
+                )[:300]
+                self._f._log_debug(
+                    f"🤖 Evidence: conjoined claim left open — {'; '.join(_short)} "
+                    f"not a direct call in the index"
+                )
+                self._f._bump_turn_metric("conjunction_withheld")
+                continue
             # A body that does not settle a STRUCTURAL claim says nothing
             # against the check that did: live, a default-value check
             # confirmed 0.2 against its declaration and this turned it into
@@ -21338,6 +21870,40 @@ class AgenticEvidenceVerifier:
             if verdict != "indeterminate":
                 settled += 1
         return settled
+
+    def _unsettled_conjunction(
+        self, claim: "LedgerClaim", project_id: str
+    ) -> List[str]:
+        """The pairs of a conjoined call claim the index does not draw directly.
+
+        [] when the claim is not a conjunction of calls (_conjoined_call_pairs)
+        or every pair it names is a direct edge. Each entry reads
+        "A → X (indirect)". Never raises: [] leaves the verdict as it was.
+        """
+        try:
+            _si = self._f._symbol_index
+
+            def _resolve(_name: str) -> str:
+                _q = _resolve_symbol_name(
+                    _name,
+                    lambda n: _si.find_blocks(n, project_id),
+                    lambda n: _si.get_qualified_names_for(n, project_id),
+                    lambda: _si.get_all_qualified_names(project_id),
+                )
+                return _q if _q and _si.find_blocks(_q, project_id) else ""
+
+            _out: List[str] = []
+            for _a, _b in _conjoined_call_pairs(claim.text, _resolve):
+                _st = _relation_edge_status(
+                    _si, _a.rsplit(".", 1)[-1], _b, project_id
+                )
+                if _st != "direct":
+                    _out.append(
+                        f"{_a.rsplit('.', 1)[-1]} → {_b.rsplit('.', 1)[-1]} ({_st})"
+                    )
+            return _out
+        except Exception:
+            return []
 
 
 class AgenticStaticVerifier:
@@ -21595,7 +22161,7 @@ class AgenticStaticVerifier:
                     _verdicts = await _ev.judge(
                         claims, _groups, _bodies, aligned_prefix
                     )
-                    _settled = _ev.apply(claims, _verdicts)
+                    _settled = _ev.apply(claims, _verdicts, project_id)
                     self._f._log_debug(
                         f"🤖 Evidence: {len(_groups)} subject(s), "
                         f"{sum(len(v) for v in _groups.values())} "
@@ -23360,7 +23926,8 @@ class AgenticDynamicVerifier:
 
     _SCAFFOLD_HEAD = """import asyncio, json, math, re, time, hashlib, itertools, functools, collections
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from enum import Enum, IntEnum
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 VALVES = {}
 
@@ -23432,7 +23999,7 @@ if __name__ == "__main__":
         "`symbol(_FakeSelf(), other_args)`; set needed valve values first "
         "via a module-level dict assignment `VALVES = {{...}}`.\n"
         "- Only use these modules (already imported): asyncio, json, math, "
-        "re, time, hashlib, itertools, functools, collections.\n"
+        "re, time, hashlib, itertools, functools, collections, enum.\n"
         "- No file, network, os, sys or subprocess access. No prints.\n"
         "- Define the test functions at the TOP LEVEL, never inside a "
         "class. The runner collects them from globals(); a method of a "
@@ -23486,7 +24053,7 @@ if __name__ == "__main__":
             step.seconds = time.monotonic() - started
             return
 
-        targets = self._pick_targets(step, ledger)
+        targets = self._pick_targets(step, ledger, project_id)
         if not targets:
             # A verify with nothing to verify must not report success. When
             # step 1 lost its claims tail, this step completed "done in
@@ -23607,7 +24174,7 @@ if __name__ == "__main__":
             return
 
         # Region: resolve the edited/discussed symbols, then their callers
-        seeds = self._pick_targets(step, ledger)
+        seeds = self._pick_targets(step, ledger, project_id)
         cap = max(1, self._f.valves.agentic_regression_max_callers)
         callers: List[str] = []
         for seed in seeds:
@@ -23656,9 +24223,18 @@ if __name__ == "__main__":
     # ──────────────────────────────────────────────────────────────────────
 
     def _pick_targets(
-        self, step: AgenticStep, ledger: "AgenticEvidenceLedger"
+        self,
+        step: AgenticStep,
+        ledger: "AgenticEvidenceLedger",
+        project_id: str = "",
     ) -> List[str]:
-        """Planner hints first, then most-cited valid qids from the ledger."""
+        """Planner hints first, then most-cited valid qids from the ledger.
+
+        A module-level constant the index holds no block for is not a
+        target: it is data, read whole from its definition (E4), and has
+        no behaviour a test can exercise. Picked first because the
+        question's constant joins the first step's symbols, one cost round
+        4 87 s of a 162 s inlet in four harness calls that never ran."""
         # Two caps, and the turn one is what actually bounds cost. The
         # per-step cap bounds a step; a plan may carry several steps, so
         # alone it bounds nothing that matters — 7 steps at 2 targets was a
@@ -23681,9 +24257,30 @@ if __name__ == "__main__":
         for q, _n in sorted(counts.items(), key=lambda kv: -kv[1]):
             if q not in ordered:
                 ordered.append(q)
-        _chosen = ordered[:cap]
+        _data = [q for q in ordered if self._is_module_data(q, project_id)]
+        if _data:
+            self._f._log_debug(
+                f"🤖 verify_dynamic: {', '.join(_data[:4])} left out — "
+                f"module-level data, settled by reading its definition"
+            )
+        _chosen = [q for q in ordered if q not in _data][:cap]
         self._f._dynamic_targets_this_turn = _spent + len(_chosen)
         return _chosen
+
+    def _is_module_data(self, qid: str, project_id: str) -> bool:
+        """Whether a cited name is a module-level constant, not code.
+
+        Constant-shaped (_MODULE_CONSTANT_RE) and holding no block in the
+        index: the index records classes and functions, so a constant
+        name with a block is one of those after all. Never raises.
+        """
+        try:
+            _tail = str(qid or "").rsplit(".", 1)[-1]
+            if not _MODULE_CONSTANT_RE.match(_tail):
+                return False
+            return not self._f._symbol_index.find_blocks(qid, project_id)
+        except Exception:
+            return False
 
     # ── Per-target flow ──────────────────────────────────────────────────
 
@@ -27297,8 +27894,10 @@ class AgenticToolBroker:
     def _expand(self, sym: str, project_id: str) -> str:
         """Full body of a symbol from the first live block, char-capped.
 
-        A name the index does not hold is tried as a module-level constant
-        (_module_constant) before it is reported missing."""
+        A name no live block holds is tried as a module-level constant
+        (_module_constant) before it is reported missing: whether the
+        resolver knows the name or not, since it resolves a constant's
+        name to itself without any block to read it from."""
         qid = self._qid_for(sym, project_id)
         if not qid:
             _const = self._module_constant(sym, project_id)
@@ -27313,6 +27912,9 @@ class AgenticToolBroker:
                 block = blk
                 break
         if block is None:
+            _const = self._module_constant(qid, project_id)
+            if _const:
+                return _const
             return f"[EXPAND: no live block holds '{qid}']"
         body = CodeBlockManager.extract_symbol_body(block, qid)
         if not body:
@@ -28731,6 +29333,10 @@ class AgenticSynthesisComposer:
         "Code carries any code this turn has to show, tests included when "
         "they are worth showing. It is on the list only when the turn has "
         "content for it, so it is not a candidate for SKIP.\n\n"
+        "{proceed} says what the reader can do with what this turn found: "
+        "a change to make, a decision it settles, a question it opens. It "
+        "never sends the reader to consult, confirm or expand code the "
+        "workspace above already read; if nothing is left to do, say so.\n\n"
         "Return ONLY the section names and their lines, one per line, in "
         "the order given. No prose, no preamble, no code."
     )
@@ -28768,11 +29374,17 @@ class AgenticSynthesisComposer:
         if _tail > 0:
             _synth = _synth[:_tail].rstrip().rstrip("`").rstrip()
         if _synth.strip():
+            _synth, _ = _mark_refuted_bullets(
+                _synth, list(getattr(ledger, "claims", None) or [])
+            )
             out += [
                 "SYNTHESIS:",
                 _close_dangling_fence(_demote_headings(_synth)[:_OUTLINE_SYNTH_CHARS]),
                 "",
             ]
+            _refuted = _refuted_lines(list(getattr(ledger, "claims", None) or []))
+            if _refuted:
+                out += _refuted + [""]
         _listing = str(
             getattr(getattr(self._f, "_agentic", None), "_graph_listing", "") or ""
         )
@@ -28813,8 +29425,14 @@ class AgenticSynthesisComposer:
         sections: List[str],
         never_skip: Optional[List[str]] = None,
         fixed_bodies: Optional[Dict[str, str]] = None,
+        recheck_body: str = "",
     ) -> str:
         """One line per section, written while the workspace is still in view.
+
+        `recheck_body`, when given, replaces a How to proceed line that
+        only sends the reader to check code (_RECHECK_LINE_RE). The caller
+        gives one on turns that wrote no code, where the next step is
+        never to re-read what the turn read.
 
         `fixed_bodies` maps a section KEY to a line that overrides whatever
         the model wrote for it. Two sections need it: the surviving rivals
@@ -28850,6 +29468,9 @@ class AgenticSynthesisComposer:
                 + self._OUTLINE_CONTRACT.format(
                     sections="\n".join(f"- {x}" for x in sections),
                     langname=_names,
+                    proceed=(_SECTION_HEADINGS.get(lang) or _SECTION_HEADINGS["en"])[
+                        "proceed"
+                    ],
                 ),
                 max_tokens=1200,
                 label="agentic_outline",
@@ -28984,6 +29605,18 @@ class AgenticSynthesisComposer:
                     _kept.append(_fix)
                     _idx += 2
                     continue
+                if (
+                    _body
+                    and recheck_body
+                    and _key_of.get(_heads(_l), "") == "proceed"
+                    and _RECHECK_LINE_RE.match(_body)
+                ):
+                    self._f._log_debug(
+                        f"🤖 Outline: proceed line only sent the reader to "
+                        f"re-check code ({_body.strip()[:60]!r}) — replaced"
+                    )
+                    self._f._bump_turn_metric("proceed_recheck")
+                    _body = recheck_body
                 if _body:
                     # A protected section keeps its heading, but its body must not
                     # be the word SKIP: the guard would hand the model
@@ -29270,9 +29903,19 @@ class AgenticSynthesisComposer:
             # answer's in reverse, evidence first and conclusion last.
             # A finished-looking artifact in a competing order, ninety
             # lines above the directive, is a second template.
+            _claims_now = list(getattr(ledger, "claims", None) or [])
+            _synth, _marked = _mark_refuted_bullets(_synth, _claims_now)
+            if _marked:
+                self._f._log_debug(
+                    f"🤖 Workspace: {_marked} synthesis line(s) marked refuted "
+                    f"— the checks ran after the synthesis was written"
+                )
             lines.append("Synthesis (the pipeline's processed conclusion):")
             lines.append(_demote_headings(_synth))
             lines.append("")
+            lines += _refuted_lines(_claims_now)
+            if lines[-1] != "":
+                lines.append("")
         else:
             lines.append(
                 "(No synthesis step completed — answer from the code "
@@ -29859,9 +30502,20 @@ class AgenticSynthesisComposer:
                     "genuinely uncertain say so like a person would rather than "
                     "hedging it into fog. Warm, never chummy; the goal is that the "
                     "reader UNDERSTANDS, not that they are impressed.",
-                    "The line under each heading says what this turn "
-                    "established for it. Develop it into prose against the "
-                    "workspace above; do not simply restate it.",
+                    # The note used to say "develop it into prose", against
+                    # rule 5 just above it. With one finished sentence under
+                    # each heading, copying the line satisfied both: round 4
+                    # copied 10 of its 24 seed lines and wrote a list in one
+                    # answer of six, while the synthesis behind them held
+                    # numbered steps and code. It now says what the line is
+                    # and what the section is built from.
+                    "The line under each heading is a summary of that "
+                    "section, not its text. Write each section from the "
+                    "workspace above: Conclusion as one short paragraph, "
+                    "every other section as the list rule 5 asks for — one "
+                    "finding per item, each naming the symbol and what its "
+                    "code showed. A line copied from here as it stands is a "
+                    "section left unwritten.",
                     "",
                 ]
                 # Split into lines, with a rule ahead of every heading. The
@@ -30683,6 +31337,74 @@ class AgenticOrchestrator:
         ):
             return True, f"low_confidence:{control.get('confidence', 0.0):.2f}"
         return False, ""
+
+    def _gaps_body(self, question: str, project_id: str, lang: str) -> str:
+        """The gaps section's line, from the ledger and the asked names.
+
+        Open claims are the ones no check settled (read, blind, uncovered in
+        the coverage tally); asked names are those _asked_subjects found
+        unread. Returns "" on failure, which leaves the outline's own line.
+
+        Counted the way the tally will count them, though the tally runs
+        later: unread lists refreshed (refresh_unread, which only shrinks
+        them) and restatements folded to their best-evidenced member, as
+        collapse_restatements will. Read off the raw ledger, the line named
+        a claim "not checked" whose twin the workspace showed verified, and
+        all six answers of round 4 said more was open than the confidence
+        line under them.
+        """
+        try:
+            _open, _unop = self._open_claims_after_fold()
+            _asked = self._asked_subjects(question, project_id)
+            return _gaps_outline_body(
+                _open, _unop, list(_asked.get("asked_unread") or []), lang
+            )
+        except Exception as _e:
+            self._f._log_debug(f"🤖 Outline: gaps line not computed ({_e!r})")
+            return ""
+
+    def _open_claims_after_fold(self) -> Tuple[List[str], int]:
+        """Texts of the claims the tally will count open, and the anchorless.
+
+        Folded the way the tally folds (refresh_unread, then the best-
+        evidenced member of each proposition, as collapse_restatements
+        keeps it), without rewriting the ledger. Raises on a broken ledger;
+        callers guard.
+        """
+        _ledger = self._ledger
+        _ledger.refresh_unread()
+        _rank = {_b: _i for _i, _b in enumerate(_ledger._BUCKET_RANK)}
+        # ── Step 1: the best-evidenced statement of each proposition ──
+        _best: Dict[tuple, Tuple[Any, str]] = {}
+        for _c in getattr(_ledger, "claims", None) or []:
+            _k = _ledger._proposition_key(_c)
+            _b = AgenticEvidenceLedger.bucket_of(_c)
+            if _k not in _best or _rank.get(_b, 99) < _rank.get(_best[_k][1], 99):
+                _best[_k] = (_c, _b)
+        # ── Step 2: the ones that stay open after folding ──
+        _open: List[str] = []
+        _unop = 0
+        for _c, _b in _best.values():
+            if _b in ("read", "blind", "uncovered"):
+                _open.append(_c.text or "")
+            elif _b == "unoperationalizable":
+                _unop += 1
+        return _open, _unop
+
+    def _recheck_proceed_body(self, lang: str, code_action: str) -> str:
+        """The proceed line that replaces a re-check request, or "".
+
+        Only on a turn that wrote no code (code action explain or none):
+        after a fix, checking the change is a real next step. Never raises.
+        """
+        try:
+            if str(code_action or "").strip().lower() not in ("", "explain"):
+                return ""
+            _w = _RECHECK_PROCEED_BODIES.get(lang) or _RECHECK_PROCEED_BODIES["en"]
+            _open, _ = self._open_claims_after_fold()
+            return _w["open" if _open else "none"]
+        except Exception:
+            return ""
 
     def _asked_subjects(self, question: str, project_id: str) -> Dict[str, List[str]]:
         """
@@ -33774,7 +34496,12 @@ class AgenticOrchestrator:
                             "buried",
                             _lang,
                         ),
+                        # A count the ledger holds, not a judgement: left to
+                        # the step, it came back SKIP and the placeholder
+                        # that replaced it was copied into the answer.
+                        "gaps": self._gaps_body(question, project_id, _lang),
                     },
+                    self._recheck_proceed_body(_lang, _action_now),
                 )
             except Exception as _e_ol:
                 self._f._log_debug(
@@ -61204,6 +61931,35 @@ class InletOrchestrator:
                 )
             )
 
+        # Region: past answers lose what the prompt said was not answer
+        # Before anything reads the history, and on every turn: the host
+        # sends the stored chat back each time and discards outlet edits,
+        # so the inlet is the only place a leaked note can be taken out.
+        try:
+            _scrubbed = {"notes": 0, "echoes": 0, "placeholders": 0, "repeat": 0}
+            _touched = 0
+            for _m in messages or []:
+                if not isinstance(_m, dict) or _m.get("role") != "assistant":
+                    continue
+                if not isinstance(_m.get("content"), str):
+                    continue
+                _new, _c = _scrub_history_answer(_m["content"])
+                if _new != _m["content"]:
+                    _m["content"] = _new
+                    _touched += 1
+                    for _k, _v in _c.items():
+                        _scrubbed[_k] += _v
+            if _touched:
+                self._f._log_debug(
+                    f"🧽 History: {_touched} past answer(s) cleaned — "
+                    f"{_scrubbed['notes']} workspace note(s), "
+                    f"{_scrubbed['echoes']} echoed directive(s), "
+                    f"{_scrubbed['placeholders']} placeholder line(s), "
+                    f"{_scrubbed['repeat']} repeated section cycle(s) cut"
+                )
+        except Exception as _e_scrub:
+            self._f._log_debug(f"🧽 History: scrub skipped ({_e_scrub!r})")
+
         last_user_msg = next(
             (m for m in reversed(messages) if m.get("role") == "user"), None
         )
@@ -66655,12 +67411,25 @@ class Filter:
         ("reinforce_skipped", 0),
         ("static_vacuous", 0),
         ("never_updated_refuted", 0),
+        ("conjunction_withheld", 0),
+        ("proceed_recheck", 0),
         ("contradictions_symbol", 0),
         ("contradictions_subject", 0),
+        ("outlet_missing", 0),
+        ("answer_degenerate", 0),
+        ("seed_lines", 0),
+        ("seed_copied", 0),
+        ("answer_list_items", 0),
     ) + tuple((f"tri_{_k}", 0) for _k in _TRIANGULATION_FIELDS)
 
     def _log_turn_metrics(
-        self, answer_s: float, answer_tokens: int = 0, question: str = ""
+        self,
+        answer_s: float,
+        answer_tokens: int = 0,
+        question: str = "",
+        outlet_missing: bool = False,
+        degenerate: str = "",
+        answer: str = "",
     ) -> None:
         """
         One [METRICS-TURN] line per answered turn: the totals a test run is compared on.
@@ -66687,12 +67456,24 @@ class Filter:
             answer_tokens: Tokens of the answer as delivered.
             question: The user's question, read from the outlet's body;
                 used only when the inlet froze none.
+            outlet_missing: The outlet never ran (the answer was stopped or
+                failed); answer_s is then 0, not a measurement.
+            degenerate: _output_is_degenerate's reason for the answer, or "".
+            answer: The answer's text, for its shape against this turn's
+                outline (_answer_shape); "" leaves those fields at 0.
         """
         try:
             _m = dict(getattr(self, "_inlet_handoff_metrics", {}) or {})
             _m["answer_s"] = answer_s
             _m["total_s"] = float(_m.get("inlet_s", 0.0)) + answer_s
             _m["answer_tokens"] = answer_tokens
+            _m["outlet_missing"] = 1 if outlet_missing else 0
+            _m["answer_degenerate"] = 1 if degenerate else 0
+            (
+                _m["seed_lines"],
+                _m["seed_copied"],
+                _m["answer_list_items"],
+            ) = _answer_shape(answer, getattr(self, "_answer_outline", "") or "")
             _q = " ".join(str(_m.get("question") or question or "").split())
             _qhash = hashlib.sha1(_q.casefold().encode("utf-8")).hexdigest()[:8]
             _fields = " ".join(
@@ -67490,6 +68271,7 @@ class Filter:
                     f"{self._inlet_turns - 1} inlet(s)) — its answer is "
                     f"treated as incomplete"
                 )
+                self._report_unanswered_turn(body)
             inlet_start = time.monotonic()
             self._log_section("CONTEXT MANAGER - INLET START")
             # Record the model this turn is served by. Auxiliary calls only
@@ -68815,9 +69597,61 @@ class Filter:
             _ans_tok = 0
             if _answer and getattr(self, "tokenizer", None):
                 _ans_tok = len(self.tokenizer.encode(_answer))
-            self._log_turn_metrics(_elapsed, _ans_tok, _question)
+            self._log_turn_metrics(
+                _elapsed,
+                _ans_tok,
+                _question,
+                degenerate=_output_is_degenerate(_answer),
+                answer=_answer,
+            )
         except Exception as _e_ho:
             self._log_debug(f"answer-handoff report skipped ({_e_ho!r})")
+
+    def _report_unanswered_turn(self, body: Optional[dict]) -> None:
+        """Log the [METRICS-TURN] line of a turn whose outlet never ran.
+
+        A turn the reader stops, or whose answer call fails, never reaches
+        the outlet, and its line was lost with it: the one turn of round 3
+        that looped twenty times is the one turn with no metrics. Its
+        handover metrics were frozen at the seal and are still here when
+        the next inlet starts, and the host has stored whatever the answer
+        got to, as the assistant message just before this turn's question.
+
+        answer_s is reported as 0 with outlet_missing=1: the time until the
+        answer was stopped is not known, and the gap to this inlet includes
+        however long the reader waited. Called before the history is
+        scrubbed, so the answer is counted as it was written. Never raises.
+        """
+        try:
+            if not getattr(self, "_inlet_handoff_ts", None):
+                return
+            self._inlet_handoff_ts = None
+            _msgs = [
+                _m for _m in list((body or {}).get("messages") or [])
+                if isinstance(_m, dict)
+            ]
+            _answer = ""
+            if (
+                len(_msgs) >= 2
+                and _msgs[-1].get("role") == "user"
+                and _msgs[-2].get("role") == "assistant"
+            ):
+                _answer = self._coerce_message_content(_msgs[-2].get("content"))
+            _tok = 0
+            if _answer and getattr(self, "tokenizer", None):
+                _tok = len(self.tokenizer.encode(_answer))
+            _deg = _output_is_degenerate(_answer)
+            self._log_debug(
+                f"[NO-OUTLET] metrics of the unanswered turn logged from its "
+                f"handover and the stored answer ({_tok} token(s)"
+                + (f", degenerate: {_deg}" if _deg else "")
+                + ")"
+            )
+            self._log_turn_metrics(
+                0.0, _tok, outlet_missing=True, degenerate=_deg, answer=_answer
+            )
+        except Exception as _e:
+            self._log_debug(f"[NO-OUTLET] metrics not logged ({_e!r})")
 
     def _audit_opening_against_ledger(self, body: dict) -> None:
         """Report when the answer's opening rests on something unsettled.
