@@ -40,6 +40,7 @@ from typing import (
     Literal,
     Callable,
     Union,
+    NamedTuple,
 )
 from enum import Enum
 from pydantic import BaseModel, Field
@@ -166,8 +167,10 @@ from shared_resources import (
 #       HardCoreRule · EPISTEMIC_HARD_CORE
 #       EpistemicRegime · AuxiliaryStanding
 #       AuxiliaryHypothesis · ProtectiveBelt
+#       EvidenceFamily · EvidenceScope · EvidenceObservation
+#       TriangulationRuling · EvidenceTriangulation
 #       MetacognitiveReasoningEngine · EpistemicStrategies
-#       HypothesisForge
+#       BayesianRanking · HypothesisForge
 #
 # 15. CONTEXT PREPARATION
 #       HistoryCompressor · TokenUtils · EnrichmentTasks
@@ -230,18 +233,17 @@ class ExperimentDesign:
     BEFORE gather_evidence() runs.
 
     critical_claims:
-        If ANY of these are False in the evidence → immediate falsification
-        (or score penalty if coverage guard is active).
+        If ANY of these are False in the evidence → immediate falsification,
+        unless the coverage guard holds it (too little of the hypothesis
+        checked: the refutation is held as an anomaly, not final).
         Popperian hard kill — no amount of supportive evidence overrides this.
 
     supportive_claims:
-        If False → score penalty only. Does not falsify.
+        If False → recorded; does not falsify.
 
     unknown_claims:
         Not directly verifiable in the SymbolGraph.
-        Ignored in scoring but counted in coverage_score.
-        Active Learning (_resolve_unknown_claims) may reclassify some
-        of these into supportive_claims if their symbols are found.
+        Counted in the denominator of coverage_score and never resolved.
 
     hypothesis_hash:
         MD5 of hypothesis text. Used to cache this design across iterations
@@ -293,6 +295,11 @@ def _prediction_key(text: str) -> str:
 # keeps that read cheap.
 _TESTED_AGAINST_MAX = 48
 
+# How many decided consequences a dossier keeps as Bayesian evidence
+# (BayesianRanking.note_fact). A forge cycle derives at most ten, and the
+# cycles that matter are the first few.
+_DOSSIER_FACTS_MAX = 40
+
 
 @dataclass
 class HypothesisDossier:
@@ -308,14 +315,16 @@ class HypothesisDossier:
     R34 processed-artifacts rule). Status is the forge verdict:
     'plausible' reaches the final competition; 'dead' goes to the
     graveyard with its cause (falsified / fabricated / unfounded /
-    null_bar) and is excluded from future generation. All fields are
+    null_bar / degenerating) and is excluded from future generation. A
+    plausible dossier whose belt standing is still 'untested' competes
+    but cannot win. All fields are
     JSON-safe so a dossier round-trips through dataclasses.asdict for
     graveyard persistence.
     """
 
     hypothesis: str
     status: str = "forging"  # forging | plausible | dead
-    cause_of_death: str = ""  # falsified|fabricated|unfounded|null_bar
+    cause_of_death: str = ""  # falsified|fabricated|unfounded|null_bar|degenerating
     cycles_used: int = 0
     confirmed_checks: int = 0
     refuted_checks: int = 0
@@ -369,6 +378,41 @@ class HypothesisDossier:
     # judgment time (competing / complementary / independent).
     # Reporting metadata only — it never touches the ranking.
     relation_to_winner: str = ""
+    # The protective belt's sparse_sampling auxiliary, when a cycle's
+    # refutation rested on too small a sample (ProtectiveBelt.
+    # sparse_sampling_ruling). belt_standing is an AuxiliaryStanding value,
+    # "" when the belt was never used; a dossier sealed "untested" survives
+    # but cannot win (_judge_dossiers). belt_note keeps the assumption and
+    # the prediction the adjustment was held to. Plain strings, so the
+    # dossier stays JSON-safe.
+    belt_standing: str = ""
+    belt_note: str = ""
+    # Which instrument refuted what, across all cycles: the call graph and
+    # symbol index, the AST contract checker, or the evidence judge reading
+    # a quoted span. The three are not equally reliable, and the split is
+    # what a weighting by instrument would be calibrated on.
+    refuted_by_graph: int = 0
+    refuted_by_contract: int = 0
+    refuted_by_judge: int = 0
+    # True when an earlier cycle's decided facts are what kept a cycle that
+    # decided nothing from burying this hypothesis as "unfounded"
+    # (_forge_verdict's decided_before). For the metrics only.
+    foundation_rescued: bool = False
+    # The Bayesian shadow's reading of this rival (_rank_bayesian_shadow):
+    # its posterior among the eligible rivals, its rank by it (1 = the
+    # shadow's pick unless "none" outweighs it), and the posterior of "none
+    # of them" in the same competition. -1.0 and 0 when it was not ranked
+    # (not eligible, or the shadow is off). Never read by any decision.
+    bayes_posterior: float = -1.0
+    bayes_rank: int = 0
+    bayes_p_none: float = -1.0
+    # Every consequence of this hypothesis an instrument decided, once each:
+    # {"key", "kind", "verdict"}, plus "agree" and "disagree" when an
+    # instrument of another family decided it again (BayesianRanking.
+    # note_fact). The evidence
+    # the Bayesian ranking weighs, and the rows metric_forge_facts keeps so
+    # the ranking can be recomputed offline under other parameters.
+    facts: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -411,6 +455,12 @@ class CompetitionRecord:
     # gate by (project, question_type). Same safe defaulted
     # widening as external_validation; old rows hydrate to "".
     question_type: str = ""
+    # The turn the competition ran in, as metric_turns keys it
+    # (Filter._turn_started_at), so an outcome label marks the record of
+    # the turn it names instead of the newest one. Same defaulted widening
+    # as the two above; rows from before it hydrate to 0.0 and no label
+    # can reach them.
+    turn_started: float = 0.0
 
 
 # What sits between the KV prefix and whatever follows it. One constant,
@@ -1031,6 +1081,97 @@ def _confidence_share_words(cov: Dict[str, Any]) -> str:
             f"their corroboration"
         )
     return f"dividing the figure by {1 + indep}" if indep > 1 else "halving the figure"
+
+
+# Names a question can ask about: backticked spans, dotted names, snake_case,
+# CamelCase and UPPER_SNAKE (AgenticOrchestrator._asked_subjects).
+_ASKED_NAME_RE = re.compile(
+    r"`([^`\n]+)`"
+    r"|\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+"
+    r"|_?[a-z][a-z0-9]*(?:_[a-z0-9]+)+"
+    r"|_[a-z0-9_]+"
+    r"|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+"
+    r"|_*[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b"
+)
+# How far a module-level constant's statement is followed before giving up
+# on it (CodeBlockManager.extract_module_constant).
+_MODULE_CONSTANT_MAX_LINES = 600
+# A module-level constant by convention. The symbol index holds classes,
+# functions and methods, so a name of this shape can be what a question
+# asks about without the index knowing it.
+_MODULE_CONSTANT_RE = re.compile(r"^_*[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+
+
+def _asked_coverage(cov: Dict[str, Any]) -> float:
+    """
+    The part of the confidence figure left after what the question asked about
+    and nobody read.
+
+    Claims can all be settled while the symbol the question names was never
+    opened: the investigation checked other things. The figure then
+    measures those other things, and is scaled by the share of the named
+    symbols whose body was read (AgenticOrchestrator._asked_subjects). 1.0
+    when the question names none, as exploratory questions often do.
+    """
+    asked = list(cov.get("asked_subjects") or [])
+    unread = list(cov.get("asked_unread") or [])
+    if not asked:
+        return 1.0
+    return max(0.0, (len(asked) - len(unread)) / len(asked))
+
+
+def _asked_coverage_words(cov: Dict[str, Any]) -> str:
+    """How the confidence line says what _asked_coverage did; "" when nothing."""
+    unread = list(cov.get("asked_unread") or [])
+    if not unread:
+        return ""
+    unindexed = set(cov.get("asked_unindexed") or [])
+    names = ", ".join(
+        _n + (" (not in the symbol index)" if _n in unindexed else "")
+        for _n in unread[:4]
+    )
+    return (
+        f"the question asks about {names}, never read this turn — scaling "
+        f"the figure by {_asked_coverage(cov):.2f}"
+    )
+
+
+# Claims that a variable never changes, in the shapes the steps write them:
+# "S never assigns/updates … v", "v is never updated", "v is initialised to
+# -1 and never assigned", "v is always 0", "v remains 0". The name must look
+# like a variable (snake_case or underscored) and stand on its own, not as
+# the tail of a dotted name: that keeps "never updates a non-zero value"
+# from naming "a" and "S._forge_hypothesis never assigns" from naming the
+# method (AgenticStaticVerifier._never_updated_check).
+_VARIABLE_NAME = (
+    r"(?<![.\w])(?:self\.)?_*[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?![\w(])"
+    r"|(?<![.\w])_+[a-z][a-z0-9_]*(?![\w(])"
+)
+_NEVER_VERB = (
+    r"(?:re)?(?:assign|update|modif(?:y|ie)|set|change|increment|write|touch"
+    r"|accumulate)"
+)
+_NEVER_UPDATED_CLAIM_RES = (
+    re.compile(
+        r"\bnever\s+" + _NEVER_VERB + r"s?\b[^.;]{0,80}?`?(?P<name>"
+        + _VARIABLE_NAME
+        + r")`?",
+        re.I,
+    ),
+    re.compile(
+        r"`?(?P<name>"
+        + _VARIABLE_NAME
+        + r")`?[^.;]{0,60}?\bnever\s+(?:been\s+)?" + _NEVER_VERB + r"(?:s|d|ed)?\b",
+        re.I,
+    ),
+    re.compile(
+        r"`?(?P<name>"
+        + _VARIABLE_NAME
+        + r")`?,?\s+(?:which\s+)?(?:is\s+always|always\s+stays|remains|stays)\s+"
+        r"(?:0|zero|none|false|empty|-1)(?!\.?\d|\w)",
+        re.I,
+    ),
+)
 
 
 # A fenced block inside a pasted .txt (InletOrchestrator.merge_pasted_files).
@@ -4523,7 +4664,9 @@ _RIVAL_TEXT_CHARS = 400
 _RIVAL_CLAIMS_CHARS = 2000
 
 # Pipeline metrics (StateStore.init_db): how long rows are kept, and the
-# one INSERT per table that Filter._record_metric queues.
+# one statement per row kind that Filter._record_metric queues. A turn an
+# outcome label names is exempt from the age cutoff: its rows are the
+# denominator of every rate the label feeds.
 _METRICS_KEEP_DAYS = 30
 _METRIC_INSERTS = {
     "llm_call": (
@@ -4534,17 +4677,75 @@ _METRIC_INSERTS = {
     "turn": (
         "INSERT INTO metric_turns (project_id, turn_started, ts, question, "
         "bodies_shown, block_b_chars, carry_over, backed, structure_hash, "
-        "from_cache) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "from_cache, turn_number, experiment_arm, system_tokens, chat_id, "
+        "triangulation) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ),
+    # Not an insert. The answer call ends in the outlet, after the turn's
+    # row was queued, so its duration is added to that row; the write
+    # queue is FIFO, which keeps the update behind the insert it amends.
+    "turn_answer": (
+        "UPDATE metric_turns SET answer_seconds = ? "
+        "WHERE project_id = ? AND turn_started = ?"
+    ),
+    # One row per decided consequence of a forged rival (BayesianRanking).
+    # (turn_started, comp_ts, position) is the rival: comp_ts is the write
+    # time its competition's rows share in metric_forge_rivals, position its
+    # place among them, which is how CommandRouter._turn_rivals numbers it.
+    "forge_fact": (
+        "INSERT INTO metric_forge_facts (project_id, turn_started, comp_ts, "
+        "position, ts, kind, verdict, fact_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ),
+    # One label per turn. Labelling a turn again replaces its label, so
+    # an operator who changes their mind leaves one answer, not two.
+    "outcome": (
+        "INSERT OR REPLACE INTO metric_outcomes (project_id, turn_started, "
+        "ts, verdict, correct_rival, answer_tokens, note) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)"
     ),
     "forge_rival": (
         "INSERT INTO metric_forge_rivals (project_id, turn_started, ts, "
         "rivals, l1_rank, won, status, cause_of_death, corroboration, "
         "predictions_corroborated, predictions_refuted, cycles_used, "
         "nodes_read, coverage_score, hypothesis, confirmed_claims, "
-        "refuted_claims, analysis_head) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "refuted_claims, analysis_head, belt_standing, belt_note, "
+        "refuted_by_graph, refuted_by_contract, refuted_by_judge, "
+        "bayes_posterior, bayes_rank, bayes_p_none) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "?, ?, ?, ?, ?, ?, ?, ?)"
     ),
 }
+
+# What an operator may say about a delivered answer (metric_outcomes), and
+# the command that says it. "partial" is a right diagnosis with a wrong
+# remedy, or the reverse; the headline rate leaves it out rather than
+# counting it as either. The dispatch, the handler and the report all read
+# this one table.
+_OUTCOME_COMMANDS = (("/accept", "right"), ("/reject", "wrong"), ("/partial", "partial"))
+_OUTCOME_VERDICTS = tuple(_verdict for _, _verdict in _OUTCOME_COMMANDS)
+
+# metric_outcomes.correct_rival when the label names no rival: the turn
+# ran no competition, or the operator did not say which one was right.
+# 0 is a statement ("none of the rivals was right"); this is its absence.
+_OUTCOME_RIVAL_UNSTATED = -1
+
+# The values of d /outcomes recomputes the Bayesian shadow at, to show
+# whether its comparison with Layer 1 survives a different derivation
+# reliability (CommandRouter._bayes_comparison).
+_BAYES_SENSITIVITY_D = (0.3, 0.5, 0.7)
+
+# Labelled competitions needed in EACH half before /outcomes splits them in
+# time, choosing d on the older and scoring it on the newer.
+_BAYES_SPLIT_MIN = 10
+
+# How much of an experiment arm's name a metric_turns row keeps.
+_EXPERIMENT_ARM_CHARS = 40
+
+# Below this many right-or-wrong labels, /outcomes flags an arm's rate as
+# too thin to compare: at 10 labels a 95% interval still spans 45 to 55
+# points (CommandRouter._wilson_interval).
+_OUTCOME_MIN_PER_ARM = 10
 
 # A bare seed name shared by more symbols than this says nothing about
 # which one is meant (ActivationEngine._narrow_ambiguous_seeds).
@@ -14539,7 +14740,8 @@ class StateStore:
         #   SELECT question, block_b_chars, bodies_shown, carry_over
         #   FROM metric_turns ORDER BY turn_started DESC LIMIT 20;
         #
-        # Rows older than _METRICS_KEEP_DAYS are dropped on start-up.
+        # Rows older than _METRICS_KEEP_DAYS are dropped on start-up, except
+        # those of a turn metric_outcomes holds a label for.
         self._f._db_conn.execute("""
             CREATE TABLE IF NOT EXISTS metric_llm_calls (
                 project_id   TEXT NOT NULL,
@@ -14603,24 +14805,135 @@ class StateStore:
                 analysis_head            TEXT NOT NULL
             )
         """)
-        # from_cache came after the table: added to one that lacks it.
+        # What came after metric_forge_rivals: the protective belt's ruling
+        # on each rival (HypothesisDossier.belt_standing, belt_note) and the
+        # instrument behind each of its refutations. Added to an older
+        # table the same way metric_turns' late columns are.
+        _rival_cols = {
+            r[1]
+            for r in self._f._db_conn.execute(
+                "PRAGMA table_info(metric_forge_rivals)"
+            ).fetchall()
+        }
+        for _col, _ddl in (
+            ("belt_standing", "TEXT NOT NULL DEFAULT ''"),
+            ("belt_note", "TEXT NOT NULL DEFAULT ''"),
+            ("refuted_by_graph", "INTEGER NOT NULL DEFAULT 0"),
+            ("refuted_by_contract", "INTEGER NOT NULL DEFAULT 0"),
+            ("refuted_by_judge", "INTEGER NOT NULL DEFAULT 0"),
+            # The Bayesian shadow's reading (BayesianRanking); NULL and 0
+            # where the rival was not ranked.
+            ("bayes_posterior", "REAL"),
+            ("bayes_rank", "INTEGER NOT NULL DEFAULT 0"),
+            ("bayes_p_none", "REAL"),
+        ):
+            if _col not in _rival_cols:
+                self._f._db_conn.execute(
+                    f"ALTER TABLE metric_forge_rivals ADD COLUMN {_col} {_ddl}"
+                )
+        # The evidence the Bayesian ranking weighs, one row per decided
+        # consequence of a forged rival (BayesianRanking.note_fact). Two
+        # readers: the base rate of each kind, over the turns before the
+        # one being ranked; and an offline recomputation of the ranking
+        # under other parameters, against the operator's labels.
+        #
+        #   SELECT kind, SUM(verdict), COUNT(*) FROM metric_forge_facts
+        #   WHERE project_id = ? GROUP BY kind;
+        #
+        # No cutoff, like the rivals it belongs to.
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS metric_forge_facts (
+                project_id   TEXT NOT NULL,
+                turn_started REAL NOT NULL,
+                comp_ts      REAL NOT NULL,
+                position     INTEGER NOT NULL,
+                ts           REAL NOT NULL,
+                kind         TEXT NOT NULL,
+                verdict      INTEGER NOT NULL,
+                fact_key     TEXT NOT NULL
+            )
+        """)
+        self._f._db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_metric_forge_facts_kind
+            ON metric_forge_facts (project_id, kind, turn_started)
+        """)
+        # The operator's verdict on a delivered answer, one row per turn,
+        # joined to every other metric table on (project_id, turn_started).
+        # Written only by an explicit command: a label derived from the
+        # pipeline's own measurements would grade the pipeline by itself
+        # (see CommandRouter._handle_accept_command for why that is
+        # circular). verdict is one of _OUTCOME_VERDICTS; correct_rival is
+        # the H-number of the rival the operator says was right, 0 for
+        # none of them, _OUTCOME_RIVAL_UNSTATED when not said.
+        #
+        #   SELECT t.experiment_arm, o.verdict, COUNT(*)
+        #   FROM metric_outcomes o JOIN metric_turns t
+        #     ON t.project_id = o.project_id
+        #    AND t.turn_started = o.turn_started
+        #   GROUP BY 1, 2;
+        #
+        # No cutoff: labels are scarce, and each one keeps its turn's rows
+        # in the other tables alive (the deletes below).
+        self._f._db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS metric_outcomes (
+                project_id    TEXT NOT NULL,
+                turn_started  REAL NOT NULL,
+                ts            REAL NOT NULL,
+                verdict       TEXT NOT NULL,
+                correct_rival INTEGER NOT NULL,
+                answer_tokens INTEGER NOT NULL,
+                note          TEXT NOT NULL,
+                PRIMARY KEY (project_id, turn_started)
+            )
+        """)
+        # Columns that came after metric_turns, added to a table that lacks
+        # them, so an old database and a fresh one end up the same shape.
+        # experiment_arm is '' on rows from before arms existed, which is
+        # not the same as any arm's name. chat_id tells apart the turn
+        # numbers each conversation restarts. answer_seconds stays NULL where
+        # the outlet never measured the answer call (a cache hit, a
+        # command, a cancelled stream). triangulation is the shadow's tally
+        # as JSON (AgenticEvidenceLedger.triangulate), '' before it existed
+        # and '{}' on a turn the pipeline did not run.
         _metric_turn_cols = {
             r[1]
             for r in self._f._db_conn.execute(
                 "PRAGMA table_info(metric_turns)"
             ).fetchall()
         }
-        if "from_cache" not in _metric_turn_cols:
-            self._f._db_conn.execute(
-                "ALTER TABLE metric_turns "
-                "ADD COLUMN from_cache INTEGER NOT NULL DEFAULT 0"
-            )
+        for _col, _ddl in (
+            ("from_cache", "INTEGER NOT NULL DEFAULT 0"),
+            ("turn_number", "INTEGER NOT NULL DEFAULT 0"),
+            ("experiment_arm", "TEXT NOT NULL DEFAULT ''"),
+            ("system_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("answer_seconds", "REAL"),
+            ("chat_id", "TEXT NOT NULL DEFAULT ''"),
+            ("triangulation", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if _col not in _metric_turn_cols:
+                self._f._db_conn.execute(
+                    f"ALTER TABLE metric_turns ADD COLUMN {_col} {_ddl}"
+                )
+        # Every metric table joins metric_turns on this pair, and the outlet
+        # amends a turn's row by it (turn_answer).
+        self._f._db_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_metric_turns_turn "
+            "ON metric_turns (project_id, turn_started)"
+        )
         _metrics_cutoff = time.time() - _METRICS_KEEP_DAYS * 86400
         self._f._db_conn.execute(
-            "DELETE FROM metric_llm_calls WHERE ts < ?", (_metrics_cutoff,)
+            "DELETE FROM metric_llm_calls WHERE ts < ? AND NOT EXISTS ("
+            "SELECT 1 FROM metric_outcomes o "
+            "WHERE o.project_id = metric_llm_calls.project_id "
+            "AND o.turn_started = metric_llm_calls.turn_started)",
+            (_metrics_cutoff,),
         )
         self._f._db_conn.execute(
-            "DELETE FROM metric_turns WHERE ts < ?", (_metrics_cutoff,)
+            "DELETE FROM metric_turns WHERE ts < ? AND NOT EXISTS ("
+            "SELECT 1 FROM metric_outcomes o "
+            "WHERE o.project_id = metric_turns.project_id "
+            "AND o.turn_started = metric_turns.turn_started)",
+            (_metrics_cutoff,),
         )
         # No cutoff for metric_forge_rivals: a few rows per session, and
         # the decisions it serves need months of them. A database from
@@ -15547,17 +15860,18 @@ class LongTermMemory:
         # metric row is written here: no bodies, no Block B, from_cache.
         self._f._record_metric(
             "turn",
-            (
-                str(self._f.valves.project_id or ""),
-                float(getattr(self._f, "_turn_started_at", 0.0)),
-                time.time(),
-                str(getattr(self._f, "_turn_user_question", "") or query or "")[:300],
-                0,
-                0,
-                0,
-                1,
-                str(meta.get("structure_hash", "") or ""),
-                1,
+            self._f._turn_metric_row(
+                project_id=str(self._f.valves.project_id or ""),
+                question=str(
+                    getattr(self._f, "_turn_user_question", "") or query or ""
+                ),
+                bodies_shown=0,
+                block_b_chars=0,
+                carry_over=False,
+                backed=True,
+                structure_hash=str(meta.get("structure_hash", "") or ""),
+                from_cache=True,
+                system_tokens=0,
             ),
         )
         # Footer and similarity ride along so the delivering path can say
@@ -18572,6 +18886,15 @@ class LLMOrchestrator:
                                 int(bool(result.truncated)),
                             ),
                         )
+                        for _mk, _mv in (
+                            ("llm_calls", 1),
+                            ("llm_in", int(in_tokens or 0)),
+                            ("llm_out", int(out_tokens or 0)),
+                            ("llm_s", time.monotonic() - t_start),
+                            ("llm_wait_s", t_acquired - t_start),
+                            ("llm_truncated", int(bool(result.truncated))),
+                        ):
+                            self._f._bump_turn_metric(_mk, _mv)
                         # Agent forensics. One hook covers every agent
                         # in the file: all 43 call sites funnel through
                         # here and each already passes a label naming
@@ -18815,6 +19138,35 @@ class AgenticPlan:
     )
 
 
+# How many instrument verdicts a claim keeps (LedgerClaim.observe). A claim
+# meets a handful of instruments; the bound only keeps a long check list
+# from bloating the step cache, which stores claims whole.
+_CLAIM_OBSERVATIONS_MAX = 12
+# How much of an instrument's own explanation an observation keeps.
+_OBSERVATION_DETAIL_CHARS = 120
+# How much of the question the [METRICS-TURN] line repeats at its end.
+_METRICS_QUESTION_CHARS = 80
+# What the triangulation shadow counts per turn
+# (AgenticEvidenceLedger.triangulate), in the order the [METRICS-TURN]
+# line and /outcomes print them.
+_TRIANGULATION_FIELDS = (
+    "observed",
+    "corroborated",
+    "single",
+    "anomaly",
+    "drift",
+    "overruled",
+    "held_robust",
+    "out_of_scope",
+    "would_flip",
+    "would_settle",
+    "twin_conflicts",
+)
+# How many claims the shadow names in the log, of those a live ruling
+# would change.
+_TRIANGULATION_NOTES_MAX = 6
+
+
 @dataclass
 class LedgerClaim:
     """One typed claim emitted by a step, with citation-validation results."""
@@ -18852,6 +19204,42 @@ class LedgerClaim:
     # relation needs no body — but a claim about what a method DOES,
     # carrying one of these, was written from the signature.
     unread_qids: List[str] = field(default_factory=list)
+    # Every instrument's verdict on this claim, in the order they ruled
+    # (EvidenceObservation). `verification` is the pipeline's working
+    # verdict and each instrument overwrites it; this list keeps what each
+    # of them said, so a disagreement between them survives to be ruled
+    # on (EvidenceTriangulation) instead of being settled by whichever
+    # ran last.
+    observations: List["EvidenceObservation"] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # A claim rebuilt from the step cache or the ledger snapshot brings
+        # its observations back as JSON lists. They are rebuilt here, and
+        # an unreadable one is dropped rather than losing the claim.
+        self.observations = [
+            _o
+            for _o in (
+                EvidenceObservation.coerce(_r) for _r in (self.observations or [])
+            )
+            if _o is not None
+        ]
+
+    def observe(self, observation: "EvidenceObservation") -> None:
+        """
+        Keep one instrument's verdict beside the others.
+
+        Never overwrites. An observation identical to one already kept
+        (same instrument, family, scope, verdict and regime) adds nothing
+        and is skipped; past _CLAIM_OBSERVATIONS_MAX the rest are dropped.
+
+        Args:
+            observation: What the instrument said about this claim.
+        """
+        if len(self.observations) >= _CLAIM_OBSERVATIONS_MAX:
+            return
+        if any(_o[:5] == observation[:5] for _o in self.observations):
+            return
+        self.observations.append(observation)
 
 
 # ==========================================================================
@@ -19053,6 +19441,9 @@ class AgenticEvidenceLedger:
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
         self.claims: List[LedgerClaim] = []
+        # Groups of restatements whose members reached opposite verdicts,
+        # counted by collapse_restatements before it keeps one of them.
+        self.twin_conflicts = 0
 
     # ──────────────────────────────────────────────────────────────────────
     # 1. Recording claims as steps emit them
@@ -19803,6 +20194,13 @@ class AgenticEvidenceLedger:
                     _members,
                     key=lambda _m: _rank.get(self.bucket_of(_m), 99),
                 )
+                # Twins with opposite verdicts are one proposition two
+                # instruments disagree on, or two assertions the key cannot
+                # tell apart. Either way one side is about to be dropped,
+                # so the disagreement is counted before it is.
+                _polar = {_m.verification for _m in _members}
+                if {"confirmed", "refuted"} <= _polar:
+                    self.twin_conflicts += 1
                 _keep.append(_best)
                 _removed += len(_members) - 1
 
@@ -19818,6 +20216,144 @@ class AgenticEvidenceLedger:
         except Exception as _e:
             self._f._log_debug(f"🤖 Ledger: restatement collapse skipped ({_e!r})")
         return _removed
+
+    def triangulate(self, project_id: str) -> Dict[str, Any]:
+        """
+        Rule on every claim from its observations, in shadow, and count the rulings.
+
+        Nothing is written to a claim: `verification` stays the pipeline's
+        verdict, and what EvidenceTriangulation would have decided is only
+        counted against it. Run after collapse_restatements, so the counts
+        cover the claims the synthesis reads.
+
+        A disagreement between the strongest observations is ruled again
+        as drift when the claim's subject is indexed in more than one
+        block: a re-pasted file arrives under a new synthetic name and
+        never supersedes the old one, so two instruments may have read
+        two versions of it.
+
+        Args:
+            project_id: Project whose index answers the drift question.
+
+        Returns:
+            {"counts": {field: n} over _TRIANGULATION_FIELDS, "pairs":
+            {"family_a|family_b": [both confirm, only a confirms, only b
+            confirms, both refute]} over claims both families judged as
+            stated, "notes": a line per claim a live ruling would change,
+            up to _TRIANGULATION_NOTES_MAX}. Never raises.
+        """
+        _counts = {_k: 0 for _k in _TRIANGULATION_FIELDS}
+        _pairs: Dict[str, List[int]] = {}
+        _notes: List[str] = []
+        _drift: Dict[str, bool] = {}
+
+        def _indexed_twice(subject: str) -> bool:
+            if subject not in _drift:
+                try:
+                    _blocks = self._f._symbol_index.find_blocks(subject, project_id)
+                    _drift[subject] = len(set(_blocks or ())) > 1
+                except Exception:
+                    _drift[subject] = False
+            return _drift[subject]
+
+        _label = {True: "confirmed", False: "refuted", None: "undecided"}
+        try:
+            for _n, _c in enumerate(self.claims, 1):
+                # ── Step 1: the ruling; drift is asked only on a conflict ──
+                _obs = list(_c.observations or [])
+                if not any(_o.verdict is not None for _o in _obs):
+                    continue
+                _counts["observed"] += 1
+                _r = EvidenceTriangulation.rule(_obs)
+                _twice = bool(_c.subject) and _r.conflict == "anomaly"
+                if _twice and _indexed_twice(_c.subject):
+                    _r = EvidenceTriangulation.rule(_obs, version_drift=True)
+
+                # ── Step 2: what it establishes, and against the pipeline ──
+                if _r.corroborated:
+                    _counts["corroborated"] += 1
+                elif _r.verdict is not None:
+                    _counts["single"] += 1
+                if _r.conflict:
+                    _counts[_r.conflict] += 1
+                if _r.held >= 2:
+                    _counts["held_robust"] += 1
+                if _r.support_out_of_scope and _c.verification == "confirmed":
+                    _counts["out_of_scope"] += 1
+                if _r.differs_from(_c.verification):
+                    _decided = _c.verification in ("confirmed", "refuted")
+                    _counts["would_flip" if _decided else "would_settle"] += 1
+                    if len(_notes) < _TRIANGULATION_NOTES_MAX:
+                        _notes.append(
+                            f"C{_n} {_c.verification or 'unverified'} → "
+                            f"{_label[_r.verdict]}"
+                            + (f" ({_r.conflict})" if _r.conflict else "")
+                            + (
+                                f" by {', '.join(_r.ruled_by)}"
+                                if _r.ruled_by
+                                else " — nothing decisive"
+                            )
+                            + f": {' '.join(_c.text.split())[:70]}"
+                        )
+
+                # ── Step 3: how families agree on the claim as stated ──
+                # A family that both confirmed and refuted it disagrees with
+                # itself, which says nothing about agreement between families.
+                _said: Dict[str, Set[bool]] = {}
+                for _o in _obs:
+                    if _o.verdict is not None and _o.scope is EvidenceScope.PROPOSITION:
+                        _said.setdefault(_o.family.value, set()).add(bool(_o.verdict))
+                _clear = sorted(_f for _f, _v in _said.items() if len(_v) == 1)
+                for _i, _a in enumerate(_clear):
+                    for _b in _clear[_i + 1 :]:
+                        _va, _vb = next(iter(_said[_a])), next(iter(_said[_b]))
+                        _cell = (0 if _va else 2) + (0 if _vb else 1)
+                        _pairs.setdefault(f"{_a}|{_b}", [0, 0, 0, 0])[_cell] += 1
+        except Exception as _e:
+            self._f._log_debug(f"🔺 [TRIANGULATION] partial ({_e!r})")
+        _counts["twin_conflicts"] = int(getattr(self, "twin_conflicts", 0) or 0)
+        return {"counts": _counts, "pairs": _pairs, "notes": _notes}
+
+    @staticmethod
+    def triangulation_status(tally: Dict[str, Any]) -> str:
+        """
+        One status line for the chat from a triangulate() tally.
+
+        Names the kind of triangulation it is: between methods, with the
+        pairs of instrument families that judged the same claims. Pure.
+
+        Args:
+            tally: What triangulate returned.
+
+        Returns:
+            The line, or "" when no claim was observed.
+        """
+        _k = tally.get("counts") or {}
+        if not _k.get("observed"):
+            return ""
+        _names = {
+            "static_analysis": "static analysis",
+            "quoted_reading": "quoted reading",
+            "execution": "execution",
+        }
+        _pairs = [
+            " × ".join(_names.get(_f, _f) for _f in _p.split("|"))
+            for _p, _cells in sorted((tally.get("pairs") or {}).items())
+            if sum(_cells)
+        ]
+        _conflicts = sum(_k.get(_c, 0) for _c in ("anomaly", "drift", "overruled"))
+        return (
+            f"🔺 Triangulation between methods: {_k.get('corroborated', 0)} of "
+            f"{_k['observed']} claim(s) corroborated by two instrument families"
+            + (f" ({'; '.join(_pairs)})" if _pairs else "")
+            + f", {_k.get('single', 0)} on one"
+            + (f", {_conflicts} in conflict" if _conflicts else "")
+            + (
+                f", {_k['held_robust']} refutation(s) held by two families"
+                if _k.get("held_robust")
+                else ""
+            )
+        )
 
     def refresh_unread(self) -> int:
         """Re-ask which cited bodies went unread, now that the turn is over.
@@ -20765,6 +21301,21 @@ class AgenticEvidenceVerifier:
             if not (1 <= n <= len(claims)):
                 continue
             claim = claims[n - 1]
+            _ruled = {"supported": True, "contradicted": False}.get(verdict)
+            claim.observe(
+                EvidenceObservation(
+                    instrument="judge",
+                    family=EvidenceFamily.QUOTED_READING,
+                    scope=EvidenceScope.PROPOSITION,
+                    verdict=_ruled,
+                    regime=(
+                        EpistemicRegime.POPPERIAN_FALSIFICATION
+                        if _ruled is not None
+                        else None
+                    ),
+                    detail=f"'{quote}'"[:_OBSERVATION_DETAIL_CHARS],
+                )
+            )
             # A body that does not settle a STRUCTURAL claim says nothing
             # against the check that did: live, a default-value check
             # confirmed 0.2 against its declaration and this turned it into
@@ -20993,7 +21544,36 @@ class AgenticStaticVerifier:
             )
 
         results = [self._execute(ch, project_id) for ch in checks]
-        self._apply_verdicts(claims, checks, results)
+        _withheld = self._apply_verdicts(claims, checks, results)
+        _overturned = [
+            str(_ch.get("name", ""))
+            for _ch, (_v, _d) in zip(checks, results)
+            if _ch.get("kind") == "never_updated" and _v == "refuted"
+        ]
+        if _overturned:
+            self._f._bump_turn_metric("never_updated_refuted", len(_overturned))
+            await self._f._emit_status(
+                f"🤖 Verify · Popper: \"never updated\" refuted for "
+                f"{', '.join(dict.fromkeys(_overturned))} — the body assigns it"
+            )
+        if _withheld:
+            # Counted once per claim: the closing sweep verifies the same
+            # claims again, and counting each pass inflated the figure.
+            _seen = getattr(self._f, "_turn_vacuous_keys", None)
+            if not isinstance(_seen, set):
+                _seen = set()
+                self._f._turn_vacuous_keys = _seen
+            _seen.update((_c.step_id, _c.text) for _c in _withheld)
+            self._f._set_turn_metric("static_vacuous", len(_seen))
+            self._f._log_debug(
+                f"🤖 Verify: {len(_withheld)} claim(s) left unverified — their "
+                f"only confirmations were the existence of a cited symbol "
+                f"or a fallback guess, which confirm nothing they say"
+            )
+            await self._f._emit_status(
+                f"🤖 Verify · scope: {len(_withheld)} claim(s) rested only on a "
+                f"symbol existing — left open for the body reader"
+            )
         step.output = self._render_report(checks, results, mode)
 
         # Region: evidence pass — behavioural claims are settled by bodies
@@ -21119,11 +21699,43 @@ class AgenticStaticVerifier:
                 check["claim"] = open_ids[int(check["claim"]) - 1]
         return self._select_checks(fixed + elicited, len(claims)) or None
 
+    @staticmethod
+    def _never_updated_check(n: int, claim: LedgerClaim) -> Optional[Dict[str, Any]]:
+        """
+        A never_updated check for a claim that a variable never changes, or None.
+
+        Args:
+            n: The claim's 1-based number in the step.
+            claim: The claim.
+
+        Returns:
+            The check, over the bodies of up to three cited symbols, or None
+            when the text is not of that shape or cites nothing.
+        """
+        _hosts = [_q for _q in (claim.valid_qids or claim.qids or []) if _q][:3]
+        if not _hosts:
+            return None
+        for _rx in _NEVER_UPDATED_CLAIM_RES:
+            _m = _rx.search(claim.text or "")
+            if _m:
+                return {
+                    "claim": n,
+                    "kind": "never_updated",
+                    "src": _hosts[0],
+                    "hosts": _hosts,
+                    "name": _m.group("name"),
+                }
+        return None
+
     def _formalize_plain_claims(
         self, claims: List[LedgerClaim]
     ) -> Tuple[List[Dict[str, Any]], List[int]]:
         """
         Checks for the claims whose whole text is one call or existence fact.
+
+        A claim that a variable never changes ("S never updates v", "v is
+        always 0") gets a never_updated check over the bodies it cites,
+        before anything else is tried.
 
         A claim that opens with the call ("A calls B to keep string keys",
         "A is called only by B, during seed preparation") gets the check
@@ -21163,9 +21775,16 @@ class AgenticStaticVerifier:
                 # not a callee.
                 return bool(re.search(r"[_.A-Z]", written))
 
-            check: Optional[Dict[str, Any]] = None
-            m = _LEADING_CALLS_CLAIM_RE.match(text)
-            if m and _anchored(m.group("a")) and _is_symbol(m.group("b")):
+            # A claim that a variable never changes is about the bodies of
+            # the symbols it cites, which can be read for assignments
+            # outright (_never_updated_verdict).
+            check: Optional[Dict[str, Any]] = (
+                AgenticStaticVerifier._never_updated_check(n, claim)
+            )
+            m = _LEADING_CALLS_CLAIM_RE.match(text) if check is None else None
+            if check is not None:
+                pass
+            elif m and _anchored(m.group("a")) and _is_symbol(m.group("b")):
                 check = {"claim": n, "kind": "calls", "src": m.group("a")}
                 check["dst"] = _named(m.group("b"))
             else:
@@ -21176,7 +21795,14 @@ class AgenticStaticVerifier:
                 else:
                     m = exists_re.match(text)
                     if m and _anchored(m.group(1)):
-                        check = {"claim": n, "kind": "exists", "src": m.group(1)}
+                        # The whole claim is the existence fact, which
+                        # this check settles (_observation_of).
+                        check = {
+                            "claim": n,
+                            "kind": "exists",
+                            "src": m.group(1),
+                            "states_existence": True,
+                        }
             # A claim that speaks of no call at all ("X returns an empty
             # dict when…") has one structural fact to check: that its
             # subject exists. That is the check the model writes for it (36
@@ -21732,19 +22358,38 @@ class AgenticStaticVerifier:
     @staticmethod
     def _fallback_checks(claims: List[LedgerClaim]) -> List[Dict[str, Any]]:
         """Deterministic pass: pairwise edges for 2+ cited qids, existence
-        for single citations. Some signal is better than none."""
+        for single citations. Some signal is better than none.
+
+        Each check is tagged "fallback": it is a guess at which relation
+        among the cited symbols to look at, in both directions, so a hit
+        is not necessarily the relation the claim asserts
+        (_observation_of)."""
         checks: List[Dict[str, Any]] = []
         for n, c in enumerate(claims, 1):
             qids = c.valid_qids or c.qids
             if len(qids) >= 2:
                 checks.append(
-                    {"claim": n, "kind": "calls", "src": qids[0], "dst": qids[1]}
+                    {
+                        "claim": n,
+                        "kind": "calls",
+                        "src": qids[0],
+                        "dst": qids[1],
+                        "fallback": True,
+                    }
                 )
                 checks.append(
-                    {"claim": n, "kind": "calls", "src": qids[1], "dst": qids[0]}
+                    {
+                        "claim": n,
+                        "kind": "calls",
+                        "src": qids[1],
+                        "dst": qids[0],
+                        "fallback": True,
+                    }
                 )
             elif qids:
-                checks.append({"claim": n, "kind": "exists", "src": qids[0]})
+                checks.append(
+                    {"claim": n, "kind": "exists", "src": qids[0], "fallback": True}
+                )
         return AgenticStaticVerifier._select_checks(checks, len(claims))
 
     # ── Deterministic execution ──────────────────────────────────────────
@@ -21772,6 +22417,13 @@ class AgenticStaticVerifier:
                 if self._qid_for(src_n, project_id):
                     return "confirmed", f"'{src_n}' exists in the index"
                 return "refuted", f"'{src_n}' is not in the index"
+
+            if kind == "never_updated":
+                return self._never_updated_verdict(
+                    list(check.get("hosts") or [check.get("src", "")]),
+                    str(check.get("name", "")),
+                    project_id,
+                )
 
             if kind == "default_value":
                 declared = self._declared_default(src_n, project_id)
@@ -22043,25 +22695,248 @@ class AgenticStaticVerifier:
             return "unverifiable", f"check failed: {e}"
         return "unverifiable", "unrecognized check"
 
+    def _never_updated_verdict(
+        self, hosts: List[str], name: str, project_id: str
+    ) -> Tuple[str, str]:
+        """
+        Whether the bodies a claim cites ever update a variable it says never changes.
+
+        Read from each body's AST, not from text: an augmented assignment,
+        a loop target, or a second plain assignment is an update. The
+        first plain assignment is the initialisation the claim does not
+        dispute ("set to 0 before the loop and never updated"). Names are
+        compared without leading underscores and without "self.", since
+        the steps write "decided_before" for "_decided_before".
+
+        Refutes on the first update found: the body was read and the
+        update is in it (Popper, where the instrument is the parser).
+        Confirms only a local variable, initialised and never updated in
+        any cited body. A body that takes the name as a parameter says
+        nothing about it and is skipped. Abstains when no body parses, when
+        the name is only ever a parameter (its value comes from the
+        callers), or when it is an attribute, which other methods may write.
+
+        Args:
+            hosts: The symbols the claim cites, whose bodies are read.
+            name: The variable, as the claim wrote it.
+            project_id: Current project.
+
+        Returns:
+            (verdict, detail) in _execute's vocabulary.
+        """
+        _want = name.split(".")[-1].lstrip("_")
+        _attribute = name.startswith("self.")
+        _belt = getattr(self._f, "_protective_belt", None)
+        if not _want or _belt is None:
+            return "unverifiable", "no variable name, or no parser to read bodies with"
+
+        def _names(target: ast.AST) -> List[str]:
+            if isinstance(target, ast.Name):
+                return [target.id]
+            if isinstance(target, ast.Attribute):
+                return [target.attr]
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return [_n for _e in target.elts for _n in _names(_e)]
+            return []
+
+        _read_any, _initialised = False, False
+        _parameter_of: List[str] = []
+        for _qid in hosts:
+            _tree = _belt._body_tree(_qid, project_id)
+            if _tree is None:
+                continue
+            _read_any = True
+            _fn = next(
+                (
+                    _n
+                    for _n in ast.walk(_tree)
+                    if isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                ),
+                None,
+            )
+            if _fn is not None:
+                _params = [
+                    _a.arg
+                    for _a in _fn.args.args + _fn.args.kwonlyargs + _fn.args.posonlyargs
+                ]
+                if any(_p.lstrip("_") == _want for _p in _params):
+                    # Its value comes from the callers: this body says
+                    # nothing about it, another cited one may.
+                    _parameter_of.append(_qid)
+                    continue
+            _writes = []
+            for _node in ast.walk(_tree):
+                if isinstance(_node, ast.AugAssign):
+                    _hit, _plain = _names(_node.target), False
+                elif isinstance(_node, (ast.Assign, ast.AnnAssign)):
+                    _targets = (
+                        _node.targets
+                        if isinstance(_node, ast.Assign)
+                        else [_node.target]
+                    )
+                    _hit = [_n for _t in _targets for _n in _names(_t)]
+                    _plain = True
+                elif isinstance(_node, (ast.For, ast.AsyncFor)):
+                    _hit, _plain = _names(_node.target), False
+                elif isinstance(_node, ast.NamedExpr):
+                    _hit, _plain = _names(_node.target), False
+                else:
+                    continue
+                if any(_h.lstrip("_") == _want for _h in _hit):
+                    _writes.append((getattr(_node, "lineno", 0), _plain, _node))
+            _writes.sort(key=lambda _w: _w[0])
+            if _writes and _writes[0][1]:
+                _initialised = True
+                _writes = _writes[1:]
+            if _writes:
+                _stmt = " ".join(ast.unparse(_writes[0][2]).split())[:80]
+                return (
+                    "refuted",
+                    f"the body of {_qid} updates it: `{_stmt}`",
+                )
+        if not _read_any:
+            return "unverifiable", f"no body of {', '.join(hosts)} could be parsed"
+        if _parameter_of and not _initialised:
+            return (
+                "unverifiable",
+                f"{name} is a parameter of {', '.join(_parameter_of)}: its value "
+                f"comes from the callers",
+            )
+        if _attribute or not _initialised:
+            return (
+                "unverifiable",
+                f"no update of {name} in the cited bodies, but it is not a local "
+                f"they initialise, so another place may write it",
+            )
+        return (
+            "confirmed",
+            f"{name} is initialised once and never updated in {', '.join(hosts)}",
+        )
+
     # ── Verdict aggregation + report ─────────────────────────────────────
+
+    # Checks whose generator matched the claim stating the measurement
+    # itself (a count, a declared default, "nothing calls X"): they test
+    # the claim as written, whatever kind the model gave it.
+    _MEASUREMENT_CHECK_KINDS = (
+        "counts",
+        "counts_listed",
+        "default_value",
+        "graph_absence",
+    )
+
+    @staticmethod
+    def _observation_of(
+        claim: LedgerClaim,
+        check: Dict[str, Any],
+        verdict: str,
+        detail: str,
+        checks: List[Dict[str, Any]],
+    ) -> "EvidenceObservation":
+        """
+        One check's verdict as an observation of the claim it checked.
+
+        A structural claim is the graph's own question, so a check of it
+        tests the claim itself. An existence check counts as that only
+        when existence is all the claim was checked for, or when the
+        claim's whole text is that fact (_formalize_plain_claims marks
+        those): naming a symbol that exists confirms nothing said about
+        it. A measurement check tests the claim as written. Any other
+        check tests a part the claim states, which can refute it and
+        never confirm it, and so does a fallback check, which only
+        guesses which relation among the cited symbols to look at.
+
+        The pass decides only where the graph can be taken at its word
+        and abstains everywhere else, so a decided verdict is Popperian.
+
+        Args:
+            claim: The claim the check was generated for.
+            check: The check.
+            verdict: What _execute returned for it.
+            detail: _execute's explanation.
+            checks: Every check run for this claim.
+
+        Returns:
+            The observation, for LedgerClaim.observe.
+        """
+        kind = str(check.get("kind") or "")
+        _kinds = {str(_c.get("kind") or "") for _c in checks}
+        if check.get("fallback"):
+            _scope = EvidenceScope.COMPONENT
+        elif check.get("states_existence"):
+            _scope = EvidenceScope.PROPOSITION
+        elif kind in AgenticStaticVerifier._MEASUREMENT_CHECK_KINDS or (
+            claim.claim_kind == "structural"
+            and (kind != "exists" or _kinds == {"exists"})
+        ):
+            _scope = EvidenceScope.PROPOSITION
+        else:
+            _scope = EvidenceScope.COMPONENT
+        _decided = {"confirmed": True, "refuted": False}.get(verdict)
+        return EvidenceObservation(
+            instrument=f"graph:{kind or 'check'}",
+            family=EvidenceFamily.STATIC_ANALYSIS,
+            scope=_scope,
+            verdict=_decided,
+            regime=(
+                EpistemicRegime.POPPERIAN_FALSIFICATION
+                if _decided is not None
+                else None
+            ),
+            detail=str(detail or "")[:_OBSERVATION_DETAIL_CHARS],
+        )
 
     @staticmethod
     def _apply_verdicts(
         claims: List[LedgerClaim],
         checks: List[Dict[str, Any]],
         results: List[Tuple[str, str]],
-    ) -> None:
+    ) -> List[LedgerClaim]:
         """Aggregate per-claim: any refuted → refuted; else any confirmed →
-        confirmed; else any unsupported → unsupported; else unverifiable."""
+        confirmed; else any unsupported → unsupported; else unverifiable.
+
+        Two confirmations are left out of the fold because they confirm
+        nothing the claim says (EPISTEMIC_HARD_CORE:
+        abstention_is_not_confirmation, scope_before_support): an
+        existence check of a claim that asserts more than existence, and
+        a fallback check, which guessed which relation among the cited
+        symbols to look at. Both are still kept as observations. A claim
+        whose only verdicts were those keeps no verdict, so it stays
+        unverified and remains open to the evidence pass.
+
+        Returns:
+            The claims left unverified that way."""
         per: Dict[int, List[Tuple[str, str]]] = {}
+        run: Dict[int, List[Dict[str, Any]]] = {}
+        withheld: List[LedgerClaim] = []
         for ch, outcome in zip(checks, results):
             per.setdefault(ch["claim"], []).append(outcome)
+            run.setdefault(ch["claim"], []).append(ch)
         for n, claim in enumerate(claims, 1):
             # Named apart from the loop above: one name holding a tuple and
             # then a list of tuples reads as a type error at every later use.
             outcomes = per.get(n)
             if not outcomes:
                 continue
+            # Each check's own verdict is kept before the fold below
+            # reduces them to one.
+            _counted: List[Tuple[str, str]] = []
+            for _ch, (_v, _d) in zip(run.get(n, []), outcomes):
+                _obs = AgenticStaticVerifier._observation_of(
+                    claim, _ch, _v, _d, run.get(n, [])
+                )
+                claim.observe(_obs)
+                _vacuous = (
+                    _obs.verdict is True
+                    and _obs.scope is not EvidenceScope.PROPOSITION
+                    and (_ch.get("kind") == "exists" or bool(_ch.get("fallback")))
+                )
+                if not _vacuous:
+                    _counted.append((_v, _d))
+            if not _counted:
+                withheld.append(claim)
+                continue
+            outcomes = _counted
             verdicts = [v for v, _ in outcomes]
             if "refuted" in verdicts:
                 claim.verification = "refuted"
@@ -22073,6 +22948,7 @@ class AgenticStaticVerifier:
                 claim.verification = "unverifiable"
             details = [d for v, d in outcomes if v == claim.verification]
             claim.verification_detail = "; ".join(dict.fromkeys(details))[:300]
+        return withheld
 
     @staticmethod
     def _render_report(
@@ -23233,9 +24109,33 @@ if __name__ == "__main__":
         # read dynamic_validation off the original claim instead of joining
         # it on-the-fly to the separate ⚗ claim below. A claim validated by
         # real execution should carry that fact on itself.
+        _ran = {"passed": True, "refuted": False}.get(_dyn_verdict)
+        _ran_regime = (
+            EpistemicRegime.POPPERIAN_FALSIFICATION if _ran is not None else None
+        )
         for _c in ledger.claims:
             if _c.evidence_type != "dynamic" and qid in _c.qids:
                 _c.dynamic_validation = _dyn_verdict
+                # The tests exercised the symbol, not this claim's
+                # assertion about it: an observation of its subject at
+                # best, and of a symbol it merely cites otherwise.
+                _is_subject = bool(_c.subject) and (
+                    _c.subject.split(".")[-1] == qid.split(".")[-1]
+                )
+                _c.observe(
+                    EvidenceObservation(
+                        instrument="sandbox",
+                        family=EvidenceFamily.EXECUTION,
+                        scope=(
+                            EvidenceScope.SUBJECT
+                            if _is_subject
+                            else EvidenceScope.MENTION
+                        ),
+                        verdict=_ran,
+                        regime=_ran_regime,
+                        detail=detail[:_OBSERVATION_DETAIL_CHARS],
+                    )
+                )
 
         claim = LedgerClaim(
             step_id=step_id,
@@ -23251,6 +24151,16 @@ if __name__ == "__main__":
             ),
             verification_detail=detail[:300],
             dynamic_validation=_dyn_verdict,
+        )
+        claim.observe(
+            EvidenceObservation(
+                instrument="sandbox",
+                family=EvidenceFamily.EXECUTION,
+                scope=EvidenceScope.PROPOSITION,
+                verdict=_ran,
+                regime=_ran_regime,
+                detail=detail[:_OBSERVATION_DETAIL_CHARS],
+            )
         )
         ledger.claims.append(claim)
 
@@ -26337,10 +27247,63 @@ class AgenticToolBroker:
         except Exception:
             return ""
 
+    def _module_constant(self, sym: str, project_id: str) -> str:
+        """
+        A module-level constant's definition, for a name the index does not hold.
+
+        Only for names shaped like constants (UPPER_SNAKE): the index holds
+        classes, functions and methods, so a question about a constant
+        could never have its subject read. Recorded as shown, like any
+        body, so the turn's evidence and the confidence line count it.
+
+        Args:
+            sym: The name asked for.
+            project_id: Current project.
+
+        Returns:
+            The rendered definition, or "" when the name is not a constant
+            or no live block assigns it.
+        """
+        _name = sym.strip().rsplit(".", 1)[-1]
+        if not _MODULE_CONSTANT_RE.match(_name):
+            return ""
+        try:
+            state = self._f._conversation_state_manager.get(project_id)
+            for _blk in list(state.active_blocks.values()):
+                if getattr(_blk, "obsolete", False):
+                    continue
+                _src = CodeBlockManager.extract_module_constant(_blk, _name)
+                if not _src:
+                    continue
+                _note_body_shown(self._f, _name, step_local=True)
+                _cap = int(
+                    getattr(
+                        self._f.valves, "agentic_expand_max_chars", self._MAX_BODY_CHARS
+                    )
+                )
+                if len(_src) > _cap:
+                    _src = (
+                        _src[:_cap] + f"\n# ... [truncated by broker: showing {_cap} "
+                        f"of {len(_src)} chars of {_name}]"
+                    )
+                return (
+                    f"### Definition of {_name} (module-level constant)\n"
+                    f"```\n{_src}\n```"
+                )
+        except Exception as _e:
+            self._f._log_debug(f"module constant {_name} unreadable ({_e!r})")
+        return ""
+
     def _expand(self, sym: str, project_id: str) -> str:
-        """Full body of a symbol from the first live block, char-capped."""
+        """Full body of a symbol from the first live block, char-capped.
+
+        A name the index does not hold is tried as a module-level constant
+        (_module_constant) before it is reported missing."""
         qid = self._qid_for(sym, project_id)
         if not qid:
+            _const = self._module_constant(sym, project_id)
+            if _const:
+                return _const
             return f"[EXPAND: symbol '{sym}' not found in the index]"
         state = self._f._conversation_state_manager.get(project_id)
         block = None
@@ -28360,14 +29323,24 @@ class AgenticSynthesisComposer:
                         )
                     elif c.verification == "confirmed":
                         cited = f" [{', '.join(c.valid_qids)}]" if c.valid_qids else ""
-                        # NUEVO-1: a claim also validated by real execution
-                        # carries dynamic_validation — surface the strongest
-                        # triangulated guarantee (static confirm + dynamic pass).
-                        _dyn = (
-                            " ⚗ (dynamically verified)"
-                            if c.dynamic_validation == "passed"
-                            else ""
+                        # A passing sandbox run is named for what it ran.
+                        # The tests are chosen by symbol, so a pass verifies
+                        # this claim only when the claim is the test's own;
+                        # otherwise it shows the subject, or a symbol the
+                        # claim cites, runs (EvidenceScope).
+                        _ran = EvidenceTriangulation.execution_scope(
+                            c.observations
                         )
+                        _dyn = {
+                            EvidenceScope.PROPOSITION: " ⚗ (dynamically verified)",
+                            EvidenceScope.SUBJECT: (
+                                " ⚗ (its subject ran in the sandbox; this "
+                                "claim was not what the tests checked)"
+                            ),
+                            EvidenceScope.MENTION: (
+                                " ⚗ (a symbol it cites ran in the sandbox)"
+                            ),
+                        }.get(_ran, "")
                         lines.append(
                             f"- {badge}✓✓ {c.text}{cited}{_dyn} — verified: "
                             f"{c.verification_detail}"
@@ -29711,6 +30684,56 @@ class AgenticOrchestrator:
             return True, f"low_confidence:{control.get('confidence', 0.0):.2f}"
         return False, ""
 
+    def _asked_subjects(self, question: str, project_id: str) -> Dict[str, List[str]]:
+        """
+        The code names a question asks about, and which of them nobody read.
+
+        A name counts when the symbol index knows it, or when it has the
+        shape of a module-level constant, which the index does not hold.
+        Anything else that looks like an identifier (a field, a valve) is
+        left out: it has no body of its own to read. Read means its body
+        was rendered this turn, by either spelling (_note_body_shown).
+        Never raises.
+
+        Args:
+            question: The user's question.
+            project_id: Project whose index answers the lookup.
+
+        Returns:
+            {"asked_subjects", "asked_unread", "asked_unindexed"}: lists of
+            names, the last two subsets of the first.
+        """
+        _asked: List[str] = []
+        _unread: List[str] = []
+        _unindexed: List[str] = []
+        try:
+            _seen = getattr(self._f, "_bodies_seen_this_turn", None) or set()
+            for _quoted, _bare in _ASKED_NAME_RE.findall(question or ""):
+                for _name in re.split(r"[\s(),]+", _quoted or _bare):
+                    _name = _name.strip(".:;'\"")
+                    if not _name or _name in _asked:
+                        continue
+                    try:
+                        _known = bool(
+                            self._f._symbol_index.find_blocks(_name, project_id)
+                        )
+                    except Exception:
+                        _known = False
+                    if not _known and not _MODULE_CONSTANT_RE.match(_name):
+                        continue
+                    _asked.append(_name)
+                    if _name not in _seen and _name.rsplit(".", 1)[-1] not in _seen:
+                        _unread.append(_name)
+                        if not _known:
+                            _unindexed.append(_name)
+        except Exception as _e:
+            self._f._log_debug(f"asked-subject check skipped ({_e!r})")
+        return {
+            "asked_subjects": _asked,
+            "asked_unread": _unread,
+            "asked_unindexed": _unindexed,
+        }
+
     def _detect_cross_step_contradiction(self) -> Optional[str]:
         """
         Scan the ledger for two steps that reached CONTRADICTORY verdicts on
@@ -29718,28 +30741,81 @@ class AgenticOrchestrator:
 
         Each step is validated in isolation, so nothing catches step 2
         concluding a symbol is fine while step 5 concludes it is the bug.
-        This is a light, no-LLM scan: group high-confidence claims by the
-        symbols they cite, and flag a symbol carrying both a 'confirmed'/
-        positive claim and a 'refuted' one from different steps. A shared
+        This is a light, no-LLM scan: group high-confidence claims, and
+        flag a group carrying both a 'confirmed'/positive claim and a
+        'refuted' one from different steps. A shared
         contradiction over the same symbol is the strongest cheap signal an
         internally inconsistent workspace is about to be synthesized.
+
+        Grouped by the claim's subject, the symbol it asserts something
+        about, and only by its citations when it names none. Grouping by
+        every cited symbol paired "X calls Y" confirmed with "Y returns
+        None" refuted as a contradiction on Y. A sandbox verdict counts
+        only on the dynamic claim that carries it, since a run of a symbol
+        is not a verdict on what other claims say about it. The old
+        grouping is still computed and logged when it differs, and both
+        counts go to the turn's metrics.
 
         Returns:
             A short description of the first contradiction found, or None.
         """
+        _found = self._cross_step_contradictions(by_subject=True)
+        _before = self._cross_step_contradictions(by_subject=False)
+        self._f._bump_turn_metric("contradictions_subject", len(_found))
+        self._f._bump_turn_metric("contradictions_symbol", len(_before))
+        # Compared by group and steps, without the word naming the grouping.
+        _now = [_d.split(" ", 1)[-1] for _d in _found]
+        _then = [_d.split(" ", 1)[-1] for _d in _before]
+        if _now != _then:
+            self._f._log_debug(
+                f"🤖 [COHERENCE] by subject: {len(_found)} contradiction(s); "
+                f"by cited symbol it would have been {len(_before)}"
+                + (f" ({'; '.join(_before[:2])})" if _before else "")
+            )
+        return _found[0] if _found else None
+
+    def _cross_step_contradictions(self, by_subject: bool) -> List[str]:
+        """
+        Every group of claims two steps reached opposite verdicts on.
+
+        Args:
+            by_subject: Group by subject, with only verdicts on the claim
+                itself as poles. False reproduces the grouping by every
+                cited symbol, with propagated sandbox verdicts as poles,
+                for comparison.
+
+        Returns:
+            One description per contradicting group, in ledger order.
+        """
         min_conf = self._f.valves.agentic_coherence_min_confidence
+        _found: List[str] = []
         # symbol -> {"confirmed": {step_ids}, "refuted": {step_ids}}
         by_symbol: Dict[str, Dict[str, set]] = {}
         for c in self._ledger.claims:
             if c.confidence < min_conf:
                 continue
-            if c.verification == "confirmed" or c.dynamic_validation == "passed":
+            _passed = not by_subject and c.dynamic_validation == "passed"
+            _failed = not by_subject and c.dynamic_validation == "refuted"
+            if c.verification == "confirmed" or _passed:
                 pole = "confirmed"
-            elif c.verification == "refuted" or c.dynamic_validation == "refuted":
+            elif c.verification == "refuted" or _failed:
                 pole = "refuted"
             else:
                 continue
-            for qid in c.valid_qids:
+            if by_subject and c.subject:
+                # The subject as the model wrote it, bare or qualified,
+                # resolved to the cited qid it names when there is one, so
+                # "inlet" and "Filter.inlet" fall in one group.
+                _tail = c.subject.split(".")[-1]
+                _keys = [
+                    next(
+                        (_q for _q in c.valid_qids if _q.split(".")[-1] == _tail),
+                        c.subject,
+                    )
+                ]
+            else:
+                _keys = c.valid_qids
+            for qid in _keys:
                 slot = by_symbol.setdefault(qid, {"confirmed": set(), "refuted": set()})
                 slot[pole].add(c.step_id)
         for qid, poles in by_symbol.items():
@@ -29754,11 +30830,12 @@ class AgenticOrchestrator:
                 and (confirming | refuting) - (confirming & refuting)
             ):
                 if confirming - refuting and refuting - confirming:
-                    return (
-                        f"symbol {qid}: step(s) {sorted(confirming)} confirm, "
+                    _found.append(
+                        f"{'subject' if by_subject else 'symbol'} {qid}: "
+                        f"step(s) {sorted(confirming)} confirm, "
                         f"step(s) {sorted(refuting)} refute"
                     )
-        return None
+        return _found
 
     def _verify_dynamic_needed(self, question: str, project_id: str) -> bool:
         """
@@ -29979,6 +31056,12 @@ class AgenticOrchestrator:
                     project_id,
                     f"agentic_serial_step_{step.id}",
                 )
+                # Shadow only: reads the judged dossiers and decides nothing.
+                _bstatus = self._f._hypothesis_forge._rank_bayesian_shadow(
+                    _dossiers, _winner, project_id
+                )
+                if _bstatus:
+                    await self._f._emit_status(_bstatus)
                 await self._f._hypothesis_forge._record_serial_competition(
                     _dossiers, _winner, project_id
                 )
@@ -30212,6 +31295,36 @@ class AgenticOrchestrator:
             self._f._log_debug(f"🤖 Agentic: gate dynamic verify failed ({e})")
         return True
 
+    @staticmethod
+    def _reinforce_can_inform(claim: LedgerClaim) -> bool:
+        """
+        Whether a reinforcement test of this claim could change what is known.
+
+        The test is static analysis of a consequence and can only refute.
+        It adds nothing to a claim that instrument family already refuted
+        where it is trusted (it would be the same family agreeing with
+        itself, EvidenceTriangulation.independent), to a claim with no
+        checkable anchor, or to a sandbox report, whose text describes a
+        test run rather than the code. A claim another family refuted is
+        kept: a static refutation of it would corroborate.
+
+        Args:
+            claim: A claim of the step being reinforced.
+
+        Returns:
+            False when the test can only repeat what is known.
+        """
+        if claim.verification == "unoperationalizable":
+            return False
+        if claim.evidence_type == "dynamic":
+            return False
+        return not any(
+            _o.family is EvidenceFamily.STATIC_ANALYSIS
+            and _o.verdict is False
+            and _o.regime is EpistemicRegime.POPPERIAN_FALSIFICATION
+            for _o in claim.observations
+        )
+
     async def _reinforce_step(
         self,
         step: AgenticStep,
@@ -30237,6 +31350,11 @@ class AgenticOrchestrator:
         unfalsified. The natural bound remains: at most 4 claims, one
         small design call each, under call_llm's anti-hang backstop.
 
+        The four are chosen among the claims a test here can still tell
+        something about (_reinforce_can_inform): this pass is static
+        analysis and can only refute, so a claim static analysis already
+        refuted would cost a design call to learn nothing.
+
         KV: the design calls use their own prompts and dirty the single
         inference slot; recovery of the main prefix afterwards is the
         server's job via native context checkpoints.
@@ -30245,7 +31363,16 @@ class AgenticOrchestrator:
             Number of claims refuted (0 also when nothing could be tested).
         """
         # Region: claims of this step (complementary facts, tested one by one)
-        claims = [c for c in self._ledger.claims if c.step_id == step.id][:4]
+        _own = [c for c in self._ledger.claims if c.step_id == step.id]
+        _open = [c for c in _own if self._reinforce_can_inform(c)]
+        if len(_open) < len(_own):
+            self._f._bump_turn_metric("reinforce_skipped", len(_own) - len(_open))
+            self._f._log_debug(
+                f"🤖 Reinforce step {step.display_no}: "
+                f"{len(_own) - len(_open)} of {len(_own)} claim(s) skipped — "
+                f"a static refutation-only test cannot add to them"
+            )
+        claims = _open[:4]
         if not claims:
             return 0
         _prefix = status_prefix or f"🤖 Agentic step {step.display_no}"
@@ -30260,6 +31387,10 @@ class AgenticOrchestrator:
         n_refuted = 0
         n_tested = 0
         refuted_lines: List[str] = []
+        # Refutations is_falsified downgraded for low coverage: kept apart
+        # from the refuted ones, and reported, rather than dropped.
+        n_held = 0
+        held_lines: List[str] = []
         for _ci, claim in enumerate(claims, start=1):
             await self._f._emit_status(
                 f"{_prefix} · metacog {_ci}/{len(claims)}: falsifying "
@@ -30283,6 +31414,29 @@ class AgenticOrchestrator:
             except Exception:
                 continue
             n_tested += 1
+            # What was tested is a consequence the model derived from the
+            # claim, by the graph: a refutation under the coverage guard is
+            # Popperian, one the guard held is Lakatosian, and surviving
+            # decides nothing.
+            _held = not falsified and bool(reason)
+            claim.observe(
+                EvidenceObservation(
+                    instrument="reinforce",
+                    family=EvidenceFamily.STATIC_ANALYSIS,
+                    scope=EvidenceScope.CONSEQUENCE,
+                    verdict=False if (falsified or _held) else None,
+                    regime=(
+                        EpistemicRegime.POPPERIAN_FALSIFICATION
+                        if falsified
+                        else (
+                            EpistemicRegime.LAKATOSIAN_PROTECTIVE_BELT
+                            if _held
+                            else None
+                        )
+                    ),
+                    detail=str(reason or "survived")[:_OBSERVATION_DETAIL_CHARS],
+                )
+            )
             if falsified:
                 n_refuted += 1
                 claim.verification = "refuted"
@@ -30292,6 +31446,17 @@ class AgenticOrchestrator:
                 refuted_lines.append(
                     f"✗ {claim.text[:90]} — {reason or 'critical claim failed'}"
                 )
+            elif reason:
+                # A refutation is_falsified held back: a critical claim
+                # failed, on too little of the claim checked for the
+                # failure to be trusted (EpistemicRegime.for_coverage). The
+                # claim is not refuted, but the anomaly is a result, and it
+                # used to be dropped here without a trace.
+                n_held += 1
+                held_lines.append(
+                    f"◐ {claim.text[:90]} — held by the belt at coverage "
+                    f"{coverage:.2f}: {reason}"
+                )
 
         # Region: annotate the step (digest/cache pick this up downstream)
         if n_tested:
@@ -30299,13 +31464,26 @@ class AgenticOrchestrator:
                 "",
                 "",
                 "### Metacognitive reinforcement (static falsification)",
-                f"{n_tested} claim(s) tested, {n_refuted} refuted.",
+                f"{n_tested} claim(s) tested, {n_refuted} refuted"
+                + (
+                    f", {n_held} refutation(s) held on too small a sample"
+                    if n_held
+                    else ""
+                )
+                + ".",
             ]
             lines.extend(refuted_lines)
+            lines.extend(held_lines)
             step.output = (step.output or "") + "\n".join(lines)
+        for _mk, _mv in (
+            ("reinforce_tested", n_tested),
+            ("reinforce_refuted", n_refuted),
+            ("reinforce_held", n_held),
+        ):
+            self._f._bump_turn_metric(_mk, _mv)
         self._f._log_debug(
             f"🤖 Agentic reinforcement: step {step.id} — {n_tested} tested, "
-            f"{n_refuted} refuted in {time.monotonic() - t0:.1f}s"
+            f"{n_refuted} refuted, {n_held} held in {time.monotonic() - t0:.1f}s"
         )
         # Stashed for the Stats block. The status line above is emitted mid
         # step and the next one overwrites it; across seventeen investigate
@@ -30315,11 +31493,17 @@ class AgenticOrchestrator:
             self._f._measured_reinforcement = (
                 f"{n_tested} claim{'' if n_tested == 1 else 's'} re-tested, "
                 f"{n_refuted} refuted"
+                + (f", {n_held} held on too small a sample" if n_held else "")
             )
         if n_tested:
             await self._f._emit_status(
                 f"{_prefix} · metacog: {n_tested} claim(s) tested, "
-                f"{n_refuted} refuted"
+                f"{n_refuted} refuted (Popper: enough of the claim checked)"
+                + (
+                    f", {n_held} held (Lakatos: too small a sample to kill)"
+                    if n_held
+                    else ""
+                )
             )
         return n_refuted
 
@@ -31069,6 +32253,7 @@ class AgenticOrchestrator:
         # is_continuation is classified in the inlet, so pstate already
         # holds this turn's verdict.
         self._ledger.claims = []
+        self._ledger.twin_conflicts = 0
         # Stamped on entry, overwritten by the real tally when the ledger
         # is counted. Without it, a pipeline that entered and then lost
         # its calls left the field at the inlet's None, and the footer
@@ -31168,6 +32353,26 @@ class AgenticOrchestrator:
             f"🤖 Agentic: plan ready ({len(plan.steps)} steps, "
             f"source={plan.source}, trigger={trigger})"
         )
+        # A constant the question names is outside the symbol index, so no
+        # step would have it served by name. It goes into the first step's
+        # focus, where EXPAND now reads module-level constants too.
+        try:
+            _consts = [
+                _n
+                for _n in self._asked_subjects(question, project_id)["asked_unindexed"]
+                if _MODULE_CONSTANT_RE.match(_n)
+            ]
+            _first = next((_s for _s in plan.steps if _s.kind != "analyze"), None)
+            if _consts and _first is not None:
+                _missing = [_n for _n in _consts if _n not in (_first.symbols or [])]
+                if _missing:
+                    _first.symbols = list(_first.symbols or []) + _missing
+                    self._f._log_debug(
+                        f"🤖 Agentic: step {_first.id} focus gains the "
+                        f"question's constant(s) {', '.join(_missing)}"
+                    )
+        except Exception as _e_const:
+            self._f._log_debug(f"constant focus skipped ({_e_const!r})")
 
         # Region: planner-level clarification (framing pause). The planner
         # judged the question too ambiguous to plan; reuse the Fase 7 ask
@@ -32692,6 +33897,51 @@ class AgenticOrchestrator:
             # stale blind flag would win the wrong claim.
             self._ledger.collapse_restatements()
             _cov = self._ledger.coverage()
+            # The turn's shape and coverage for [METRICS-TURN], from the
+            # same tally the dump and the footer read.
+            self._f._set_turn_metric("pipeline", 1)
+            self._f._set_turn_metric(
+                "steps", sum(1 for _s in plan.steps if _s.status == "done")
+            )
+            for _ck, _mk in (
+                ("total", "claims"),
+                ("hard", "cov_hard"),
+                ("structural", "cov_structural"),
+                ("read", "cov_read"),
+                ("blind", "cov_blind"),
+                ("uncovered", "cov_uncovered"),
+                ("unoperationalizable", "cov_no_anchor"),
+            ):
+                self._f._set_turn_metric(_mk, int(_cov.get(_ck, 0) or 0))
+            # The triangulation shadow, over the claims the synthesis will
+            # read. Counted, logged and kept for the turn's metric row; no
+            # verdict is changed by it.
+            _tri = self._ledger.triangulate(project_id)
+            _cov["triangulation"] = dict(_tri["counts"])
+            self._f._turn_triangulation = {
+                "counts": _tri["counts"],
+                "pairs": _tri["pairs"],
+            }
+            for _tk, _tn in _tri["counts"].items():
+                self._f._set_turn_metric(f"tri_{_tk}", _tn)
+            self._f._log_debug(
+                "🔺 [TRIANGULATION] "
+                + " ".join(f"{_tk}={_tn}" for _tk, _tn in _tri["counts"].items())
+                + (
+                    " · pairs "
+                    + " ".join(
+                        f"{_tp}={'/'.join(str(_x) for _x in _tc)}"
+                        for _tp, _tc in sorted(_tri["pairs"].items())
+                    )
+                    if _tri["pairs"]
+                    else ""
+                )
+            )
+            for _tnote in _tri["notes"]:
+                self._f._log_debug(f"🔺   {_tnote}")
+            _tstatus = AgenticEvidenceLedger.triangulation_status(_tri)
+            if _tstatus:
+                await self._f._emit_status(_tstatus)
             # Survivors the evidence did not separate from the winner. Only
             # 'independent' ones bear on whether the presented account is the
             # right one; 'competing' was settled by the ranking and
@@ -32743,6 +33993,18 @@ class AgenticOrchestrator:
             _cov["had_hypothesize"] = any(
                 getattr(_s, "kind", "") == "hypothesize" for _s in plan.steps
             )
+            # What the question named and whether anyone read it, after the
+            # last-mile sweep, so the bodies it fetched count. Read by both
+            # confidence composers (_asked_coverage).
+            _cov.update(self._asked_subjects(question, project_id))
+            self._f._set_turn_metric("asked", len(_cov["asked_subjects"]))
+            self._f._set_turn_metric("asked_unread", len(_cov["asked_unread"]))
+            if _cov["asked_unread"]:
+                self._f._log_debug(
+                    f"🤖 Agentic: the question names "
+                    f"{len(_cov['asked_subjects'])} symbol(s); never read: "
+                    + ", ".join(_cov["asked_unread"][:5])
+                )
             # Carried with the tally it should be read against, so a dump
             # cannot report a percentage without reporting that the turn lost
             # calls while measuring it.
@@ -32776,7 +34038,9 @@ class AgenticOrchestrator:
                 )
                 _t_ind = int(_cov.get("rivals_independent", 0) or 0)
                 _t_share = _confidence_share(_cov)
-                _t_pct = int(round(100 * (_t_ok / _t_all) * _t_share))
+                _t_pct = int(
+                    round(100 * (_t_ok / _t_all) * _t_share * _asked_coverage(_cov))
+                )
                 _t_open = []
                 for _k, _w in (
                     ("read", "read but unresolved"),
@@ -32788,6 +34052,8 @@ class AgenticOrchestrator:
                         _t_open.append(f"{_n_k} {_w}")
                 if getattr(self._f, "_serial_unestablished", None):
                     _t_open.append("no cause established")
+                if _asked_coverage_words(_cov):
+                    _t_open.append(_asked_coverage_words(_cov))
                 if _t_ind:
                     # Whether another pass would help. A turn reported
                     # 24% and the person asked for more investigation,
@@ -35380,8 +36646,19 @@ class CommandRouter:
         ):
             response = await self._handle_freeze_command(content, project_id)
             return True, self._deliver_command_response(messages, response)
-        if self._f.valves.enable_accept_command and content.startswith("/accept"):
-            response = await self._handle_accept_command(project_id)
+        # Outcome labels: one handler, the verdict decided by the verb.
+        if self._f.valves.enable_accept_command:
+            for _verb, _verdict in _OUTCOME_COMMANDS:
+                if content.startswith(_verb):
+                    response = await self._handle_outcome_command(
+                        project_id, content, _verdict, messages
+                    )
+                    return True, self._deliver_command_response(messages, response)
+        if self._f.valves.enable_accept_command and content.startswith("/rivals"):
+            response = self._handle_rivals_command(project_id, content)
+            return True, self._deliver_command_response(messages, response)
+        if self._f.valves.enable_accept_command and content.startswith("/outcomes"):
+            response = self._handle_outcomes_command(project_id, content)
             return True, self._deliver_command_response(messages, response)
         if content.startswith("/exhume"):
             response = await self._handle_exhume_command(project_id)
@@ -35499,10 +36776,46 @@ class CommandRouter:
                 "show the plan the pipeline would run, without running it",
             ),
             (
-                "/accept",
+                "/accept [T12] [note]",
                 getattr(_v, "enable_accept_command", True),
-                "record that the last diagnosis held up — the ONLY signal the "
-                "strategy history gets that something worked",
+                "label the last answer right: the diagnosis held up. The ONLY "
+                "signal the strategy history gets that something worked. T "
+                "and a number labels an earlier turn; anything else is kept "
+                "as a note",
+            ),
+            (
+                "/reject [H2|H0] [T12] [note]",
+                getattr(_v, "enable_accept_command", True),
+                "label the last answer wrong. H and a rival's number says "
+                "which hypothesis was right instead, H0 that none was",
+            ),
+            (
+                "/partial [H2] [T12] [note]",
+                getattr(_v, "enable_accept_command", True),
+                "the diagnosis was right and the remedy was not, or the "
+                "reverse. Kept apart from right and wrong in every rate",
+            ),
+            (
+                "/outcomes [all] [arm …]",
+                getattr(_v, "enable_accept_command", True),
+                "the labels so far, per experiment arm: how many were "
+                "right, the rate with its 95% interval, how often the "
+                "winning hypothesis was the right one, and the tokens and "
+                "seconds a right answer cost. Arm names narrow the report; "
+                "`all` reads every project, which is how an A/B with one "
+                "project per arm is read. With two arms, their answers to "
+                "the same questions are paired and tested. Below, how the "
+                "forge ruled in each arm, which needs no labels, and how "
+                "often the Bayesian shadow picked the right rival against "
+                "the ranking actually used",
+            ),
+            (
+                "/rivals [T12]",
+                getattr(_v, "enable_accept_command", True),
+                "the hypotheses a turn's competition forged, numbered H1, "
+                "H2 … so a label can name the one that was right. Bare, the "
+                "last answer; T and a number, the turn its Stats block "
+                "showed",
             ),
             (
                 "/expand [depth] <name|Class|Class.method>",
@@ -35607,6 +36920,12 @@ class CommandRouter:
         automatable by making the model larger. Rewrites the newest row's JSON
         with external_validation=True through the same DB queue the
         writers use.
+
+        Since outcome labels exist, /accept goes through
+        _handle_outcome_command, which marks the record of the turn it
+        labels. This remains the path for a database that has competition
+        records but no turn rows yet, so a bare /accept right after an
+        upgrade still does what it did.
         """
         # Region: read the newest record
         try:
@@ -35650,6 +36969,1453 @@ class CommandRouter:
             )
         except Exception as _e:
             return f"/accept failed: {_e}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Outcome labelling: which turn, which rival
+    # ══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _outcome_selector(token: str, letter: str) -> Optional[int]:
+        """The number in a selector such as `T12` or `H2`, or None.
+
+        Args:
+            token: One command argument.
+            letter: The selector's letter, matched case-insensitively.
+
+        Returns:
+            The non-negative number after the letter, or None when the token
+            is not that selector.
+        """
+        _t = (token or "").strip()
+        if len(_t) >= 2 and _t[0].upper() == letter.upper() and _t[1:].isdigit():
+            return int(_t[1:])
+        return None
+
+    def _resolve_outcome_turn(
+        self, project_id: str, tokens: List[str]
+    ) -> Tuple[Optional[Tuple[float, int, str]], List[str], str]:
+        """
+        The turn an outcome command is about, and the arguments left over.
+
+        Bare, it is the newest turn that wrote a metric row: the answer the
+        operator has just read. A command turn writes none (it returns
+        before record_answer_basis), and the inlet drains the write queue
+        before it dispatches commands, so the newest row is that answer.
+        `T12` names an earlier turn by the number its Stats block showed.
+        Turn numbers start again in every conversation, so a number is
+        looked for in this conversation first and only then in the rest of
+        the project, newest first in both; rows from before turn numbers
+        were recorded carry 0 and can only be reached bare. A bare label
+        prefers this conversation's newest turn for the same reason: with
+        two chats open, the newest row in the project may be the other's.
+
+        Args:
+            project_id: Current project identifier.
+            tokens: The command's arguments.
+
+        Returns:
+            ((turn_started, turn_number, question) or None, the arguments
+            that were not the turn selector, an error when there is no turn).
+        """
+        # ── Step 1: pick out the turn selector ──
+        _rest: List[str] = []
+        _wanted: Optional[int] = None
+        for _tok in tokens:
+            _n = self._outcome_selector(_tok, "T")
+            if _n is not None and _wanted is None:
+                _wanted = _n
+            else:
+                _rest.append(_tok)
+        # ── Step 2: read that turn's metric row, this conversation first ──
+        _chat = str(getattr(self._f, "_chat_id_this_turn", "") or "")
+        try:
+            if _wanted is None:
+                _row = self._f._db_conn.execute(
+                    "SELECT turn_started, turn_number, question FROM metric_turns "
+                    "WHERE project_id = ? "
+                    "ORDER BY (chat_id = ?) DESC, turn_started DESC LIMIT 1",
+                    (project_id, _chat),
+                ).fetchone()
+            else:
+                _row = self._f._db_conn.execute(
+                    "SELECT turn_started, turn_number, question FROM metric_turns "
+                    "WHERE project_id = ? AND turn_number = ? "
+                    "ORDER BY (chat_id = ?) DESC, turn_started DESC LIMIT 1",
+                    (project_id, _wanted, _chat),
+                ).fetchone()
+        except Exception as _e:
+            return None, _rest, f"could not read the turn metrics ({_e})"
+        if not _row:
+            return (
+                None,
+                _rest,
+                (
+                    "no answered turn has been recorded for this project yet"
+                    if _wanted is None
+                    else f"no turn T{_wanted} is on record for this project"
+                ),
+            )
+        return (float(_row[0]), int(_row[1] or 0), str(_row[2] or "")), _rest, ""
+
+    def _turn_rivals(self, project_id: str, turn_started: float) -> List[Dict[str, Any]]:
+        """
+        Every rival a turn's competitions forged, numbered H1…Hn.
+
+        The one place the numbering is decided, so the list /rivals shows
+        and the H-number a label names cannot disagree. Rows are read in
+        insertion order, which is the order the forge sealed its dossiers
+        (HypothesisForge._record_rivals). The numbering runs on across a
+        turn's competitions, so one number names one rival in that turn;
+        the competitions themselves are told apart by the write time each
+        one shares across all of its rows.
+
+        Args:
+            project_id: Current project identifier.
+            turn_started: The turn's key in the metric tables.
+
+        Returns:
+            One dict per rival with h, competition, comp_ts, position
+            (the keys its rows in metric_forge_facts carry), rivals, l1_rank, won,
+            status, cause, corroboration, coverage, hypothesis,
+            analysis_head, belt_standing, belt_note, refuted_by (graph,
+            contract, judge), and the Bayesian shadow's bayes_posterior,
+            bayes_rank and bayes_p_none (None and 0 where not ranked);
+            empty when the turn held no competition or the rows cannot be
+            read.
+        """
+        try:
+            _rows = self._f._db_conn.execute(
+                "SELECT ts, rivals, l1_rank, won, status, cause_of_death, "
+                "corroboration, coverage_score, hypothesis, analysis_head, "
+                "belt_standing, belt_note, refuted_by_graph, "
+                "refuted_by_contract, refuted_by_judge, "
+                "bayes_posterior, bayes_rank, bayes_p_none "
+                "FROM metric_forge_rivals "
+                "WHERE project_id = ? AND turn_started = ? ORDER BY rowid",
+                (project_id, turn_started),
+            ).fetchall()
+        except Exception as _e:
+            self._f._log_debug(f"_turn_rivals: could not read ({_e!r})")
+            return []
+        _out: List[Dict[str, Any]] = []
+        _competition, _last_ts, _position = 0, None, 0
+        for _h, _r in enumerate(_rows, start=1):
+            if _r[0] != _last_ts:
+                _competition += 1
+                _last_ts = _r[0]
+                _position = 0
+            else:
+                _position += 1
+            _out.append(
+                {
+                    "h": _h,
+                    "competition": _competition,
+                    # The keys metric_forge_facts links a fact to this rival by.
+                    "comp_ts": float(_r[0]),
+                    "position": _position,
+                    "rivals": int(_r[1] or 0),
+                    "l1_rank": int(_r[2] or 0),
+                    "won": bool(_r[3]),
+                    "status": str(_r[4] or ""),
+                    "cause": str(_r[5] or ""),
+                    "corroboration": float(_r[6] or 0.0),
+                    "coverage": float(_r[7] or 0.0),
+                    "hypothesis": str(_r[8] or ""),
+                    "analysis_head": str(_r[9] or ""),
+                    "belt_standing": str(_r[10] or ""),
+                    "belt_note": str(_r[11] or ""),
+                    "refuted_by": (int(_r[12] or 0), int(_r[13] or 0), int(_r[14] or 0)),
+                    "bayes_posterior": (None if _r[15] is None else float(_r[15])),
+                    "bayes_rank": int(_r[16] or 0),
+                    "bayes_p_none": (None if _r[17] is None else float(_r[17])),
+                }
+            )
+        return _out
+
+    @staticmethod
+    def _render_rival_line(rival: Dict[str, Any], reveal_bayes: bool = False) -> str:
+        """One /rivals entry: number, how the rival ended, and what it claimed.
+
+        How it ended reads the same way the investigation record does: the
+        winner, a survivor out-ranked but not refuted, or a death with its
+        cause. The rank Layer 1 gave it is shown where it had one, so a
+        winner the operator disagrees with can be compared with the rival
+        the ranking put second. The verdict its own analysis reached is
+        shown when that analysis gave one, which instrument refuted what
+        when anything did, and the protective belt's ruling when a
+        refutation of it was held.
+        """
+        # ── Step 1: how it ended ──
+        if rival["won"]:
+            _end = "**won**"
+        elif rival["status"] == "dead":
+            _end = f"died: {(rival['cause'] or 'unknown cause').replace('_', ' ')}"
+        else:
+            _end = "survived, out-ranked"
+        if rival["l1_rank"]:
+            _end += f" · rank {rival['l1_rank']}"
+        # ── Step 2: the line and the claim under it ──
+        _line = (
+            f"- **H{rival['h']}** · {_end} · corr {rival['corroboration']:.2f}"
+            f" · coverage {rival['coverage']:.2f}\n"
+            f"  “{_clip_words(' '.join(rival['hypothesis'].split()), 180)}”"
+        )
+        _head = rival["analysis_head"]
+        if _head.startswith("[") and "]" in _head:
+            _line += f"\n  own analysis: {_head[1:_head.index(']')].replace('_', ' ')}"
+        # ── Step 3: what refuted it, and whether the belt held it ──
+        _g, _c, _j = rival.get("refuted_by", (0, 0, 0))
+        if _g or _c or _j:
+            _line += f"\n  refuted by: graph {_g} · contract {_c} · judge {_j}"
+        if rival.get("belt_standing"):
+            _line += (
+                f"\n  ◐ belt: {rival['belt_standing'].replace('_', ' ')}"
+                + (
+                    f" — {_clip_words(rival['belt_note'], 200)}"
+                    if rival.get("belt_note")
+                    else ""
+                )
+            )
+        # ── Step 4: the Bayesian shadow, only once the turn is labelled ──
+        if reveal_bayes and rival.get("bayes_posterior") is not None:
+            _line += (
+                f"\n  🎲 Bayes: posterior {rival['bayes_posterior']:.2f}"
+                f" · Bayes rank {rival.get('bayes_rank', 0)}"
+            )
+        return _line
+
+    @staticmethod
+    def _bayes_pick(rivals: List[Dict[str, Any]]) -> Tuple[Optional[int], Optional[float]]:
+        """The rival the Bayesian shadow would have chosen in one competition.
+
+        The rank-1 rival, unless "none of them" has the higher posterior.
+
+        Args:
+            rivals: One competition's rivals, as _turn_rivals returns them.
+
+        Returns:
+            (its H-number, or 0 for none, or None when the shadow did not
+            rank this competition; P(none), or None likewise).
+        """
+        _ranked = [_r for _r in rivals if _r.get("bayes_posterior") is not None]
+        if not _ranked:
+            return None, None
+        _top = max(_ranked, key=lambda _r: _r["bayes_posterior"])
+        _none = _top.get("bayes_p_none")
+        if _none is not None and _none >= _top["bayes_posterior"]:
+            return 0, _none
+        return _top["h"], _none
+
+    def _handle_rivals_command(self, project_id: str, command_text: str) -> str:
+        """
+        List a turn's hypothesis rivals, numbered so a label can name one.
+
+        The investigation record carries the same rivals, but it is added
+        in the outlet, and what the outlet writes into the message never
+        reaches the reader. A command's reply is delivered by the inlet, so
+        this is the list the operator can actually see.
+
+        Args:
+            project_id: Current project identifier.
+            command_text: The command as typed: `/rivals [T12]`.
+
+        Returns:
+            The rivals of the newest answered turn, or of the turn named.
+        """
+        # ── Step 1: which turn ──
+        _args = self._command_args(command_text, "/rivals")
+        _turn, _rest, _err = self._resolve_outcome_turn(project_id, _args)
+        if _turn is None:
+            return f"/rivals: {_err}."
+        _started, _number, _question = _turn
+        _label = f"T{_number}" if _number else "the last answer"
+        # ── Step 2: its rivals, grouped by competition ──
+        _rivals = self._turn_rivals(project_id, _started)
+        if not _rivals:
+            return (
+                f"/rivals: {_label} ran no hypothesis competition, so there "
+                f"are no rivals to number."
+            )
+        _n_comp = _rivals[-1]["competition"]
+        # The Bayesian shadow stays out of sight until the turn is labelled:
+        # a label written while looking at its ranking would be graded
+        # against itself (BayesianRanking).
+        try:
+            _labelled = bool(
+                self._f._db_conn.execute(
+                    "SELECT 1 FROM metric_outcomes WHERE project_id = ? "
+                    "AND turn_started = ?",
+                    (project_id, _started),
+                ).fetchone()
+            )
+        except Exception:
+            _labelled = False
+        _shadowed = any(_r.get("bayes_posterior") is not None for _r in _rivals)
+        _lines = [
+            f"**Rivals of {_label}** — “{_clip_words(' '.join(_question.split()), 120)}”",
+            "",
+        ]
+        for _c in range(1, _n_comp + 1):
+            _comp = [_r for _r in _rivals if _r["competition"] == _c]
+            if _n_comp > 1:
+                _lines += ([""] if _c > 1 else []) + [f"Competition {_c} of {_n_comp}"]
+            _lines.extend(self._render_rival_line(_r, _labelled) for _r in _comp)
+            _pick, _none = self._bayes_pick(_comp)
+            if _labelled and _pick is not None:
+                _lines.append(
+                    "🎲 Bayes would have chosen "
+                    + (f"H{_pick}" if _pick else "none of them")
+                    + (f" · P(none) {_none:.2f}" if _none is not None else "")
+                )
+        if _shadowed and not _labelled:
+            _lines += [
+                "",
+                "The Bayesian ranking is hidden until this turn is labelled, so "
+                "the label cannot lean on it.",
+            ]
+        if _rest:
+            _lines += ["", f"Ignored: {' '.join(_rest)}"]
+        return "\n".join(_lines)
+
+    def _answer_tokens(self, messages: List[dict]) -> int:
+        """Tokens of the newest assistant message: the answer being labelled.
+
+        The answer call is issued by the host and never passes through
+        call_llm, so its output size is in no metric table. A label is
+        typed right after reading that answer, which is still the newest
+        assistant message, so it is counted here and kept with the label.
+        0 without a tokenizer or without an assistant message.
+        """
+        try:
+            if not self._f.tokenizer:
+                return 0
+            _last = next(
+                (
+                    m
+                    for m in reversed(messages or [])
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None:
+                return 0
+            return len(self._f.tokenizer.encode(str(_last.get("content") or "")))
+        except Exception:
+            return 0
+
+    async def _set_turn_validation(
+        self, project_id: str, turn_started: float, validated: bool
+    ) -> int:
+        """
+        Make the competition records of one turn say what its label says.
+
+        external_validation is the strategy history's view of a label, so it
+        follows the label of the turn the record belongs to: set when the
+        turn is labelled right, cleared when it is relabelled anything else.
+        Matched on the record's own turn key (CompetitionRecord.turn_started),
+        so a turn without a competition marks nothing, where the old /accept
+        marked whichever record was newest.
+
+        Args:
+            project_id: Current project identifier.
+            turn_started: The labelled turn's key.
+            validated: The value external_validation should hold.
+
+        Returns:
+            How many of the project's records belong to that turn.
+        """
+        # ── Step 1: the records of that turn ──
+        try:
+            import json as _json
+
+            _rows = self._f._db_conn.execute(
+                "SELECT id, record_json FROM competition_history WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        except Exception as _e:
+            self._f._log_debug(f"outcome: competition history unreadable ({_e!r})")
+            return 0
+        _changes: List[Tuple[int, str]] = []
+        _found = 0
+        for _id, _rj in _rows:
+            try:
+                _d = _json.loads(_rj)
+            except Exception:
+                continue
+            if float(_d.get("turn_started", 0.0) or 0.0) != turn_started:
+                continue
+            _found += 1
+            if bool(_d.get("external_validation")) != validated:
+                _d["external_validation"] = validated
+                _changes.append((_id, _json.dumps(_d)))
+        # ── Step 2: rewrite the ones that disagree ──
+        if _changes:
+
+            def _rewrite(changes=_changes):
+                for _rid, _new in changes:
+                    self._f._db_conn.execute(
+                        "UPDATE competition_history SET record_json = ? WHERE id = ?",
+                        (_new, _rid),
+                    )
+                self._f._db_conn.commit()
+
+            await self._f._state_store._db_enqueue(_rewrite)
+        return _found
+
+    async def _handle_outcome_command(
+        self,
+        project_id: str,
+        command_text: str,
+        verdict: str,
+        messages: List[dict],
+    ) -> str:
+        """
+        Label a delivered answer right, wrong or partial (metric_outcomes).
+
+        The three commands share one handler because they share every rule
+        but the verdict. The turn is the last answer, or the one `T12`
+        names. `H2` names a rival from /rivals; what it may mean depends on
+        the verdict, and a combination that contradicts itself is refused
+        with the command that says what was probably meant:
+
+        - right: the answer, and so the winner it rested on, held up. The
+          winner is recorded as the right rival; naming another rival, or
+          H0, contradicts that.
+        - wrong: the answer did not hold. `H2` says which rival was right
+          instead, `H0` that none was; naming the winner contradicts it.
+        - partial: the diagnosis was right and the remedy was not, or the
+          reverse. `H2` is optional and recorded as given.
+
+        A turn labelled again keeps one label, the newest. The competition
+        records of the turn follow the label (_set_turn_validation).
+
+        Args:
+            project_id: Current project identifier.
+            command_text: The command as typed.
+            verdict: One of _OUTCOME_VERDICTS.
+            messages: The conversation, to count the answer's tokens.
+
+        Returns:
+            What was recorded, or why nothing was.
+        """
+        _verb = next(_c for _c, _v in _OUTCOME_COMMANDS if _v == verdict)
+        # ── Step 1: which turn ──
+        _args = self._command_args(command_text, _verb)
+        _named_turn = any(self._outcome_selector(_a, "T") is not None for _a in _args)
+        _turn, _rest, _err = self._resolve_outcome_turn(project_id, _args)
+        if _turn is None:
+            # A database from before outcome labels has competition records
+            # and no turn rows; a bare accept keeps doing what it did.
+            if verdict == "right" and not _named_turn:
+                return await self._handle_accept_command(project_id)
+            return f"{_verb}: {_err}."
+        _started, _number, _question = _turn
+        _label = f"T{_number}" if _number else "the last answer"
+        _sel = f" T{_number}" if _named_turn and _number else ""
+
+        # ── Step 2: which rival, and whether it fits the verdict ──
+        _h: Optional[int] = None
+        _note_tokens: List[str] = []
+        for _tok in _rest:
+            _n = self._outcome_selector(_tok, "H")
+            if _n is not None and _h is None:
+                _h = _n
+            else:
+                _note_tokens.append(_tok)
+        _rivals = self._turn_rivals(project_id, _started)
+        _winner = next((_r["h"] for _r in _rivals if _r["won"]), None)
+        if _h is not None and not _rivals:
+            return (
+                f"{_verb}: {_label} ran no hypothesis competition, so H{_h} "
+                f"names nothing. Label it without an H."
+            )
+        if _h is not None and _h > len(_rivals):
+            return (
+                f"{_verb}: {_label} has rivals H1–H{len(_rivals)}; there is no "
+                f"H{_h}. `/rivals{_sel}` lists them."
+            )
+        if verdict == "right":
+            if _h is not None and _h != _winner:
+                _won = f"H{_winner}" if _winner else "no rival"
+                return (
+                    f"{_verb}: {_label}'s answer rested on {_won}, not H{_h}. "
+                    f"If H{_h} was the right one, the answer was not: "
+                    f"`/reject H{_h}{_sel}`."
+                )
+            _correct = _winner if _winner is not None else _OUTCOME_RIVAL_UNSTATED
+        elif verdict == "wrong":
+            if _h is not None and _h == _winner:
+                return (
+                    f"{_verb}: H{_h} is the winner {_label}'s answer rested on. "
+                    f"If its diagnosis held and the answer did not, that is "
+                    f"`/partial H{_h}{_sel}`."
+                )
+            _correct = _h if _h is not None else _OUTCOME_RIVAL_UNSTATED
+        else:
+            _correct = _h if _h is not None else _OUTCOME_RIVAL_UNSTATED
+
+        # ── Step 3: the earlier label, and the answer's size ──
+        try:
+            _prev = self._f._db_conn.execute(
+                "SELECT verdict, answer_tokens FROM metric_outcomes "
+                "WHERE project_id = ? AND turn_started = ?",
+                (project_id, _started),
+            ).fetchone()
+        except Exception:
+            _prev = None
+        # The newest assistant message is this turn's answer only when the
+        # label is for the newest turn; a label for an earlier one keeps
+        # whatever count that turn already had.
+        _tokens = 0 if _named_turn else self._answer_tokens(messages)
+        if not _tokens and _prev:
+            _tokens = int(_prev[1] or 0)
+        _note = " ".join(_note_tokens)[:300]
+
+        # ── Step 4: write the label, then align the strategy history ──
+        _row = (
+            project_id,
+            _started,
+            time.time(),
+            verdict,
+            int(_correct),
+            int(_tokens),
+            _note,
+        )
+
+        def _write(row=_row):
+            self._f._db_conn.execute(_METRIC_INSERTS["outcome"], row)
+            self._f._db_conn.commit()
+
+        try:
+            await self._f._state_store._db_enqueue(_write)
+        except Exception as _e:
+            return f"{_verb}: the label could not be written ({_e})."
+        _records = await self._set_turn_validation(
+            project_id, _started, verdict == "right"
+        )
+        # The arm the labelled turn ran under, from its own row: a label can
+        # be typed later, under another arm, than the answer it judges.
+        try:
+            _arm_row = self._f._db_conn.execute(
+                "SELECT experiment_arm FROM metric_turns WHERE project_id = ? "
+                "AND turn_started = ?",
+                (project_id, _started),
+            ).fetchone()
+            _arm = (_arm_row[0] if _arm_row else "") or "-"
+        except Exception:
+            _arm = "-"
+        self._f._log_debug(
+            f"[OUTCOME] t={_number} arm={_arm} verdict={verdict} "
+            f"correct_rival={_correct} winner={_winner if _winner is not None else 0} "
+            f"answer_tokens={_tokens} records={_records} "
+            f"replaces={_prev[0] if _prev else '-'}"
+        )
+
+        # ── Step 5: say what was recorded ──
+        _mark = {"right": "✅", "wrong": "✗", "partial": "◐"}[verdict]
+        _what = f"{_mark} {_label} labelled **{verdict}**"
+        if _correct > 0:
+            _what += f" — H{_correct}" + (
+                ", the winner" if _correct == _winner else " was the right rival"
+            )
+        elif _correct == 0:
+            _what += " — none of the rivals was right"
+        _what += "."
+        if _prev:
+            _what += f" Replaces the earlier label '{_prev[0]}'."
+        if _rivals and not _records:
+            _what += (
+                " No competition record carries this turn (written before "
+                "records did, or never written), so the strategy history is "
+                "unchanged."
+            )
+        elif _records and verdict == "right":
+            _what += " Its competition record now counts as validated."
+        if _note:
+            _what += f"\nNote: {_note}"
+        return _what
+
+    @staticmethod
+    def _wilson_interval(hits: int, n: int, z: float = 1.96) -> Tuple[float, float]:
+        """The 95% Wilson score interval for a rate of hits in n trials.
+
+        Reported beside every rate /outcomes shows, because the rates are
+        built from a handful of hand labels: 4 of 5 right and 40 of 50
+        right print the same percentage, and only the interval says that
+        the first cannot tell two arms apart. Wilson rather than the normal
+        approximation, which goes below 0 or above 1 at these sizes.
+
+        Returns:
+            (low, high), both in [0, 1]; (0.0, 1.0) when n is 0.
+        """
+        if n <= 0:
+            return 0.0, 1.0
+        _p = hits / n
+        _den = 1 + z * z / n
+        _mid = (_p + z * z / (2 * n)) / _den
+        _half = z * math.sqrt(_p * (1 - _p) / n + z * z / (4 * n * n)) / _den
+        return max(0.0, _mid - _half), min(1.0, _mid + _half)
+
+    @staticmethod
+    def _summarise_outcomes(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """
+        Per-arm tallies of labelled turns, for /outcomes.
+
+        Pure: every number /outcomes prints comes from here, from rows the
+        caller read, so the arithmetic can be checked without a database.
+
+        Each row is one labelled turn with: arm, verdict, correct_rival,
+        winner (the H-number that won, 0 when the competition had no
+        winner, None when the turn held no competition), tokens (every
+        token the turn moved: auxiliary calls in and out, the answer
+        prompt, the answer itself) and seconds (inlet plus answer call, or
+        None when the answer call was not timed).
+
+        Cost is charged per RIGHT answer over every labelled turn, wrong
+        and partial included: a configuration that answers cheaply and
+        wrongly must not look efficient. Seconds are summed over timed
+        turns only, and the count of them is kept: the report charges an
+        untimed turn the timed mean and says how many were timed.
+
+        Returns:
+            {arm: {n, right, wrong, partial, ranked, ranked_hits, tokens,
+            timed, seconds}} with totals, not ratios.
+        """
+        _out: Dict[str, Dict[str, Any]] = {}
+        for _r in rows:
+            _a = _out.setdefault(
+                _r["arm"],
+                {
+                    "n": 0,
+                    **{_v: 0 for _v in _OUTCOME_VERDICTS},
+                    "ranked": 0,
+                    "ranked_hits": 0,
+                    "tokens": 0,
+                    "timed": 0,
+                    "seconds": 0.0,
+                },
+            )
+            _a["n"] += 1
+            if _r["verdict"] in _OUTCOME_VERDICTS:
+                _a[_r["verdict"]] += 1
+            # Ranking accuracy: only where there was a competition and the
+            # operator said which rival was right. "None was right" and "no
+            # winner" agree, which is the null bar doing its job.
+            if _r["winner"] is not None and _r["correct_rival"] >= 0:
+                _a["ranked"] += 1
+                _a["ranked_hits"] += int(_r["correct_rival"] == _r["winner"])
+            _a["tokens"] += int(_r["tokens"] or 0)
+            if _r["seconds"] is not None:
+                _a["timed"] += 1
+                _a["seconds"] += float(_r["seconds"])
+        return _out
+
+    def _outcome_rows(
+        self, project_id: Optional[str]
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """
+        Read every labelled turn, and the unlabelled count per arm.
+
+        Joins the label to its turn row, its auxiliary calls and its
+        competition winner, in the shape _summarise_outcomes takes, plus
+        the question, which is what pairs two arms' answers to the same
+        prompt (_paired_outcomes).
+
+        Args:
+            project_id: The project to read, or None for every project.
+                An A/B runs each arm in a project of its own, because a
+                project is what scopes the response cache, long-term memory,
+                the graveyard, the step cache and the strategy history; one
+                arm sharing them would answer from the other's work.
+
+        Returns:
+            (rows, {arm: turns recorded but not labelled}).
+        """
+        _conn = self._f._db_conn
+        _scope = (project_id, project_id)
+        # ── Step 1: labelled turns with their turn row ──
+        _labelled = _conn.execute(
+            "SELECT o.project_id, t.experiment_arm, t.turn_started, t.question, "
+            "o.verdict, o.correct_rival, o.answer_tokens, t.system_tokens, "
+            "t.answer_seconds, t.ts - t.turn_started "
+            "FROM metric_outcomes o JOIN metric_turns t "
+            "ON t.project_id = o.project_id AND t.turn_started = o.turn_started "
+            "WHERE (? IS NULL OR o.project_id = ?)",
+            _scope,
+        ).fetchall()
+        # ── Step 2: auxiliary call totals per turn ──
+        _aux = {
+            (_r[0], _r[1]): int(_r[2] or 0)
+            for _r in _conn.execute(
+                "SELECT project_id, turn_started, SUM(in_tokens + out_tokens) "
+                "FROM metric_llm_calls WHERE (? IS NULL OR project_id = ?) "
+                "GROUP BY project_id, turn_started",
+                _scope,
+            ).fetchall()
+        }
+        # ── Step 3: one row per labelled turn ──
+        _rows: List[Dict[str, Any]] = []
+        for (
+            _pid,
+            _arm,
+            _started,
+            _question,
+            _verdict,
+            _rival,
+            _ans,
+            _sys,
+            _ans_s,
+            _inlet_s,
+        ) in _labelled:
+            _rivals = self._turn_rivals(_pid, _started)
+            _winner = (
+                next((_x["h"] for _x in _rivals if _x["won"]), 0) if _rivals else None
+            )
+            _rows.append(
+                {
+                    "arm": _arm or "(before arms)",
+                    "question": " ".join(str(_question or "").lower().split()),
+                    "labelled_turn": float(_started),
+                    "verdict": str(_verdict),
+                    "correct_rival": int(_rival),
+                    "winner": _winner,
+                    "tokens": (
+                        _aux.get((_pid, _started), 0) + int(_sys or 0) + int(_ans or 0)
+                    ),
+                    "seconds": (
+                        None
+                        if _ans_s is None
+                        else float(_ans_s) + max(0.0, float(_inlet_s or 0.0))
+                    ),
+                }
+            )
+        # ── Step 4: what is still waiting for a label ──
+        _unlabelled = {
+            (_r[0] or "(before arms)"): int(_r[1])
+            for _r in _conn.execute(
+                "SELECT experiment_arm, COUNT(*) FROM metric_turns t "
+                "WHERE (? IS NULL OR project_id = ?) AND NOT EXISTS (SELECT 1 "
+                "FROM metric_outcomes o WHERE o.project_id = t.project_id AND "
+                "o.turn_started = t.turn_started) GROUP BY experiment_arm",
+                _scope,
+            ).fetchall()
+        }
+        return _rows, _unlabelled
+
+    @staticmethod
+    def _paired_outcomes(
+        rows: List[Dict[str, Any]], arm_a: str, arm_b: str
+    ) -> Tuple[int, int, int]:
+        """
+        Pair two arms' labelled answers to the same question.
+
+        An A/B asks both arms the same questions, so the comparison that
+        uses that is per question: only the questions where the arms
+        DISAGREE carry information about which arm is better, and the
+        exact McNemar test reads exactly those. Two independent rates
+        throw the pairing away and need several times the labels to see
+        the same difference. Questions match after case and whitespace are
+        folded; when an arm answered one twice, its newest label counts.
+        Partial labels are left out, as in the headline rate.
+
+        Returns:
+            (pairs, a right where b was wrong, a wrong where b was right).
+        """
+        # ── Step 1: each arm's newest right-or-wrong label per question ──
+        _latest: Dict[str, Dict[str, Tuple[float, bool]]] = {arm_a: {}, arm_b: {}}
+        for _r in rows:
+            if _r["arm"] not in _latest or _r["verdict"] not in ("right", "wrong"):
+                continue
+            _q = _r["question"]
+            if not _q:
+                continue
+            _seen = _latest[_r["arm"]].get(_q)
+            if _seen is None or _r["labelled_turn"] > _seen[0]:
+                _latest[_r["arm"]][_q] = (_r["labelled_turn"], _r["verdict"] == "right")
+        # ── Step 2: count agreement and the two kinds of disagreement ──
+        _shared = set(_latest[arm_a]) & set(_latest[arm_b])
+        _a_only = sum(
+            1 for _q in _shared if _latest[arm_a][_q][1] and not _latest[arm_b][_q][1]
+        )
+        _b_only = sum(
+            1 for _q in _shared if _latest[arm_b][_q][1] and not _latest[arm_a][_q][1]
+        )
+        return len(_shared), _a_only, _b_only
+
+    @staticmethod
+    def _mcnemar_exact(a_only: int, b_only: int) -> float:
+        """Two-sided exact McNemar p-value over the discordant pairs.
+
+        Under "neither arm is better", each disagreement is a fair coin, so
+        the smaller count follows Binomial(a_only + b_only, 1/2). Exact
+        rather than the chi-square form, which is wrong at the handful of
+        disagreements a hand-labelled A/B produces.
+
+        Returns:
+            The p-value in [0, 1]; 1.0 when the arms never disagreed.
+        """
+        _n = a_only + b_only
+        if _n == 0:
+            return 1.0
+        _k = min(a_only, b_only)
+        _tail = sum(math.comb(_n, _i) for _i in range(_k + 1)) / (2**_n)
+        return min(1.0, 2 * _tail)
+
+    def _forge_rows(self, project_id: Optional[str]) -> List[Dict[str, Any]]:
+        """
+        Every rival the forge recorded, with the arm of the turn it ran in.
+
+        Unlike the outcome rows these need no label: how the forge ruled is
+        measured on every competition. A rival whose turn row was purged
+        (older than _METRICS_KEEP_DAYS and never labelled) has no arm left
+        to report and is grouped as such.
+
+        Args:
+            project_id: The project to read, or None for every project.
+
+        Returns:
+            One dict per rival: arm, turn, status, cause, coverage,
+            belt_standing and refuted_by (graph, contract, judge).
+        """
+        _rows = self._f._db_conn.execute(
+            "SELECT t.experiment_arm, t.turn_started IS NULL, r.project_id, "
+            "r.turn_started, r.status, r.cause_of_death, r.coverage_score, "
+            "r.belt_standing, r.refuted_by_graph, r.refuted_by_contract, "
+            "r.refuted_by_judge "
+            "FROM metric_forge_rivals r LEFT JOIN metric_turns t "
+            "ON t.project_id = r.project_id AND t.turn_started = r.turn_started "
+            "WHERE (? IS NULL OR r.project_id = ?)",
+            (project_id, project_id),
+        ).fetchall()
+        return [
+            {
+                "arm": (
+                    "(turn row purged)"
+                    if _r[1]
+                    else (_r[0] or "(before arms)")
+                ),
+                "turn": (_r[2], float(_r[3])),
+                "status": str(_r[4] or ""),
+                "cause": str(_r[5] or ""),
+                "coverage": float(_r[6] or 0.0),
+                "belt_standing": str(_r[7] or ""),
+                "refuted_by": (int(_r[8] or 0), int(_r[9] or 0), int(_r[10] or 0)),
+            }
+            for _r in _rows
+        ]
+
+    @staticmethod
+    def _summarise_forge(
+        rows: List[Dict[str, Any]], min_coverage: float
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Per-arm tallies of how the forge ruled: the coherence readout.
+
+        The figure the Lakatosian regime is judged by is sparse_kills: a
+        rival killed as falsified on a cycle that decided less than
+        min_coverage of its consequences, which EpistemicRegime.
+        for_coverage says may not happen. With
+        forge_belt_for_sparse_refutation on it should be zero, and the
+        deliberate deaths it allows instead are counted apart
+        (degenerating). Pure, like _summarise_outcomes.
+
+        Returns:
+            {arm: {competitions, rivals, falsified, sparse_kills,
+            degenerating, belt: {standing: n}, refuted_by: [g, c, j]}}.
+        """
+        _out: Dict[str, Dict[str, Any]] = {}
+        _turns: Dict[str, Set[Tuple[str, float]]] = {}
+        for _r in rows:
+            _a = _out.setdefault(
+                _r["arm"],
+                {
+                    "rivals": 0,
+                    "falsified": 0,
+                    "sparse_kills": 0,
+                    "degenerating": 0,
+                    "belt": {},
+                    "refuted_by": [0, 0, 0],
+                },
+            )
+            _turns.setdefault(_r["arm"], set()).add(_r["turn"])
+            _a["rivals"] += 1
+            if _r["status"] == "dead" and _r["cause"] == "falsified":
+                _a["falsified"] += 1
+                if _r["coverage"] < min_coverage:
+                    _a["sparse_kills"] += 1
+            if _r["status"] == "dead" and _r["cause"] == "degenerating":
+                _a["degenerating"] += 1
+            if _r["belt_standing"]:
+                _a["belt"][_r["belt_standing"]] = (
+                    _a["belt"].get(_r["belt_standing"], 0) + 1
+                )
+            for _i, _n in enumerate(_r["refuted_by"]):
+                _a["refuted_by"][_i] += _n
+        for _arm, _a in _out.items():
+            _a["competitions"] = len(_turns.get(_arm, ()))
+        return _out
+
+    def _render_forge_section(self, project_id: Optional[str], wanted: Set[str]) -> List[str]:
+        """The forge's coherence table for /outcomes, or [] when nothing ran."""
+        try:
+            _rows = self._forge_rows(project_id)
+        except Exception as _e:
+            return ["", f"Forge figures could not be read ({_e})."]
+        if wanted:
+            _rows = [_r for _r in _rows if _r["arm"] in wanted]
+        _min = float(
+            getattr(self._f.valves, "min_coverage_for_falsification", 0.3) or 0.0
+        )
+        _tally = self._summarise_forge(_rows, _min)
+        if not _tally:
+            return []
+        _lines = [
+            "",
+            "**Forge by experiment arm** (needs no labels)",
+            "",
+            f"| arm | competitions | rivals | falsified | on a sample under "
+            f"{_min:.0%} | degenerating | belt: progressive · untested · "
+            f"ad hoc | refuted by graph · contract · judge |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for _arm in sorted(_tally):
+            _a = _tally[_arm]
+            _b = _a["belt"]
+            _lines.append(
+                f"| {_arm} | {_a['competitions']} | {_a['rivals']} | "
+                f"{_a['falsified']} | {_a['sparse_kills']} | "
+                f"{_a['degenerating']} | {_b.get('progressive', 0)} · "
+                f"{_b.get('untested', 0)} · {_b.get('ad_hoc', 0)} | "
+                f"{_a['refuted_by'][0]} · {_a['refuted_by'][1]} · "
+                f"{_a['refuted_by'][2]} |"
+            )
+        _lines += [
+            "",
+            "A kill on a sample under the minimum is the one the Lakatosian "
+            "regime forbids; with forge_belt_for_sparse_refutation on it "
+            "should be 0. Refutations by instrument are counted from the "
+            "rivals recorded after they were.",
+        ]
+        return _lines
+
+    def _triangulation_rows(self, project_id: Optional[str]) -> List[Dict[str, Any]]:
+        """
+        Every turn the triangulation shadow tallied, with its arm.
+
+        Args:
+            project_id: The project to read, or None for every project.
+
+        Returns:
+            One dict per turn: arm, counts and pairs, as
+            AgenticEvidenceLedger.triangulate returned them. Turns with no
+            tally, or an unreadable one, are left out.
+        """
+        _rows = self._f._db_conn.execute(
+            "SELECT experiment_arm, triangulation FROM metric_turns "
+            "WHERE (? IS NULL OR project_id = ?) "
+            "AND triangulation NOT IN ('', '{}')",
+            (project_id, project_id),
+        ).fetchall()
+        _out: List[Dict[str, Any]] = []
+        for _arm, _raw in _rows:
+            try:
+                _t = json.loads(_raw)
+                _out.append(
+                    {
+                        "arm": _arm or "(before arms)",
+                        "counts": dict(_t.get("counts") or {}),
+                        "pairs": dict(_t.get("pairs") or {}),
+                    }
+                )
+            except Exception:
+                continue
+        return _out
+
+    @staticmethod
+    def _summarise_triangulation(
+        rows: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Per-arm totals of the triangulation shadow. Pure.
+
+        flip_turns counts turns with at least one claim a live ruling would
+        flip: a paired A/B of the live ruling can only find discordant
+        answers among them.
+
+        Returns:
+            {arm: {turns, flip_turns, counts: {field: n}, pairs:
+            {"a|b": [4 cells]}}}.
+        """
+        _out: Dict[str, Dict[str, Any]] = {}
+        for _r in rows:
+            _a = _out.setdefault(
+                _r["arm"],
+                {
+                    "turns": 0,
+                    "flip_turns": 0,
+                    "counts": {_k: 0 for _k in _TRIANGULATION_FIELDS},
+                    "pairs": {},
+                },
+            )
+            _a["turns"] += 1
+            for _k in _TRIANGULATION_FIELDS:
+                _a["counts"][_k] += int(_r["counts"].get(_k, 0) or 0)
+            if int(_r["counts"].get("would_flip", 0) or 0) > 0:
+                _a["flip_turns"] += 1
+            for _p, _cells in _r["pairs"].items():
+                _acc = _a["pairs"].setdefault(_p, [0, 0, 0, 0])
+                for _i, _n in enumerate(list(_cells)[:4]):
+                    _acc[_i] += int(_n or 0)
+        return _out
+
+    @staticmethod
+    def _cohen_kappa(cells: List[int]) -> Optional[float]:
+        """
+        Cohen's kappa for two raters' yes/no verdicts on the same items.
+
+        Args:
+            cells: [both yes, only the first yes, only the second yes,
+                both no].
+
+        Returns:
+            Kappa, or None when there are no items or chance agreement
+            is already total (both raters always gave one answer).
+        """
+        _tt, _tf, _ft, _ff = (int(_x) for _x in cells)
+        _n = _tt + _tf + _ft + _ff
+        if _n <= 0:
+            return None
+        _po = (_tt + _ff) / _n
+        _pa, _pb = (_tt + _tf) / _n, (_tt + _ft) / _n
+        _pe = _pa * _pb + (1 - _pa) * (1 - _pb)
+        if _pe >= 1:
+            return None
+        return (_po - _pe) / (1 - _pe)
+
+    def _render_triangulation_section(
+        self, project_id: Optional[str], wanted: Set[str]
+    ) -> List[str]:
+        """The triangulation shadow's table for /outcomes, or [] when nothing ran."""
+        try:
+            _rows = self._triangulation_rows(project_id)
+        except Exception as _e:
+            return ["", f"Triangulation figures could not be read ({_e})."]
+        if wanted:
+            _rows = [_r for _r in _rows if _r["arm"] in wanted]
+        _tally = self._summarise_triangulation(_rows)
+        if not _tally:
+            return []
+        _lines = [
+            "",
+            "**Triangulation (shadow) by experiment arm** (needs no labels)",
+            "",
+            "| arm | turns | claims observed | corroborated · single | "
+            "anomaly · drift · overruled | confirmed out of scope | "
+            "would flip (turns) · would settle | twin conflicts |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for _arm in sorted(_tally):
+            _a = _tally[_arm]
+            _k = _a["counts"]
+            _lines.append(
+                f"| {_arm} | {_a['turns']} | {_k['observed']} | "
+                f"{_k['corroborated']} · {_k['single']} | "
+                f"{_k['anomaly']} · {_k['drift']} · {_k['overruled']} | "
+                f"{_k['out_of_scope']} | {_k['would_flip']} "
+                f"({_a['flip_turns']}) · {_k['would_settle']} | "
+                f"{_k['twin_conflicts']} |"
+            )
+        _agreement: List[str] = []
+        for _arm in sorted(_tally):
+            for _p, _cells in sorted(_tally[_arm]["pairs"].items()):
+                _kappa = self._cohen_kappa(_cells)
+                _agreement.append(
+                    f"- {_arm}: {_p.replace('|', ' × ')} on {sum(_cells)} "
+                    f"claim(s), agreeing on {_cells[0] + _cells[3]}"
+                    + (f", κ = {_kappa:.2f}" if _kappa is not None else "")
+                )
+        if _agreement:
+            _lines += ["", "Families judging the same claim as stated:"] + _agreement
+        _lines += [
+            "",
+            "Shadow only: no verdict was changed. Confirmed out of scope is a "
+            "claim the pipeline confirmed on evidence short of the claim. A "
+            "live ruling can change an answer only in turns where it would "
+            "flip a verdict, and a paired A/B of it needs at least 6 of those "
+            "to be able to reach p < 0.05.",
+        ]
+        return _lines
+
+    def _bayes_comparison(
+        self, project_id: Optional[str], wanted: Set[str]
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """
+        Every labelled competition the Bayesian shadow ranked, read for /outcomes.
+
+        For each: the rival the operator named as right, the one Layer 1
+        chose, the one the shadow chose, the shadow's posterior on the
+        right one, and what the shadow would have chosen at each value of
+        _BAYES_SENSITIVITY_D, recomputed from metric_forge_facts with the
+        same function the live shadow uses (HypothesisForge.
+        _bayes_posterior_for). A turn with more than one competition is
+        left out, because a label names one rival of the turn and not which
+        competition it settles; so is one the shadow never ranked.
+
+        Args:
+            project_id: The project to read, or None for every project.
+            wanted: Arms to keep; empty keeps all.
+
+        Returns:
+            (rows, {reason: competitions left out}).
+        """
+        _conn = self._f._db_conn
+        _forge = self._f._hypothesis_forge
+        _skipped = {
+            "several competitions": 0,
+            "not ranked (shadow off, or no eligible rival)": 0,
+        }
+        _labels = _conn.execute(
+            "SELECT o.project_id, o.turn_started, o.correct_rival, "
+            "COALESCE(t.experiment_arm, '') FROM metric_outcomes o "
+            "LEFT JOIN metric_turns t ON t.project_id = o.project_id "
+            "AND t.turn_started = o.turn_started "
+            "WHERE o.correct_rival >= 0 AND (? IS NULL OR o.project_id = ?) "
+            "ORDER BY o.turn_started",
+            (project_id, project_id),
+        ).fetchall()
+        _rows: List[Dict[str, Any]] = []
+        for _pid, _turn, _correct, _arm in _labels:
+            _arm = _arm or "(before arms)"
+            if wanted and _arm not in wanted:
+                continue
+            _rivals = self._turn_rivals(_pid, _turn)
+            if not _rivals:
+                continue
+            if _rivals[-1]["competition"] > 1:
+                _skipped["several competitions"] += 1
+                continue
+            _ranked = [_r for _r in _rivals if _r["bayes_posterior"] is not None]
+            if not _ranked:
+                _skipped["not ranked (shadow off, or no eligible rival)"] += 1
+                continue
+            # ── what each ranking chose, and the shadow's belief in the truth ──
+            _l1 = next((_r["h"] for _r in _rivals if _r["won"]), 0)
+            _shadow, _p_none = self._bayes_pick(_rivals)
+            if int(_correct) == 0:
+                _p_correct = _p_none
+            else:
+                _p_correct = next(
+                    (_r["bayes_posterior"] for _r in _ranked if _r["h"] == int(_correct)),
+                    None,
+                )
+            # ── the same competition at other values of d ──
+            _facts: Dict[int, List[Dict[str, Any]]] = {}
+            for _pos, _kind, _verdict in _conn.execute(
+                "SELECT position, kind, verdict FROM metric_forge_facts "
+                "WHERE project_id = ? AND turn_started = ? AND comp_ts = ?",
+                (_pid, _turn, _ranked[0]["comp_ts"]),
+            ).fetchall():
+                _facts.setdefault(int(_pos), []).append(
+                    {"kind": str(_kind), "verdict": bool(_verdict)}
+                )
+            _by_d: Dict[float, int] = {}
+            for _d in _BAYES_SENSITIVITY_D:
+                _post, _none, _ = _forge._bayes_posterior_for(
+                    [_facts.get(_r["position"], []) for _r in _ranked], _pid, _turn, _d
+                )
+                _top = max(range(len(_ranked)), key=lambda _i: _post[_i])
+                _by_d[_d] = _ranked[_top]["h"] if _post[_top] > _none else 0
+            _rows.append(
+                {
+                    "turn": float(_turn),
+                    "correct": int(_correct),
+                    "l1": int(_l1),
+                    "bayes": int(_shadow or 0),
+                    "p_correct": _p_correct,
+                    "by_d": _by_d,
+                    # Rivals the shadow ranked, for the uniform baseline.
+                    "k": len(_ranked),
+                }
+            )
+        return _rows, _skipped
+
+    @staticmethod
+    def _summarise_bayes(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Layer 1 against the Bayesian shadow, over labelled competitions.
+
+        Pure. The paired counts feed the exact McNemar test (_mcnemar_exact),
+        as for two arms. The log score is the mean log posterior the shadow
+        gave the rival that was right: the calibration measure, and the one
+        that would have to be good before its posterior replaced the
+        confidence line. Competitions whose right rival was not eligible
+        (neither ranking could have chosen it) have no log score and are
+        counted apart.
+
+        The split guards the sensitivity grid against tuning d on the
+        labels it is judged by: d is chosen on the older half and scored on
+        the newer one, beside Layer 1 on the same newer half. With fewer
+        than _BAYES_SPLIT_MIN competitions per half there is no split.
+
+        Returns:
+            {n, l1_right, bayes_right, l1_only, bayes_only, log_score,
+            uniform_score, scored, ineligible, by_d: {d: right},
+            split: {...} or None}.
+        """
+        _n = len(rows)
+        _l1 = [_r["l1"] == _r["correct"] for _r in rows]
+        _by = [_r["bayes"] == _r["correct"] for _r in rows]
+        _scored_rows = [
+            _r for _r in rows if _r["p_correct"] is not None and _r["p_correct"] > 0
+        ]
+        _scores = [math.log(_r["p_correct"]) for _r in _scored_rows]
+        # What guessing would score: the uniform over each competition's
+        # ranked rivals and "none".
+        _uniform = [math.log(1.0 / (int(_r.get("k", 1)) + 1)) for _r in _scored_rows]
+        _out: Dict[str, Any] = {
+            "n": _n,
+            "l1_right": sum(_l1),
+            "bayes_right": sum(_by),
+            "l1_only": sum(1 for _a, _b in zip(_l1, _by) if _a and not _b),
+            "bayes_only": sum(1 for _a, _b in zip(_l1, _by) if _b and not _a),
+            "log_score": (sum(_scores) / len(_scores)) if _scores else None,
+            "uniform_score": (sum(_uniform) / len(_uniform)) if _uniform else None,
+            "scored": len(_scores),
+            "ineligible": sum(1 for _r in rows if _r["p_correct"] is None),
+            "by_d": {
+                _d: sum(1 for _r in rows if _r["by_d"].get(_d) == _r["correct"])
+                for _d in _BAYES_SENSITIVITY_D
+            },
+            "split": None,
+        }
+        # ── the temporal split ──
+        _ordered = sorted(rows, key=lambda _r: _r["turn"])
+        _half = len(_ordered) // 2
+        if _half >= _BAYES_SPLIT_MIN:
+            _old, _new = _ordered[:_half], _ordered[_half:]
+            _fit = {
+                _d: sum(1 for _r in _old if _r["by_d"].get(_d) == _r["correct"])
+                for _d in _BAYES_SENSITIVITY_D
+            }
+            _best = max(_BAYES_SENSITIVITY_D, key=lambda _d: (_fit[_d], -abs(_d - 0.5)))
+            _out["split"] = {
+                "d": _best,
+                "older": len(_old),
+                "newer": len(_new),
+                "bayes_newer": sum(
+                    1 for _r in _new if _r["by_d"].get(_best) == _r["correct"]
+                ),
+                "l1_newer": sum(1 for _r in _new if _r["l1"] == _r["correct"]),
+            }
+        return _out
+
+    def _render_bayes_section(self, project_id: Optional[str], wanted: Set[str]) -> List[str]:
+        """The Layer 1 versus Bayes table for /outcomes, or [] with nothing to compare."""
+        try:
+            _rows, _skipped = self._bayes_comparison(project_id, wanted)
+        except Exception as _e:
+            return ["", f"Bayesian comparison could not be read ({_e})."]
+        if not _rows:
+            return []
+        _s = self._summarise_bayes(_rows)
+        _p = self._mcnemar_exact(_s["l1_only"], _s["bayes_only"])
+        _lines = [
+            "",
+            "**Layer 1 vs the Bayesian shadow** (labelled competitions with the "
+            "right rival stated)",
+            "",
+            f"Right: Layer 1 {_s['l1_right']}/{_s['n']} · Bayes "
+            f"{_s['bayes_right']}/{_s['n']} · only Layer 1 {_s['l1_only']} · "
+            f"only Bayes {_s['bayes_only']} · exact McNemar p = {_p:.3f}"
+            + (" — not told apart yet." if _p >= 0.05 else "."),
+        ]
+        if _s["log_score"] is not None:
+            _lines.append(
+                f"Mean log posterior on the right answer: {_s['log_score']:.2f} "
+                f"over {_s['scored']} (guessing uniformly would score "
+                f"{_s['uniform_score']:.2f}; higher is better)"
+                + (
+                    f"; in {_s['ineligible']} the right rival was not eligible "
+                    f"for either ranking"
+                    if _s["ineligible"]
+                    else ""
+                )
+                + "."
+            )
+        _lines.append(
+            "Right by d: "
+            + " · ".join(f"d={_d}: {_s['by_d'][_d]}/{_s['n']}" for _d in _BAYES_SENSITIVITY_D)
+            + ". A verdict that flips with d is not robust."
+        )
+        if _s["split"]:
+            _sp = _s["split"]
+            _lines.append(
+                f"Split: d={_sp['d']} chosen on the older {_sp['older']}, then on "
+                f"the newer {_sp['newer']} Bayes {_sp['bayes_newer']} right, "
+                f"Layer 1 {_sp['l1_newer']}."
+            )
+        else:
+            _lines.append(
+                f"No temporal split yet: it needs {2 * _BAYES_SPLIT_MIN} labelled "
+                f"competitions, there are {_s['n']}. Until then the d row is "
+                f"tuned on the labels it is judged by."
+            )
+        _left = ", ".join(f"{_n} {_why}" for _why, _n in _skipped.items() if _n)
+        if _left:
+            _lines.append(f"Left out: {_left}.")
+        return _lines
+
+    def _handle_outcomes_command(self, project_id: str, command_text: str) -> str:
+        """
+        Report labelled outcomes per experiment arm: the A/B readout.
+
+        One line per arm: how many turns are labelled, how they split, the
+        rate of right answers with its interval, how often the forge's
+        winner was the rival the operator named, and the cost of a right
+        answer in tokens and seconds. Arms named after the command narrow
+        the report to them. A rate from fewer than _OUTCOME_MIN_PER_ARM
+        labels is printed but flagged, since its interval is too wide to
+        separate anything.
+
+        `all` reads every project instead of this one, which is how an A/B
+        run with one project per arm is read (_outcome_rows says why each
+        arm needs its own). With exactly two arms in the report, their
+        answers to the same questions are paired and tested
+        (_paired_outcomes, _mcnemar_exact). A second table, which needs no
+        labels, shows how the forge ruled in each arm: falsifications on
+        too small a sample, the belt's rulings and the refutations by
+        instrument (_summarise_forge). A third compares Layer 1's pick with
+        the Bayesian shadow's on the labelled competitions
+        (_summarise_bayes).
+
+        Args:
+            project_id: Current project identifier.
+            command_text: The command as typed: `/outcomes [all] [arm …]`.
+
+        Returns:
+            The report, or why there is none.
+        """
+        # ── Step 1: read and tally ──
+        _args = self._command_args(command_text, "/outcomes")
+        _every_project = "all" in _args
+        _wanted = {_a for _a in _args if _a != "all"}
+        try:
+            _rows, _unlabelled = self._outcome_rows(
+                None if _every_project else project_id
+            )
+        except Exception as _e:
+            return f"/outcomes: the metric tables could not be read ({_e})."
+        if _wanted:
+            _rows = [_r for _r in _rows if _r["arm"] in _wanted]
+            _unlabelled = {_k: _v for _k, _v in _unlabelled.items() if _k in _wanted}
+        _tally = self._summarise_outcomes(_rows)
+        _forge = self._render_forge_section(
+            None if _every_project else project_id, _wanted
+        ) + self._render_triangulation_section(
+            None if _every_project else project_id, _wanted
+        )
+        if not _tally:
+            _waiting = sum(_unlabelled.values())
+            return "\n".join(
+                [
+                    "/outcomes: no labelled turns yet"
+                    + (
+                        f" ({_waiting} answered turn(s) waiting for a label)"
+                        if _waiting
+                        else ""
+                    )
+                    + ". Label answers as you read them, and this fills in."
+                ]
+                + _forge
+            )
+
+        # ── Step 2: one row per arm ──
+        _lines = [
+            "**Outcomes by experiment arm**"
+            + (" · every project" if _every_project else ""),
+            "",
+            "| arm | labelled | right · wrong · partial | right rate (95% CI) "
+            "| winner was right | tokens / right | s / right | unlabelled |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        _thin: List[str] = []
+        for _arm in sorted(_tally):
+            _a = _tally[_arm]
+            _decided = _a["right"] + _a["wrong"]
+            if _decided:
+                _lo, _hi = self._wilson_interval(_a["right"], _decided)
+                _rate = (
+                    f"{100 * _a['right'] / _decided:.0f}% "
+                    f"({100 * _lo:.0f}–{100 * _hi:.0f})"
+                )
+            else:
+                _rate = "—"
+            if _decided < _OUTCOME_MIN_PER_ARM:
+                _thin.append(_arm)
+            _ranked = (
+                f"{_a['ranked_hits']}/{_a['ranked']}" if _a["ranked"] else "—"
+            )
+            _per_tok = (
+                f"{_a['tokens'] / _a['right']:,.0f}" if _a["right"] else "—"
+            )
+            # Untimed turns are charged the timed ones' mean rather than
+            # nothing, which would make missing measurements look cheap.
+            _per_s = (
+                f"{_a['seconds'] / _a['timed'] * _a['n'] / _a['right']:.0f}"
+                + (f" ({_a['timed']}/{_a['n']} timed)" if _a["timed"] < _a["n"] else "")
+                if _a["right"] and _a["timed"]
+                else "—"
+            )
+            _lines.append(
+                f"| {_arm} | {_a['n']} | {_a['right']} · {_a['wrong']} · "
+                f"{_a['partial']} | {_rate} | {_ranked} | {_per_tok} | {_per_s} "
+                f"| {_unlabelled.get(_arm, 0)} |"
+            )
+
+        # ── Step 3: what the numbers can and cannot carry ──
+        _lines += [
+            "",
+            "Right rate leaves partial out. Cost is every token and second the "
+            "arm's labelled turns spent, divided by its right answers.",
+        ]
+        if _thin:
+            _lines.append(
+                f"Fewer than {_OUTCOME_MIN_PER_ARM} right-or-wrong labels in: "
+                f"{', '.join(_thin)}. Their intervals are too wide to compare."
+            )
+
+        # ── Step 4: two arms — the paired comparison ──
+        if len(_tally) == 2:
+            _a, _b = sorted(_tally)
+            _pairs, _a_only, _b_only = self._paired_outcomes(_rows, _a, _b)
+            if _pairs:
+                _p = self._mcnemar_exact(_a_only, _b_only)
+                _lines += [
+                    "",
+                    f"**Paired** on {_pairs} question(s) both arms answered: "
+                    f"only {_a} right {_a_only} · only {_b} right {_b_only} · "
+                    f"exact McNemar p = {_p:.3f}"
+                    + (
+                        " — the arms are not told apart yet."
+                        if _p >= 0.05
+                        else " — a difference this lopsided is unlikely by chance."
+                    ),
+                ]
+            else:
+                _lines += [
+                    "",
+                    f"No question was answered and labelled in both {_a} and "
+                    f"{_b}, so nothing pairs. An A/B asks both arms the same "
+                    f"questions.",
+                ]
+
+        # ── Step 5: forge and triangulation, labelled or not ──
+        _lines += _forge
+        # ── Step 6: Layer 1 against the Bayesian shadow ──
+        _lines += self._render_bayes_section(
+            None if _every_project else project_id, _wanted
+        )
+        return "\n".join(_lines)
 
     async def _handle_forget_command(
         self, messages: List[dict], project_id: str, __user__: Optional[dict]
@@ -38857,6 +41623,49 @@ class CodeBlockManager:
     # ═══════════════════════════════════════════════════════════════════════════
 
     @staticmethod
+    def extract_module_constant(block: "CodeBlock", name: str) -> str:
+        """
+        The module-level assignment of a constant, cut from a block's source.
+
+        The symbol index holds classes, functions and methods; a constant
+        such as EPISTEMIC_HARD_CORE is in no symbol's line range, so
+        extract_symbol_body cannot reach it. Found by its assignment at
+        column 0, and ended at the first later column-0 line where the
+        source so far parses as complete Python: a list or a call that
+        spans a hundred lines ends at its closing bracket, not at its
+        first line.
+
+        Args:
+            block: A live block.
+            name: The constant's name.
+
+        Returns:
+            The statement's source, or "" when the block assigns no such
+            name at module level or the statement never parses.
+        """
+        try:
+            lines = [_l.rstrip("\r") for _l in (block.content or "").split("\n")]
+            head = re.compile(rf"^{re.escape(name)}\s*(?::[^=]+)?=(?!=)")
+            start = next((i for i, _l in enumerate(lines) if head.match(_l)), -1)
+            if start < 0:
+                return ""
+            end = start + 1
+            while end <= len(lines) and end - start <= _MODULE_CONSTANT_MAX_LINES:
+                while end < len(lines) and (
+                    lines[end][:1] in ("", " ", "\t", ")", "]", "}", "#")
+                ):
+                    end += 1
+                chunk = "\n".join(lines[start:end]).rstrip()
+                try:
+                    ast.parse(chunk)
+                    return chunk
+                except SyntaxError:
+                    end += 1
+        except Exception:
+            return ""
+        return ""
+
+    @staticmethod
     def extract_symbol_body(
         block: "CodeBlock", node_id: str, max_chars: int = 0
     ) -> str:
@@ -39371,7 +42180,8 @@ class CodeBlockManager:
 #   Popper where the instrument is reliable, Lakatos where it is not.
 # EpistemicRegime names the two sides and decides between them;
 # MetacognitiveReasoningEngine rules under the first, ProtectiveBelt
-# under the second.
+# under the second. EvidenceTriangulation rules on what several
+# instruments said about one claim, under both.
 #
 # What is never revised by evidence is EPISTEMIC_HARD_CORE, below. Each
 # rule names the audit that shows the instrument still deserves it.
@@ -39402,7 +42212,7 @@ class HardCoreRule:
 
 
 # Bumped whenever a rule is added, removed or reworded.
-EPISTEMIC_HARD_CORE_VERSION = 2
+EPISTEMIC_HARD_CORE_VERSION = 3
 
 EPISTEMIC_HARD_CORE: Tuple[HardCoreRule, ...] = (
     HardCoreRule(
@@ -39484,6 +42294,57 @@ EPISTEMIC_HARD_CORE: Tuple[HardCoreRule, ...] = (
         guarded_by=(
             "a planner output without hypothesize, for an exploratory "
             "question under the auto profile, gets one inserted"
+        ),
+    ),
+    HardCoreRule(
+        name="independence_by_failure_mode",
+        statement=(
+            "Agreement between instruments corroborates a claim only when "
+            "they cannot fail for the same reason; any number of checks "
+            "from one family of instruments is one observation."
+        ),
+        guarded_by=(
+            "observations of one claim from one family and from two, "
+            "ruled on by EvidenceTriangulation: only the second raises "
+            "the level"
+        ),
+    ),
+    HardCoreRule(
+        name="scope_before_support",
+        statement=(
+            "A verdict confirms a claim only if the instrument judged that "
+            "claim; a part it states or a consequence derived from it can "
+            "refute it, and a test that only ran its subject does neither."
+        ),
+        guarded_by=(
+            "sandbox passes of a claim's subject and graph confirmations "
+            "of parts of behavioural claims: the ruling counts none of "
+            "them as support"
+        ),
+    ),
+    HardCoreRule(
+        name="conflict_is_anomaly",
+        statement=(
+            "Every instrument's verdict on a claim is kept beside the "
+            "others; a later verdict never erases an earlier one, so "
+            "instruments that disagree leave an anomaly on record."
+        ),
+        guarded_by=(
+            "a claim confirmed by a quoted reading and then refuted by "
+            "the graph keeps both observations, and the ruling reports "
+            "the disagreement"
+        ),
+    ),
+    HardCoreRule(
+        name="corroboration_is_not_verification",
+        statement=(
+            "Agreement raises a claim's standing but never outvotes a "
+            "refutation by an instrument trusted at the same scope: that "
+            "is an anomaly, not a minority."
+        ),
+        guarded_by=(
+            "two families confirming a claim and a third refuting it at "
+            "the same scope and regime: the ruling returns no verdict"
         ),
     ),
 )
@@ -39621,7 +42482,10 @@ class ProtectiveBelt:
 
     It rules only under EpistemicRegime.LAKATOSIAN_PROTECTIVE_BELT, that
     is, where the instrument cannot be taken at its word. Where it can,
-    the evidence stands and nothing here is consulted.
+    the evidence stands and nothing here is consulted. Two blind spots
+    are answered here: a call edge the graph does not draw
+    (absorb_missing_call_edge), and a forge cycle that refuted its
+    hypothesis on too small a sample (sparse_sampling_ruling).
 
     Deterministic and free of model calls, like the engine it sits beside:
     the prediction is read from source, never asked of the model.
@@ -39905,6 +42769,451 @@ class ProtectiveBelt:
                 return True
         return False
 
+    # ══════════════════════════════════════════════════════════════════════
+    # Sparse refutation in the forge: the sampling auxiliary
+    # ══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def propose_sparse_sampling(
+        hypothesis: str, decided: int, total: int, min_coverage: float
+    ) -> AuxiliaryHypothesis:
+        """
+        Test "the refutation came from too small a sample".
+
+        A forge cycle derives consequences of a hypothesis and the index
+        rules on each. When it could rule on only a few of them, a refuted
+        one says less about the hypothesis than it seems: what was refuted
+        is the hypothesis together with the model's derivation, and the
+        rest of the hypothesis was never put at risk. EpistemicRegime.
+        for_coverage names that situation Lakatosian. This is the
+        auxiliary that answers it, and like every adjustment the belt
+        offers it states the fact it predicts: read more, and the
+        refutation does not recur.
+
+        The prediction cannot be checked in the cycle that raised it, so
+        it is returned UNTESTED; sparse_sampling_ruling settles it on the
+        cycles that follow.
+
+        Args:
+            hypothesis: The hypothesis the adjustment keeps alive.
+            decided: Consequences the index ruled on this cycle.
+            total: Consequences derived this cycle.
+            min_coverage: The share a refutation needs to be trusted.
+
+        Returns:
+            The auxiliary hypothesis, untested.
+        """
+        _share = (decided / total) if total else 0.0
+        return AuxiliaryHypothesis(
+            name="sparse_sampling",
+            rescues=hypothesis,
+            assumption=(
+                f"the refutation came from a small sample: the index ruled on "
+                f"{decided} of {total} consequence(s) ({_share:.0%}), under "
+                f"the {min_coverage:.0%} a refutation needs to be trusted"
+            ),
+            prediction=(
+                f"a later cycle that rules on at least {min_coverage:.0%} of "
+                f"its consequences refutes none of them"
+            ),
+        )
+
+    @staticmethod
+    def sparse_sampling_ruling(
+        standing: str, refuted: int, coverage: float, min_coverage: float
+    ) -> Tuple[str, str]:
+        """
+        Rule on one forge cycle under the sampling auxiliary.
+
+        Pure: the whole state machine of the adjustment is here, decided
+        from four measured facts, so it is testable alone. The states are
+        AuxiliaryStanding values; "" means the belt has not been used.
+
+        - No belt yet, refutation on a sample under min_coverage: the
+          refutation is ABSORBED. The cycle does not kill, and the
+          adjustment is untested.
+        - Untested, and a cycle reaches min_coverage: the test has run.
+          No refutation makes the adjustment PROGRESSIVE; any refutation
+          makes it AD_HOC, and the hypothesis dies of it after all.
+        - Untested, under min_coverage, nothing refuted: still pending.
+          A cycle that decided nothing is no evidence either way, so it
+          cannot fail the test.
+        - Already used, and another refutation on a small sample: the
+          belt is being reached for a second time to save the same
+          hypothesis. That is the mark of a degenerating programme, and
+          the hypothesis dies (one absorption per dossier).
+        - Anything else is not the belt's case: the cycle is ruled on by
+          _forge_verdict as before, Popperian where the sample suffices.
+
+        Args:
+            standing: The dossier's belt standing before this cycle.
+            refuted: Consequences refuted this cycle.
+            coverage: Share of this cycle's consequences the index decided.
+            min_coverage: The share a refutation needs to be trusted.
+
+        Returns:
+            (standing after this cycle, action), action one of "none",
+            "absorb", "pending", "corroborate", "refute", "degenerate".
+        """
+        _untested = AuxiliaryStanding.UNTESTED.value
+        _sufficient = coverage >= min_coverage
+        if refuted <= 0:
+            if standing == _untested and _sufficient:
+                return AuxiliaryStanding.PROGRESSIVE.value, "corroborate"
+            if standing == _untested:
+                return standing, "pending"
+            return standing, "none"
+        if _sufficient:
+            if standing == _untested:
+                return AuxiliaryStanding.AD_HOC.value, "refute"
+            return standing, "none"
+        if not standing:
+            return _untested, "absorb"
+        return AuxiliaryStanding.AD_HOC.value, "degenerate"
+
+
+class EvidenceFamily(str, Enum):
+    """
+    The ways an instrument can be wrong, one member per way.
+
+    Agreement is worth something only between instruments that cannot fail
+    for the same reason, so instruments are grouped by how they fail, not
+    by what they are called. In doubt an instrument joins the family it
+    shares the most with: two checks wrongly merged lose a corroboration,
+    two wrongly kept apart invent one.
+
+    STATIC_ANALYSIS: the call graph, the symbol table and the AST contract
+    checker. Deterministic, and blind to whatever is decided at run time: a
+    callable handed over by reference, a value computed on the way.
+
+    QUOTED_READING: a model reading a body, held to a span it quotes from
+    it. Sees what static analysis cannot, and can misread what it sees.
+
+    EXECUTION: the sandbox running the code. Sees what really happens, in
+    an environment that may differ, against assertions a model wrote.
+    """
+
+    STATIC_ANALYSIS = "static_analysis"
+    QUOTED_READING = "quoted_reading"
+    EXECUTION = "execution"
+
+
+class EvidenceScope(str, Enum):
+    """
+    What an instrument's verdict was about, relative to the claim.
+
+    A test that ran a symbol shows the symbol runs, not that what a claim
+    says about it is true; a call edge shows the call exists, not what the
+    caller does with the result. The asymmetry is Popper's: a claim entails
+    its parts and its consequences, so their failure refutes it, while
+    their success leaves it open.
+
+    PROPOSITION: the instrument judged the claim as stated. Confirms and
+    refutes.
+
+    COMPONENT: a part the claim states ("A calls B" in "A calls B when x is
+    None"). Refutes; never confirms.
+
+    CONSEQUENCE: something a model derived from the claim. Refutes as far
+    as the derivation can be trusted; never confirms.
+
+    SUBJECT: the symbol the claim is about, not the claim (a sandbox run of
+    it). Neither.
+
+    MENTION: a symbol the claim only cites. Neither.
+    """
+
+    PROPOSITION = "proposition"
+    COMPONENT = "component"
+    CONSEQUENCE = "consequence"
+    SUBJECT = "subject"
+    MENTION = "mention"
+
+
+class EvidenceObservation(NamedTuple):
+    """
+    One instrument's verdict on one claim, kept beside every other.
+
+    A NamedTuple rather than a dataclass because claims travel as their
+    __dict__ through json.dumps (step cache, ledger snapshot): strings,
+    str-valued enums and a bool serialise as they stand, and coerce()
+    rebuilds the tuple on the way back in.
+
+    Attributes:
+        instrument: What produced it ("graph:calls", "judge", "sandbox",
+            "reinforce").
+        family: How that instrument fails.
+        scope: What the verdict was about.
+        verdict: True confirms, False refutes, None abstains.
+        regime: The EpistemicRegime the instrument ruled under; None for an
+            abstention, which rules under neither.
+        detail: The instrument's own explanation, shortened.
+    """
+
+    instrument: str
+    family: EvidenceFamily
+    scope: EvidenceScope
+    verdict: Optional[bool]
+    regime: Optional[EpistemicRegime]
+    detail: str = ""
+
+    @classmethod
+    def coerce(cls, raw: Any) -> Optional["EvidenceObservation"]:
+        """
+        Rebuild an observation from its JSON form.
+
+        Args:
+            raw: An observation, or the list json.dumps made of one.
+
+        Returns:
+            The observation, or None when raw cannot be read as one.
+        """
+        if isinstance(raw, cls):
+            return raw
+        try:
+            _inst, _fam, _scope, _verdict, _regime, *_rest = raw
+            return cls(
+                instrument=str(_inst),
+                family=EvidenceFamily(_fam),
+                scope=EvidenceScope(_scope),
+                verdict=None if _verdict is None else bool(_verdict),
+                regime=None if _regime is None else EpistemicRegime(_regime),
+                detail=str(_rest[0]) if _rest else "",
+            )
+        except Exception:
+            return None
+
+
+@dataclass(frozen=True)
+class TriangulationRuling:
+    """
+    What the instruments that observed one claim establish together.
+
+    Attributes:
+        verdict: True or False when the strongest observations agree; None
+            when nothing decisive was observed, or the strongest disagree.
+        level: How many mutually independent observations back the verdict.
+            Two or more is a corroborated (triangulated) verdict.
+        families: The families of those observations.
+        conflict: "" when nothing disagrees with the verdict. "anomaly"
+            when the strongest observations disagree; "drift" when they
+            disagree and the subject is indexed in more than one version,
+            which explains it. "overruled" when only weaker observations
+            disagree with the verdict.
+        held: Families whose refutation was held under the Lakatosian
+            regime. Two or more rule out instrument error as the cause,
+            though not an auxiliary assumption being the one at fault.
+        support_out_of_scope: Something short of the claim was confirmed (a
+            part, a consequence, its subject) and nothing decisive
+            confirmed the claim itself.
+        ruled_by: The instruments whose observations decided.
+    """
+
+    verdict: Optional[bool] = None
+    level: int = 0
+    families: Tuple[str, ...] = ()
+    conflict: str = ""
+    held: int = 0
+    support_out_of_scope: bool = False
+    ruled_by: Tuple[str, ...] = ()
+
+    @property
+    def corroborated(self) -> bool:
+        """True when two or more independent observations back a verdict."""
+        return self.verdict is not None and self.level >= 2
+
+    def differs_from(self, verification: str) -> bool:
+        """
+        Whether the ruling decides otherwise than the pipeline did.
+
+        Args:
+            verification: The claim's working verdict (LedgerClaim).
+
+        Returns:
+            True when the ruling's verdict is not the one "confirmed" or
+            "refuted" stands for, counting any other value as undecided.
+        """
+        _current = {"confirmed": True, "refuted": False}.get(verification or "")
+        return self.verdict is not _current
+
+
+class EvidenceTriangulation:
+    """
+    Rules on what several instruments said about one claim.
+
+    Pure: it reads EvidenceObservations and returns a TriangulationRuling,
+    and never writes a verdict. Three questions, in order:
+
+    1. Is the observation about the claim? Only a verdict on the claim
+       itself confirms; a part or a derived consequence can only refute,
+       and a run of the subject does neither (EvidenceScope).
+    2. Was the instrument trustworthy where it ruled? A Popperian verdict
+       decides on its own. A Lakatosian refutation is held. Lakatosian
+       confirmations decide only when two independent ones converge, which
+       is what agreement can do where hard evidence is missing.
+    3. Do the strongest agree? Strength is scope first and regime second;
+       when the strongest disagree the result is an anomaly, never a
+       majority.
+
+    independent() is the one definition of independence; every count of
+    corroboration goes through it.
+    """
+
+    # Scopes at which a verdict can decide, strongest first. A refutation
+    # may come from any of them; a confirmation only from the first.
+    _SCOPE_STRENGTH = {
+        EvidenceScope.PROPOSITION: 0,
+        EvidenceScope.COMPONENT: 1,
+        EvidenceScope.CONSEQUENCE: 2,
+    }
+
+    @staticmethod
+    def independent(a: EvidenceObservation, b: EvidenceObservation) -> bool:
+        """
+        Whether two observations can be wrong for different reasons.
+
+        Args:
+            a: One observation.
+            b: Another.
+
+        Returns:
+            True when they come from different families.
+        """
+        return a.family is not b.family
+
+    @classmethod
+    def _independent_subset(
+        cls, observations: List[EvidenceObservation]
+    ) -> List[EvidenceObservation]:
+        """The observations that remain once each dependent one is dropped."""
+        _kept: List[EvidenceObservation] = []
+        for _o in observations:
+            if all(cls.independent(_o, _k) for _k in _kept):
+                _kept.append(_o)
+        return _kept
+
+    @staticmethod
+    def execution_scope(
+        observations: List[EvidenceObservation],
+    ) -> Optional[EvidenceScope]:
+        """
+        How close to the claim a passing sandbox run came.
+
+        Args:
+            observations: The claim's observations.
+
+        Returns:
+            The nearest EvidenceScope among passing executions, or None
+            when nothing ran and passed.
+        """
+        _order = list(EvidenceScope)
+        _scopes = [
+            _o.scope
+            for _o in observations
+            if _o.family is EvidenceFamily.EXECUTION and _o.verdict is True
+        ]
+        return min(_scopes, key=_order.index) if _scopes else None
+
+    @classmethod
+    def _bears_against(cls, observation: EvidenceObservation, verdict: bool) -> bool:
+        """
+        Whether an observation, taken at its word, contradicts a verdict.
+
+        A refutation of anything the claim entails contradicts True. Only a
+        confirmation of the claim itself contradicts False: a part that
+        holds says nothing against a whole that does not.
+        """
+        if observation.verdict is None or observation.verdict is verdict:
+            return False
+        if observation.verdict is False:
+            return observation.scope in cls._SCOPE_STRENGTH
+        return observation.scope is EvidenceScope.PROPOSITION
+
+    @classmethod
+    def rule(
+        cls,
+        observations: List[EvidenceObservation],
+        version_drift: bool = False,
+    ) -> TriangulationRuling:
+        """
+        Rule on one claim from everything observed about it.
+
+        Args:
+            observations: The claim's observations (LedgerClaim.observations).
+            version_drift: True when the claim's subject is indexed in more
+                than one version, so instruments may have read different
+                code.
+
+        Returns:
+            The ruling.
+        """
+        _popper = EpistemicRegime.POPPERIAN_FALSIFICATION
+        # ── Step 1: abstentions never count ──
+        _decided = [_o for _o in observations if _o.verdict is not None]
+
+        # ── Step 2: what may decide, with its strength ──
+        _decisive: List[Tuple[Tuple[int, int], EvidenceObservation]] = []
+        for _o in _decided:
+            if _o.regime is not _popper:
+                continue
+            if _o.scope is EvidenceScope.PROPOSITION or (
+                _o.verdict is False and _o.scope in cls._SCOPE_STRENGTH
+            ):
+                _decisive.append(((cls._SCOPE_STRENGTH[_o.scope], 0), _o))
+        _converging = [
+            _o
+            for _o in _decided
+            if _o.regime is not _popper
+            and _o.verdict is True
+            and _o.scope is EvidenceScope.PROPOSITION
+        ]
+        if len(cls._independent_subset(_converging)) >= 2:
+            _decisive.extend(((0, 1), _o) for _o in _converging)
+        _held = len(
+            cls._independent_subset(
+                [
+                    _o
+                    for _o in _decided
+                    if _o.regime is not _popper and _o.verdict is False
+                ]
+            )
+        )
+        _short = any(
+            _o.verdict is True and _o.scope is not EvidenceScope.PROPOSITION
+            for _o in _decided
+        ) and not any(_o.verdict is True for _, _o in _decisive)
+        if not _decisive:
+            return TriangulationRuling(held=_held, support_out_of_scope=_short)
+
+        # ── Step 3: the strongest decide, or disagree ──
+        _best = min(_s for _s, _ in _decisive)
+        _top = [_o for _s, _o in _decisive if _s == _best]
+        _ruled_by = tuple(dict.fromkeys(_o.instrument for _o in _top))
+        if len({_o.verdict for _o in _top}) > 1:
+            return TriangulationRuling(
+                conflict="drift" if version_drift else "anomaly",
+                held=_held,
+                support_out_of_scope=_short,
+                ruled_by=_ruled_by,
+            )
+        _verdict = bool(_top[0].verdict)
+        _backing = cls._independent_subset(
+            [_o for _, _o in _decisive if _o.verdict is _verdict]
+        )
+        return TriangulationRuling(
+            verdict=_verdict,
+            level=len(_backing),
+            families=tuple(sorted(_o.family.value for _o in _backing)),
+            conflict=(
+                "overruled"
+                if any(cls._bears_against(_o, _verdict) for _o in _decided)
+                else ""
+            ),
+            held=_held,
+            support_out_of_scope=_short,
+            ruled_by=_ruled_by,
+        )
+
 
 class MetacognitiveReasoningEngine:
     """
@@ -39913,23 +43222,22 @@ class MetacognitiveReasoningEngine:
     and provides epistemic tools that reasoning methods can use.
 
     Temporal hierarchy (H5):
-    ┌─ ITERATION LEVEL (PID/OODA) ──────────────────────────────────────┐
-    │  stagnation_detection on obj_score_history (deterministic)         │
-    │  _build_refinement_constraints (PID output → LLM input)            │
-    │  _generate_divergent_hypotheses (escape from local optima)         │
+    ┌─ CYCLE LEVEL (one hypothesis, HypothesisForge) ────────────────────┐
+    │  _forge_hypothesis: investigate → experiment → analysis            │
+    │  ProtectiveBelt.sparse_sampling_ruling → _forge_verdict            │
     └────────────────────────────────────────────────────────────────────┘
-    ┌─ TURN LEVEL (Scientific method + Active Learning) ─────────────────┐
-    │  design_critical_experiment → generate_predictions                  │
-    │  gather_evidence → Active Learning → is_falsified                   │
-    │  compute_weighted_score → _compute_epistemic_uncertainty            │
+    ┌─ TURN LEVEL (scientific method) ───────────────────────────────────┐
+    │  _forge_all → _judge_dossiers (ranking, crucis, null bar)          │
+    │  reinforcement: design_critical_experiment → gather_evidence →     │
+    │  _compute_effective_coverage → is_falsified                        │
     └────────────────────────────────────────────────────────────────────┘
     ┌─ CONVERSATION LEVEL (Dialectical — H6) ────────────────────────────┐
-    │  experimentum_crucis (tiebreaker)                                   │
-    │  peer_review (antithesis) BEFORE delimit_scope (synthesis)          │
+    │  find_experimentum_crucis (tiebreaker)                              │
+    │  peer_review_hypothesis BEFORE delimit_scope (synthesis)            │
     └────────────────────────────────────────────────────────────────────┘
-    ┌─ PROJECT LEVEL (Bayesian — H5) ────────────────────────────────────┐
-    │  _debrief_competition → _performance_history                        │
-    │  _get_adaptive_strategy → constraints for next competition          │
+    ┌─ PROJECT LEVEL (rates over the competition history — H5) ──────────┐
+    │  _record_serial_competition → competition_history                   │
+    │  _get_adaptive_strategy → constraints for the next competition      │
     └────────────────────────────────────────────────────────────────────┘
 
     Key epistemic principle:
@@ -40014,8 +43322,8 @@ class MetacognitiveReasoningEngine:
         Migrated from ActivationEngine._gather_static_evidence.
         No LLM. No GPU. Instant.
 
-        Called N × M times per competition turn (N hypotheses × M iterations +
-        Active Learning re-gathers). Must be fully side-effect free.
+        Called N × M times per competition turn (N hypotheses × M
+        iterations). Must be fully side-effect free.
         mark_stale_for_symbol intentionally omitted — path staleness is
         managed by the main activation pipeline, not by evidence gathering.
         """
@@ -40148,11 +43456,11 @@ class MetacognitiveReasoningEngine:
         Abstentions do not count, whatever label they carry.
 
         Why this exists: coverage is the engine's own estimate of how much
-        of a hypothesis it managed to inspect, and it drives five separate
-        mechanisms — the falsification coverage guard, the combined-score
-        penalty, half the weight of _compute_epistemic_uncertainty, the
-        honest-abstention floor, and the project debrief. All five were
-        being fed the classifier's self-report. Live (16-jul 19:33): a
+        of a hypothesis it managed to inspect, and it decides the regime of
+        a refuted critical claim: is_falsified's coverage guard
+        (EpistemicRegime.for_coverage). When this was written it drove four
+        other mechanisms as well, since removed, and all five were being
+        fed the classifier's self-report. Live (16-jul 19:33): a
         design of 12 critical / 0 supportive / 0 unknown reported
         coverage 1.00 — "everything is checkable" — while every one of
         those 12 claims abstained. Real coverage was 0.00. The engine
@@ -40162,8 +43470,7 @@ class MetacognitiveReasoningEngine:
 
         Unknown claims stay in the denominator and out of the numerator:
         they are part of what the hypothesis asserted and part of what was
-        not checked. Only critical and supportive claims are resolved,
-        matching exactly the set compute_weighted_score scores.
+        not checked. Only critical and supportive claims are resolved.
 
         Returns (coverage, n_resolved, n_total).
         """
@@ -40484,7 +43791,7 @@ class MetacognitiveReasoningEngine:
                     relation. Callers must treat None as ABSTENTION, not
                     confirmation. The previous contract returned True for
                     unverifiable claims ("benefit of the doubt"), and
-                    compute_weighted_score counted that True at full
+                    compute_weighted_score (since removed) counted that True at full
                     critical weight (10x) — which, combined with design
                     claims being routinely MORE SPECIFIC than the
                     hypothesis whose evidence they were matched against
@@ -40666,12 +43973,16 @@ class MetacognitiveReasoningEngine:
             verified a small fraction of the hypothesis's claims.
             A failed critical claim may reflect incomplete sampling,
             not a true structural contradiction.
-            In this case: returns (False, reason) — caller applies
-            a penalty via compute_weighted_score instead of killing.
+            In this case: returns (False, reason), the Lakatosian regime
+            (EpistemicRegime.for_coverage): the refutation is held, not
+            final. The caller keeps it as a held anomaly rather than a
+            refuted claim (AgenticOrchestrator._reinforce_step reports
+            it; the forge's own version of the rule is
+            ProtectiveBelt.sparse_sampling_ruling).
 
         With sufficient coverage AND design:
             ANY critical claim False → immediate hard kill.
-            Supportive claim failures → score penalty only.
+            Supportive claim failures never kill, and nothing scores them.
 
         Without design (fallback — enable_experiment_design=False):
             Symmetric ratio > 0.5 → falsified.
@@ -40745,7 +44056,7 @@ class MetacognitiveReasoningEngine:
     # ═══════════════════════════════════════════════════════════════════════
 
     # ═══════════════════════════════════════════════════════════════════════
-    # 3. Active Learning (H4)
+    # 3. Contract checks (deterministic, from the AST of expanded bodies)
     # ═══════════════════════════════════════════════════════════════════════
 
     # A bound call (self.X(...)) injects the instance as the first
@@ -40927,7 +44238,7 @@ class EpistemicStrategies:
 
         Classifies each structural claim as:
             CRITICAL   — hard kill if false (sine qua non)
-            SUPPORTIVE — score penalty only if false
+            SUPPORTIVE — recorded if false, never kills
             UNKNOWN    — not directly verifiable in SymbolGraph
 
         The evidence argument is what makes the classification honest.
@@ -41749,6 +45060,275 @@ class TestedCode:
         return ""
 
 
+class BayesianRanking:
+    """
+    Weigh the forge's surviving rivals by how surprising their evidence is.
+
+    The Lakatosian side of the judgment, quantified. Popper already ran:
+    a rival the index refuted where it is reliable is dead before this is
+    consulted. What remains are rivals the hard evidence did not separate,
+    and Layer 1 ranks them by corroboration, which counts how much real
+    code a hypothesis names. That rewards the mechanism's skeleton, true
+    whatever the cause turns out to be. Here each decided consequence is
+    weighed by its likelihood ratio instead: a fact almost every claim of
+    its kind turns out to have carries almost no weight, a risky one that
+    held carries a lot, and a refutation counts against.
+
+    Every fact is a consequence the forge or the crucis derived and an
+    instrument decided (graph, AST contract checker, quote-checked evidence
+    judge). Abstentions are not facts. Nothing here asks the model
+    anything, and nothing here changes a decision while
+    valves.bayes_shadow is the only switch on: the ranking is recorded
+    beside Layer 1's and compared with the operator's labels.
+    """
+
+    # The kinds a fact is sorted into, each with its own base rate: which
+    # instrument decided it, and for the graph whether it was a relation.
+    KINDS = ("graph_relation", "graph_symbol", "contract", "judge")
+    # How each kind's instrument fails (EvidenceFamily). The graph and the
+    # AST contract checker are both static analysis, blind to the same
+    # run-time hand-overs; only the judge reads the body as a reader does.
+    FAMILY_OF_KIND = {
+        "graph_relation": EvidenceFamily.STATIC_ANALYSIS,
+        "graph_symbol": EvidenceFamily.STATIC_ANALYSIS,
+        "contract": EvidenceFamily.STATIC_ANALYSIS,
+        "judge": EvidenceFamily.QUOTED_READING,
+    }
+
+    @staticmethod
+    def fact_kind(claim: str, instrument: str) -> str:
+        """
+        The kind a decided consequence belongs to, from how it was decided.
+
+        Deterministic: the instrument is known where the verdict was taken,
+        and for a graph verdict the claim's own wording says whether it
+        asserted a call relation (the same patterns the forge and the
+        ledger match relations with).
+
+        Args:
+            claim: The consequence as derived.
+            instrument: "graph", "contract" or "judge".
+
+        Returns:
+            One of BayesianRanking.KINDS.
+        """
+        if instrument in ("contract", "judge"):
+            return instrument
+        if _RELATION_CALL_RE.search(claim or "") or _RELATION_NEG_RE.search(
+            claim or ""
+        ):
+            return "graph_relation"
+        return "graph_symbol"
+
+    @staticmethod
+    def note_fact(
+        dossier: "HypothesisDossier", claim: str, instrument: str, verdict: bool
+    ) -> bool:
+        """
+        Record one decided consequence on the dossier that asserted it.
+
+        Each fact counts once: a consequence restated in a later cycle, or
+        derived twice in one, is the same evidence, and counting it again
+        would multiply its likelihood ratio by itself. Restatements are
+        recognised by the forge's own normalisation (_prediction_key); the
+        first verdict stands. Capped at _DOSSIER_FACTS_MAX, so the dossier
+        stays small enough to persist whole.
+
+        A restatement decided by an instrument of another family
+        (FAMILY_OF_KIND) is not evidence again, but it is a second
+        observation of the same consequence: the first fact counts it
+        under "agree" or "disagree", and its verdict is left alone.
+
+        Args:
+            dossier: The dossier whose hypothesis derived the consequence.
+            claim: The consequence as derived.
+            instrument: "graph", "contract" or "judge".
+            verdict: What the instrument ruled.
+
+        Returns:
+            True when the fact was recorded, False when it was a repeat or
+            the cap was reached.
+        """
+        # ── Step 1: a restatement is counted on the first fact, not kept ──
+        _key = _prediction_key(claim)
+        if not _key:
+            return False
+        _kind = BayesianRanking.fact_kind(claim, instrument)
+        _first = next((_f for _f in dossier.facts if _f.get("key") == _key), None)
+        if _first is not None:
+            _fam = BayesianRanking.FAMILY_OF_KIND
+            if _fam.get(str(_first.get("kind", ""))) is not _fam.get(_kind):
+                _same = bool(_first.get("verdict")) == bool(verdict)
+                _slot = "agree" if _same else "disagree"
+                _first[_slot] = int(_first.get(_slot, 0)) + 1
+            return False
+        # ── Step 2: a new fact, while there is room ──
+        if len(dossier.facts) >= _DOSSIER_FACTS_MAX:
+            return False
+        dossier.facts.append({"key": _key, "kind": _kind, "verdict": bool(verdict)})
+        return True
+
+    # Base rates and accuracies are kept off 0 and 1: either end makes one
+    # verdict infinitely informative, which no instrument here is.
+    _P_FLOOR = 0.01
+    _P_CEIL = 0.99
+
+    @staticmethod
+    def base_rate(
+        project: Tuple[int, int], everywhere: Tuple[int, int], shrinkage: float
+    ) -> float:
+        """
+        How often a fact of one kind turns out true, for one project.
+
+        b in the likelihood ratio: the chance a consequence of this kind
+        holds whoever asserted it. Estimated from the facts recorded before
+        the turn being ranked, never from the facts being weighed. The
+        global rate is Beta(1, 1) smoothed; the project's is pulled toward
+        it by `shrinkage` pseudo-observations, so a project with few facts
+        of a kind borrows the global rate and one with many uses its own.
+
+        Args:
+            project: (true, total) facts of this kind in the project.
+            everywhere: (true, total) facts of this kind in all projects.
+            shrinkage: Pseudo-observations the global rate counts as.
+
+        Returns:
+            The base rate, kept within [_P_FLOOR, _P_CEIL].
+        """
+        _g = (everywhere[0] + 1.0) / (everywhere[1] + 2.0)
+        _den = project[1] + max(0.0, shrinkage)
+        _b = (project[0] + max(0.0, shrinkage) * _g) / _den if _den > 0 else _g
+        return min(BayesianRanking._P_CEIL, max(BayesianRanking._P_FLOOR, _b))
+
+    @staticmethod
+    def likelihood_ratio(verdict: bool, b: float, d: float, q: float) -> float:
+        """
+        How much one decided consequence favours the hypothesis that derived it.
+
+        If the hypothesis H is true, its consequence holds with probability
+        t_H = d + (1 - d)·b: the derivation was right (d), or it was wrong
+        and the consequence happens to hold anyway (b). If H is false, the
+        consequence is just a claim of its kind: t_notH = b. The instrument
+        reports the truth with probability q. So
+
+            P(verdict | X) = q·t_X + (1 - q)(1 - t_X)   for a "true" verdict
+            LR = P(verdict | H) / P(verdict | not H)
+
+        A consequence nearly every claim of its kind has (b near 1) gives
+        an LR near 1 whichever way it goes: confirming the skeleton of a
+        mechanism tells nothing about its cause. A risky one (b lower)
+        moves the ranking both ways.
+
+        Args:
+            verdict: What the instrument ruled.
+            b: Base rate of the fact's kind.
+            d: Derivation reliability.
+            q: The instrument's accuracy.
+
+        Returns:
+            The likelihood ratio, > 1 for evidence for H, < 1 against.
+        """
+        _lo, _hi = BayesianRanking._P_FLOOR, BayesianRanking._P_CEIL
+        b = min(_hi, max(_lo, b))
+        q = min(_hi, max(0.5, q))
+        d = min(1.0, max(0.0, d))
+        _t_h = d + (1.0 - d) * b
+        _t_n = b
+
+        def _p(t: float) -> float:
+            _true = q * t + (1.0 - q) * (1.0 - t)
+            return _true if verdict else 1.0 - _true
+
+        return _p(_t_h) / _p(_t_n)
+
+    @staticmethod
+    def log_evidence(
+        facts: List[Dict[str, Any]],
+        rates: Dict[str, float],
+        d: float,
+        q_by_kind: Dict[str, float],
+    ) -> float:
+        """
+        The summed log likelihood ratio of a rival's facts.
+
+        Facts are treated as independent, which they are not: one rival's
+        consequences share a derivation and the bodies read for it. For
+        ranking rivals against each other the error falls on all of them
+        alike; for the size of the posterior it does not, which is why the
+        posterior is not reported as a confidence until labels calibrate it.
+
+        Args:
+            facts: The rival's facts, as BayesianRanking.note_fact keeps them.
+            rates: Base rate per kind.
+            d: Derivation reliability.
+            q_by_kind: Instrument accuracy per kind.
+
+        Returns:
+            Sum of log LR; 0.0 for a rival with no facts.
+        """
+        _total = 0.0
+        for _f in facts or []:
+            _kind = str(_f.get("kind", ""))
+            _total += math.log(
+                BayesianRanking.likelihood_ratio(
+                    bool(_f.get("verdict")),
+                    rates.get(_kind, 0.5),
+                    d,
+                    q_by_kind.get(_kind, 0.8),
+                )
+            )
+        return _total
+
+    @staticmethod
+    def none_prior_weight(
+        labelled: int, none_right: int, rivals: int, min_labels: int
+    ) -> float:
+        """
+        The prior weight of "none of the rivals is right", next to 1 per rival.
+
+        Taken from the operator's labels once there are enough: the share
+        of labelled competitions where no rival was right (H0), Beta(1, 1)
+        smoothed, turned into a weight against `rivals` rivals of weight 1
+        each. With fewer than `min_labels`, it weighs as one more rival.
+
+        Args:
+            labelled: Labelled competitions with the right rival stated.
+            none_right: Of those, how many had none right.
+            rivals: Rivals in the competition being ranked.
+            min_labels: Labels needed before the observed share is used.
+
+        Returns:
+            The weight, > 0.
+        """
+        if labelled < min_labels or rivals <= 0:
+            return 1.0
+        _p0 = (none_right + 1.0) / (labelled + 2.0)
+        return _p0 * rivals / (1.0 - _p0)
+
+    @staticmethod
+    def posterior(log_evidence: List[float], none_weight: float) -> Tuple[List[float], float]:
+        """
+        Posterior of each rival and of "none is right", from their evidence.
+
+        Each rival has prior weight 1, "none" has `none_weight`, and "none"
+        asserts nothing, so its likelihood ratio is 1. Computed in log
+        space against the largest term, so a rival with a long run of
+        strong evidence does not overflow.
+
+        Args:
+            log_evidence: Each rival's summed log LR, in rival order.
+            none_weight: The prior weight of "none".
+
+        Returns:
+            (posterior per rival, posterior of none); they sum to 1.
+        """
+        _terms = list(log_evidence) + [math.log(max(none_weight, 1e-12))]
+        _top = max(_terms)
+        _w = [math.exp(_t - _top) for _t in _terms]
+        _z = sum(_w)
+        return [_x / _z for _x in _w[:-1]], _w[-1] / _z
+
+
 class HypothesisForge:
     """Forge competing explanations, judge them, and remember the dead ones.
 
@@ -41882,9 +45462,27 @@ class HypothesisForge:
         cov_threshold: float,
         rungs_walked: int = 99,
         min_rungs: int = 1,
+        refutation_held: bool = False,
+        decided_before: int = 0,
     ) -> Tuple[str, str]:
         """
         Deterministic forge verdict for one completed cycle.
+
+        decided_before: consequences the index decided in this
+        hypothesis's EARLIER cycles. The counts above are this cycle's
+        alone, and "unfounded" used to read them alone too, so a
+        hypothesis that confirmed something on cycle 1 and decided
+        nothing on cycle 2 was buried as having no foundation. Lack of
+        foundation is a property of the iterations, as the gate's own
+        comment says; this is what lets it be judged over them. Defaults
+        to 0, the verdict as it was.
+
+        refutation_held: the protective belt absorbed this cycle's
+        refutations (ProtectiveBelt.sparse_sampling_ruling returned
+        "absorb"), so they do not kill here. They still count as decided
+        facts: a held cycle is not an empty one, and at the end of the
+        iterations it seals plausible rather than unfounded. Defaults to
+        False, which is the verdict as it always was.
 
         Returns (verdict, cause): verdict is 'dead' | 'plausible' |
         'continue'. Pure function of measured facts — model confidence
@@ -41912,7 +45510,7 @@ class HypothesisForge:
         # Region: kill gates — facts AGAINST the hypothesis kill on
         # any cycle (refutation is evidence, not absence of it)
         resolvable = confirmed + refuted
-        if refuted >= 2 or (refuted >= 1 and confirmed == 0):
+        if not refutation_held and (refuted >= 2 or (refuted >= 1 and confirmed == 0)):
             return "dead", "falsified"
         # Region: maturity (facts for the hypothesis) — enough
         # confirmations, over enough of the tree. A hypothesis that
@@ -41936,7 +45534,7 @@ class HypothesisForge:
         _budget_end = cycles_max > 0 and cycle >= cycles_max
         _stalled = resolvable <= resolvable_prev
         if _budget_end or _stalled:
-            if resolvable == 0:
+            if resolvable + max(0, decided_before) == 0:
                 return "dead", "unfounded"
             return (
                 "plausible",
@@ -42299,6 +45897,70 @@ class HypothesisForge:
             _promote("callers")
         return _order[0]
 
+    def _rule_sparse_refutation(
+        self,
+        dossier: "HypothesisDossier",
+        hyp_text: str,
+        confirmed: int,
+        refuted: int,
+        total: int,
+        cycle: int,
+    ) -> Tuple[bool, str]:
+        """
+        Let the protective belt rule on one forge cycle before its verdict.
+
+        The forge used to kill on a refutation whatever share of the
+        cycle's consequences the index could decide, which is the
+        Popperian regime applied where EpistemicRegime.for_coverage says
+        the Lakatosian one rules. This hands the cycle to
+        ProtectiveBelt.sparse_sampling_ruling and records what it decided
+        on the dossier: the standing, and the assumption and prediction an
+        absorbed refutation is held to. Gated by
+        valves.forge_belt_for_sparse_refutation; off, it returns
+        (False, "none") and the forge is what it was.
+
+        Args:
+            dossier: The dossier being forged; its belt fields are updated.
+            hyp_text: The hypothesis, for the auxiliary's record.
+            confirmed: Consequences confirmed this cycle.
+            refuted: Consequences refuted this cycle.
+            total: Consequences derived this cycle.
+            cycle: The cycle number, for the log.
+
+        Returns:
+            (whether this cycle's refutation is held, the ruling's action).
+        """
+        # ── Step 1: only when the regime is switched on ──
+        if not getattr(self._f.valves, "forge_belt_for_sparse_refutation", False):
+            return False, "none"
+        _min_cov = float(
+            getattr(self._f.valves, "min_coverage_for_falsification", 0.3) or 0.0
+        )
+        # ── Step 2: the belt's ruling, and the dossier's record of it ──
+        _before = dossier.belt_standing
+        _after, _action = ProtectiveBelt.sparse_sampling_ruling(
+            _before, refuted, dossier.coverage_score, _min_cov
+        )
+        dossier.belt_standing = _after
+        if _action == "absorb":
+            _aux = ProtectiveBelt.propose_sparse_sampling(
+                hyp_text, confirmed + refuted, total, _min_cov
+            )
+            dossier.belt_note = (
+                f"{_aux.name}: {_aux.assumption}; predicts: {_aux.prediction}"
+            )
+            self._tag_strategy(dossier, "belt:sparse_sampling")
+        # ── Step 3: one line per ruling that did anything ──
+        if _action != "none":
+            self._f._log_debug(
+                f"🛡️ [BELT] sparse_sampling c{cycle}: {_action.upper()} — "
+                f"{refuted} refuted, coverage {dossier.coverage_score:.2f} "
+                f"(min {_min_cov:.2f}), standing "
+                f"{(_before or 'unused')} → {(_after or 'unused')} "
+                f"'{hyp_text[:50]}'"
+            )
+        return _action == "absorb", _action
+
     async def _forge_hypothesis(
         self,
         question: str,
@@ -42379,6 +46041,9 @@ class HypothesisForge:
         _deduced: List[str] = []
         _deduced_once = False
         _resolvable_prev = -1
+        # Consequences decided over the cycles already run, so that "no
+        # foundation" is judged on the hypothesis and not on its last cycle.
+        _decided_before = 0
         _cycles_max = int(self._f.valves.agentic_serial_cycles_max)
         _eff_c = getattr(self._f, "_agentic_effort_override", None)
         if _eff_c and len(_eff_c) > 1 and _eff_c[1] > 0:
@@ -42765,6 +46430,7 @@ class HypothesisForge:
             _undecided_idx: List[int] = []
             for _c in _claims:
                 _v = self._f._meta_reasoning._claim_verified(_c, evidence, project_id)
+                _decided_by = "graph"
                 if _v is not None:
                     _by_graph += 1
                 # S12: the graph abstained — a contract claim may
@@ -42777,6 +46443,7 @@ class HypothesisForge:
                     )
                     if _v is not None:
                         _by_contract += 1
+                        _decided_by = "contract"
                         # Tagged only on a real verdict: the contract
                         # checker ran on every abstention, but it only
                         # CONTRIBUTED when it settled one.
@@ -42792,6 +46459,8 @@ class HypothesisForge:
                 if _v is None:
                     _undecided_idx.append(len(_undecided_txt))
                     _undecided_txt.append(_c)
+                if _v is not None:
+                    BayesianRanking.note_fact(_dossier, _c, _decided_by, _v)
                 if _v is True:
                     _conf_n += 1
                     _predictions_corroborated.add(_prediction_key(_c))
@@ -42799,6 +46468,10 @@ class HypothesisForge:
                         _dossier.confirmed_claims.append(_c)
                 elif _v is False:
                     _ref_n += 1
+                    if _decided_by == "contract":
+                        _dossier.refuted_by_contract += 1
+                    else:
+                        _dossier.refuted_by_graph += 1
                     _predictions_refuted.add(_prediction_key(_c))
                     if len(_dossier.refuted_claims) < 8:
                         _dossier.refuted_claims.append(_c)
@@ -42835,6 +46508,8 @@ class HypothesisForge:
                     _rulings = [None] * len(_undecided_txt)
                 _ev_conf = _ev_ref = 0
                 for _txt, _r in zip(_undecided_txt, _rulings):
+                    if _r is not None:
+                        BayesianRanking.note_fact(_dossier, _txt, "judge", _r)
                     if _r is True:
                         _conf_n += 1
                         _ev_conf += 1
@@ -42846,6 +46521,7 @@ class HypothesisForge:
                     elif _r is False:
                         _ref_n += 1
                         _ev_ref += 1
+                        _dossier.refuted_by_judge += 1
                         _predictions_refuted.add(_prediction_key(_txt))
                         if len(_dossier.refuted_claims) < 8:
                             _dossier.refuted_claims.append(_txt)
@@ -43003,6 +46679,26 @@ class HypothesisForge:
                 _touched.add(_b2)
             _dossier.anchors_touched = len(_touched & _anchors)
             # ── Step 7: the deterministic verdict ──
+            # The belt rules first, because it decides whether this cycle's
+            # refutation may kill at all (EpistemicRegime.for_coverage). Off,
+            # nothing is held and the verdict is the Popperian one it always
+            # was.
+            _held, _belt_action = self._rule_sparse_refutation(
+                _dossier, hyp_text, _conf_n, _ref_n, _total, _cycle
+            )
+            _belt_line = {
+                "absorb": "refutation held — the sample is too small to kill "
+                "(auxiliary: sparse sampling, to be tested next cycle)",
+                "corroborate": "auxiliary corroborated — the wider sample "
+                "did not refute (progressive)",
+                "refute": "auxiliary failed — the wider sample refutes too",
+                "degenerate": "refuted again on a small sample — the "
+                "programme degenerates",
+            }.get(_belt_action)
+            if _belt_line:
+                await self._f._emit_status(
+                    f"🛡️ Lakatos belt · cycle {_cycle}: {_belt_line}"
+                )
             _verdict, _cause = self._forge_verdict(
                 confirmed=_conf_n,
                 refuted=_ref_n,
@@ -43020,7 +46716,45 @@ class HypothesisForge:
                     }
                 ),
                 min_rungs=int(self._f.valves.agentic_serial_maturity_min_rungs),
+                refutation_held=_held,
+                decided_before=_decided_before,
             )
+            # Whether the earlier cycles' facts are what kept this one from
+            # "unfounded": the same verdict without them, for the metrics.
+            if (
+                _decided_before > 0
+                and _verdict != "dead"
+                and self._forge_verdict(
+                    confirmed=_conf_n,
+                    refuted=_ref_n,
+                    resolvable_prev=_resolvable_prev,
+                    coverage=_dossier.coverage_score,
+                    cycle=_cycle,
+                    cycles_max=_cycles_max,
+                    maturity_need=_need,
+                    cov_threshold=_cov_thr,
+                    rungs_walked=len(
+                        {
+                            t.split(":", 1)[1]
+                            for t in _dossier.strategy_trace
+                            if t.startswith("investigate:")
+                        }
+                    ),
+                    min_rungs=int(self._f.valves.agentic_serial_maturity_min_rungs),
+                    refutation_held=_held,
+                )
+                == ("dead", "unfounded")
+            ):
+                _dossier.foundation_rescued = True
+            _decided_before += _conf_n + _ref_n
+            # The adjustment's own test can end the hypothesis where the
+            # verdict alone would not: a cycle that read enough and still
+            # refuted (the prediction failed), or a second refutation on a
+            # small sample (the belt reached for twice).
+            if _belt_action == "refute":
+                _verdict, _cause = "dead", "falsified"
+            elif _belt_action == "degenerate":
+                _verdict, _cause = "dead", "degenerating"
             # Rung tags key internally as 'investigate:callers';
             # the reader sees 'investigated callers'. Other tags
             # already read as plain names and pass through.
@@ -43778,6 +47512,7 @@ class HypothesisForge:
         # ── Step 1: deterministic ranking (Layer 1) ──
         _pool = [d for d in dossiers if d.status == "plausible"]
         if not _pool:
+            self._l1_eligible = []
             return None, "no plausible dossiers"
         _pool.sort(
             key=lambda d: (
@@ -43790,6 +47525,10 @@ class HypothesisForge:
         # Where Layer 1 put each rival, for the per-rival record
         # (_record_rivals): later layers reorder nothing, they only remove.
         self._l1_ranks = {id(d): n for n, d in enumerate(_pool, 1)}
+        # The rivals allowed to win, for the Bayesian shadow, which must rank
+        # exactly the pool Layer 1 ranked (_rank_bayesian_shadow). Narrowed
+        # below with the pool itself; empty when no rival is eligible.
+        self._l1_eligible = [id(d) for d in _pool]
         # ── Step 1b: a rival its own analysis did not establish cannot win ──
         # Corroboration counts the consequences the graph confirmed, mostly
         # the mechanism's skeleton (the named code exists and calls what it
@@ -43800,25 +47539,50 @@ class HypothesisForge:
         # left there is no winner (the null bar's honest terminal). A rival
         # whose analysis gave no verdict is judged as before.
         _verdicts = {id(d): _analysis_verdict(d.analysis) for d in _pool}
-        _held = [d for d in _pool if _verdicts[id(d)] in ("not_established", "refuted")]
+        # A rival the protective belt is still holding cannot win either: one
+        # of its refutations was set aside on too small a sample, and no later
+        # cycle read enough to show the refutation would not recur
+        # (ProtectiveBelt.sparse_sampling_ruling). It stays a survivor.
+        _belt_pending = AuxiliaryStanding.UNTESTED.value
+        _on_belt = {id(d) for d in _pool if d.belt_standing == _belt_pending}
+        _held = [
+            d
+            for d in _pool
+            if _verdicts[id(d)] in ("not_established", "refuted") or id(d) in _on_belt
+        ]
         if _held:
             _held_ids = {id(d) for d in _held}
             self._f._log_debug(
                 f"judge: {len(_held)} of {len(_pool)} rival(s) not eligible "
-                f"to win — their own analysis concluded "
+                f"to win — "
                 + ", ".join(
-                    f"{_verdicts[id(d)].replace('_', ' ')} ('{d.hypothesis[:40]}')"
+                    (
+                        "anomaly held by the belt, untested"
+                        if id(d) in _on_belt
+                        else f"own analysis: {_verdicts[id(d)].replace('_', ' ')}"
+                    )
+                    + f" ('{d.hypothesis[:40]}')"
                     for d in _held
                 )
             )
             _eligible = [d for d in _pool if id(d) not in _held_ids]
             if not _eligible:
-                _n_ref = sum(1 for d in _held if _verdicts[id(d)] == "refuted")
-                _note = (
-                    f"no winner: no rival's own analysis established its "
-                    f"cause ({len(_held) - _n_ref} not established, "
-                    f"{_n_ref} refuted)"
-                )
+                _n_belt = sum(1 for d in _held if id(d) in _on_belt)
+                _by_analysis = [d for d in _held if id(d) not in _on_belt]
+                _n_ref = sum(1 for d in _by_analysis if _verdicts[id(d)] == "refuted")
+                _reasons = []
+                if _by_analysis:
+                    _reasons.append(
+                        f"{len(_by_analysis) - _n_ref} whose own analysis did not "
+                        f"establish its cause, {_n_ref} whose analysis refuted it"
+                    )
+                if _n_belt:
+                    _reasons.append(
+                        f"{_n_belt} whose refutation on a small sample was never "
+                        f"tested by a cycle that read enough"
+                    )
+                _note = "no winner: no rival is eligible (" + "; ".join(_reasons) + ")"
+                self._l1_eligible = []
                 _plan_items = [c for c in _pool[0].unresolved_claims[:3] if c.strip()]
                 if _plan_items:
                     _note += (
@@ -43827,6 +47591,7 @@ class HypothesisForge:
                     )
                 return None, _note
             _pool = _eligible
+            self._l1_eligible = [id(d) for d in _pool]
         _eps = float(getattr(self._f.valves, "agentic_parsimony_epsilon", 0.05))
         _top = _pool[0].corroboration
         _tied = [d for d in _pool if _top - d.corroboration <= _eps]
@@ -43901,6 +47666,14 @@ class HypothesisForge:
                 break
             _loser = _b if (_v is (_fav == _CRUCIS_FIRST)) else _a
             _winner_of_round = _a if _loser is _b else _b
+            # The crucis claim is the most discriminating fact the run
+            # produces: one rival asserted it, the other its negation. Each
+            # keeps it as evidence for the Bayesian ranking, which weighs
+            # rather than eliminates.
+            _favoured = _a if _fav == _CRUCIS_FIRST else _b
+            _other = _b if _favoured is _a else _a
+            BayesianRanking.note_fact(_favoured, _claim, "graph", bool(_v))
+            BayesianRanking.note_fact(_other, f"not: {_claim}", "graph", not _v)
             _crucis_log.append(
                 f"round {_round}: '{_claim[:60]}' → "
                 f"{'TRUE' if _v else 'FALSE'} — eliminated "
@@ -44209,6 +47982,192 @@ class HypothesisForge:
                     )
         return _winner, _note
 
+    def _bayes_priors(
+        self, project_id: str, before: float, rivals: int
+    ) -> Tuple[Dict[str, float], List[str], float]:
+        """
+        What the Bayesian shadow needs from history: base rates and the none prior.
+
+        Base rates come from facts recorded before the turn being ranked,
+        so the facts being weighed never set their own rate. The prior of
+        "none" comes from the labelled competitions before it, in any
+        project: how often the operator said no rival was right is a
+        property of the forge, and per project there would be too few
+        labels.
+
+        Args:
+            project_id: Current project identifier.
+            before: The turn being ranked; only earlier facts count.
+            rivals: How many rivals are being ranked.
+
+        Returns:
+            (base rate per kind, kinds still under bayes_warm_min facts,
+            prior weight of "none").
+        """
+        _v = self._f.valves
+        _shrink = float(getattr(_v, "bayes_shrinkage", 10.0))
+        _warm = int(getattr(_v, "bayes_warm_min", 30))
+        _conn = self._f._db_conn
+        # ── Step 1: counts per kind, here and everywhere ──
+        _here: Dict[str, Tuple[int, int]] = {}
+        _all: Dict[str, Tuple[int, int]] = {}
+        for _pid_filter, _into in ((project_id, _here), (None, _all)):
+            for _kind, _true, _n in _conn.execute(
+                "SELECT kind, SUM(verdict), COUNT(*) FROM metric_forge_facts "
+                "WHERE turn_started < ? AND (? IS NULL OR project_id = ?) "
+                "GROUP BY kind",
+                (before, _pid_filter, _pid_filter),
+            ).fetchall():
+                _into[str(_kind)] = (int(_true or 0), int(_n or 0))
+        # ── Step 2: the rates, and which are still cold ──
+        _rates = {
+            _k: BayesianRanking.base_rate(
+                _here.get(_k, (0, 0)), _all.get(_k, (0, 0)), _shrink
+            )
+            for _k in BayesianRanking.KINDS
+        }
+        _cold = [_k for _k in BayesianRanking.KINDS if _all.get(_k, (0, 0))[1] < _warm]
+        # ── Step 3: the prior of none, from the operator's H0 labels ──
+        # Earlier turns only, like the facts: when /outcomes recomputes a
+        # past competition, its own label must not set its own prior.
+        _row = _conn.execute(
+            "SELECT COUNT(*), SUM(o.correct_rival = 0) FROM metric_outcomes o "
+            "WHERE o.correct_rival >= 0 AND o.turn_started < ? AND EXISTS "
+            "(SELECT 1 FROM metric_forge_rivals r WHERE r.project_id = "
+            "o.project_id AND r.turn_started = o.turn_started)",
+            (before,),
+        ).fetchone()
+        _none_w = BayesianRanking.none_prior_weight(
+            int(_row[0] or 0),
+            int(_row[1] or 0),
+            rivals,
+            int(getattr(_v, "bayes_none_min_labels", 10)),
+        )
+        return _rates, _cold, _none_w
+
+    def _bayes_posterior_for(
+        self,
+        facts_by_rival: List[List[Dict[str, Any]]],
+        project_id: str,
+        before: float,
+        d: Optional[float] = None,
+    ) -> Tuple[List[float], float, List[str]]:
+        """
+        The posterior of each rival, and of "none", from their facts.
+
+        The one computation both readers share: the live shadow
+        (_rank_bayesian_shadow) and the offline recomputation /outcomes runs
+        to test other values of d (CommandRouter._bayes_comparison). Sharing
+        it is what makes the recomputation at the configured d reproduce
+        what the shadow recorded.
+
+        Args:
+            facts_by_rival: Each rival's facts, in rival order.
+            project_id: The project the competition ran in.
+            before: The competition's turn; history is read before it.
+            d: Derivation reliability to use instead of the valve's.
+
+        Returns:
+            (posterior per rival, posterior of none, cold kinds).
+        """
+        _v = self._f.valves
+        _rates, _cold, _none_w = self._bayes_priors(
+            project_id, before, len(facts_by_rival)
+        )
+        _q = float(getattr(_v, "bayes_q_graph", 0.97))
+        _q_by_kind = {
+            "graph_relation": _q,
+            "graph_symbol": _q,
+            "contract": float(getattr(_v, "bayes_q_contract", 0.95)),
+            "judge": float(getattr(_v, "bayes_q_judge", 0.8)),
+        }
+        _d = (
+            float(getattr(_v, "bayes_derivation_reliability", 0.5))
+            if d is None
+            else float(d)
+        )
+        _logs = [
+            BayesianRanking.log_evidence(_facts, _rates, _d, _q_by_kind)
+            for _facts in facts_by_rival
+        ]
+        _post, _none = BayesianRanking.posterior(_logs, _none_w)
+        return _post, _none, _cold
+
+    def _rank_bayesian_shadow(
+        self,
+        dossiers: List["HypothesisDossier"],
+        winner: Optional["HypothesisDossier"],
+        project_id: str,
+    ) -> str:
+        """
+        Rank the eligible rivals by posterior, beside Layer 1, and change nothing.
+
+        Runs after the judgment, so the crucis facts are in, over exactly
+        the rivals Layer 1 was allowed to choose from (_l1_eligible). Writes
+        each ranked rival's posterior and rank, and the posterior of "none",
+        onto the dossiers, where _record_rivals persists them; logs one
+        line comparing the two picks. The winner, statuses and every other
+        field are left as the judgment set them. Never raises.
+
+        Args:
+            dossiers: Every dossier of the competition.
+            winner: The judgment's winner, for the comparison line only.
+            project_id: Current project identifier.
+
+        Returns:
+            A status line for the chat, or "" when nothing was ranked.
+        """
+        if not getattr(self._f.valves, "bayes_shadow", False):
+            return ""
+        try:
+            # ── Step 1: the pool Layer 1 ranked ──
+            _ids = set(getattr(self, "_l1_eligible", []) or [])
+            _pool = [d for d in dossiers if id(d) in _ids]
+            # ── Step 2: evidence, posterior, rank ──
+            _post, _none, _cold = self._bayes_posterior_for(
+                [_x.facts for _x in _pool],
+                project_id,
+                float(getattr(self._f, "_turn_started_at", 0.0)),
+            )
+            _order = sorted(range(len(_pool)), key=lambda _i: -_post[_i])
+            for _rank, _i in enumerate(_order, start=1):
+                _pool[_i].bayes_posterior = round(_post[_i], 6)
+                _pool[_i].bayes_rank = _rank
+                _pool[_i].bayes_p_none = round(_none, 6)
+            # ── Step 3: one line for the log ──
+            _pick = _pool[_order[0]] if _order and _post[_order[0]] > _none else None
+            _l1 = f"'{winner.hypothesis[:45]}'" if winner is not None else "no winner"
+            _sh = (
+                f"'{_pick.hypothesis[:45]}' (P={_post[_order[0]]:.2f})"
+                if _pick is not None
+                else "none of them"
+            )
+            self._f._log_debug(
+                f"🎲 [BAYES] shadow over {len(_pool)} eligible rival(s): "
+                f"Layer 1 → {_l1} | Bayes → {_sh} · P(none)={_none:.2f}"
+                + (" · AGREE" if _pick is winner else " · DIFFER")
+                + (f" · cold: {', '.join(_cold)}" if _cold else "")
+            )
+            if not _pool:
+                return ""
+            return (
+                "🎲 Bayesian ranking (shadow, not used for the answer): "
+                + (
+                    f"'{_clip_words(_pick.hypothesis, 48)}' leads, "
+                    f"P={_post[_order[0]]:.2f}"
+                    if _pick is not None
+                    else f"no rival beats 'none' (P={_none:.2f})"
+                )
+                + (
+                    " — agrees with the judgment"
+                    if _pick is winner
+                    else " — differs from the judgment"
+                )
+            )
+        except Exception as _e:
+            self._f._log_debug(f"🎲 [BAYES] shadow skipped ({_e!r})")
+        return ""
+
     def _dossier_symbols(
         self, d: "HypothesisDossier", project_id: str = ""
     ) -> Set[str]:
@@ -44479,7 +48438,7 @@ class HypothesisForge:
         The serial judgment bypasses compete_hypotheses, so without
         this the adaptive strategies would starve and the serial-vs-
         parallel A/B would lack its data. The record uses ONLY the
-        thirteen existing fields (hydration is CompetitionRecord(**d)
+        dataclass's own fields (hydration is CompetitionRecord(**d)
         and tolerates no extras): trajectory carries per-dossier
         corroborations; the failure split comes from the dossiers'
         refuted-check split; stagnated is always False (the serial
@@ -44518,6 +48477,7 @@ class HypothesisForge:
                 question_type=str(
                     getattr(self._f, "_preplanner_question_type", "") or ""
                 ),
+                turn_started=float(getattr(self._f, "_turn_started_at", 0.0)),
             )
             _rj = _json.dumps(_asdict(_rec))
 
@@ -44717,7 +48677,10 @@ class HypothesisForge:
         own analysis opens, where Layer 1 ranked it and whether it won. A
         rival the judgment itself buried (the null bar) keeps the rank it
         was given, with the status and cause it ended with; one that died
-        in the forge was never ranked and has rank 0.
+        in the forge was never ranked and has rank 0. Each rival's decided
+        consequences go to metric_forge_facts beside it, keyed by the
+        competition's write time and the rival's position, the same order
+        CommandRouter._turn_rivals numbers rivals by.
         Replayed from the context dumps of nine live rivals, that is what
         showed a hypothesis whose own analysis began "The hypothesis is
         wrong" sealed plausible and ranked first. Reports only; decides
@@ -44730,7 +48693,27 @@ class HypothesisForge:
         try:
             ranks = getattr(self, "_l1_ranks", {}) or {}
             now = time.time()
-            for d in dossiers:
+            _pid = str(self._f.valves.project_id or "")
+            _turn = float(getattr(self._f, "_turn_started_at", 0.0))
+            # Every rival's evidence, keyed to its row by the competition's
+            # write time and its position in it, written as ONE job after
+            # the rival rows: a job per fact could overflow the bounded
+            # write queue and drop rows (Filter._record_metric_many).
+            _fact_rows: List[tuple] = []
+            for _position, d in enumerate(dossiers):
+                for _fact in getattr(d, "facts", None) or []:
+                    _fact_rows.append(
+                        (
+                            _pid,
+                            _turn,
+                            now,
+                            _position,
+                            now,
+                            str(_fact.get("kind", "")),
+                            int(bool(_fact.get("verdict"))),
+                            str(_fact.get("key", ""))[:_RIVAL_TEXT_CHARS],
+                        )
+                    )
                 self._f._record_metric(
                     "forge_rival",
                     (
@@ -44761,12 +48744,133 @@ class HypothesisForge:
                             else ""
                         )
                         + " ".join(str(d.analysis or "").split())[:_RIVAL_TEXT_CHARS],
+                        str(d.belt_standing or ""),
+                        str(d.belt_note or "")[:_RIVAL_TEXT_CHARS],
+                        int(d.refuted_by_graph),
+                        int(d.refuted_by_contract),
+                        int(d.refuted_by_judge),
+                        (
+                            float(d.bayes_posterior)
+                            if d.bayes_posterior >= 0
+                            else None
+                        ),
+                        int(d.bayes_rank),
+                        float(d.bayes_p_none) if d.bayes_p_none >= 0 else None,
                     ),
                 )
+            self._f._record_metric_many("forge_fact", _fact_rows)
+            self._log_competition_metrics(dossiers, winner)
         except Exception as _e:
             self._f._log_debug(f"_record_rivals: skipped ({_e!r})")
         finally:
             self._l1_ranks = {}
+
+    def _log_competition_metrics(
+        self,
+        dossiers: List["HypothesisDossier"],
+        winner: Optional["HypothesisDossier"],
+    ) -> None:
+        """
+        One [METRICS-FORGE] line per competition, and its share of the turn's totals.
+
+        Key=value, so a run of test prompts can be compared by grep and awk
+        without the database: how many rivals died of what, how many were
+        falsified on a sample the Lakatosian regime says cannot kill
+        (sparse_kills), what the protective belt did, how many hypotheses
+        the decided_before rule kept from "unfounded", which instrument
+        refuted what, and Layer 1's pick against the Bayesian shadow's.
+        Rivals are numbered as /rivals numbers them: across the turn, in
+        the order they were recorded. Called from _record_rivals, after the
+        rows are queued. Never raises.
+        """
+        try:
+            _f = self._f
+            _min = float(
+                getattr(_f.valves, "min_coverage_for_falsification", 0.3) or 0.0
+            )
+            _m = getattr(_f, "_turn_metrics", {}) or {}
+            _offset = int(_m.get("rivals", 0))
+            # ── Step 1: how the rivals ended ──
+            _causes: Dict[str, int] = {}
+            for _d in dossiers:
+                if _d.status == "dead":
+                    _causes[_d.cause_of_death or "unknown"] = (
+                        _causes.get(_d.cause_of_death or "unknown", 0) + 1
+                    )
+            _sparse = sum(
+                1
+                for _d in dossiers
+                if _d.status == "dead"
+                and _d.cause_of_death == "falsified"
+                and _d.coverage_score < _min
+            )
+            _belt = {
+                _s: sum(1 for _d in dossiers if _d.belt_standing == _s)
+                for _s in ("progressive", "untested", "ad_hoc")
+            }
+            _rescued = sum(1 for _d in dossiers if _d.foundation_rescued)
+            _ref = [
+                sum(_d.refuted_by_graph for _d in dossiers),
+                sum(_d.refuted_by_contract for _d in dossiers),
+                sum(_d.refuted_by_judge for _d in dossiers),
+            ]
+            _facts = sum(len(_d.facts) for _d in dossiers)
+            # ── Step 2: the two picks, as H-numbers of the turn ──
+            _h = {id(_d): _offset + _i + 1 for _i, _d in enumerate(dossiers)}
+            _l1 = f"H{_h[id(winner)]}" if winner is not None else "none"
+            _ranked = [_d for _d in dossiers if _d.bayes_posterior >= 0]
+            if _ranked:
+                _top = max(_ranked, key=lambda _d: _d.bayes_posterior)
+                _p_none = _top.bayes_p_none
+                _bayes = (
+                    f"H{_h[id(_top)]}" if _top.bayes_posterior > _p_none else "none"
+                )
+                _bayes_part = (
+                    f"bayes={_bayes} agree={int(_bayes == _l1)} "
+                    f"p_top={_top.bayes_posterior:.3f} p_none={_p_none:.3f}"
+                )
+            else:
+                _bayes = ""
+                _bayes_part = "bayes=off"
+            _f._log_debug(
+                f"[METRICS-FORGE] t={_f._metric_turn_number(str(_f.valves.project_id or ''))} "
+                f"arm={_f._metric_arm() or '-'} "
+                f"qtype={getattr(_f, '_preplanner_question_type', '') or '-'} "
+                f"rivals={len(dossiers)} "
+                f"plausible={sum(1 for _d in dossiers if _d.status == 'plausible')} "
+                + " ".join(
+                    f"{_c}={_causes.get(_c, 0)}"
+                    for _c in (
+                        "falsified",
+                        "fabricated",
+                        "unfounded",
+                        "null_bar",
+                        "degenerating",
+                    )
+                )
+                + f" sparse_kills={_sparse} "
+                f"belt_progressive={_belt['progressive']} "
+                f"belt_untested={_belt['untested']} "
+                f"belt_ad_hoc={_belt['ad_hoc']} "
+                f"foundation_rescued={_rescued} "
+                f"refuted_graph={_ref[0]} refuted_contract={_ref[1]} "
+                f"refuted_judge={_ref[2]} facts={_facts} "
+                f"winner={_l1} {_bayes_part}"
+            )
+            # ── Step 3: the turn's totals ──
+            for _mk, _mv in (
+                ("competitions", 1),
+                ("rivals", len(dossiers)),
+                ("sparse_kills", _sparse),
+                ("belt_used", sum(_belt.values())),
+                ("degenerating", _causes.get("degenerating", 0)),
+                ("foundation_rescued", _rescued),
+                ("bayes_ranked", 1 if _ranked else 0),
+                ("bayes_differ", 1 if _ranked and _bayes != _l1 else 0),
+            ):
+                _f._bump_turn_metric(_mk, _mv)
+        except Exception as _e:
+            self._f._log_debug(f"[METRICS-FORGE] skipped ({_e!r})")
 
     def _refutation_still_holds(
         self,
@@ -52952,17 +57056,18 @@ class MessageAssembler:
             ] = _basis
             self._f._record_metric(
                 "turn",
-                (
-                    project_id,
-                    float(getattr(self._f, "_turn_started_at", 0.0)),
-                    time.time(),
-                    str(getattr(self._f, "_turn_user_question", "") or "")[:300],
-                    len(shown),
-                    int(block_b_chars),
-                    int(getattr(self._f, "_block_b_carry_over", False)),
-                    int(_basis["backed"]),
-                    _basis["structure_hash"],
-                    0,
+                self._f._turn_metric_row(
+                    project_id=project_id,
+                    question=str(getattr(self._f, "_turn_user_question", "") or ""),
+                    bodies_shown=len(shown),
+                    block_b_chars=int(block_b_chars),
+                    carry_over=bool(getattr(self._f, "_block_b_carry_over", False)),
+                    backed=bool(_basis["backed"]),
+                    structure_hash=_basis["structure_hash"],
+                    from_cache=False,
+                    system_tokens=int(
+                        getattr(self._f, "_last_system_prompt_tokens", 0) or 0
+                    ),
                 ),
             )
         except Exception as _e_basis:
@@ -60266,10 +64371,11 @@ class Valves(BaseModel):
         default=True,  # ← NEVER disable: foundational for all other features
         description=(
             "Classify hypothesis claims as CRITICAL (hard kill if false) vs "
-            "SUPPORTIVE (score penalty only) before gathering evidence. "
-            "Enables Popperian asymmetric falsification. "
-            "Required for enable_weighted_scoring and enable_active_learning "
-            "to have any effect. Adds N LLM calls in iter 1 only (cached)."
+            "SUPPORTIVE (never kills) before gathering evidence. "
+            "Enables Popperian asymmetric falsification and the coverage "
+            "guard in is_falsified; without it the guard is inert and "
+            "falsification falls back to a symmetric ratio. Adds N LLM "
+            "calls in iter 1 only (cached)."
         ),
     )
 
@@ -60318,29 +64424,149 @@ class Valves(BaseModel):
     low_coverage_threshold: float = Field(
         default=0.3,
         description=(
-            "Coverage below this ratio triggers: (1) Active Learning, "
-            "(2) coverage penalty in compute_weighted_score, "
-            "(3) atomic-claims constraint in _build_refinement_constraints. "
-            "0.3 = at least 30% of claims must be verifiable for normal scoring."
+            "The share of a forge cycle's consequences the index must "
+            "decide for the cycle to count as well sampled. Below it, the "
+            "next cycle reads with a wider budget, and a hypothesis cannot "
+            "seal as mature (agentic_serial_maturity_confirmed); a "
+            "competition record counts the rivals that ended under it "
+            "(low_coverage_count). The share at which a refutation may "
+            "kill is min_coverage_for_falsification, a separate valve "
+            "kept equal to this one by default."
         ),
     )
 
     enable_coverage_guard_for_falsification: bool = Field(
         default=True,  # ← NEVER disable: free, prevents false kills
         description=(
-            "Downgrade hard kill to score penalty when coverage < "
-            "min_coverage_for_falsification. Prevents Popperian hard kill "
-            "based on sparse evidence — a failed critical claim is only "
-            "trustworthy when we've verified enough of the total claims."
+            "In is_falsified (the metacognitive reinforcement), hold a "
+            "refuted critical claim as an anomaly instead of killing when "
+            "coverage < min_coverage_for_falsification: a failed critical "
+            "claim is only trustworthy when enough of the hypothesis was "
+            "checked (EpistemicRegime.for_coverage). The forge applies the "
+            "same rule under its own switch, "
+            "forge_belt_for_sparse_refutation."
         ),
     )
 
     min_coverage_for_falsification: float = Field(
         default=0.3,  # ← equal to low_coverage_threshold: consistent policy
         description=(
-            "Minimum coverage_score required to apply hard kill. "
-            "Keep equal to low_coverage_threshold for consistent policy: "
-            "below 30% coverage, neither penalize heavily nor kill."
+            "The share of a hypothesis's claims that must be decided for "
+            "a refutation to kill it (the Popperian regime); below it, the "
+            "refutation is held (the Lakatosian one). One policy for both "
+            "places that apply it: is_falsified, and the forge when "
+            "forge_belt_for_sparse_refutation is on. Keep equal to "
+            "low_coverage_threshold, so a cycle too thin to mature is also "
+            "too thin to kill."
+        ),
+    )
+
+    forge_belt_for_sparse_refutation: bool = Field(
+        default=False,
+        description=(
+            "Apply the coverage regime inside the hypothesis forge. A "
+            "forge cycle whose refutation rests on fewer decided "
+            "consequences than min_coverage_for_falsification no longer "
+            "kills the hypothesis on the spot: the protective belt holds "
+            "it under the sparse_sampling auxiliary, whose prediction is "
+            "that a cycle reading enough of the code refutes nothing. "
+            "Corroborated, the hypothesis competes; refuted, it dies as "
+            "before; never tested, it survives but cannot win. One "
+            "absorption per hypothesis: a second refutation on a small "
+            "sample kills it as degenerating. Off, the forge kills on any "
+            "refutation whatever the coverage, which is what it always "
+            "did and is the A/B baseline (EpistemicRegime.for_coverage, "
+            "ProtectiveBelt.sparse_sampling_ruling)."
+        ),
+    )
+
+    bayes_shadow: bool = Field(
+        default=True,
+        description=(
+            "Rank each competition's eligible rivals by Bayesian posterior "
+            "beside Layer 1, and record both (BayesianRanking). Shadow "
+            "only: the winner is Layer 1's whatever this says. The point "
+            "is to measure, against the operator's labels, whether the "
+            "posterior picks the right rival more often than corroboration "
+            "does (/outcomes). Costs no model call."
+        ),
+    )
+
+    bayes_derivation_reliability: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "d: the probability that a consequence the model derived from a "
+            "true hypothesis is itself true. The Duhem-Quine parameter — a "
+            "refuted consequence reaches the hypothesis only through it, "
+            "because the derivation may be what failed. 0.5 assumes the "
+            "model derives a right consequence half the time; a value "
+            "that is too high makes every refutation near-fatal, too low "
+            "makes evidence weightless. Calibrated later from labels."
+        ),
+    )
+
+    bayes_q_graph: float = Field(
+        default=0.97,
+        ge=0.5,
+        le=0.999,
+        description=(
+            "q for verdicts the call graph and symbol index gave: the "
+            "probability such a verdict is right. High, because where the "
+            "graph rules at all it rules on what the source says."
+        ),
+    )
+
+    bayes_q_contract: float = Field(
+        default=0.95,
+        ge=0.5,
+        le=0.999,
+        description=(
+            "q for verdicts the AST contract checker gave (returns, "
+            "asserts, annotations read from the bodies)."
+        ),
+    )
+
+    bayes_q_judge: float = Field(
+        default=0.8,
+        ge=0.5,
+        le=0.999,
+        description=(
+            "q for verdicts the evidence judge gave: a model reading a "
+            "quoted span it had to find verbatim in the body. Anchored, "
+            "but the reading is the model's, hence lower than the graph."
+        ),
+    )
+
+    bayes_shrinkage: float = Field(
+        default=10.0,
+        ge=0.0,
+        description=(
+            "How many observations the global base rate of a fact kind "
+            "counts as when the project's own is estimated: a project with "
+            "few facts of a kind borrows the global rate, one with many "
+            "uses its own. 0 uses the project's alone."
+        ),
+    )
+
+    bayes_warm_min: int = Field(
+        default=30,
+        ge=1,
+        description=(
+            "Below this many observed facts of a kind, its base rate is "
+            "logged as cold: still used, but read the ranking with that "
+            "in mind."
+        ),
+    )
+
+    bayes_none_min_labels: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Labelled competitions needed before the prior of 'none of the "
+            "rivals is right' is taken from how often the operator said "
+            "so (H0). Fewer, and it weighs as one more rival."
         ),
     )
 
@@ -61530,7 +65756,28 @@ class Valves(BaseModel):
             "(external_validation=True). Closes the R33 "
             "learning loop — without it the strategy history "
             "learns only from falsifications, never from "
-            "confirmed wins."
+            "confirmed wins. Also gates the outcome commands "
+            "that work beside it: /reject and /partial, which "
+            "label an answer wrong or half right, and /rivals, "
+            "which numbers a turn's hypotheses so a label can "
+            "name one. The labels write the metric_outcomes "
+            "table, and the competition record of the labelled "
+            "turn follows its label; /outcomes reports them per "
+            "experiment arm."
+        ),
+    )
+
+    experiment_arm: str = Field(
+        default="baseline",
+        description=(
+            "Name of the A/B arm this deployment is running, recorded on "
+            "every turn's metric row (metric_turns.experiment_arm) so "
+            "labelled outcomes can be split by arm. Changing it changes "
+            "nothing the pipeline does; it only says which configuration "
+            "produced the turns that follow. Run a fixed question set "
+            "under one arm, switch the name together with the valves "
+            "under test, run it again, and compare. Cut to "
+            "_EXPERIMENT_ARM_CHARS characters."
         ),
     )
 
@@ -62367,6 +66614,237 @@ class Filter:
         except Exception:
             pass
 
+    # The [METRICS-TURN] fields, in the order the line prints them, each
+    # with the decimals it is shown with. Every field is printed on every
+    # turn, 0 when nothing counted it, so lines from different runs align.
+    _TURN_METRIC_FIELDS = (
+        ("inlet_s", 1),
+        ("answer_s", 1),
+        ("total_s", 1),
+        ("system_tokens", 0),
+        ("llm_calls", 0),
+        ("llm_in", 0),
+        ("llm_out", 0),
+        ("llm_s", 1),
+        ("llm_wait_s", 1),
+        ("llm_truncated", 0),
+        ("answer_tokens", 0),
+        ("from_cache", 0),
+        ("pipeline", 0),
+        ("steps", 0),
+        ("claims", 0),
+        ("cov_hard", 0),
+        ("cov_structural", 0),
+        ("cov_read", 0),
+        ("cov_blind", 0),
+        ("cov_uncovered", 0),
+        ("cov_no_anchor", 0),
+        ("asked", 0),
+        ("asked_unread", 0),
+        ("competitions", 0),
+        ("rivals", 0),
+        ("sparse_kills", 0),
+        ("belt_used", 0),
+        ("degenerating", 0),
+        ("foundation_rescued", 0),
+        ("bayes_ranked", 0),
+        ("bayes_differ", 0),
+        ("reinforce_tested", 0),
+        ("reinforce_refuted", 0),
+        ("reinforce_held", 0),
+        ("reinforce_skipped", 0),
+        ("static_vacuous", 0),
+        ("never_updated_refuted", 0),
+        ("contradictions_symbol", 0),
+        ("contradictions_subject", 0),
+    ) + tuple((f"tri_{_k}", 0) for _k in _TRIANGULATION_FIELDS)
+
+    def _log_turn_metrics(
+        self, answer_s: float, answer_tokens: int = 0, question: str = ""
+    ) -> None:
+        """
+        One [METRICS-TURN] line per answered turn: the totals a test run is compared on.
+
+        Key=value with a fixed field set, so two runs of the same prompts
+        under two arms can be summed and compared with grep and awk. Time
+        is split where it is spent: the inlet (everything this file does
+        before the answer call, auxiliary calls included) and the answer
+        call the host makes. The auxiliary counters are the inlet's,
+        frozen at the handover (_seal_answer_handoff). The forge, belt,
+        Bayes and reinforcement counters are summed over the turn's
+        competitions and steps; [METRICS-FORGE] has them per competition.
+
+        A turn is identified by its chat and its question, not only its
+        number: turn numbers restart in every conversation, and a test run
+        asks each question in a chat of its own. chat= is the first eight
+        characters of the chat id, q= a short hash of the question as
+        asked (the same question hashes the same in every arm), and the
+        question itself closes the line, quoted, so the numeric fields
+        before it split on spaces. Never raises.
+
+        Args:
+            answer_s: Seconds from the inlet handover to the outlet.
+            answer_tokens: Tokens of the answer as delivered.
+            question: The user's question, read from the outlet's body;
+                used only when the inlet froze none.
+        """
+        try:
+            _m = dict(getattr(self, "_inlet_handoff_metrics", {}) or {})
+            _m["answer_s"] = answer_s
+            _m["total_s"] = float(_m.get("inlet_s", 0.0)) + answer_s
+            _m["answer_tokens"] = answer_tokens
+            _q = " ".join(str(_m.get("question") or question or "").split())
+            _qhash = hashlib.sha1(_q.casefold().encode("utf-8")).hexdigest()[:8]
+            _fields = " ".join(
+                f"{_k}={float(_m.get(_k, 0) or 0):.{_dec}f}"
+                for _k, _dec in self._TURN_METRIC_FIELDS
+            )
+            _shown = _q[:_METRICS_QUESTION_CHARS].replace('"', "'")
+            self._log_debug(
+                f"[METRICS-TURN] t={_m.get('t', 0)} arm={_m.get('arm', '-')} "
+                f"chat={str(_m.get('chat', '') or '-')[:8]} q={_qhash} "
+                f"qtype={_m.get('qtype', '-')} {_fields} question=\"{_shown}\""
+            )
+        except Exception as _e:
+            self._log_debug(f"[METRICS-TURN] skipped ({_e!r})")
+
+    def _set_turn_metric(self, key: str, value: float) -> None:
+        """
+        Set one of this turn's [METRICS-TURN] values outright.
+
+        For the values that describe the turn once (its coverage, how many
+        steps ran) rather than accumulate over it, so a second tally in
+        the same turn replaces the first instead of doubling it. Never
+        raises.
+        """
+        try:
+            _m = getattr(self, "_turn_metrics", None)
+            if not isinstance(_m, dict):
+                _m = {}
+                self._turn_metrics = _m
+            _m[key] = value
+        except Exception:
+            pass
+
+    def _bump_turn_metric(self, key: str, amount: float = 1) -> None:
+        """
+        Add to one of this turn's counters for the [METRICS-TURN] log line.
+
+        The metric tables hold the same facts row by row; these counters
+        exist so one greppable line per turn carries the totals a run of
+        test prompts is compared on, without a database at hand. Reset when
+        the inlet starts a turn. Never raises.
+        """
+        try:
+            _m = getattr(self, "_turn_metrics", None)
+            if not isinstance(_m, dict):
+                _m = {}
+                self._turn_metrics = _m
+            _m[key] = _m.get(key, 0) + amount
+        except Exception:
+            pass
+
+    def _record_metric_many(self, table: str, rows: List[tuple]) -> None:
+        """
+        Queue many rows of one metric table as a single write job.
+
+        For bursts written without an await in between, which the worker
+        cannot drain while they are queued: a competition's facts are up to
+        _DOSSIER_FACTS_MAX per rival, and one job per row could fill the
+        bounded queue and drop rows, the rival rows they belong to among
+        them. Same contract as _record_metric otherwise: never raises,
+        never waits, and a full queue drops the batch.
+        """
+        if not rows:
+            return
+        try:
+            sql = _METRIC_INSERTS[table]
+
+            def _write(sql: str = sql, rows: List[tuple] = list(rows)) -> None:
+                self._db_conn.executemany(sql, rows)
+                self._db_conn.commit()
+
+            self._db_write_queue.put_nowait((_write, (), {}))
+        except Exception:
+            pass
+
+    def _metric_turn_number(self, project_id: str) -> int:
+        """The turn number the reader sees in Stats, as the metrics record it; 0 if unknown."""
+        try:
+            return int(
+                self._project_state_manager.get_pstate(project_id).get(
+                    "napmem_turn_number", 0
+                )
+                or 0
+            )
+        except Exception:
+            return 0
+
+    def _metric_arm(self) -> str:
+        """The experiment arm this configuration was declared as, cut as the rows keep it."""
+        return str(getattr(self.valves, "experiment_arm", "") or "").strip()[
+            :_EXPERIMENT_ARM_CHARS
+        ]
+
+    def _turn_metric_row(
+        self,
+        project_id: str,
+        question: str,
+        bodies_shown: int,
+        block_b_chars: int,
+        carry_over: bool,
+        backed: bool,
+        structure_hash: str,
+        from_cache: bool,
+        system_tokens: int,
+    ) -> tuple:
+        """
+        Build one metric_turns row, in the column order the "turn" insert names.
+
+        Two paths write a turn row: the assembled answer
+        (MessageAssembler.record_answer_basis) and the cache hit
+        (LongTermMemory.find_cached_response). Each used to lay out the
+        tuple itself; the columns that identify a turn for an A/B
+        comparison are added here once, so the two cannot drift apart.
+
+        Args:
+            project_id: Project the turn belongs to.
+            question: The user's question, cut to 300 characters.
+            bodies_shown: Distinct indexed bodies shown this turn.
+            block_b_chars: Size of Block B as sent.
+            carry_over: Whether Block B served the previous subject.
+            backed: Whether the answer had the question's own bodies.
+            structure_hash: Project structure hash at answer time.
+            from_cache: Whether the answer was served from the cache.
+            system_tokens: Tokens of the system prompt handed to the
+                answer call; 0 when no prompt was assembled.
+
+        Returns:
+            The row tuple for _record_metric("turn", ...).
+        """
+        _turn_no = self._metric_turn_number(project_id)
+        _arm = self._metric_arm()
+        return (
+            project_id,
+            float(getattr(self, "_turn_started_at", 0.0)),
+            time.time(),
+            str(question or "")[:300],
+            int(bodies_shown),
+            int(block_b_chars),
+            int(bool(carry_over)),
+            int(bool(backed)),
+            str(structure_hash or ""),
+            int(bool(from_cache)),
+            _turn_no,
+            _arm,
+            int(system_tokens or 0),
+            str(getattr(self, "_chat_id_this_turn", "") or ""),
+            json.dumps(
+                getattr(self, "_turn_triangulation", None) or {},
+                separators=(",", ":"),
+            ),
+        )
+
     def _record_agent_act(
         self,
         agent: str,
@@ -63037,6 +67515,23 @@ class Filter:
             self._turn_question_seeds = set()
             # Groups this turn's metric rows (_record_metric).
             self._turn_started_at = time.time()
+            # Written by the assembler only when it has a tokenizer and a
+            # system prompt. Left standing, a turn that assembled none would
+            # report the previous turn's size, on its metric row and in the
+            # handover line both.
+            self._last_system_prompt_tokens = 0
+            # This turn's counters for the [METRICS-TURN] line
+            # (_bump_turn_metric, _report_answer_handoff).
+            self._turn_metrics = {}
+            # The triangulation shadow's tally, for the turn's metric row;
+            # empty on a turn the pipeline did not run.
+            self._turn_triangulation = {}
+            # Claims the static pass left unverified this turn, once each
+            # (static_vacuous), across every verify pass.
+            self._turn_vacuous_keys = set()
+            # Set by the preplanner when it runs. Left standing, a turn it
+            # skipped would report the previous turn's question type.
+            self._preplanner_question_type = ""
             self._bodies_shown_count = 0
             self._measured_stats_lines = []
             # Read and cleared together, at the one point every turn
@@ -63909,6 +68404,10 @@ class Filter:
                 )
                 body["messages"] = messages
                 _inlet_timing("total_inlet (end-to-end)", inlet_start)
+                # Sealed like any other turn, so the outlet reports it and
+                # a run's [METRICS-TURN] lines count every question asked.
+                self._set_turn_metric("from_cache", 1)
+                self._seal_answer_handoff()
                 self._log_section(
                     "CONTEXT MANAGER - INLET END",
                     duration=time.monotonic() - inlet_start,
@@ -64124,6 +68623,8 @@ class Filter:
             # Same words as the pipeline's line (_serial_unestablished).
             if getattr(self, "_serial_unestablished", None):
                 _open.append("no cause established")
+            if _asked_coverage_words(_cov):
+                _open.append(_asked_coverage_words(_cov))
             # ── Step 2b: the selection the evidence did not settle ──
             # A uniform prior over the accounts that were NOT discriminated:
             # with one independent survivor the presented account is one of
@@ -64132,7 +68633,9 @@ class Filter:
             # weight so it can be argued with.
             _indep = int(_cov.get("rivals_independent", 0) or 0)
             _compl = int(_cov.get("rivals_complementary", 0) or 0)
-            _conf = (_settled / _total) * _confidence_share(_cov)
+            _conf = (
+                (_settled / _total) * _confidence_share(_cov) * _asked_coverage(_cov)
+            )
             if _indep:
                 _open.append(
                     # Same wording and same arithmetic as the pipeline's
@@ -64209,7 +68712,6 @@ class Filter:
             )
         except Exception as _e_conf:
             self._log_debug(f"outlet: confidence footer skipped ({_e_conf!r})")
-        self._report_answer_handoff()
 
     def _seal_answer_handoff(self) -> None:
         """Stamp the moment the inlet hands the turn to the host.
@@ -64230,10 +68732,32 @@ class Filter:
             self._inlet_handoff_tokens = int(
                 getattr(self, "_last_system_prompt_tokens", 0) or 0
             )
+            # The metric row this handover's duration belongs to. Kept with
+            # the stamp, not read from _turn_started_at in the outlet, which
+            # a newer inlet may already have moved.
+            self._inlet_handoff_turn = (
+                str(self.valves.project_id or ""),
+                float(getattr(self, "_turn_started_at", 0.0)),
+            )
+            # What the [METRICS-TURN] line reports, frozen at the handover:
+            # the inlet's own work, which is the critical path. Calls made
+            # while the answer streams (background tasks) are not in it.
+            self._inlet_handoff_metrics = {
+                **(getattr(self, "_turn_metrics", {}) or {}),
+                "t": self._metric_turn_number(str(self.valves.project_id or "")),
+                "arm": self._metric_arm() or "-",
+                "qtype": str(getattr(self, "_preplanner_question_type", "") or "-"),
+                "chat": str(getattr(self, "_chat_id_this_turn", "") or ""),
+                # The question as the inlet read it, so the line names the
+                # turn even when the host hands the outlet no messages.
+                "question": str(getattr(self, "_turn_user_question", "") or ""),
+                "inlet_s": time.time() - float(getattr(self, "_turn_started_at", 0.0)),
+                "system_tokens": self._inlet_handoff_tokens,
+            }
         except Exception:
             self._inlet_handoff_ts = None
 
-    def _report_answer_handoff(self) -> None:
+    def _report_answer_handoff(self, body: Optional[dict] = None) -> None:
         """Report the one call this file never sees: the answer itself.
 
         Every auxiliary call is timed by call_llm and lands in the log with
@@ -64251,6 +68775,17 @@ class Filter:
         Measured from the inlet handover, so it includes queueing on the
         single slot as well as prefill and generation — which is the number
         that matters, because that is what the reader waits.
+
+        The duration is also written to the turn's metric_turns row
+        (answer_seconds), which is what makes a turn's wall time comparable
+        across experiment arms. Called from the outlet on every turn: it
+        used to hang off the end of _replace_asserted_confidence, whose
+        early returns skip every turn without a measured tally, so the line
+        appeared on pipeline turns only.
+
+        Args:
+            body: The outlet's body, read for the answer's length and the
+                question it answers; None reports both as empty.
         """
         try:
             _t0 = getattr(self, "_inlet_handoff_ts", None)
@@ -64264,6 +68799,23 @@ class Filter:
                 f"outlet, carrying ~{_tok} system tokens. Issued by the host, "
                 f"so it is not in the call_llm tally above."
             )
+            _pid, _started = getattr(self, "_inlet_handoff_turn", ("", 0.0))
+            if _started:
+                self._record_metric(
+                    "turn_answer", (round(_elapsed, 3), _pid, _started)
+                )
+            _answer, _question = "", ""
+            _msgs = list((body or {}).get("messages") or [])
+            for _msg in reversed(_msgs):
+                if not _answer and _msg.get("role") == "assistant":
+                    _answer = str(_msg.get("content") or "")
+                elif _answer and _msg.get("role") == "user":
+                    _question = str(_msg.get("content") or "")
+                    break
+            _ans_tok = 0
+            if _answer and getattr(self, "tokenizer", None):
+                _ans_tok = len(self.tokenizer.encode(_answer))
+            self._log_turn_metrics(_elapsed, _ans_tok, _question)
         except Exception as _e_ho:
             self._log_debug(f"answer-handoff report skipped ({_e_ho!r})")
 
@@ -65025,6 +69577,9 @@ class Filter:
         self._audit_stats_fidelity(body)
         self._audit_gap_promotion(body)
         self._audit_index_versions()
+        # Every turn the inlet handed over, measured or not: a speed
+        # comparison that only sees pipeline turns is not one.
+        self._report_answer_handoff(body)
         await self._emit_outlet_probe(__event_emitter__)
 
         # ------------------------------------------------------------------
