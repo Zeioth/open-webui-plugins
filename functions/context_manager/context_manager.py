@@ -9,6 +9,120 @@ license: GPL3
 requirements: loguru, tiktoken, sentence-transformers, chromadb, rapidfuzz, tree-sitter==0.25.2, tree-sitter-language-pack==1.8.1, llmlingua>=0.2.2, scikit-learn==1.9.0, pyflakes
 """
 
+# ══════════════════════════════════════════════════════════════════════════════
+# EPISTEMIC TOOLS: what each one is for, and what runs today
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Ground and observer. In code the ground is certain: the index, the AST and an
+# execution say what the code is. The uncertain part is the observer, the LLM,
+# which errs at three points: reading (a body misread, an instrument's blind
+# spot), deriving (a consequence that does not follow from its hypothesis) and
+# formulating (a hypothesis that is false or invented). Each tool answers one
+# question about those errors:
+#
+#   Triangulation  Is this a fact, and what is it worth? Instrument families that
+#                  fail for different reasons (EvidenceFamily: static analysis,
+#                  quoted reading, execution) agree or conflict on one claim.
+#                  Two reads by the same model are one source, whatever their
+#                  family (EvidenceTriangulation.independent_by_provenance).
+#   Popper         Does a firm fact contradict what the hypothesis states? Then
+#                  the hypothesis is dead. Agreement only corroborates it.
+#   Lakatos        Is a weak refutation the instrument's fault, not the
+#                  hypothesis's? Only if an auxiliary assumption (the protective
+#                  belt) predicts a new, checkable fact and that fact holds
+#                  (progressive). An auxiliary that predicts nothing is ad hoc;
+#                  reaching for the belt again on the same weakness kills
+#                  (degenerating).
+#   Bayes          Which rival explains the facts best, or none of them? Each
+#                  fact weighs by its instrument's precision, the reliability of
+#                  the derivation and how surprising the prediction was. Planned:
+#                  pick the next experiment that best separates the rivals.
+#
+# Order (adopted 2026-11-19): observe, triangulate each fact, apply Popper or
+# Lakatos to each refutation, rank the rivals with Bayes, and let Bayes pick the
+# next experiment, which is a new observation. Why: Popper and Bayes both
+# consume facts, so a fact is settled first. Bayes multiplies evidence as if it
+# were independent, and only triangulation measures independence. Popper is
+# Bayes at certainty, so it may gate early, but only on a firm fact: a
+# deterministic instrument where it is reliable, or two independent families.
+#
+# Scenarios
+#   Deterministic: questions about this code (does X call Y, what Z returns,
+#     does this test pass). Popper is enough: a deterministic instrument checks
+#     the LLM's claim. Lakatos only covers an instrument's known blind spots.
+#     Bayes and triangulation add little: one instrument decides, and
+#     triangulation would change under 1% of the verdicts (test rounds 3-10).
+#   Exploratory: something behaves oddly and no cause is proposed. Rival
+#     mechanisms compete, and most of their consequences are beyond what the
+#     index decides. All four tools, in the order above; this is where the
+#     forge runs.
+#   Web search (planned): the ground itself is uncertain, since a page is not a
+#     deterministic instrument. Triangulation becomes the main tool
+#     (independence by origin, provenance "web:<origin>"), Popper seldom kills
+#     on the web alone, Lakatos applies to the theory (docs versus code) and
+#     Bayes weighs the sources.
+#
+# What runs today (2026-11-20). LIVE decides; SHADOW logs and measures and
+# decides nothing; OFF does not run.
+#   Popper   LIVE    Verify steps (graph, AST, quoted reading), the sandbox,
+#                    metacog falsification (is_falsified) and the forge's kill
+#                    gate (_forge_verdict). The quoted-reading judge is an LLM,
+#                    yet its refutation kills in the forge like the graph's.
+#            SHADOW  The firmness gate (ForgeFactTriangulation.firm_gate,
+#                    forge_kill_gate="shadow"): only a firm refutation of what
+#                    the hypothesis asserts kills, and a refuted derivation
+#                    kills nothing. "firm" makes it decide, and the forge's
+#                    analysis step then reads each result as the gate does
+#                    (ForgeFactTriangulation.result_line).
+#   Lakatos  LIVE    Missing call edges (ProtectiveBelt.absorb_missing_call_edge:
+#                    dispatch by reference, indirect call path). 23 rulings in
+#                    the test rounds, mostly progressive.
+#            LIVE    Coverage guard (enable_coverage_guard_for_falsification): a
+#                    critical refutation on too little coverage is a penalty,
+#                    not a kill. Evaluated 10 times, never needed.
+#            OFF     Sparse sampling in the forge (forge_belt_for_sparse_
+#                    refutation=False). Its one real case, round 10, would have
+#                    saved an invented hypothesis: coverage is the wrong key.
+#            SHADOW  The firmness gate's belt (forge_kill_gate): a weak
+#                    refutation of what the hypothesis asserts is held once and
+#                    the rival cannot win; a second kills it as degenerating.
+#                    Round 10's invented hypothesis dies there on a firm one.
+#   Bayes    SHADOW  HypothesisForge._rank_bayesian_shadow (bayes_shadow=True)
+#                    ranks every surviving rival beside Layer 1, those Layer 1
+#                    holds back included. Facts weigh as triangulation settled
+#                    them (unsettled ones not at all; a restatement of the
+#                    hypothesis with no derivation in between), the belt's
+#                    standing is one more fact, and an instrument's precision
+#                    comes from the leave-one-out calibration once that has
+#                    bayes_warm_min observations. Not live because every kind
+#                    is still cold and the calibration held 3 observations per
+#                    instrument after rounds 3-10, before the forge added to
+#                    it. Next: the experiment that best separates the rivals
+#                    (step 4).
+#   Triang.  SHADOW  AgenticEvidenceLedger.triangulate after every verdict, and
+#                    DecisionArbiter at the framing decision
+#                    (arbiter_framing_mode="shadow"). Its per-instrument
+#                    calibration ("loo"), which the forge's second readings add
+#                    to (forge:<instrument>), sets Bayes's precisions once an
+#                    instrument has bayes_warm_min observations.
+#            SHADOW  The forge's facts (ForgeFactTriangulation,
+#                    forge_triangulation_shadow=True). The forge decides each
+#                    consequence with one instrument (graph, then contract,
+#                    then judge); this rules every decided one, has the judge
+#                    read each static refutation too, and counts where the
+#                    firmness gate and the count gate part (would_spare,
+#                    would_kill). Bayes weighs these facts (step 3), and each
+#                    one read by two families calibrates both instruments.
+#
+# A SHADOW mechanism logs and feeds metrics; it never emits a chat status. A
+# status means the step changed the turn or the answer (Filter._emit_status).
+#
+# How to reach them: the forge (HypothesisForge) runs when the plan has a
+# hypothesize step, which exploratory questions must schedule
+# (agentic_exploratory_requires_hypothesis). Nothing above is dead code: each
+# SHADOW or OFF line says what makes it decide. Update this block whenever one
+# of them changes state.
+
 import os
 import time
 import re
@@ -106,6 +220,23 @@ from shared_resources import (
     get_model_backend,
     LLMResult,
 )
+
+# Whether the installed shared client bounds its retries by wall clock
+# (call_llm's deadline_seconds). A deployment with an older copy keeps the
+# one-attempt rule for deadline calls instead of failing on the keyword.
+try:
+    import inspect as _inspect
+
+    _SHARED_LLM_HAS_DEADLINE = (
+        "deadline_seconds" in _inspect.signature(_shared_call_llm).parameters
+    )
+except Exception:
+    _SHARED_LLM_HAS_DEADLINE = False
+# A deadline call retries only failures that come early: the shared client
+# starts another attempt only while elapsed + backoff is inside this window,
+# a share of the caller's deadline with a floor that admits one retry.
+_DEADLINE_RETRY_SHARE = 0.25
+_DEADLINE_RETRY_MIN_S = 3.0
 
 # ==========================================================================
 # FILE INDEX
@@ -493,7 +624,46 @@ _PREFIX_ROLE_SEPARATOR = "\n\n---\n\n"
 # HOW TO TELL: `⏱️ Answer call` ~15-35 s means the checkpoint is reached,
 # ~110 s means not; the server's `forcing full prompt re-processing`
 # counts the misses.
+#
+# The user turn carries a second boundary of the same kind. Profile and
+# Block B are identical across every heavy call of a turn, so they go out
+# as a user message of their own (_split_turn_context): llama.cpp
+# checkpoints where the last user message starts, and each later call of
+# the turn resumes there instead of re-processing them (~11k tokens).
 # ═════════════════════════════════════════════════════════════════════════
+
+
+def _split_turn_context(
+    system_prompt: str, prompt: str, invariant: str, prelim_full: str
+) -> Tuple[str, str]:
+    """
+    Split an aligned call's user turn where the turn's shared context ends.
+
+    The shared context is `prelim_full` minus the invariant: profile and
+    Block B, byte-identical for every call that carries this turn's prelim.
+    The rest is the call's own role and prompt. Returns (shared, own), or
+    ("", "") when the call does not carry the prelim whole or a side would
+    be empty.
+    """
+    if not (
+        invariant
+        and prelim_full.startswith(invariant)
+        and len(prelim_full) > len(invariant)
+        and system_prompt.startswith(prelim_full)
+    ):
+        return "", ""
+    shared = prelim_full[len(invariant) :]
+    if shared.endswith(_PREFIX_ROLE_SEPARATOR):
+        shared = shared[: -len(_PREFIX_ROLE_SEPARATOR)]
+    shared = shared.strip()
+    own = "\n\n".join(
+        _p
+        for _p in (system_prompt[len(prelim_full) :].strip(), (prompt or "").strip())
+        if _p
+    )
+    if not shared or not own:
+        return "", ""
+    return shared, own
 
 # A boundary the sections are grouped by, resolved to a horizontal rule
 # only where a group exists on both sides. A sentinel rather than the rule
@@ -557,6 +727,11 @@ _SECTION_HEADINGS: Dict[str, Dict[str, str]] = {
         "gaps": "Lo que no se verificó",
     },
 }
+
+# The line the investigation record opens with. The outlet appends the record
+# to the answer (HypothesisForge._render_investigation_record) before its
+# audits run, and they cut it away: none of it is the model's prose.
+_INVESTIGATION_RECORD_TITLE = "\U0001f4cb **Investigation record**"
 
 # The body line for a protected section whose outline came back SKIP:
 # report what there is, or say plainly there is nothing. Imperative, so it
@@ -760,9 +935,21 @@ _RECHECK_PROCEED_BODIES: Dict[str, Dict[str, str]] = {
         ),
     },
 }
-# A line whose first word sends the reader to read or check code.
+# A How to proceed whose first words say nothing is left to do.
+_NOTHING_LEFT_RE = re.compile(
+    r"(?:nada\b|no queda nada|no hay nada|no hace falta nada|nothing\b|"
+    r"no further\b|none\b)",
+    re.I,
+)
+# A line whose first word sends the reader to read or check code, or whose
+# first word does once a lead-in naming that purpose is set aside. Round 10
+# wrote "Para confirmar la ruta completa, lee …" over a relation the turn had
+# already verified; a lead-in naming another purpose ("Para reducir este
+# descarte, revisa …") proposes a change and stays.
 _RECHECK_LINE_RE = re.compile(
-    r"^\W*(?:consult|confirm|verific|verify|revis|review|expand|comprob|"
+    r"^\W*(?:(?:para|to|in\s+order\s+to)\s+(?:confirm|verific|verify|comprob|"
+    r"asegur|ensure|make\s+sure|check|valid)\w*\b[^,.;:]{0,120},\s*)?"
+    r"(?:consult|confirm|verific|verify|revis|review|expand|comprob|"
     r"check|inspect|inspeccion|examin|look\s+at|lee[rd]?\b|read\b|abr[ae]\b|"
     r"open\b|mir[ae]\b)",
     re.I,
@@ -786,10 +973,16 @@ def _gaps_outline_body(
     # ── Step 1: the parts that have something to report ──
     _parts: List[str] = []
     if open_claims:
+        # Cut at a word: "…as the count of cons…" was copied into an answer
+        # as it stood, half a word and all.
         _quoted = [
-            "«" + _t[:_GAPS_CLAIM_CHARS].rstrip(" .,;:") + (
-                "…" if len(_t) > _GAPS_CLAIM_CHARS else ""
-            ) + "»"
+            "«"
+            + (
+                _t.rstrip(" .,;:")
+                if len(_t) <= _GAPS_CLAIM_CHARS
+                else _t[:_GAPS_CLAIM_CHARS].rsplit(" ", 1)[0].rstrip(" .,;:") + "…"
+            )
+            + "»"
             for _t in (" ".join(str(_c).split()) for _c in open_claims[:2])
             if _t
         ]
@@ -817,6 +1010,8 @@ _DIRECTIVE_ECHO_PREFIXES: Tuple[str, ...] = (
     "Your answer begins with these two lines",
     "The line under each heading says what this turn established",
     "The line under each heading is a summary of that section",
+    "This turn did NOT establish how these behave",
+    "This turn was asked to make something, so How to proceed",
 )
 _ANSWER_HEADING_RE = re.compile(r"^##\s+\*\*[^*\n]+\*\*\s*$")
 
@@ -832,6 +1027,77 @@ def _placeholder_lines() -> Set[str]:
     return {_l for _l in _out if _l}
 
 
+# What the answer prompt's evidence lines carry besides the claim itself: the
+# verdict and how it was reached, written by AgenticSynthesisComposer.render.
+# Strings only this plugin writes, in English whatever the answer's language,
+# so in a reply they are a workspace line copied whole. Round 8 copied them
+# into four answers in a row, each one the next turn's example. The quote a
+# verdict carries may run over indented lines of code until it closes; the
+# badge rule keeps the list marker it follows.
+_LEDGER_ANNOTATION_RES: Tuple["re.Pattern[str]", ...] = (
+    re.compile(
+        r"(?:[ \t]\[[A-Za-z_][\w.]*(?:,[ \t]*[A-Za-z_][\w.]*)*\])?"
+        r"(?:[ \t]⚗[ \t]\([^)\n]{0,160}\))?"
+        r"[ \t]—[ \t](?:(?:verified|unsupported|unverifiable|unoperationalizable):"
+        r"|body of [A-Za-z_][\w.]* read\b)"
+        r"(?:[^\n']*'[^'\n]{0,400}(?:\n[ \t]+[^'\n]{0,400}){0,6}'[^\n]*|[^\n]*)"
+    ),
+    re.compile(
+        r"[ \t]\(written without reading [^\n]{0,300}?— EXPAND it before "
+        r"relying on this, or say what is still unknown\)"
+    ),
+    re.compile(
+        r"[ \t]\(NOT CHECKED — no verification ran against this claim;"
+        r"[^\n]{0,300}?unchecked\)"
+    ),
+    re.compile(
+        r"[ \t]\((?:cites unknown symbol\(s\)|asserts call relation\(s\) with "
+        r"no edge): [^\n]{0,300}?— treat as unverified\)"
+    ),
+    re.compile(
+        r"(?m)^([ \t]*(?:[-*+]|\d+[.)])[ \t]+)(?:(?:📖|⚗)[ \t]*)?✓✓[ \t]*"
+    ),
+)
+
+
+def _strip_ledger_annotations(text: str) -> Tuple[str, int]:
+    """Take the ledger's verdict annotations out of an answer, keeping the claim.
+
+    "`X` returns None … [X] — verified: body of X read: '…'" leaves as "`X`
+    returns None …": what the answer asserts stays, the evidence line's
+    bookkeeping goes (_LEDGER_ANNOTATION_RES). Fenced code is left alone.
+    Returns the text and how many annotations were removed; the text
+    unchanged when there were none or on any failure.
+    """
+    try:
+        if not isinstance(text, str) or ("—" not in text and "✓✓" not in text):
+            return text, 0
+        _segments: List[Tuple[bool, List[str]]] = []
+        _fence = False
+        for _l in text.split("\n"):
+            _is_fence = _l.lstrip().startswith("```")
+            _code = _fence or _is_fence
+            if not _segments or _segments[-1][0] != _code:
+                _segments.append((_code, []))
+            _segments[-1][1].append(_l)
+            if _is_fence:
+                _fence = not _fence
+        _n = 0
+        _out: List[str] = []
+        for _code, _lines in _segments:
+            _seg = "\n".join(_lines)
+            if not _code:
+                for _rx in _LEDGER_ANNOTATION_RES:
+                    _seg, _k = _rx.subn(
+                        lambda _m: _m.group(1) if _m.re.groups else "", _seg
+                    )
+                    _n += _k
+            _out.append(_seg)
+        return ("\n".join(_out), _n) if _n else (text, 0)
+    except Exception:
+        return text, 0
+
+
 def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
     """Remove from a past answer what the prompt said was not answer.
 
@@ -839,19 +1105,29 @@ def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
     with its label; the outline's placeholder line written as the body of a
     section; and an answer that finished its sections and started them
     again, twenty times over. Left in the history, each was copied by the
-    next turns, which is how one bad answer became four.
+    next turns, which is how one bad answer became four. A fourth, the
+    ledger's verdict annotations copied onto claims, did the same in round
+    8 (_strip_ledger_annotations).
 
     Fenced code is left untouched, since this project's answers quote its
     own prompts. Only whole lines match, so prose that mentions a note is
     kept. Returns the text and what was removed; the text unchanged on any
     failure.
     """
-    _counts = {"notes": 0, "echoes": 0, "placeholders": 0, "repeat": 0}
+    _counts = {
+        "notes": 0,
+        "echoes": 0,
+        "placeholders": 0,
+        "repeat": 0,
+        "glued_rules": 0,
+        "annotations": 0,
+    }
     try:
         if not isinstance(text, str) or not text:
             return text, _counts
         _ph = _placeholder_lines()
-        _lines = text.split("\n")
+        _source, _counts["annotations"] = _strip_ledger_annotations(text)
+        _lines = _source.split("\n")
         # ── Step 1: cut where the first heading comes round again ──
         _first = ""
         _fence = False
@@ -899,6 +1175,11 @@ def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
             if _st in _ph:
                 _counts["placeholders"] += 1
                 continue
+            if _st == "---" and _kept and _kept[-1].strip():
+                # A rule under a line of text is a setext heading in
+                # Markdown; left in the history, the next answer copies it.
+                _kept.append("")
+                _counts["glued_rules"] += 1
             _kept.append(_l)
         # ── Step 3: tidy what the removals left behind ──
         _out = re.sub(r"\n{3,}", "\n\n", "\n".join(_kept)).rstrip()
@@ -909,7 +1190,14 @@ def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
             return text, _counts
         return (_out or text), _counts
     except Exception:
-        return text, {"notes": 0, "echoes": 0, "placeholders": 0, "repeat": 0}
+        return text, {
+            "notes": 0,
+            "echoes": 0,
+            "placeholders": 0,
+            "repeat": 0,
+            "glued_rules": 0,
+            "annotations": 0,
+        }
 
 
 # Function words, which appear in ordinary prose and almost never inside an
@@ -2317,29 +2605,347 @@ def _extract_answer_footer(text: str) -> str:
 _NAMED_SYMBOL_RE = re.compile(r"`([^`\s]+)`|\b([A-Za-z_]\w*(?:\.\w+)+)\b")
 
 
-def _named_indexed_symbols(text: str, idx: Any, project_id: str) -> List[str]:
+_CUT_WRITES_MAX = 8
+
+
+def _assigned_name(target: "ast.AST") -> str:
+    """The dotted name an assignment target writes, or "" for anything else."""
+    _parts: List[str] = []
+    while isinstance(target, ast.Attribute):
+        _parts.append(target.attr)
+        target = target.value
+    if not isinstance(target, ast.Name):
+        return ""
+    return ".".join([target.id] + _parts[::-1])
+
+
+def _writes_beyond_cut(full: str, shown: str) -> str:
+    """Comment lines naming what the hidden tail of a body writes, or "".
+
+    `shown` is the prefix of `full` that reaches the prompt. The body is
+    parsed; names assigned in the shown lines (plain, annotated or
+    augmented) are looked up among the assignments past the cut, listed
+    with the body line they sit on, accumulations (+=, -=, …) first. A
+    keyword argument is not an assignment, which is why this reads the AST
+    and not the lines. "" when nothing qualifies or the body does not
+    parse. Never raises.
     """
-    The indexed symbols a piece of text names, each resolved to one qid.
+    try:
+        _full = str(full or "").split("\n")
+        _shown_n = len(str(shown or "").split("\n"))
+        if _shown_n >= len(_full):
+            return ""
+        _tree = ast.parse(textwrap.dedent(str(full)))
+        # ── Step 1: every write, with its line and whether it accumulates ──
+        _writes: List[Tuple[int, str, bool]] = []
+        for _n in ast.walk(_tree):
+            if isinstance(_n, ast.Assign):
+                _targets = list(_n.targets)
+            elif isinstance(_n, ast.AnnAssign) and _n.value is not None:
+                _targets = [_n.target]
+            elif isinstance(_n, ast.AugAssign):
+                _targets = [_n.target]
+            else:
+                continue
+            for _t in _targets:
+                _name = _assigned_name(_t)
+                if _name:
+                    _writes.append((_n.lineno, _name, isinstance(_n, ast.AugAssign)))
+        # ── Step 2: names the reader saw written, written again past the cut ──
+        # The last shown line may be partial, so it counts as hidden.
+        _seen = {_nm for _ln, _nm, _ in _writes if _ln < _shown_n}
+        _past = sorted(
+            {
+                (_ln, _nm, _aug)
+                for _ln, _nm, _aug in _writes
+                if _ln >= _shown_n and _nm in _seen
+            },
+            key=lambda _w: (not _w[2], _w[0]),
+        )
+        if not _past:
+            return ""
+        _rows = [
+            f"#   body line {_ln}: {_full[_ln - 1].strip()[:140]}"
+            for _ln, _, _ in _past[:_CUT_WRITES_MAX]
+        ]
+        _more = len(_past) - len(_rows)
+        return "\n".join(
+            [
+                "# Past the cut, names assigned above are written again (read "
+                "from the full body — do not conclude they never change):"
+            ]
+            + _rows
+            + ([f"#   … and {_more} more"] if _more > 0 else [])
+        )
+    except Exception:
+        return ""
 
-    A qualified id the index holds is taken as written; a bare or partly
-    qualified name is taken only when exactly one symbol carries its last
-    part. Anything else is dropped rather than guessed.
 
-    Args:
-        text: A question or message.
-        idx: The SymbolIndex.
-        project_id: Current project identifier.
+# Lines kept either side of a passage the claims name. A call's arguments
+# run on below the line that names it, so the window leans forward.
+_EXCERPT_BEFORE = 3
+_EXCERPT_AFTER = 6
+_EXCERPT_MARK = "# [excerpt: "
+
+
+def _claim_terms(texts: List[str], own: str) -> List[str]:
+    """What claims name that a body line can contain: code names, literals.
+
+    The parts of code names (_PROSE_CODE_NAME_RE, backticked spans) and the
+    quoted literals ('dead'), minus the parts of the symbol's own name,
+    which every line of its body would match. A part of a dotted name
+    counts whatever its shape (`step.output`); elsewhere a word counts only
+    when it looks like code. Order kept, repeats dropped.
+    """
+    _skip = set(str(own or "").split(".")) | {"self", "cls"}
+    _out: Dict[str, None] = {}
+    for _t in texts or []:
+        _t = str(_t or "")
+        _spans = [_m.group(1) for _m in _PROSE_CODE_NAME_RE.finditer(_t)] + [
+            _m.group(1) for _m in re.finditer(r"`([^`\n]{2,80})`", _t)
+        ]
+        for _span in _spans:
+            _dotted = {
+                _p
+                for _d in re.findall(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", _span)
+                for _p in _d.split(".")
+                if len(_p) >= 4
+            }
+            for _part in re.findall(r"[A-Za-z_]\w+", _span):
+                if _part not in _skip and (
+                    _part in _dotted
+                    or "_" in _part
+                    or re.search(r"[a-z][A-Z]", _part)
+                ):
+                    _out[_part] = None
+        for _m in re.finditer(r"""['"]([^'"\n]{2,40})['"]""", _t):
+            _out[_m.group(1)] = None
+    return list(_out)
+
+
+def _claim_excerpt(body: str, claims: List[str], cap: int, own: str) -> str:
+    """The parts of a body too long to show whole that its claims are about.
+
+    A head cut showed the first `cap` characters, and the line a claim
+    turns on is as likely to sit past them as before: in rounds 6-8, 16 of
+    the 26 claims judged against a cut body came back indeterminate,
+    against 10 of 199 against a whole one. Here every line is scored by
+    the claims' terms (_claim_terms), each weighted by how few lines carry
+    it, so the one call that passes `decided_before` outranks the forty
+    lines that mention the loop; the signature is kept, then a window
+    around each line in score order while `cap` lasts. Elided runs are
+    marked where they were, so what is printed is still literal code a
+    quote can be checked against. "" when no claim term is in the body.
+    """
+    _lines = str(body or "").split("\n")
+    _terms = _claim_terms(claims, own)
+    if not _terms or not _lines:
+        return ""
+    _score = [0.0] * len(_lines)
+    for _t in _terms:
+        _pat = re.compile(r"(?<![\w])" + re.escape(_t) + r"(?![\w])")
+        _hits = [_i for _i, _l in enumerate(_lines) if _pat.search(_l)]
+        for _i in _hits:
+            _score[_i] += 1.0 / len(_hits)
+    # ── Step 1: the signature, to the colon that closes it ──
+    _head, _depth = 0, 0
+    for _i, _l in enumerate(_lines[:25]):
+        _depth += _l.count("(") - _l.count(")")
+        if _depth <= 0 and _l.rstrip().endswith(":"):
+            _head = _i
+            break
+    _keep = set(range(_head + 1))
+    # Room for the header and an elision mark per passage.
+    _used = sum(len(_lines[_i]) + 1 for _i in _keep) + 300
+    # ── Step 2: a window around each scored line, best first ──
+    _passages = 0
+    for _a in sorted(
+        (_i for _i, _s in enumerate(_score) if _s > 0), key=lambda _i: (-_score[_i], _i)
+    ):
+        _win = [
+            _i
+            for _i in range(
+                max(0, _a - _EXCERPT_BEFORE), min(len(_lines), _a + _EXCERPT_AFTER + 1)
+            )
+            if _i not in _keep
+        ]
+        _cost = sum(len(_lines[_i]) + 1 for _i in _win) + 40
+        if not _win or _used + _cost > cap:
+            continue
+        _keep.update(_win)
+        _used += _cost
+        _passages += 1
+    if not _passages:
+        return ""
+    # ── Step 3: in body order, elisions marked ──
+    _out: List[str] = []
+    _prev = -1
+    for _i in sorted(_keep):
+        if _i > _prev + 1:
+            _out.append(f"# ... [{_i - _prev - 1} line(s) not shown]")
+        _out.append(_lines[_i])
+        _prev = _i
+    if _prev < len(_lines) - 1:
+        _out.append(f"# ... [{len(_lines) - 1 - _prev} line(s) not shown]")
+    _text = "\n".join(_out)
+    return (
+        f"{_EXCERPT_MARK}{own} is {len(body)} chars, past the {cap}-char cap. "
+        f"Printed: its signature and the {_passages} passage(s) that name what "
+        f"the claims below mention, {len(_text)} chars, in body order; elided "
+        f"lines are marked. Quote only printed lines.]\n" + _text
+    )
+
+
+def _framing_grounding(
+    text: str, idx: Any, project_id: str, sources: Optional[List[str]] = None
+) -> Tuple[int, List[str]]:
+    """How a piece of text's code names stand against the index and the code.
+
+    Returns (resolved, unknown): how many distinct code-shaped names
+    (_PROSE_CODE_NAME_RE, backticked names) resolve to exactly one indexed
+    symbol, and the ones found nowhere — not in the index, and not written
+    in any of `sources` (the live code), where locals and parameters such
+    as `decided_before` live without being symbols. A framing that names
+    code that is nowhere is reasoning about something that is not there. A
+    name shared by several symbols is neither. Never raises.
+    """
+    try:
+        _names: List[str] = []
+        for _m in _PROSE_CODE_NAME_RE.finditer(str(text or "")):
+            _names.append(_m.group(1))
+        for _m in re.finditer(r"`([A-Za-z_][\w.]*)`", str(text or "")):
+            _names.append(_m.group(1))
+        _resolved = 0
+        _unknown: List[str] = []
+        _all = idx.get_all_qualified_names(project_id) or set()
+        for _n in dict.fromkeys(_n.strip(".") for _n in _names if _n):
+            if _n in _all:
+                _resolved += 1
+                continue
+            _tail = _n.rsplit(".", 1)[-1]
+            _q = idx.get_qualified_names_for(_tail, project_id) or set()
+            # get_qualified_names_for echoes an unknown name back.
+            _q = {_x for _x in _q if _x in _all}
+            if len(_q) == 1:
+                _resolved += 1
+            elif not _q and not any(
+                re.search(r"(?<![\w])" + re.escape(_tail) + r"(?![\w])", _src)
+                for _src in sources or []
+            ):
+                _unknown.append(_n)
+        return _resolved, _unknown
+    except Exception:
+        return 0, []
+
+
+# A question about whether, or by what path, a piece of code runs at all.
+_REACH_QUESTION_RE = re.compile(
+    r"\bse\s+(?:ejecuta|llama|usa|invoca|lanza)\s+(?:alguna\s+vez|nunca)\b"
+    r"|\bllega\s+a\s+(?:ejecutarse|llamarse|usarse|invocarse|lanzarse)\b"
+    r"|\bpor\s+qu[eé]\s+camino\b|\bqui[eé]n\s+(?:ejecuta|lanza|arranca)\b"
+    r"|\b(?:c[oó]digo\s+muerto|dead\s+code)\b"
+    r"|\b(?:is|are)\s+\S+\s+ever\s+(?:called|run|executed|used|invoked)\b"
+    r"|\bdoes\s+\S+\s+ever\s+(?:run|execute|get\s+called)\b"
+    r"|\bwho\s+(?:runs|launches|starts)\b",
+    re.IGNORECASE,
+)
+_REFERENCE_SITES_MAX = 8
+_REFERENCE_HOPS_MAX = 6
+
+
+def _reference_sites(
+    tree: "ast.AST", lines: List[str], name: str
+) -> Tuple[List[Tuple[str, int, str, str]], List[Tuple[str, int, str]]]:
+    """Where `name` is named without being called, and where its receiver runs.
+
+    Returns (sites, hops). A site is (enclosing qualified name, line, the
+    line's text, the keyword it is passed as or ""): a Name or Attribute
+    `name` that is not the function of a Call. A hop is (enclosing name,
+    line, text) for each read of an attribute named after one of those
+    keywords (`task.bg_func`), outside an assignment to it: where the
+    function passed by reference is handed on or run.
+    """
+    # ── Step 1: parents and enclosing definitions ──
+    _parent: Dict[int, ast.AST] = {}
+    _owner: Dict[int, str] = {}
+
+    def _walk(node: ast.AST, stack: List[str]) -> None:
+        for _child in ast.iter_child_nodes(node):
+            _parent[id(_child)] = node
+            if isinstance(
+                _child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                _walk(_child, stack + [_child.name])
+            else:
+                _owner[id(_child)] = ".".join(stack)
+                _walk(_child, stack)
+
+    _walk(tree, [])
+
+    def _text(_n: ast.AST) -> str:
+        _ln = getattr(_n, "lineno", 0)
+        return lines[_ln - 1].strip()[:160] if 0 < _ln <= len(lines) else ""
+
+    # ── Step 2: the name, not called ──
+    _sites: List[Tuple[str, int, str, str]] = []
+    _keywords: Set[str] = set()
+    for _n in ast.walk(tree):
+        _hit = (isinstance(_n, ast.Attribute) and _n.attr == name) or (
+            isinstance(_n, ast.Name) and _n.id == name
+        )
+        if not _hit:
+            continue
+        _p = _parent.get(id(_n))
+        if isinstance(_p, ast.Call) and _p.func is _n:
+            continue
+        _kw = _p.arg if isinstance(_p, ast.keyword) and _p.arg else ""
+        if _kw:
+            _keywords.add(_kw)
+        _sites.append((_owner.get(id(_n), ""), _n.lineno, _text(_n), _kw))
+    # ── Step 3: where the receiving attribute is read ──
+    _hops: List[Tuple[str, int, str]] = []
+    if _keywords:
+        for _n in ast.walk(tree):
+            if not (
+                isinstance(_n, ast.Attribute)
+                and _n.attr in _keywords
+                and isinstance(_n.ctx, ast.Load)
+            ):
+                continue
+            _hops.append((_owner.get(id(_n), ""), _n.lineno, _text(_n)))
+    return _sites, _hops
+
+
+def _named_indexed_spans(
+    text: str, idx: Any, project_id: str, bare: bool = False
+) -> List[Tuple[int, int, str]]:
+    """
+    The indexed symbols a piece of text names, with where it first names each.
+
+    The reading behind _named_indexed_symbols, which documents it; this one
+    keeps the position too, for a caller that needs to know what the text
+    says between two names (_relation_named_pair).
 
     Returns:
-        Distinct qids in the order the text names them.
+        (start, end, qid) for each distinct qid, in the order the text names
+        them; start and end delimit its first mention.
     """
     try:
         qualified = idx.get_all_qualified_names(project_id) or set()
     except Exception:
         return []
-    named: List[str] = []
-    for _m in _NAMED_SYMBOL_RE.finditer(text or ""):
-        token = (_m.group(1) or _m.group(2) or "").strip("().,;:¿?¡!")
+    _found: List[Tuple[int, int, str]] = [
+        (_m.start(), _m.end(), _m.group(1) or _m.group(2) or "")
+        for _m in _NAMED_SYMBOL_RE.finditer(text or "")
+    ]
+    if bare:
+        _found += [
+            (_m.start(), _m.end(1), _m.group(1))
+            for _m in _PROSE_CODE_NAME_RE.finditer(text or "")
+        ]
+    spans: List[Tuple[int, int, str]] = []
+    for _start, _end, _tok in sorted(_found, key=lambda _p: _p[0]):
+        token = _tok.strip("().,;:¿?¡!`")
         if not token:
             continue
         if token in qualified:
@@ -2347,9 +2953,94 @@ def _named_indexed_symbols(text: str, idx: Any, project_id: str) -> List[str]:
         else:
             resolved = idx.get_qualified_names_for(token.split(".")[-1], project_id)
             qid = next(iter(resolved)) if len(resolved) == 1 else ""
-        if qid and qid not in named:
-            named.append(qid)
-    return named
+        # get_qualified_names_for hands a name it does not know back as
+        # itself, so a parameter or a word in backticks came out as a qid.
+        if qid and qid in qualified and all(qid != _q for _, _, _q in spans):
+            spans.append((_start, _end, qid))
+    return spans
+
+
+def _named_indexed_symbols(
+    text: str, idx: Any, project_id: str, bare: bool = False
+) -> List[str]:
+    """
+    The indexed symbols a piece of text names, each resolved to one qid.
+
+    A qualified id the index holds is taken as written; a bare or partly
+    qualified name is taken only when exactly one symbol carries its last
+    part. Anything else is dropped rather than guessed — including a name
+    the index does not hold at all, which get_qualified_names_for echoes
+    back and which used to come out as a qid of its own.
+
+    Args:
+        text: A question or message.
+        idx: The SymbolIndex.
+        project_id: Current project identifier.
+        bare: Also read code-shaped names written without backticks
+            (snake_case, _private, CamelCase: _PROSE_CODE_NAME_RE). Off by
+            default; the index-answer path turns it on, because questions
+            arrive as typed: both rounds that asked "¿Qué funciones o
+            métodos llaman a _relation_edge_status?" sent it without
+            backticks, and the listing never ran.
+
+    Returns:
+        Distinct qids in the order the text names them.
+    """
+    return [_q for _, _, _q in _named_indexed_spans(text, idx, project_id, bare)]
+
+
+# A call relation stated in words: "A llama a B", "does A call B", "¿Usa A B?".
+# Not "cómo se llama", which asks for a name rather than about a call; "se llama
+# desde" (is called from) is still a call.
+_RELATION_VERB_RE = re.compile(
+    r"\b(?:calls?|call(?:ed|ing)|invok(?:e|es|ed|ing)|uses?|us(?:ed|ing)"
+    r"|runs?|execut(?:e|es|ed|ing)|reach(?:es|ed)?|trigger(?:s|ed)?"
+    r"|(?<!cómo se )(?<!como se )llam(?:a|an|ar|ó|aba|ará|ando)"
+    r"|invoc(?:a|an|ar|ó|ando)|usan?"
+    r"|utilizan?|ejecutan?|lanzan?|alcanzan?|disparan?)\b",
+    re.IGNORECASE,
+)
+# How far apart two names may be and still be read as the two ends of the
+# relation a verb between them states.
+_RELATION_PAIR_GAP = 80
+# How much text before the first name may hold the verb: "¿Llama A a B?".
+_RELATION_VERB_LEAD = 24
+
+
+def _relation_named_pair(text: str, idx: Any, project_id: str) -> List[str]:
+    """
+    The caller and callee of a call relation a text states without backticks.
+
+    Questions are typed as prose: "Como HypothesisForge._forge_verdict llama
+    a _relation_edge_status…" names its second symbol bare, and a function
+    at module level is indexed under its module ("context_manager._x"), so
+    the backticked reading found one symbol and the relation was never
+    settled. Read bare instead, two symbols are a relation only when the
+    text states one between them: a call verb in the gap, or just before
+    the first ("¿Llama A a B?"), with the two at most _RELATION_PAIR_GAP
+    characters apart. Two names that merely appear in one question are not
+    a claim about each other. Never raises.
+
+    Returns:
+        [caller, callee] in the order the text names them, or [].
+    """
+    try:
+        spans = _named_indexed_spans(text, idx, project_id, bare=True)
+        if len(spans) != 2:
+            return []
+        (_s1, _e1, _q1), (_s2, _, _q2) = spans
+        if _s2 - _e1 > _RELATION_PAIR_GAP:
+            return []
+        # Searched in place rather than on slices, so the verb's lookbehind
+        # still sees the words before the window ("¿Cómo se llama…").
+        _text = text or ""
+        if _RELATION_VERB_RE.search(_text, _e1, _s2) or _RELATION_VERB_RE.search(
+            _text, max(0, _s1 - _RELATION_VERB_LEAD), _s1
+        ):
+            return [_q1, _q2]
+        return []
+    except Exception:
+        return []
 
 
 def _note_body_shown(filt, qid: str, step_local: bool = False) -> None:
@@ -4840,6 +5531,20 @@ _NO_CAUSE_VERDICT = (
     "exists and is wired as they say, which makes none of them the cause. "
 )
 
+# How the conclusion opens when the competition established no cause
+# (AgenticOrchestrator._hedge_unestablished_conclusion and the seeded opening),
+# and the words that show a conclusion already says so.
+_NO_CAUSE_LEADS = {
+    "es": "No se estableció la causa; lo que sigue es una candidata sin verificar: ",
+    "en": "No cause was established; what follows is an unverified candidate: ",
+}
+_NO_CAUSE_SAID_RE = re.compile(
+    r"\bno se (?:ha )?(?:estableci[oó]|pudo establecer|encontr[oó])"
+    r"|\bsin verificar\b|\bno (?:est[aá]|qued[oó]) establecid"
+    r"|\bno cause\b|\bnot established\b|\bunverified\b|\bcould not establish",
+    re.IGNORECASE,
+)
+
 # A file name a claim put in front of a symbol (AgenticEvidenceLedger.
 # _canonical_qid).
 _CITED_FILE_PREFIX_RE = re.compile(
@@ -4918,8 +5623,8 @@ _METRIC_INSERTS = {
     # place among them, which is how CommandRouter._turn_rivals numbers it.
     "forge_fact": (
         "INSERT INTO metric_forge_facts (project_id, turn_started, comp_ts, "
-        "position, ts, kind, verdict, fact_key) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        "position, ts, kind, verdict, fact_key, settled, settled_by, asserted) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ),
     # One label per turn. Labelling a turn again replaces its label, so
     # an operator who changes their mind leaves one answer, not two.
@@ -12009,9 +12714,12 @@ class ContextBuilder:
                     # ── Step 3: cap oversized bodies (parity with LOD-3) ──
                     _cap = self._f.valves.max_code_block_tokens
                     if _cap > 0 and self._f._tokens.estimate_code_tokens(body) > _cap:
+                        _shown = self._f._tokens.truncate_text_to_tokens(body, _cap)
+                        _past = _writes_beyond_cut(body, _shown)
                         body = (
-                            self._f._tokens.truncate_text_to_tokens(body, _cap)
+                            _shown
                             + "\n# ... [truncated — use /expand for full body]"
+                            + ("\n" + _past if _past else "")
                         )
                     _note_body_shown(self._f, qid)
         # A header with nothing under it is worse than no section at all:
@@ -12166,6 +12874,12 @@ class ContextBuilder:
             self._f._log_debug(
                 f"DIAG bbb: <<< infer_seeds → {len(inferred_seeds)} seed(s)"
             )
+        # Text the question quotes anchors the search beside whatever was
+        # inferred: the symbols that print it, found by a literal search.
+        for _qid, _v in self._f._seed_inferencer.resolve_quoted_seeds(
+            query, project_id
+        ).items():
+            inferred_seeds.setdefault(_qid, _v)
 
         # ------------------------------------------------------------------
         # Step 4: Build ActivationGraph and get activated nodes.
@@ -15081,6 +15795,24 @@ class StateStore:
             CREATE INDEX IF NOT EXISTS idx_metric_forge_facts_kind
             ON metric_forge_facts (project_id, kind, turn_started)
         """)
+        # How triangulation settled each fact (BayesianRanking.settle_fact):
+        # settled_by '' on a row from before it ruled, 'none' where it left
+        # the fact unsettled, else whose families back the settled verdict.
+        _fact_cols = {
+            r[1]
+            for r in self._f._db_conn.execute(
+                "PRAGMA table_info(metric_forge_facts)"
+            ).fetchall()
+        }
+        for _col, _ddl in (
+            ("settled", "INTEGER"),
+            ("settled_by", "TEXT NOT NULL DEFAULT ''"),
+            ("asserted", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if _col not in _fact_cols:
+                self._f._db_conn.execute(
+                    f"ALTER TABLE metric_forge_facts ADD COLUMN {_col} {_ddl}"
+                )
         # The operator's verdict on a delivered answer, one row per turn,
         # joined to every other metric table on (project_id, turn_started).
         # Written only by an explicit command: a label derived from the
@@ -18672,6 +19404,7 @@ class LLMOrchestrator:
         # it in the system would cost the first heavy call of each turn a
         # full re-prefill. Reading order is unchanged — Block B still sits
         # between the hub tier and the role, across the message boundary.
+        _split_shared = _split_own = ""
         try:
             # The invariant describes the SESSION, not the turn, so it is
             # remembered the moment it is published and read from there
@@ -18717,6 +19450,15 @@ class LLMOrchestrator:
             ):
                 _moved = system_prompt[len(_cut) :].strip()
                 if _moved:
+                    # Computed from the call as it arrived, before the merge
+                    # below: what it returns is sent instead of the merged
+                    # turn where the transport allows (see the call site).
+                    if _cut == _stab and getattr(
+                        self._f.valves, "split_turn_context_message", True
+                    ):
+                        _split_shared, _split_own = _split_turn_context(
+                            system_prompt, prompt, _stab, _pre_full
+                        )
                     system_prompt = _cut
                     prompt = _moved + "\n\n" + (prompt or "")
 
@@ -18927,6 +19669,40 @@ class LLMOrchestrator:
                         f"prompt size: ~{prompt_tokens} tokens"
                     )
 
+                # ── Shared turn context as its own user message ───────────
+                # The merged `prompt` stays the currency of the keys above
+                # and of every log; only the request carries the split.
+                # extra_body is merged last by the shared client, so its
+                # messages replace the single user turn it would build.
+                # Chat endpoints only: a completion prompt has no message
+                # boundary for the server to checkpoint at.
+                _call_extra = _extra_body
+                if (
+                    _split_shared
+                    and ep_type == "chat"
+                    and get_model_backend(model) != "ollama"
+                ):
+                    _call_extra = dict(_extra_body or {})
+                    _call_extra["messages"] = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": _split_shared},
+                        {"role": "user", "content": _split_own},
+                    ]
+                    try:
+                        _c = getattr(self._f, "_cut_census_this_turn", None)
+                        if _c is not None:
+                            _c["split"] = _c.get("split", 0) + 1
+                            if _c["split"] == 1:
+                                self._f._log_debug(
+                                    f"🧷 Shared turn context: "
+                                    f"{len(_split_shared)} chars sent as "
+                                    f"their own user message — llama.cpp "
+                                    f"checkpoints where it ends, so later "
+                                    f"calls this turn resume there"
+                                )
+                    except Exception:
+                        pass
+
                 task = asyncio.current_task()
                 async with self._f._active_llm_tasks_lock:
                     self._f._active_llm_tasks.add(task)
@@ -18940,6 +19716,7 @@ class LLMOrchestrator:
                     # 100 s and cost the run its next three steps.
                     _http_timeout = self._f.valves.llm_request_timeout
                     _retries = 3
+                    _retry_kw: Dict[str, Any] = {}
                     if total_timeout is not None and total_timeout > 0:
                         _http_timeout = min(_http_timeout, int(total_timeout))
                         # The shared client's timeout applies PER ATTEMPT and
@@ -18952,6 +19729,23 @@ class LLMOrchestrator:
                         # the ceiling exactly, and losing the transient-error
                         # retry costs less than tripling the deadline.
                         _retries = 1
+                        # Except for a failure that costs nothing: a refused
+                        # connection or an empty reply returns in
+                        # milliseconds, and round 5 lost both its framing and
+                        # its plan to one (pre-planner and planner, the same
+                        # second) with three minutes of deadline unspent.
+                        # The shared client's deadline_seconds stops starting
+                        # attempts once elapsed + backoff leaves the window,
+                        # so only early failures are retried, and a timeout
+                        # (which spends the window) never is. Worst case, an
+                        # early failure then a full attempt: about 1.25x the
+                        # deadline, against 3x for the old blind retry.
+                        if _SHARED_LLM_HAS_DEADLINE:
+                            _retries = 3
+                            _retry_kw["deadline_seconds"] = max(
+                                _DEADLINE_RETRY_MIN_S,
+                                _DEADLINE_RETRY_SHARE * float(total_timeout),
+                            )
                     result = await _shared_call_llm(
                         prompt=prompt,
                         system=system_prompt,
@@ -18973,7 +19767,8 @@ class LLMOrchestrator:
                         log_raw_response=log_raw_response,
                         label=label,
                         return_meta=True,
-                        extra_body=_extra_body,
+                        extra_body=_call_extra,
+                        **_retry_kw,
                     )
 
                     content = result.content if result else ""
@@ -19337,6 +20132,9 @@ class AgenticStep:
     seconds: float = 0.0
     symbols: List[str] = field(default_factory=list)
     cached: bool = False
+    # Never served from the step cache, though still written to it. The cache
+    # keys on kind and goal, and a re-analysis repeats its step's goal.
+    fresh: bool = False
     skip_reason: str = ""
     truncated: bool = False  # generation hit max_tokens: output is incomplete
     # Which INSTRUCTION set this step gets, when the plan's intent
@@ -19389,6 +20187,32 @@ _TRIANGULATION_FIELDS = (
 # How many claims the shadow names in the log, of those a live ruling
 # would change.
 _TRIANGULATION_NOTES_MAX = 6
+# What the forge's triangulation counts per turn (ForgeFactTriangulation),
+# printed as forge_tri_<field> on [METRICS-TURN]. would_spare and would_kill
+# count the hypotheses on which the firmness gate and the count gate part: one
+# the count gate kills and the firmness gate would not, and the other way.
+_FORGE_TRIANGULATION_FIELDS = (
+    "facts",
+    "refuted",
+    "firm",
+    "weak",
+    "invalid",
+    "asserted",
+    "second",
+    "corroborated",
+    "anomaly",
+    "out_of_scope",
+    "judge_only",
+    "would_spare",
+    "would_kill",
+)
+# The system prompt of the forge's judge calls: its evidence pass, and the
+# second family its triangulation asks. The same for both, and the bodies
+# open both prompts, so the second call's prompt starts as the first's did.
+_FORGE_JUDGE_SYSTEM = (
+    "You check claims against code shown in full. "
+    "Answer ONLY with the JSON object requested."
+)
 
 
 @dataclass
@@ -19435,6 +20259,10 @@ class LedgerClaim:
     # on (EvidenceTriangulation) instead of being settled by whichever
     # ran last.
     observations: List["EvidenceObservation"] = field(default_factory=list)
+    # (caller, callee) of each call check that tested this claim as it is
+    # stated (AgenticStaticVerifier._apply_verdicts), for the discrepancy
+    # probe (_call_site_reading) when the graph and the judge disagree.
+    call_checks: List[List[str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # A claim rebuilt from the step cache or the ledger snapshot brings
@@ -19588,6 +20416,61 @@ def _conjoined_call_pairs(
     return []
 
 
+def _edge_reaches(
+    idx: Any, dst: str, callee: str, project_id: str, caller: str = ""
+) -> Optional[bool]:
+    """
+    Whether a call edge's destination is the callee a claim names.
+
+    Edge destinations are mostly bare: SignatureExtractor keeps the name a
+    call is made by and drops its receiver, so `self._meta._relation_in_graph(…)`
+    is drawn to "_relation_in_graph". Compared by that tail alone, the edge
+    confirmed "GraphRelationObserver.observe calls
+    GraphRelationObserver._relation_in_graph" — a method that does not exist —
+    and the triangulation shadow overruled the judge that had read the call.
+
+    Args:
+        idx: The SymbolIndex.
+        dst: The edge's destination as the index stores it.
+        callee: The callee as the claim writes it.
+        project_id: Current project identifier.
+        caller: The qualified id the edge leaves from, when known.
+
+    Returns:
+        False when the names differ. True when they agree: the callee is
+        written bare (the tail is all it names), or the destination is the
+        callee qualified, or the destination is bare and the index holds no
+        other symbol of that name (the only one, or none at all: a call out
+        of the index such as `list.append`), or the callee is an indexed
+        method of the caller's own class (a call by that name from inside
+        the class is `self.` far more often than anything else). None when
+        the destination is bare and the index holds that name under another
+        owner, or several: the edge cannot say which of them the call
+        reached. An inherited method is one of those, since the index does
+        not record bases.
+    """
+    if dst.split(".")[-1] != callee.split(".")[-1]:
+        return False
+    if "." not in callee:
+        return True
+    if "." in dst:
+        return dst == callee
+    try:
+        _known = idx.get_all_qualified_names(project_id) or set()
+        _namesakes = set(idx.get_qualified_names_for(dst, project_id)) & set(_known)
+    except Exception:
+        return None
+    if not _namesakes or _namesakes == {callee}:
+        return True
+    if (
+        callee in _namesakes
+        and "." in caller
+        and caller.rsplit(".", 1)[0] == callee.rsplit(".", 1)[0]
+    ):
+        return True
+    return None
+
+
 def _relation_edge_status(idx: Any, caller: str, callee: str, project_id: str) -> str:
     """
     Classify how a caller relates to a callee in the call graph.
@@ -19601,13 +20484,17 @@ def _relation_edge_status(idx: Any, caller: str, callee: str, project_id: str) -
     Args:
         idx: The SymbolIndex.
         caller: Bare name of the caller, already known to the index.
-        callee: Name of the callee; only its bare tail is compared.
+        callee: Name of the callee, bare or qualified; matched against
+            each edge by _edge_reaches.
         project_id: Current project identifier.
 
     Returns:
         "direct" when a calls, reads or writes edge reaches the callee;
         "indirect" when a path of at most _RELATION_MAX_HOPS call edges
-        does; "dynamic" when neither exists but the caller hands functions
+        does; "ambiguous" when neither, but an edge or a path ends at a
+        name the index holds under another owner than the one the callee is
+        written with, so the graph cannot tell whether it is the callee;
+        "dynamic" when none of those exists but the caller hands functions
         over by reference (_DYNAMIC_DISPATCH_CALLS); "absent" otherwise.
     """
     callee_bare = callee.split(".")[-1]
@@ -19623,13 +20510,17 @@ def _relation_edge_status(idx: Any, caller: str, callee: str, project_id: str) -
 
     # ── Step 1: direct edges, collecting where the walk continues ──
     dynamic = False
+    ambiguous = False
     seen = set(start)
     frontier: set = set()
     for cq in start:
         for e in idx.get_edges_out(cq, project_id):
             tail = e.dst.split(".")[-1]
             if tail == callee_bare and e.type in ("calls", "reads", "writes"):
-                return "direct"
+                _reach = _edge_reaches(idx, e.dst, callee, project_id, cq)
+                if _reach:
+                    return "direct"
+                ambiguous = ambiguous or _reach is None
             if e.type != "calls":
                 continue
             if tail in _DYNAMIC_DISPATCH_CALLS:
@@ -19653,7 +20544,10 @@ def _relation_edge_status(idx: Any, caller: str, callee: str, project_id: str) -
                     continue
                 tail = e.dst.split(".")[-1]
                 if tail == callee_bare:
-                    return "indirect"
+                    _reach = _edge_reaches(idx, e.dst, callee, project_id, sq)
+                    if _reach:
+                        return "indirect"
+                    ambiguous = ambiguous or _reach is None
                 targets = idx.get_qualified_names_for(tail, project_id)
                 if len(targets) > _RELATION_FANOUT_CAP:
                     continue
@@ -19662,6 +20556,8 @@ def _relation_edge_status(idx: Any, caller: str, callee: str, project_id: str) -
                         seen.add(tq)
                         nxt.add(tq)
         frontier = nxt
+    if ambiguous:
+        return "ambiguous"
     return "dynamic" if dynamic else "absent"
 
 
@@ -19839,6 +20735,384 @@ def _answer_shape(answer: str, outline: str) -> Tuple[int, int, int]:
         return len(_seeds), _copied, _items
     except Exception:
         return 0, 0, 0
+
+
+# A code name in prose: dotted (Class.method), snake_case with at least one
+# inner underscore, a leading-underscore lower-case name, or CamelCase; with
+# "()" when written as a call. Plain words of either language match none,
+# and neither does Markdown italics: "_Usar …_" opens with an underscore
+# and a capital, and "…_execute._" closes on a part with no letter.
+_PROSE_CODE_NAME_RE = re.compile(
+    r"(?<![\w`/.])("
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_]*[A-Za-z][A-Za-z0-9_]*)+"
+    r"|_*[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+_*"
+    r"|_+[a-z][a-z0-9]*"
+    r"|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+"
+    r")(\(\))?(?![\w`/])"
+)
+
+
+def _backtick_code_names(line: str) -> str:
+    """Put the code names of a prose line in backticks, leaving the rest.
+
+    Text already inside backticks is left alone, and so is a dotted name
+    whose parts are all lower case with no underscore (an abbreviation
+    such as "e.g", not a symbol). Idempotent. Never raises.
+    """
+    try:
+        _parts = str(line).split("`")
+        for _i in range(0, len(_parts), 2):
+
+            def _wrap(_m: "re.Match") -> str:
+                _name = _m.group(1)
+                if "." in _name and "_" not in _name and _name == _name.lower():
+                    return _m.group(0)
+                return "`" + _name + (_m.group(2) or "") + "`"
+
+            _parts[_i] = _PROSE_CODE_NAME_RE.sub(_wrap, _parts[_i])
+        return "`".join(_parts)
+    except Exception:
+        return line
+
+
+# A sandbox failure that names something the harness never defined: the
+# runner's "test_N: <Type>: <message>" line for a NameError or a failed import
+# (AgenticDynamicVerifier._suspect_reason_of). UnboundLocalError is left out: that
+# one the code under test can raise on its own.
+_COMPOSITION_FAULT_RE = re.compile(
+    r"^\s*[\w.]+:\s*(?:NameError|ImportError|ModuleNotFoundError):"
+)
+
+# What an edge cannot settle when a call claim adds it: a value, a quantifier,
+# a condition, a consequence, or the shape of a signature (parameters, async,
+# a decorator). A purpose ("X calls Y to verify relations") is description,
+# and the edge settles the claim it decorates. Round 10's "_update_active_code
+# is an async method that accepts message, project_id and is_continuation and
+# delegates to process" was settled by the edge alone.
+_CALL_EXTRA_RE = re.compile(
+    r"=|\d|\b(?:every|each|always|never|all|any|so|therefore|because|which|"
+    r"when|whenever|while|without|unless|before|after|if|returns?|returning|"
+    r"passes|passing|with|accepts?|accepting|takes|taking|receives?|"
+    r"receiving|parameters?|params?|arguments?|args|kwargs|signature|async|"
+    r"asynchronous|synchronous|coroutine|staticmethod|classmethod|"
+    r"defined\s+as|new|"
+    r"cada|siempre|nunca|todos?|todas?|por\s+lo\s+que|porque|cuando|sin|si|"
+    r"devuelve|pasa|pasando|con|antes|despu[eé]s|acepta|recibe|"
+    r"par[aá]metros?|argumentos?|firma|as[ií]ncron[oa]|nuev[oa]s?)\b",
+    re.IGNORECASE,
+)
+
+
+# A claim whose whole content is that a named symbol exists. It is the only
+# shape the symbol index can confirm on its own; any other claim that merely
+# names a symbol asserts something the index cannot see.
+_EXISTENCE_CLAIM_RE = re.compile(
+    r"^(?:the\s+)?(?:(?:class|function|method|symbol|helper)\s+)?"
+    r"`?([A-Za-z_][\w.]*)`?\s+"
+    r"(?:exists?|existe|is\s+(?:defined|declared|present|implemented)"
+    r"(?:\s+in\s+[\w./`]+)?)\s*[.!]?$",
+    re.IGNORECASE,
+)
+
+
+def _states_only_the_call(text: str, names: Optional[List[str]] = None) -> bool:
+    """Whether a call claim adds nothing an edge cannot settle.
+
+    Code names are removed first (_PROSE_CODE_NAME_RE, anything in
+    backticks, and the last part of each of `names`, the check's two ends),
+    so a name such as `decided_before` cannot pass for a word; then no value,
+    quantifier, condition or consequence may remain (_CALL_EXTRA_RE). "X
+    calls Y to verify relations" qualifies; "X passes v=0 to Y on every
+    cycle, so …" does not. Of 56 call claims in four rounds, 25 qualify.
+    Never raises: False, the cautious answer, on any failure.
+    """
+    try:
+        _rest = re.sub(r"`[^`]*`", " ", str(text or ""))
+        _rest = _PROSE_CODE_NAME_RE.sub(" ", _rest)
+        for _n in names or []:
+            _tail = str(_n or "").rsplit(".", 1)[-1]
+            if _tail:
+                _rest = re.sub(
+                    r"(?<![\w])" + re.escape(_tail) + r"(?![\w])", " ", _rest
+                )
+        return not _CALL_EXTRA_RE.search(_rest)
+    except Exception:
+        return False
+
+
+def _names_both_ends(text: str, ends: List[str]) -> bool:
+    """Whether a claim names each end of the relation a check tested.
+
+    An end counts as named when the claim writes its last part, or the class
+    or module before it ("HypothesisForge" for HypothesisForge._forge_loop)
+    standing alone: written as the prefix of another member it names that
+    member. Round 7's "TaskRegistry._build_tasks constructs the list" was
+    otherwise confirmed by the edge TaskRegistry.__init__ → _build_tasks.
+    The checks generator works from the claim's citations, not its sentence:
+    round 8's "_forge_verdict uses _relation_edge_status indirectly", citing
+    _forge_hypothesis, was checked as _forge_hypothesis → _relation_edge_status
+    and "verified" by that path, about a caller the claim never mentions.
+    Never raises: True, which leaves the check as it was, on any failure.
+    """
+    try:
+        _text = str(text or "")
+        for _end in ends:
+            _parts = [_p for _p in str(_end or "").split(".") if _p]
+            if not _parts:
+                continue
+            _named = re.search(
+                r"(?<![\w])" + re.escape(_parts[-1]) + r"(?![\w])", _text
+            ) or (
+                len(_parts) > 1
+                and re.search(
+                    r"(?<![\w])" + re.escape(_parts[-2]) + r"(?![\w])(?!\.\w)",
+                    _text,
+                )
+            )
+            if not _named:
+                return False
+        return True
+    except Exception:
+        return True
+
+
+# Where each class, method and function of the last block read starts and
+# ends: one parse per block, kept for the next probe (_symbol_spans).
+_SYMBOL_SPANS_CACHE: Dict[str, Any] = {}
+
+# A claim about reaching something, which a direct call site cannot settle.
+_REACH_CLAIM_RE = re.compile(
+    r"\b(?:indirect(?:ly)?|through|via|reach(?:es|ed)?|transitively)\b", re.I
+)
+
+
+def _symbol_spans(content: str) -> Tuple[Dict[str, Tuple[int, int]], Set[str]]:
+    """Line spans of a block's classes, methods and functions, and its class names.
+
+    Keyed "Class", "Class.method" and "function", decorators included in a
+    span. Cached for the block last read. Never raises: ({}, set()).
+    """
+    try:
+        _key = f"{len(content)}:{hash(content)}"
+        if _SYMBOL_SPANS_CACHE.get("key") != _key:
+            _spans: Dict[str, Tuple[int, int]] = {}
+            _classes: Set[str] = set()
+
+            def _span(_n: ast.AST) -> Tuple[int, int]:
+                _decos = getattr(_n, "decorator_list", []) or []
+                return (
+                    min([_n.lineno] + [_d.lineno for _d in _decos]),
+                    int(getattr(_n, "end_lineno", _n.lineno)),
+                )
+
+            for _n in ast.parse(content).body:
+                if isinstance(_n, ast.ClassDef):
+                    _classes.add(_n.name)
+                    _spans[_n.name] = _span(_n)
+                    for _m in _n.body:
+                        if isinstance(_m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            _spans[f"{_n.name}.{_m.name}"] = _span(_m)
+                elif isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    _spans[_n.name] = _span(_n)
+            _SYMBOL_SPANS_CACHE.clear()
+            _SYMBOL_SPANS_CACHE.update(key=_key, spans=_spans, classes=_classes)
+        return _SYMBOL_SPANS_CACHE["spans"], _SYMBOL_SPANS_CACHE["classes"]
+    except Exception:
+        return {}, set()
+
+
+# A span a question quotes: «…», “…”, "…", `…`, or a bracketed log tag such as
+# [METRICS-TURN]. In a debugging question it is usually what the program
+# printed, and the symbol that prints it is where the answer starts.
+_QUOTED_SPAN_RE = re.compile(
+    r"«([^»\n]{4,160})»|“([^”\n]{4,160})”|\"([^\"\n]{4,160})\""
+    r"|`([^`\n]{4,160})`|(\[[A-Z][A-Z0-9_-]{2,40}\])"
+)
+
+# More symbols than this printing a quoted text make it vocabulary, not a
+# line of output: "refuted" is in forty.
+_QUOTED_SEED_MAX = 3
+
+# String literals per symbol, one parse per block content, the last few
+# kept (_symbol_literals).
+_SYMBOL_LITERALS_CACHE: Dict[str, Any] = {}
+_SYMBOL_LITERALS_KEEP = 8
+
+
+def _quoted_spans(text: str) -> List[str]:
+    """The spans a text quotes, in order, whitespace collapsed, each once."""
+    _out: Dict[str, None] = {}
+    for _m in _QUOTED_SPAN_RE.finditer(str(text or "")):
+        _s = " ".join(next(_g for _g in _m.groups() if _g).split())
+        if _s:
+            _out[_s] = None
+    return list(_out)
+
+
+def _symbol_literals(
+    content: str,
+) -> Dict[str, Tuple[int, List[Tuple[int, str]]]]:
+    """The string literals of each class body, method and function of a block.
+
+    Keyed as _symbol_spans keys its spans ("Class", "Class.method",
+    "function"), each with its first line and its literals as (line, text),
+    whitespace collapsed. A class keeps what is outside its methods; a
+    nested function belongs to the method it sits in. Docstrings are left
+    out, since the program never prints them, and an f-string gives its
+    literal pieces. Never raises: {}.
+    """
+    try:
+        _key = f"{len(content)}:{hash(content)}"
+        if _key in _SYMBOL_LITERALS_CACHE:
+            return _SYMBOL_LITERALS_CACHE[_key]
+
+        def _docstring(_n: ast.AST) -> Optional[ast.AST]:
+            _b = getattr(_n, "body", None) or []
+            if (
+                _b
+                and isinstance(_b[0], ast.Expr)
+                and isinstance(getattr(_b[0], "value", None), ast.Constant)
+                and isinstance(_b[0].value.value, str)
+            ):
+                return _b[0].value
+            return None
+
+        def _literals(_stmts: List[ast.AST]) -> List[Tuple[int, str]]:
+            _docs = {
+                id(_d)
+                for _st in _stmts
+                for _n in ast.walk(_st)
+                if isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and (_d := _docstring(_n)) is not None
+            }
+            return [
+                (_n.lineno, " ".join(_n.value.split()))
+                for _st in _stmts
+                for _n in ast.walk(_st)
+                if isinstance(_n, ast.Constant)
+                and isinstance(_n.value, str)
+                and id(_n) not in _docs
+                and _n.value.strip()
+            ]
+
+        _out: Dict[str, Tuple[int, List[Tuple[int, str]]]] = {}
+        for _n in ast.parse(content).body:
+            if isinstance(_n, ast.ClassDef):
+                _doc = _docstring(_n)
+                _own = [
+                    _s
+                    for _s in _n.body
+                    if not isinstance(_s, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and not (_doc is not None and getattr(_s, "value", None) is _doc)
+                ]
+                _out[_n.name] = (_n.lineno, _literals(_own))
+                for _m in _n.body:
+                    if isinstance(_m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        _out[f"{_n.name}.{_m.name}"] = (_m.lineno, _literals([_m]))
+            elif isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _out[_n.name] = (_n.lineno, _literals([_n]))
+        while len(_SYMBOL_LITERALS_CACHE) >= _SYMBOL_LITERALS_KEEP:
+            _SYMBOL_LITERALS_CACHE.pop(next(iter(_SYMBOL_LITERALS_CACHE)))
+        _SYMBOL_LITERALS_CACHE[_key] = _out
+        return _out
+    except Exception:
+        return {}
+
+
+def _quote_in_literals(quote: str, literals: List[Tuple[int, str]]) -> int:
+    """The line of the first literal that prints a quoted text, else 0.
+
+    The quote inside a literal; a literal of 12 characters or more inside
+    the quote (an f-string piece: "confirm, step(s)" of "symbol Y: step(s)
+    [1] confirm, step(s) [2] refute"); or the quote's head, before its first
+    digit or brace, inside a literal ("sent as its own message x8" against
+    "sent as its own message x{_split}").
+    """
+    _q = " ".join(str(quote or "").split())
+    if not _q:
+        return 0
+    _head = re.split(r"[\d{]", _q, maxsplit=1)[0].rstrip()
+    for _line, _lit in literals:
+        if (
+            _q in _lit
+            or (len(_lit) >= 12 and _lit in _q)
+            or (len(_head) >= 8 and _head != _q and _head in _lit)
+        ):
+            return _line
+    return 0
+
+
+def _call_site_reading(
+    source: str, caller: str, callee: str, classes: Set[str]
+) -> Tuple[Optional[bool], str]:
+    """
+    Whether a caller's source calls the callee, read at its call sites.
+
+    The third instrument for "A calls B" when the graph and the judge
+    disagree, and one that fails differently from both: it reads the
+    receiver each call is made on, which the graph drops and the judge may
+    misread. A site's owner is the caller's class for `self.m` and `cls.m`,
+    the class for `Klass.m`, the module for a bare `m(...)`, and unknown for
+    any other receiver (`self._meta.m`). A callee of the caller's own class
+    is reached through self (or cls, or the class) and nothing else.
+
+    Args:
+        source: The caller's source.
+        caller: Its qualified id ("Class.method" or "function").
+        callee: The callee as the claim names it.
+        classes: The class names of the module, for `Klass.m` receivers.
+
+    Returns:
+        (True, how) when a site reaches the callee; (False, why) when none
+        can — no site calls that name, or every site's owner is known and
+        another; (None, why) when only unknown receivers remain. Never
+        raises: (None, the error).
+    """
+    try:
+        import textwrap as _tw
+
+        _tail = callee.split(".")[-1]
+        _parts = callee.split(".")
+        _owner = _parts[-2] if len(_parts) >= 2 and _parts[-2] in classes else ""
+        _mine = caller.split(".")[0] if "." in caller else ""
+        _sites: List[Tuple[str, str]] = []
+        for _n in ast.walk(ast.parse(_tw.dedent(source))):
+            if not isinstance(_n, ast.Call):
+                continue
+            _f = _n.func
+            if isinstance(_f, ast.Name) and _f.id == _tail:
+                _sites.append((_tail, ""))
+            elif isinstance(_f, ast.Attribute) and _f.attr == _tail:
+                _recv = ast.unparse(_f.value)
+                if _recv in ("self", "cls"):
+                    _sites.append((f"{_recv}.{_tail}", _mine or "?"))
+                elif isinstance(_f.value, ast.Name) and _f.value.id in classes:
+                    _sites.append((f"{_recv}.{_tail}", _f.value.id))
+                else:
+                    _sites.append((f"{_recv}.{_tail}", "?"))
+        if not _sites:
+            return False, f"{caller} has no call site named {_tail}"
+        _read = ", ".join(dict.fromkeys(_s for _s, _ in _sites))
+        if "." not in callee or not _owner:
+            # A function, or a callee the claim gives no class for: a bare
+            # call reaches it, and any call of the name may.
+            if any(_o == "" for _, _o in _sites) or "." not in callee:
+                return True, f"call site reads {_read}"
+            if all(_o not in ("?", "") for _, _o in _sites):
+                return False, f"call site reads {_read}, a method, not {callee}"
+            return None, f"call site reads {_read}: receiver not known"
+        if any(_o == _owner for _, _o in _sites):
+            return True, f"call site reads {_read}"
+        if _owner == _mine:
+            return (
+                False,
+                f"call site reads {_read}: not on self, so not {callee}",
+            )
+        if all(_o != "?" for _, _o in _sites):
+            return False, f"call site reads {_read}, owned elsewhere, not {callee}"
+        return None, f"call site reads {_read}: receiver not known"
+    except Exception as _e:
+        return None, f"call sites unreadable ({_e!r})"
 
 
 _REFUTED_HEAD = (
@@ -20250,6 +21524,10 @@ class AgenticEvidenceLedger:
                     self._f._symbol_index.get_all_qualified_names(project_id) or set()
                 ):
                     claim.subject = _subj
+                else:
+                    claim.subject = self._qualified_if_unique(
+                        claim.subject, project_id
+                    )
             _known_here = self._known_names(project_id)
             _known_bare = {_q.rsplit(".", 1)[-1] for _q in _known_here}
             for qid in claim.qids:
@@ -20263,6 +21541,9 @@ class AgenticEvidenceLedger:
                 if _canon and (
                     _canon in _known_here or _canon.rsplit(".", 1)[-1] in _known_bare
                 ):
+                    _canon = self._qualified_if_unique(_canon, project_id)
+                    if _canon in claim.valid_qids:
+                        continue
                     claim.valid_qids.append(_canon)
                     # The symbol exists under a different parent than the one
                     # cited. The resolver's bare-tail pass rescues miscased
@@ -20690,19 +21971,29 @@ class AgenticEvidenceLedger:
                 if len(_members) == 1:
                     _keep.append(_members[0])
                     continue
-                _best = min(
+                _by_rank = sorted(
                     _members,
                     key=lambda _m: _rank.get(self.bucket_of(_m), 99),
                 )
+                _survivors = [_by_rank[0]]
                 # Twins with opposite verdicts are one proposition two
                 # instruments disagree on, or two assertions the key cannot
-                # tell apart. Either way one side is about to be dropped,
-                # so the disagreement is counted before it is.
+                # tell apart. Neither is a reason to drop a side: the best
+                # of each verdict survives. Dropping one hid E3's refutation
+                # of "never updates decided_before" behind a confirmed
+                # "initialises it to 0", and the answer gave the refuted
+                # premise at 100% (conflict_is_anomaly).
                 _polar = {_m.verification for _m in _members}
                 if {"confirmed", "refuted"} <= _polar:
                     self.twin_conflicts += 1
-                _keep.append(_best)
-                _removed += len(_members) - 1
+                    for _side in ("confirmed", "refuted"):
+                        _top = next(
+                            (_m for _m in _by_rank if _m.verification == _side), None
+                        )
+                        if _top is not None and _top not in _survivors:
+                            _survivors.append(_top)
+                _keep.extend(_survivors)
+                _removed += len(_members) - len(_survivors)
 
             # ── Step 3: rewrite in the original order ──
             if _removed:
@@ -20740,9 +22031,31 @@ class AgenticEvidenceLedger:
             {"family_a|family_b": [both confirm, only a confirms, only b
             confirms, both refute]} over claims both families judged as
             stated, "notes": a line per claim a live ruling would change,
-            up to _TRIANGULATION_NOTES_MAX}. Never raises.
+            up to _TRIANGULATION_NOTES_MAX, "provenance": {"corroborated":
+            claims still backed by two independent observations when
+            independence is judged by provenance, "unsettled": claims whose
+            ruling that changes}, "instruments": {"kind:inst_a|inst_b": [4
+            cells as in pairs]} by instrument and claim kind, "loo":
+            {"kind:instrument": [agrees, disagrees]} — each instrument that
+            judged a claim as stated, against what the rest of the evidence
+            rules without it}. Never raises.
+
+        The last two are the calibration record (H12): over turns they
+        say how far each instrument can be trusted on each kind of claim,
+        which is what choosing an instrument to settle a disagreement
+        needs, and what a weighting of soft instruments would rest on.
         """
         _counts = {_k: 0 for _k in _TRIANGULATION_FIELDS}
+        _prov = {"corroborated": 0, "unsettled": 0}
+        _probe = {
+            "discrepancies": 0,
+            "probed": 0,
+            "resolved": 0,
+            "sides_judge": 0,
+            "sides_graph": 0,
+        }
+        _inst_pairs: Dict[str, List[int]] = {}
+        _loo: Dict[str, List[int]] = {}
         _pairs: Dict[str, List[int]] = {}
         _notes: List[str] = []
         _drift: Dict[str, bool] = {}
@@ -20768,6 +22081,14 @@ class AgenticEvidenceLedger:
                 _twice = bool(_c.subject) and _r.conflict == "anomaly"
                 if _twice and _indexed_twice(_c.subject):
                     _r = EvidenceTriangulation.rule(_obs, version_drift=True)
+                # The same claim, independence judged by provenance.
+                _rp = EvidenceTriangulation.rule(
+                    _obs, version_drift=_r.conflict == "drift", by_provenance=True
+                )
+                _prov["corroborated"] += int(_rp.corroborated)
+                _prov["unsettled"] += int(
+                    _rp.verdict != _r.verdict or _rp.corroborated != _r.corroborated
+                )
 
                 # ── Step 2: what it establishes, and against the pipeline ──
                 if _r.corroborated:
@@ -20809,51 +22130,119 @@ class AgenticEvidenceLedger:
                         _va, _vb = next(iter(_said[_a])), next(iter(_said[_b]))
                         _cell = (0 if _va else 2) + (0 if _vb else 1)
                         _pairs.setdefault(f"{_a}|{_b}", [0, 0, 0, 0])[_cell] += 1
+                # ── Step 4: calibration, by instrument and claim kind ──
+                _kind = str(getattr(_c, "claim_kind", "") or "unknown")
+                _by_inst: Dict[str, Set[bool]] = {}
+                for _o in _obs:
+                    if _o.verdict is not None and _o.scope is EvidenceScope.PROPOSITION:
+                        _by_inst.setdefault(_o.instrument, set()).add(bool(_o.verdict))
+                _sure = sorted(_k for _k, _v in _by_inst.items() if len(_v) == 1)
+                for _i, _a in enumerate(_sure):
+                    for _b in _sure[_i + 1 :]:
+                        _va, _vb = next(iter(_by_inst[_a])), next(iter(_by_inst[_b]))
+                        _cell = (0 if _va else 2) + (0 if _vb else 1)
+                        _inst_pairs.setdefault(f"{_kind}:{_a}|{_b}", [0, 0, 0, 0])[
+                            _cell
+                        ] += 1
+                for _inst in _sure:
+                    _without = EvidenceTriangulation.rule(
+                        [_o for _o in _obs if _o.instrument != _inst]
+                    )
+                    if _without.verdict is None:
+                        continue
+                    _agrees = next(iter(_by_inst[_inst])) is _without.verdict
+                    _cal = _loo.setdefault(f"{_kind}:{_inst}", [0, 0])
+                    _cal[0 if _agrees else 1] += 1
+                # ── Step 5: a discrepancy is a reason to look again (H13) ──
+                _gv = {
+                    bool(_o.verdict)
+                    for _o in _obs
+                    if _o.verdict is not None
+                    and _o.instrument in ("graph:calls", "graph:called_by")
+                }
+                _jv = {
+                    bool(_o.verdict)
+                    for _o in _obs
+                    if _o.verdict is not None and _o.instrument == "judge"
+                }
+                if len(_gv) == 1 and len(_jv) == 1 and _gv != _jv:
+                    _probe["discrepancies"] += 1
+                    _seen = self._probe_call_sites(_c, project_id)
+                    if _seen is not None:
+                        _probe["probed"] += 1
+                        _pv, _how = _seen
+                        if _pv is not None:
+                            _probe["resolved"] += 1
+                            _side = "judge" if {_pv} == _jv else "graph"
+                            _probe[f"sides_{_side}"] += 1
+                        else:
+                            _side = "neither"
+                        if len(_notes) < _TRIANGULATION_NOTES_MAX:
+                            _notes.append(
+                                f"C{_n} graph says {next(iter(_gv))}, judge says "
+                                f"{next(iter(_jv))}; the call site sides with "
+                                f"{_side}: {_how[:90]}"
+                            )
         except Exception as _e:
             self._f._log_debug(f"🔺 [TRIANGULATION] partial ({_e!r})")
         _counts["twin_conflicts"] = int(getattr(self, "twin_conflicts", 0) or 0)
-        return {"counts": _counts, "pairs": _pairs, "notes": _notes}
+        return {
+            "counts": _counts,
+            "pairs": _pairs,
+            "notes": _notes,
+            "provenance": _prov,
+            "instruments": _inst_pairs,
+            "loo": _loo,
+            "probe": _probe,
+        }
 
-    @staticmethod
-    def triangulation_status(tally: Dict[str, Any]) -> str:
+    def _probe_call_sites(
+        self, claim: "LedgerClaim", project_id: str
+    ) -> Optional[Tuple[Optional[bool], str]]:
         """
-        One status line for the chat from a triangulate() tally.
+        Read the call sites of the relations a claim was checked on.
 
-        Names the kind of triangulation it is: between methods, with the
-        pairs of instrument families that judged the same claims. Pure.
-
-        Args:
-            tally: What triangulate returned.
+        For a claim the graph and the judge disagree on: the caller's source,
+        from the live block, read by _call_site_reading. A claim about
+        reaching something through other calls is not probed; a direct site
+        cannot settle it.
 
         Returns:
-            The line, or "" when no claim was observed.
+            (verdict, how), the first decided reading among the claim's
+            call checks, else the last undecided one; None when there was
+            nothing to read. Never raises.
         """
-        _k = tally.get("counts") or {}
-        if not _k.get("observed"):
-            return ""
-        _names = {
-            "static_analysis": "static analysis",
-            "quoted_reading": "quoted reading",
-            "execution": "execution",
-        }
-        _pairs = [
-            " × ".join(_names.get(_f, _f) for _f in _p.split("|"))
-            for _p, _cells in sorted((tally.get("pairs") or {}).items())
-            if sum(_cells)
-        ]
-        _conflicts = sum(_k.get(_c, 0) for _c in ("anomaly", "drift", "overruled"))
-        return (
-            f"🔺 Triangulation between methods: {_k.get('corroborated', 0)} of "
-            f"{_k['observed']} claim(s) corroborated by two instrument families"
-            + (f" ({'; '.join(_pairs)})" if _pairs else "")
-            + f", {_k.get('single', 0)} on one"
-            + (f", {_conflicts} in conflict" if _conflicts else "")
-            + (
-                f", {_k['held_robust']} refutation(s) held by two families"
-                if _k.get("held_robust")
-                else ""
-            )
-        )
+        try:
+            if not claim.call_checks or _REACH_CLAIM_RE.search(claim.text or ""):
+                return None
+            _blocks = self._f._conversation_state_manager.get(project_id).active_blocks
+            _idx = self._f._symbol_index
+            _last: Optional[Tuple[Optional[bool], str]] = None
+            for _caller, _callee in claim.call_checks:
+                _caller = self._qualified_if_unique(_caller, project_id)
+                _bids = list(_idx.find_blocks(_caller, project_id) or ()) or list(
+                    _idx.find_blocks(_caller.split(".")[-1], project_id) or ()
+                )
+                for _bid in _bids:
+                    _content = getattr(_blocks.get(_bid), "content", "") or ""
+                    _spans, _classes = _symbol_spans(_content)
+                    # A module-level function is indexed under its module
+                    # ("context_manager._x") and spanned under its name.
+                    _names = [_caller]
+                    if "." in _caller and _caller.split(".")[0] not in _classes:
+                        _names.append(_caller.split(".", 1)[1])
+                    _key = next((_k for _k in _names if _k in _spans), "")
+                    if not _key:
+                        continue
+                    _a, _b = _spans[_key]
+                    _src = "\n".join(_content.split("\n")[_a - 1 : _b])
+                    _last = _call_site_reading(_src, _key, _callee, _classes)
+                    if _last[0] is not None:
+                        return _last
+                    break
+            return _last
+        except Exception:
+            return None
 
     def refresh_unread(self) -> int:
         """Re-ask which cited bodies went unread, now that the turn is over.
@@ -20940,6 +22329,32 @@ class AgenticEvidenceLedger:
     # ──────────────────────────────────────────────────────────────────────
     # 4. Qid resolution & relation checking
     # ──────────────────────────────────────────────────────────────────────
+
+    def _qualified_if_unique(self, name: str, project_id: str) -> str:
+        """A bare name as the one qualified id that carries it, else unchanged.
+
+        The resolver keeps a bare citation bare when the index finds blocks
+        under it, so one claim cited `_forge_verdict` and its restatement
+        `HypothesisForge._forge_verdict`. The restatement fold keys on the
+        cited symbols, did not see one proposition, and the workspace showed
+        it twice: unsupported under one step, verified under another. The
+        answer listed it as unverified on a turn at 100%. A dotted name is
+        left alone: a different parent is reported where it is cited, not
+        silently rewritten. Never raises.
+        """
+        if not name or "." in name:
+            return name
+        try:
+            _si = self._f._symbol_index
+            _known = _si.get_all_qualified_names(project_id) or set()
+            _only = {
+                _q
+                for _q in _si.get_qualified_names_for(name, project_id)
+                if _q in _known
+            }
+            return next(iter(_only)) if len(_only) == 1 else name
+        except Exception:
+            return name
 
     def _canonical_qid(self, qid: str, project_id: str) -> str:
         """
@@ -21209,11 +22624,12 @@ class AgenticEvidenceLedger:
                     len(self._f._symbol_index.get_edges_out(cq, project_id))
                     for cq in caller_qids
                 )
-                if _status in ("indirect", "dynamic"):
+                if _status in ("indirect", "dynamic", "ambiguous"):
                     # The direct edge is not drawn, but the caller reaches
                     # the callee through other calls or hands functions
-                    # over by reference: the relation cannot be called
-                    # false.
+                    # over by reference, or calls a method of that name on
+                    # an object the graph does not record: the relation
+                    # cannot be called false.
                     self._f._log_debug(
                         f"🔗 DIAG relation: '{caller} calls {callee}' "
                         f"{_status.upper()} — no direct edge from "
@@ -21379,7 +22795,16 @@ class AgenticEvidenceVerifier:
         # Reading is therefore decided by whether the body was seen, and
         # superseding by the label, which is the question the label can
         # actually answer.
-        if claim.claim_kind == "structural" and not _unread:
+        # Unless the graph looked and could not settle it: a check that
+        # tested only part of the sentence, or another sentence, leaves it
+        # with no verdict, and the body is the one instrument left. Round
+        # 10's "_update_active_code calls process with the same arguments"
+        # ended with nothing run against it although its body was in view.
+        _graph_left_open = not claim.verification and any(
+            str(getattr(_o, "instrument", "") or "").startswith("graph:")
+            for _o in (claim.observations or [])
+        )
+        if claim.claim_kind == "structural" and not _unread and not _graph_left_open:
             return False
 
         # ── Step 4: only an explicit behavioural claim overturns a verdict ──
@@ -21404,6 +22829,8 @@ class AgenticEvidenceVerifier:
         subjects: List[str],
         project_id: str,
         weights: Optional[Dict[str, int]] = None,
+        focus: Optional[Dict[str, List[str]]] = None,
+        sources: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
         """Fetch each subject's body through the broker, deterministically.
 
@@ -21412,6 +22839,9 @@ class AgenticEvidenceVerifier:
         `resolve` never raises and reports an unresolvable name as a
         bracketed note, which is dropped here — a subject with no body is
         a claim that stays unsettled, and saying so is `judge`'s job.
+        `focus` maps a subject to its claims' texts: a body past the cap
+        is then excerpted around them (_claim_excerpt) rather than cut, and
+        its whole body is kept in `sources` for the quote check (`judge`).
         """
         # ── Step 1: spend the budget on the subjects that settle most ──
         # Emission order says nothing about a body's worth. Turn 3 of the
@@ -21433,7 +22863,13 @@ class AgenticEvidenceVerifier:
             if used >= budget and bodies:
                 dropped.append(subject)
                 continue
-            text = broker.resolve("EXPAND", subject, project_id)
+            text = (
+                broker.expand_for_claims(
+                    subject, project_id, focus[subject], sources
+                )
+                if focus and focus.get(subject)
+                else broker.resolve("EXPAND", subject, project_id)
+            )
             if not text or text.lstrip().startswith("["):
                 continue
             bodies[subject] = text
@@ -21449,6 +22885,42 @@ class AgenticEvidenceVerifier:
                 f"unread — raise agentic_evidence_max_chars to cover them"
             )
         return bodies
+
+    def tally_shortened(
+        self,
+        groups: Dict[str, List[int]],
+        bodies: Dict[str, str],
+        verdicts: Dict[int, Tuple[str, str]],
+    ) -> None:
+        """Count how the claims judged against a shortened body came out.
+
+        Excerpted (_claim_excerpt) and head-cut bodies apart, each as claims
+        and how many of them stayed indeterminate, so a run says what the
+        excerpt bought against the cut it replaced: 16 of 26 indeterminate
+        under a cut body in rounds 6-8, 10 of 199 under a whole one. A claim
+        the judge returned nothing for counts as indeterminate, which is
+        what it is left as. Never raises.
+        """
+        try:
+            for _subject, _idxs in groups.items():
+                _body = bodies.get(_subject, "")
+                if _EXCERPT_MARK in _body:
+                    _kind = "excerpt"
+                    self._f._bump_turn_metric("evidence_excerpts")
+                elif "[truncated by broker" in _body:
+                    _kind = "cut"
+                else:
+                    continue
+                _open = sum(
+                    1
+                    for _n in _idxs
+                    if (verdicts.get(_n) or ("indeterminate", ""))[0]
+                    == "indeterminate"
+                )
+                self._f._bump_turn_metric(f"evidence_{_kind}_claims", len(_idxs))
+                self._f._bump_turn_metric(f"evidence_{_kind}_indeterminate", _open)
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────────────────────────────────
     # 2. Internals
@@ -21480,12 +22952,16 @@ class AgenticEvidenceVerifier:
         groups: Dict[str, List[int]],
         bodies: Dict[str, str],
         aligned_prefix: str,
+        sources: Optional[Dict[str, str]] = None,
     ) -> Dict[int, Tuple[str, str]]:
         """Ask once for all claims; return {index: (verdict, quote)}.
 
         Verdicts whose quote is absent from the body are dropped rather
         than downgraded silently, because a quote that is not in the code
-        means the judgement was not made against the code.
+        means the judgement was not made against the code. `sources` holds
+        the whole body of each subject shown as an excerpt: a quote from
+        its elided lines is still that symbol's code, and the judge reads
+        them in Block B, so it is found there.
         """
         # ── Step 1: one call carrying every body and every claim ──
         prompt = self._render_prompt(claims, groups, bodies)
@@ -21540,8 +23016,19 @@ class AgenticEvidenceVerifier:
 
         # ── Step 3: keep only verdicts whose quote is really in the body ──
         by_index = {n: s for s, idxs in groups.items() for n in idxs}
+        # What a quote is checked against: each body as shown, and for a
+        # subject shown as an excerpt, its whole body too. Round 9 discarded
+        # 3 correct verdicts that quoted lines its excerpts had left out.
+        _shown = {s: " ".join(b.split()) for s, b in bodies.items()}
+        _whole = {
+            s: " ".join(str(b).split())
+            for s, b in (sources or {}).items()
+            if s in bodies and b
+        }
+        _searched = list(_shown.values()) + list(_whole.values())
         out: Dict[int, Tuple[str, str]] = {}
         dropped = 0
+        _from_elided = 0
         unindexed = 0
         elsewhere = 0
         _own_only = 0
@@ -21592,19 +23079,21 @@ class AgenticEvidenceVerifier:
                 # four exits is settled by four quotes, and one that
                 # is not found still discards the whole verdict.
                 _found = bool(_flats) and all(
-                    any(_q in " ".join(_b.split()) for _b in bodies.values())
-                    for _q in _flats
+                    any(_q in _b for _b in _searched) for _q in _flats
                 )
                 if not _found:
                     dropped += 1
                     out[n] = ("indeterminate", "quote not found in any body")
                     continue
+                if not all(any(_q in _b for _b in _shown.values()) for _q in _flats):
+                    _from_elided += 1
                 # Per element, not the joined string. ps171 made the quote
                 # check per element and left this reading the join, so two
                 # quotes from the same body — "a ⏎ b" — matched nothing and
                 # every multi-quote verdict counted as cross-symbol.
-                _own = " ".join(bodies.get(by_index[n], "").split())
-                if any(_q not in _own for _q in _flats):
+                _own_shown = _shown.get(by_index[n], "")
+                _own_whole = _whole.get(by_index[n], "")
+                if any(_q not in _own_shown and _q not in _own_whole for _q in _flats):
                     elsewhere += 1
                     # For a behavioural claim the distinction above does not
                     # hold: "A does P" is about A's own code, and nothing in
@@ -21640,6 +23129,12 @@ class AgenticEvidenceVerifier:
                 f"🤖 Evidence: {dropped} verdict(s) discarded — the quote "
                 f"appears in none of the {len(bodies)} body/bodies read"
             )
+        if _from_elided:
+            self._f._bump_turn_metric("evidence_quotes_elided", _from_elided)
+            self._f._log_debug(
+                f"🤖 Evidence: {_from_elided} verdict(s) quote lines an "
+                f"excerpt left out — literal in the subject's whole body, kept"
+            )
         if elsewhere:
             self._f._log_debug(
                 f"🤖 Evidence: {elsewhere} verdict(s) settled from a body "
@@ -21671,6 +23166,7 @@ class AgenticEvidenceVerifier:
         texts: List[str],
         bodies_text: str,
         aligned_prefix: str,
+        purpose: str = "evidence",
     ) -> List[Optional[bool]]:
         """Rule on free-text consequences against bodies already read.
 
@@ -21685,7 +23181,9 @@ class AgenticEvidenceVerifier:
         ruling whose quote is not found is recorded as None rather than
         trusted. Returns one entry per input text: True (supported),
         False (contradicted) or None (still undecidable — a legitimate
-        outcome, stated rather than papered over).
+        outcome, stated rather than papered over). purpose names the call in
+        the log and in its label (forge_<purpose>): the forge's evidence
+        pass, or the second family its triangulation asks for.
         """
         # ── Step 1: nothing to judge, or nothing to judge against ──
         if not texts or not bodies_text.strip():
@@ -21716,7 +23214,7 @@ class AgenticEvidenceVerifier:
                 )
                 if not _hit:
                     self._f._log_debug(
-                        f"🔬 Forge evidence: skipped — none of the "
+                        f"🔬 Forge {purpose}: skipped — none of the "
                         f"{len(_named)} symbol(s) the {len(texts)} "
                         f"consequence(s) name appear in the bodies at hand, "
                         f"so no quote could settle any of them"
@@ -21741,12 +23239,12 @@ class AgenticEvidenceVerifier:
                 model_override=self._f.valves.cot_model_level2,
                 max_tokens=self._f.valves.agentic_verify_max_tokens,
                 temperature=0.1,
-                label="forge_evidence",
+                label=f"forge_{purpose}",
                 response_format={"type": "json_object"},
                 enable_thinking=False,
             )
         except Exception as _e:
-            self._f._log_debug(f"🤖 Forge evidence: call failed ({_e!r})")
+            self._f._log_debug(f"🤖 Forge {purpose}: call failed ({_e!r})")
             return [None] * len(texts)
         if not response:
             return [None] * len(texts)
@@ -21779,7 +23277,7 @@ class AgenticEvidenceVerifier:
                 out[n - 1] = verdict == "supported"
         if dropped:
             self._f._log_debug(
-                f"🤖 Forge evidence: {dropped} ruling(s) discarded — quote "
+                f"🤖 Forge {purpose}: {dropped} ruling(s) discarded — quote "
                 f"not found in the bodies read this cycle"
             )
         return out
@@ -22152,15 +23650,26 @@ class AgenticStaticVerifier:
             _ev = AgenticEvidenceVerifier(self._f)
             _groups = _ev.group_by_subject(claims)
             if _groups:
+                _whole_bodies: Dict[str, str] = {}
                 _bodies = _ev.fetch_bodies(
                     list(_groups),
                     project_id,
                     {s: len(v) for s, v in _groups.items()},
+                    (
+                        {
+                            s: [claims[n - 1].text for n in v if 1 <= n <= len(claims)]
+                            for s, v in _groups.items()
+                        }
+                        if getattr(self._f.valves, "agentic_evidence_excerpt", True)
+                        else None
+                    ),
+                    _whole_bodies,
                 )
                 if _bodies:
                     _verdicts = await _ev.judge(
-                        claims, _groups, _bodies, aligned_prefix
+                        claims, _groups, _bodies, aligned_prefix, _whole_bodies
                     )
+                    _ev.tally_shortened(_groups, _bodies, _verdicts)
                     _settled = _ev.apply(claims, _verdicts, project_id)
                     self._f._log_debug(
                         f"🤖 Evidence: {len(_groups)} subject(s), "
@@ -23146,7 +24655,13 @@ class AgenticStaticVerifier:
                 bare_dst = dst_n.split(".")[-1]
                 _dispatch: Set[str] = set()
                 for ed in self._f._symbol_index.get_edges_out(qid, project_id):
-                    if getattr(ed, "dst", "") in (dst_n, bare_dst):
+                    if _edge_reaches(
+                        self._f._symbol_index,
+                        str(getattr(ed, "dst", "")),
+                        dst_n,
+                        project_id,
+                        qid,
+                    ):
                         return "confirmed", f"{qid} → {bare_dst} edge present"
                     _tail = str(getattr(ed, "dst", "")).split(".")[-1]
                     if (
@@ -23229,6 +24744,26 @@ class AgenticStaticVerifier:
                         f"symbol named {bare_dst}{_which} — if the relation "
                         f"holds it is indirect, and the bodies on the way "
                         f"are what settles it",
+                    )
+                if _status == "ambiguous":
+                    _owners = sorted(
+                        set(
+                            self._f._symbol_index.get_qualified_names_for(
+                                bare_dst, project_id
+                            )
+                        )
+                        & set(
+                            self._f._symbol_index.get_all_qualified_names(project_id)
+                            or ()
+                        )
+                    )
+                    return (
+                        "unsupported",
+                        f"{qid} calls something named {bare_dst}, but the "
+                        f"index holds that name as "
+                        f"{', '.join(_owners[:3]) or bare_dst} and the graph "
+                        f"does not record which object the call was made on "
+                        f"— the body of {qid} settles whether it is {dst_n}",
                     )
                 if _status == "dynamic":
                     _via = (
@@ -23397,20 +24932,24 @@ class AgenticStaticVerifier:
         check: Dict[str, Any],
         verdict: str,
         detail: str,
-        checks: List[Dict[str, Any]],
     ) -> "EvidenceObservation":
         """
         One check's verdict as an observation of the claim it checked.
 
         A structural claim is the graph's own question, so a check of it
         tests the claim itself. An existence check counts as that only
-        when existence is all the claim was checked for, or when the
-        claim's whole text is that fact (_formalize_plain_claims marks
-        those): naming a symbol that exists confirms nothing said about
-        it. A measurement check tests the claim as written. Any other
+        when the claim's whole text is that fact (_formalize_plain_claims
+        marks those): naming a symbol that exists confirms nothing said
+        about it. Being the only check a claim got did once count, and over
+        rounds 3-10 it confirmed 194 structural claims on existence alone,
+        47 of them negations ("apply is not present" confirmed by apply
+        existing). A measurement check tests the claim as written. Any other
         check tests a part the claim states, which can refute it and
         never confirm it, and so does a fallback check, which only
-        guesses which relation among the cited symbols to look at.
+        guesses which relation among the cited symbols to look at. A call
+        check between symbols the sentence does not both name tests some
+        other claim, and neither confirms nor refutes this one
+        (_names_both_ends).
 
         The pass decides only where the graph can be taken at its word
         and abstains everywhere else, so a decided verdict is Popperian.
@@ -23420,20 +24959,34 @@ class AgenticStaticVerifier:
             check: The check.
             verdict: What _execute returned for it.
             detail: _execute's explanation.
-            checks: Every check run for this claim.
 
         Returns:
             The observation, for LedgerClaim.observe.
         """
         kind = str(check.get("kind") or "")
-        _kinds = {str(_c.get("kind") or "") for _c in checks}
-        if check.get("fallback"):
+        if kind in ("calls", "called_by") and not _names_both_ends(
+            claim.text, [str(check.get("src") or ""), str(check.get("dst") or "")]
+        ):
+            # A relation between symbols the sentence does not both name is
+            # some other claim's: it tells nothing about this one.
+            _scope = EvidenceScope.MENTION
+        elif check.get("fallback"):
             _scope = EvidenceScope.COMPONENT
-        elif check.get("states_existence"):
+        elif kind in ("calls", "called_by") and not _states_only_the_call(
+            claim.text, [str(check.get("src") or ""), str(check.get("dst") or "")]
+        ):
+            # The edge settles the call; an argument value, a quantifier or
+            # a consequence the sentence adds is the evidence pass's to read.
+            _scope = EvidenceScope.COMPONENT
+        elif check.get("states_existence") or (
+            kind == "exists"
+            and _EXISTENCE_CLAIM_RE.match(str(claim.text or "").strip())
+        ):
+            # The model writes exists checks too, unmarked: the sentence
+            # itself says whether it is the existence fact.
             _scope = EvidenceScope.PROPOSITION
         elif kind in AgenticStaticVerifier._MEASUREMENT_CHECK_KINDS or (
-            claim.claim_kind == "structural"
-            and (kind != "exists" or _kinds == {"exists"})
+            claim.claim_kind == "structural" and kind != "exists"
         ):
             _scope = EvidenceScope.PROPOSITION
         else:
@@ -23466,9 +25019,11 @@ class AgenticStaticVerifier:
         abstention_is_not_confirmation, scope_before_support): an
         existence check of a claim that asserts more than existence, and
         a fallback check, which guessed which relation among the cited
-        symbols to look at. Both are still kept as observations. A claim
-        whose only verdicts were those keeps no verdict, so it stays
-        unverified and remains open to the evidence pass.
+        symbols to look at. Both are still kept as observations. Nor does
+        anything a call check found between symbols the claim does not both
+        name: it tested another claim. A claim whose only verdicts were
+        those keeps no verdict, so it stays unverified and remains open to
+        the evidence pass.
 
         Returns:
             The claims left unverified that way."""
@@ -23488,17 +25043,29 @@ class AgenticStaticVerifier:
             # reduces them to one.
             _counted: List[Tuple[str, str]] = []
             for _ch, (_v, _d) in zip(run.get(n, []), outcomes):
-                _obs = AgenticStaticVerifier._observation_of(
-                    claim, _ch, _v, _d, run.get(n, [])
-                )
+                _obs = AgenticStaticVerifier._observation_of(claim, _ch, _v, _d)
                 claim.observe(_obs)
                 _vacuous = (
                     _obs.verdict is True
                     and _obs.scope is not EvidenceScope.PROPOSITION
-                    and (_ch.get("kind") == "exists" or bool(_ch.get("fallback")))
+                    and (
+                        _ch.get("kind") in ("exists", "calls", "called_by")
+                        or bool(_ch.get("fallback"))
+                    )
                 )
-                if not _vacuous:
+                # A check of a relation the sentence does not state is some
+                # other claim's, whatever it found (_names_both_ends).
+                if not _vacuous and _obs.scope is not EvidenceScope.MENTION:
                     _counted.append((_v, _d))
+                if _obs.scope is not EvidenceScope.MENTION and _ch.get("kind") in (
+                    "calls",
+                    "called_by",
+                ):
+                    _ends = [str(_ch.get("src") or ""), str(_ch.get("dst") or "")]
+                    if _ch.get("kind") == "called_by":
+                        _ends.reverse()
+                    if all(_ends) and _ends not in claim.call_checks:
+                        claim.call_checks.append(_ends)
             if not _counted:
                 withheld.append(claim)
                 continue
@@ -24019,6 +25586,12 @@ if __name__ == "__main__":
         # is shared by every instance and outlives the turn, so one turn's
         # failures would queue up behind the next one's.
         self._pending_repairs: List[Tuple[Any, str, str, Dict[str, Any], str]] = []
+        # Top-level class spans of the last block parsed for a harness
+        # (_module_class_source): one parse per block, not per class.
+        self._class_source_cache: Dict[Tuple[Any, ...], Dict[str, Tuple[int, int]]] = {}
+        # Top-level assignment spans of the last block parsed for the
+        # constants a harness needs (_module_constant_sources).
+        self._const_source_cache: Dict[Tuple[Any, ...], Dict[str, Tuple[int, int]]] = {}
 
     # ── Step entry point ─────────────────────────────────────────────────
 
@@ -24091,6 +25664,7 @@ if __name__ == "__main__":
 
         report_lines = [f"## Dynamic verification ({len(targets)} target(s))"]
         self._step_verdicts = []
+        self._step_verdict_keys = []
         for qid in targets:
             line = await self._verify_target(
                 qid, ledger, project_id, aligned_prefix, step.id
@@ -24111,8 +25685,10 @@ if __name__ == "__main__":
         # _step_verdicts is cleared at the top of every dynamic step, and
         # design_tests sorts before this one.
         _v = list(getattr(self, "_step_verdicts", []) or [])
-        for _sv in _v:
-            self._note_execution("symbol", _sv)
+        _keys = list(getattr(self, "_step_verdict_keys", []) or [])
+        _keys += [""] * (len(_v) - len(_keys))
+        for _sv, _key in zip(_v, _keys):
+            self._note_execution("symbol", _sv, _key)
         _failed = _v.count("fail")
         _skipped = _v.count("io_bound") + _v.count("skipped")
         _ran = len(_v) - _skipped
@@ -24320,7 +25896,7 @@ if __name__ == "__main__":
                 result = None
             if result:
                 self._append_evidence(ledger, step_id, qid, result, cached=True)
-                self._note_verdict(str(result.get("status", "error")))
+                self._note_verdict(self._tally_status(result), qid)
                 self._f._log_debug(
                     f"🤖 verify_dynamic {qid}: reused cached result "
                     f"status={result.get('status')} "
@@ -24357,7 +25933,15 @@ if __name__ == "__main__":
                 return f"- {qid}: harness generation failed — no dynamic evidence"
 
         callee_src = self._resolve_callee_bodies(body, qid, project_id)
-        harness = self._compose(body, tests, callee_src)
+        type_src, _type_names = self._resolve_type_dependencies(
+            [body, callee_src], qid, project_id
+        )
+        if _type_names:
+            self._f._log_debug(
+                f"🤖 verify_dynamic {qid}: harness carries the module "
+                f"class(es) it names — {', '.join(_type_names)}"
+            )
+        harness = self._compose(body, tests, callee_src, type_src)
         result = await self._runner.run(harness)
 
         # Region: Fase 8 — selective replication of a SUSPECT harness.
@@ -24431,7 +26015,7 @@ if __name__ == "__main__":
                 body, verdict, reasons, aligned_prefix, retry_hint=_hint
             )
             if _tests2:
-                _harness2 = self._compose(body, _tests2, callee_src)
+                _harness2 = self._compose(body, _tests2, callee_src, type_src)
                 _result2 = await self._runner.run(_harness2)
                 _reason2 = self._suspect_reason_of(_result2)
                 self._f._log_debug(
@@ -24482,7 +26066,7 @@ if __name__ == "__main__":
                     f"failures: {str(result.get('failures', []))[:600]}\n"
                     f"harness that ran:\n{str(tests)[:2000]}"
                 )
-        self._note_verdict(str(result.get("status", "error")))
+        self._note_verdict(self._tally_status(result), qid)
         # Every target, every time. The six log lines above this one all
         # describe anomalies — replicas, self-repair, parked suspects — so
         # a target that classified, composed, ran and returned a verdict
@@ -24564,12 +26148,18 @@ if __name__ == "__main__":
         sandbox (the regression case). Only free call-names the index can
         resolve are included; unresolved names are left alone (they may be
         builtins the classifier already vetted). Bounded to a few callees.
+        A project class called as a constructor is left to
+        _resolve_type_dependencies, which keeps its decorators: rendered
+        here it lost @dataclass and, placed after the types, replaced the
+        real one.
         """
         free = self._classifier.free_call_names(body)
         if not free:
             return ""
         parts: List[str] = []
-        for name in free[:4]:
+        for name in [
+            _n for _n in free if not self._module_class_source(_n, project_id)
+        ][:4]:
             if name == self_qid.split(".")[-1]:
                 continue
             rendered = self._broker._expand(name, project_id)
@@ -24584,7 +26174,467 @@ if __name__ == "__main__":
 
         return "\n\n".join(_tw.dedent(p).strip() for p in parts)
 
-    def _compose(self, body: str, tests: str, callee_src: str = "") -> str:
+    # Module-level classes a harness may carry for the symbol under test.
+    _TYPE_DEPS_MAX = 6
+
+    def _module_class_source(self, name: str, project_id: str) -> str:
+        """The source of a top-level class as written, decorators included.
+
+        Read from the live block by its AST rather than through the
+        broker, whose line range starts at the `class` line and dropped
+        `@dataclass(frozen=True)` from TriangulationRuling. "" when the
+        name is not a top-level class of a live block.
+        """
+        try:
+            _si = self._f._symbol_index
+            _meta = _si.get_symbol_meta(name, project_id) or {}
+            if _meta.get("kind") != "class" or _meta.get("parent_symbol"):
+                return ""
+            _blocks = self._f._conversation_state_manager.get(project_id).active_blocks
+            _cache = self._class_source_cache
+            for _bid in _si.find_blocks(name, project_id) or ():
+                _block = _blocks.get(_bid)
+                _content = getattr(_block, "content", "") or ""
+                if not _content:
+                    continue
+                _key = (_bid, len(_content), hash(_content))
+                if _key not in _cache:
+                    _cache.clear()
+                    try:
+                        _tree = ast.parse(_content)
+                    except SyntaxError:
+                        _tree = None
+                    _cache[_key] = {
+                        _n.name: (
+                            min([_n.lineno] + [_d.lineno for _d in _n.decorator_list]),
+                            _n.end_lineno,
+                        )
+                        for _n in (_tree.body if _tree else [])
+                        if isinstance(_n, ast.ClassDef)
+                    }
+                _span = _cache[_key].get(name)
+                if _span:
+                    _lines = _content.split("\n")
+                    return "\n".join(_lines[_span[0] - 1 : _span[1]])
+            return ""
+        except Exception:
+            return ""
+
+    def _resolve_type_dependencies(
+        self,
+        sources: List[str],
+        self_qid: str,
+        project_id: str,
+        exclude: Iterable[str] = (),
+    ) -> Tuple[str, List[str]]:
+        """
+        The module-level classes the symbol under test names without
+        calling, in the order they must be defined.
+
+        _resolve_callee_bodies follows calls, and a class is often named
+        another way: `EvidenceScope.PROPOSITION` as a dict key in a class
+        body, an `isinstance` test, a NamedTuple annotation. Round 7 and
+        round 8 both ran EvidenceTriangulation without its enums, failed
+        with NameError and regenerated the harness, 50–100 s for no
+        evidence. Followed through the classes it brings in (their fields
+        name more), each written before what uses it, at most
+        _TYPE_DEPS_MAX. Returns their sources joined and their names, in
+        that order. `exclude` names classes the harness already carries,
+        such as a class under test cut down to what its tests reach
+        (_reduced_class), which would otherwise come back whole. Never
+        raises: ("", []) on failure.
+        """
+        try:
+            import textwrap as _tw
+
+            def _refs(_src: str) -> List[str]:
+                try:
+                    _tree = ast.parse(_tw.dedent(_src))
+                except SyntaxError:
+                    return []
+                _own = {
+                    _n.name
+                    for _n in ast.walk(_tree)
+                    if isinstance(
+                        _n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                    )
+                }
+                _out: List[str] = []
+                for _n in ast.walk(_tree):
+                    if (
+                        isinstance(_n, ast.Name)
+                        and _n.id not in _own
+                        and _n.id not in _out
+                    ):
+                        _out.append(_n.id)
+                return _out
+
+            _seen = {self_qid.split(".")[-1]} | set(exclude)
+            _ordered: List[str] = []
+            _names: List[str] = []
+
+            def _visit(_name: str, _depth: int) -> None:
+                if (
+                    _name in _seen
+                    or _depth > 3
+                    or len(_ordered) >= self._TYPE_DEPS_MAX
+                ):
+                    return
+                _seen.add(_name)
+                _src = self._module_class_source(_name, project_id)
+                if not _src:
+                    return
+                for _r in _refs(_src):
+                    _visit(_r, _depth + 1)
+                if len(_ordered) < self._TYPE_DEPS_MAX:
+                    _ordered.append(_src)
+                    _names.append(_name)
+
+            for _source in sources:
+                for _r in _refs(_source):
+                    _visit(_r, 0)
+            return "\n\n".join(_tw.dedent(_s).strip() for _s in _ordered), _names
+        except Exception:
+            return "", []
+
+    # Module-level constants a harness may carry for the code under test.
+    _CONST_DEPS_MAX = 12
+
+    def _module_constant_sources(
+        self, sources: List[str], project_id: str
+    ) -> Tuple[str, List[str]]:
+        """The module-level constants the code names, as written, in file order.
+
+        A compiled regex such as _PROSE_CODE_NAME_RE is neither a callee
+        (_resolve_callee_bodies) nor a class (_resolve_type_dependencies),
+        and a function that reads one fails in the sandbox with NameError.
+        Followed through constants that name constants, at most
+        _CONST_DEPS_MAX. Never raises: ("", []) on failure.
+        """
+        try:
+            import textwrap as _tw
+
+            _spans: Dict[str, Tuple[int, int]] = {}
+            _lines: List[str] = []
+            _blocks = self._f._conversation_state_manager.get(project_id).active_blocks
+            for _bid, _block in _blocks.items():
+                _content = getattr(_block, "content", "") or ""
+                if not _content or getattr(_block, "obsolete", False):
+                    continue
+                _key = (_bid, len(_content), hash(_content))
+                if _key not in self._const_source_cache:
+                    try:
+                        _tree = ast.parse(_content)
+                    except SyntaxError:
+                        _tree = None
+                    _map: Dict[str, Tuple[int, int]] = {}
+                    for _n in _tree.body if _tree else []:
+                        _tg = (
+                            _n.targets[0]
+                            if isinstance(_n, ast.Assign)
+                            else _n.target if isinstance(_n, ast.AnnAssign) else None
+                        )
+                        if isinstance(_tg, ast.Name) and _n.value is not None:
+                            _map[_tg.id] = (_n.lineno, _n.end_lineno)
+                    self._const_source_cache.clear()
+                    self._const_source_cache[_key] = _map
+                _spans = self._const_source_cache[_key]
+                _lines = _content.split("\n")
+                break
+
+            def _names(_src: str) -> List[str]:
+                try:
+                    _tree = ast.parse(_tw.dedent(_src))
+                except SyntaxError:
+                    return []
+                return [_n.id for _n in ast.walk(_tree) if isinstance(_n, ast.Name)]
+
+            _picked: Dict[str, Tuple[int, int]] = {}
+            _queue = [_x for _s in sources for _x in _names(_s)]
+            while _queue and len(_picked) < self._CONST_DEPS_MAX:
+                _name = _queue.pop(0)
+                if _name in _picked or _name not in _spans:
+                    continue
+                _picked[_name] = _spans[_name]
+                _a, _z = _spans[_name]
+                _queue.extend(_names("\n".join(_lines[_a - 1 : _z])))
+            _order = sorted(_picked, key=lambda _k: _picked[_k][0])
+            return (
+                "\n".join(
+                    "\n".join(_lines[_picked[_k][0] - 1 : _picked[_k][1]])
+                    for _k in _order
+                ),
+                _order,
+            )
+        except Exception:
+            return "", []
+
+    # unittest suites are what a model writes when asked for tests; the
+    # runner collects module-level test_* callables, so each TestCase method
+    # is lifted into one (setUp and tearDown around it).
+    _UNITTEST_ADAPTER = """
+
+# === unittest methods as runner tests (fixed) ===
+def _lift_test_cases():
+    import unittest as _ut
+    for _cn, _c in list(globals().items()):
+        if isinstance(_c, type) and issubclass(_c, _ut.TestCase):
+            for _mn in sorted(dir(_c)):
+                if not _mn.startswith("test"):
+                    continue
+                def _make(_c=_c, _mn=_mn):
+                    def _t():
+                        _i = _c(_mn)
+                        _i.setUp()
+                        try:
+                            getattr(_i, _mn)()
+                        finally:
+                            _i.tearDown()
+                    return _t
+                globals()["test_" + _cn + "__" + _mn] = _make()
+_lift_test_cases()
+"""
+
+    def _module_function_qid(self, name: str, project_id: str) -> str:
+        """The qid of `name` when it is a module-level function, else ""."""
+        try:
+            _meta = self._f._symbol_index.get_symbol_meta(name, project_id) or {}
+            if _meta.get("kind") in ("function", "async_function") and not _meta.get(
+                "parent_symbol"
+            ):
+                return name
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _reduced_class(source: str, wanted: Set[str]) -> str:
+        """
+        A project class cut down to what tests of some of its methods reach.
+
+        Every class-level statement that is not a method stays (fields,
+        constants, an enum's members, the docstring), and so does every
+        dunder, which construction and comparison call without naming them.
+        Of the other methods: those in `wanted`, and every method they reach
+        through self., cls. or the class's own name. A class of thousands of
+        lines then runs a test of one method with the callees and constants
+        that method needs, not with all of those the class names. The
+        source unchanged when it does not parse.
+        """
+        import textwrap as _tw
+
+        try:
+            _tree = ast.parse(_tw.dedent(source))
+            _cls = next(_n for _n in _tree.body if isinstance(_n, ast.ClassDef))
+        except Exception:
+            return source
+        _defs = {
+            _n.name: _n
+            for _n in _cls.body
+            if isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        _keep: Set[str] = set()
+        _todo = [
+            _m
+            for _m in _defs
+            if _m in wanted or (_m.startswith("__") and _m.endswith("__"))
+        ]
+        while _todo:
+            _m = _todo.pop()
+            if _m in _keep:
+                continue
+            _keep.add(_m)
+            for _n in ast.walk(_defs[_m]):
+                if (
+                    isinstance(_n, ast.Attribute)
+                    and isinstance(_n.value, ast.Name)
+                    and _n.value.id in ("self", "cls", _cls.name)
+                    and _n.attr in _defs
+                ):
+                    _todo.append(_n.attr)
+        _cls.body = [
+            _n
+            for _n in _cls.body
+            if not isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            or _n.name in _keep
+        ] or [ast.Pass()]
+        return ast.unparse(_cls)
+
+    async def run_shown_tests(self, code: str, project_id: str) -> Dict[str, Any]:
+        """Run tests the turn wrote, against the real code of what they test.
+
+        Round 9's test-writing turn showed eight unittest methods that never
+        ran, and the answer said they validated the function. The tests are
+        cut down to what is the turn's own: a `__main__` guard goes, an
+        import of the project goes, and a copy of a project function goes
+        too, so that the tests call the indexed body rather than the copy
+        the model made of it. The module-level functions of the project the
+        tests then call are composed with their callees, the classes and
+        the constants they name, as the dynamic verifier does, and run in
+        the sandbox. So are the project classes they name, each cut down to
+        the methods the tests reach (_reduced_class): most of the code is
+        methods, and round 9's rule ran none of their tests. Returns
+        {"status", "reason", "targets", "dropped",
+        "passed", "total", "failures"}; status "skipped" with a reason when
+        nothing could be run. Never raises.
+        """
+        _out: Dict[str, Any] = {
+            "status": "skipped",
+            "reason": "",
+            "targets": [],
+            "dropped": [],
+            "passed": 0,
+            "total": 0,
+            "failures": [],
+        }
+        try:
+            if getattr(self._f.valves, "agentic_exec_mode", "off") != "subprocess":
+                _out["reason"] = "execution is off"
+                return _out
+            try:
+                _tree = ast.parse(code)
+            except SyntaxError as _e:
+                _out["reason"] = f"the tests do not parse ({_e.msg})"
+                return _out
+            _kept: List[ast.stmt] = []
+            for _n in _tree.body:
+                if (
+                    isinstance(_n, ast.If)
+                    and isinstance(_n.test, ast.Compare)
+                    and "__main__" in ast.unparse(_n.test)
+                ):
+                    continue
+                if isinstance(_n, (ast.Import, ast.ImportFrom)):
+                    _mods = (
+                        [_a.name for _a in _n.names]
+                        if isinstance(_n, ast.Import)
+                        else [_n.module or ""]
+                    )
+                    if any(_m.split(".")[0] not in _STDLIB_MODULES for _m in _mods):
+                        continue
+                if (
+                    isinstance(
+                        _n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                    )
+                    and not _n.name.lower().startswith("test")
+                    and (
+                        self._module_function_qid(_n.name, project_id)
+                        or self._module_class_source(_n.name, project_id)
+                    )
+                ):
+                    _out["dropped"].append(_n.name)
+                    continue
+                _kept.append(_n)
+            _tests = ast.unparse(ast.Module(body=_kept, type_ignores=[]))
+            if "def test" not in _tests:
+                _out["reason"] = "no test function left"
+                return _out
+            _called = {
+                _n.id
+                for _n in ast.walk(ast.Module(body=_kept, type_ignores=[]))
+                if isinstance(_n, ast.Name)
+            }
+            _targets = [
+                _q
+                for _q in sorted(_called)
+                if self._module_function_qid(_q, project_id)
+            ]
+            # The classes the tests name, and what of them the tests reach.
+            _reached = {
+                _n.attr
+                for _n in ast.walk(ast.Module(body=_kept, type_ignores=[]))
+                if isinstance(_n, ast.Attribute)
+            }
+            _classes = [
+                (_c, _s)
+                for _c, _s in (
+                    (_c, self._module_class_source(_c, project_id))
+                    for _c in sorted(_called)
+                    if _c not in _targets
+                )
+                if _s
+            ]
+            if not _targets and not _classes:
+                _out["reason"] = "the tests call no project function or class"
+                return _out
+            _bodies: List[str] = []
+            for _q in _targets:
+                _b = self._body_of(_q, project_id)
+                if not _b or "[truncated by broker" in _b:
+                    _out["reason"] = f"no whole body for {_q}"
+                    return _out
+                _bodies.append(_b)
+            _owners = list(_targets)
+            # Each class after the classes under test it names: an annotation
+            # or a field default is read when the class is defined.
+            _cut = {_c: self._reduced_class(_s, _reached) for _c, _s in _classes}
+            _left = sorted(_cut)
+            while _left:
+                _ready = [
+                    _c
+                    for _c in _left
+                    if not any(
+                        _d != _c and re.search(rf"\b{_d}\b", _cut[_c])
+                        for _d in _left
+                    )
+                ]
+                _c = (_ready or _left)[0]
+                _left.remove(_c)
+                _bodies.append(_cut[_c])
+                _owners.append(_c)
+                _methods = sorted(
+                    _n.name
+                    for _n in ast.walk(ast.parse(_bodies[-1]))
+                    if isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and _n.name in _reached
+                )
+                _targets += [f"{_c}.{_m}" for _m in _methods] or [_c]
+            _callees = "\n\n".join(
+                _c
+                for _c in (
+                    self._resolve_callee_bodies(_b, _q, project_id)
+                    for _b, _q in zip(_bodies, _owners)
+                )
+                if _c
+            )
+            _types, _ = self._resolve_type_dependencies(
+                _bodies + [_callees],
+                _owners[0],
+                project_id,
+                exclude=[_c for _c, _ in _classes],
+            )
+            _consts, _ = self._module_constant_sources(
+                _bodies + [_callees, _types], project_id
+            )
+            import textwrap as _tw
+
+            _harness = self._compose(
+                "\n\n".join(_tw.dedent(_b).strip() for _b in _bodies),
+                _tests + self._UNITTEST_ADAPTER,
+                _callees,
+                "\n\n".join(_x for _x in (_consts, _types) if _x),
+            )
+            _r = await self._runner.run(_harness)
+            _out.update(
+                status=_r.get("status", "error"),
+                reason=(
+                    str(_r.get("detail", "") or "")[-200:]
+                    if _r.get("status") == "error"
+                    else str(_r.get("detail", "") or "")[:200]
+                ),
+                targets=_targets,
+                passed=int(_r.get("passed", 0) or 0),
+                total=int(_r.get("total", 0) or 0),
+                failures=list(_r.get("failures", []) or [])[:3],
+            )
+            return _out
+        except Exception as _e:
+            _out["reason"] = f"{type(_e).__name__}: {_e}"[:200]
+            return _out
+
+    def _compose(
+        self, body: str, tests: str, callee_src: str = "", type_src: str = ""
+    ) -> str:
         """Sandwich: fixed scaffold + dedented symbol + LLM tests + runner.
 
         Also records the test names being composed, which is what makes the
@@ -24595,6 +26645,10 @@ if __name__ == "__main__":
         import textwrap as _tw
 
         dep_block = (
+            f"# === PROJECT TYPES (real definitions) ===\n{type_src}\n\n"
+            if type_src
+            else ""
+        ) + (
             f"# === PROJECT CALLEES (real bodies) ===\n{callee_src}\n\n"
             if callee_src
             else ""
@@ -24631,10 +26685,13 @@ if __name__ == "__main__":
         the HARNESS rather than the code — infrastructure statuses (the
         harness never ran) or zero-pass suspicion (0/N asserts with
         N >= 3: everything failing, including trivial asserts, signals a
-        broken composition, not a surgical refutation) — or "" when the
+        broken composition, not a surgical refutation) or every failure a
+        name the composition lacks (NameError, ImportError: the test or the
+        extracted symbol refers to something the harness never defined,
+        which says nothing about what the code does) — or "" when the
         result is trustworthy. Used by _append_evidence (verdict
-        integrity) and _verify_target (selective replication) so the two
-        phases can never drift apart.
+        integrity), _verify_target (selective replication) and the Stats
+        tally (_tally_status) so the three can never drift apart.
         """
         status = result.get("status", "error")
         if status in ("error", "timeout", "rejected"):
@@ -24650,7 +26707,36 @@ if __name__ == "__main__":
                 f"zero-pass suspicion (0/{result.get('total', 0)} asserts "
                 f"— broken composition more likely than surgical refutation)"
             )
+        _fails = [str(_x) for _x in result.get("failures") or []]
+        if (
+            status == "fail"
+            and _fails
+            and len(_fails)
+            == int(result.get("total", 0)) - int(result.get("passed", 0))
+            and all(_COMPOSITION_FAULT_RE.match(_x) for _x in _fails)
+        ):
+            return (
+                f"composition fault ({_fails[0][:80]} — the harness lacks a "
+                f"name, the code was not refuted)"
+            )
         return ""
+
+    def _tally_status(self, result: Dict[str, Any]) -> str:
+        """The status the Stats tally counts for one run.
+
+        The sandbox's own status, except a failure _append_evidence
+        downgrades to inconclusive: the clause counted it "refuted" while
+        the ledger held it inconclusive, so Stats reported refutations the
+        turn never had.
+        """
+        status = str(result.get("status", "error"))
+        if (
+            status == "fail"
+            and self._f.valves.verify_dynamic_verdict_integrity == "on"
+            and self._suspect_reason_of(result)
+        ):
+            return "suspect"
+        return status
 
     def _append_evidence(
         self,
@@ -24761,8 +26847,13 @@ if __name__ == "__main__":
         )
         ledger.claims.append(claim)
 
-    def _note_execution(self, kind: str, status: str) -> None:
+    def _note_execution(self, kind: str, status: str, key: str = "") -> None:
         """Add one executed unit to the turn's Stats clause.
+
+        key names the unit (a symbol's qid). A keyed unit already in the
+        tally is replaced, not added: a second verify_dynamic step reuses
+        the first one's cached results, and the clause read "4 symbols, 2
+        refuted" for two symbols run once.
 
         Separate from _step_verdicts, which run_dynamic_step clears at the
         top of every dynamic step: design_tests sorts BEFORE verify_dynamic,
@@ -24774,7 +26865,16 @@ if __name__ == "__main__":
         _acc = getattr(self._f, "_execution_tally", None)
         if not isinstance(_acc, list):
             _acc = []
-        _acc.append((kind, status))
+            self._f._execution_keys = {}
+        _where = getattr(self._f, "_execution_keys", None)
+        if not isinstance(_where, dict):
+            _where = self._f._execution_keys = {}
+        if key and (kind, key) in _where and _where[(kind, key)] < len(_acc):
+            _acc[_where[(kind, key)]] = (kind, status)
+        else:
+            if key:
+                _where[(kind, key)] = len(_acc)
+            _acc.append((kind, status))
         self._f._execution_tally = _acc
         # Recomposed here, not by whoever happens to run last. The clause
         # used to be built only inside run_dynamic_step, so a turn with a
@@ -24825,8 +26925,12 @@ if __name__ == "__main__":
             _parts.append(f"{_skipped} not executable")
         return " · ".join(_parts)
 
-    def _note_verdict(self, status: str) -> None:
+    def _note_verdict(self, status: str, qid: str = "") -> None:
         """Record one target's outcome for the step to count.
+
+        qid, when given, keys the turn tally: a later step that reuses a
+        symbol's cached result replaces its entry instead of counting the
+        same execution twice (_note_execution).
 
         Kept beside _format_line because the two are the only places that
         learn what happened to a target, and a counter that reads the
@@ -24845,6 +26949,9 @@ if __name__ == "__main__":
         if not hasattr(self, "_step_verdicts"):
             self._step_verdicts = []
         self._step_verdicts.append(status)
+        if not hasattr(self, "_step_verdict_keys"):
+            self._step_verdict_keys = []
+        self._step_verdict_keys.append(qid)
 
     @staticmethod
     def _format_line(
@@ -25279,7 +27386,7 @@ if __name__ == "__main__":
         self._f._dynamic_targets_this_turn = _spent + 1
         _result2 = await self._runner.run(self._compose(_fixed, ""))
         await self._cache_put(project_id, pseudo, "", _fixed, _result2)
-        self._note_verdict(str(_result2.get("status", "error")))
+        self._note_verdict(self._tally_status(_result2))
         self._note_execution("repair", str(_result2.get("status", "error")))
         # The verdict has to say which block to hand over. Appending the
         # repaired pair leaves THREE code blocks in the workspace and the
@@ -25372,7 +27479,7 @@ if __name__ == "__main__":
         await self._cache_put(project_id, pseudo, "", tests, _result)
 
         # ── Step 3: record it where every other verdict is recorded ──
-        self._note_verdict(str(_result.get("status", "error")))
+        self._note_verdict(self._tally_status(_result))
         self._note_execution("tests", str(_result.get("status", "error")))
         _line = self._format_line(pseudo, "design", _result, "design_tests")
         step.output = (step.output or "") + "\n\n" + _line
@@ -25698,6 +27805,162 @@ class AgenticPreplanner:
     # 2. The pre-planning pass
     # ──────────────────────────────────────────────────────────────────────
 
+    def _ground_framings(
+        self, data: Dict[str, Any], chosen: str, project_id: str
+    ) -> List[str]:
+        """Arbitrate the framings against the code, in shadow, and record it.
+
+        The framing decision is the most uncertain one the pipeline makes
+        and the one it checked least: the model picked in a single call, and
+        the assumptions it rested on reached only the forge, after the
+        choice, on turns that ran one. Here every framing's propositions
+        (_framing_propositions) go to the free observers — the index and
+        the call graph — and DecisionArbiter applies its policy: the choice
+        stands unless a hard refutation eliminates it. The chosen framing's
+        assumptions are ruled on apart and reported, never compared: only
+        it has them, and comparing would count that against it. What the
+        arbiter would change is counted, not acted on (arbiter_framing_mode).
+
+        Returns:
+            What the index refuted in the chosen framing and its
+            assumptions, one line each, for the planner's brief
+            (arbiter_framing_brief); [] when nothing was. Never raises:
+            shadow work must not cost a turn.
+        """
+        try:
+            _mode = getattr(
+                getattr(self._f, "valves", None), "arbiter_framing_mode", "shadow"
+            )
+            if _mode == "off":
+                return []
+            idx = self._f._symbol_index
+            if idx is None:
+                self._f._log_debug("🧭 Preplanner grounding: skipped (no index)")
+                return []
+            try:
+                _state = self._f._conversation_state_manager.get(project_id)
+                _src = [
+                    _b.content or ""
+                    for _b in _state.active_blocks.values()
+                    if not getattr(_b, "obsolete", False)
+                ]
+            except Exception:
+                _src = []
+            _framings = [
+                str(_x) for _x in (data.get("framings") or []) if str(_x).strip()
+            ]
+            if chosen and chosen not in _framings:
+                _framings.append(chosen)
+            _observers: List[ArbiterObserver] = [
+                IndexExistenceObserver(idx, _src),
+                GraphRelationObserver(getattr(self._f, "_meta_reasoning", None)),
+            ]
+            _ruling = DecisionArbiter.arbitrate(
+                "framing",
+                {_fr: _framing_propositions(_fr) for _fr in _framings},
+                chosen,
+                _observers,
+                project_id,
+            )
+            _assumed = DecisionArbiter.arbitrate(
+                "framing_assumptions",
+                {
+                    "assumptions": [
+                        _p
+                        for _a in data.get("assumptions") or []
+                        for _p in _framing_propositions(str(_a))
+                    ]
+                },
+                "assumptions",
+                _observers,
+                project_id,
+            ).standings[0]
+
+            def _absent(_st: OptionStanding) -> List[str]:
+                return [
+                    _p[len("exists: ") :]
+                    for _p, _r in _st.rulings
+                    if _r.verdict is False and _p.startswith("exists: ")
+                ]
+
+            _mine = next(
+                (_s for _s in _ruling.standings if _s.option == chosen),
+                OptionStanding(option=chosen),
+            )
+            _unknown = _absent(_mine)
+            _assumed_unknown = _absent(_assumed)
+            for _mk, _mv in (
+                ("preplan_framings", len(_framings)),
+                ("preplan_unknown_names", len(_unknown)),
+                ("preplan_assumption_unknown", len(_assumed_unknown)),
+                ("preplan_would_change", int(_ruling.would_change)),
+                (
+                    "arb_framing_checkable",
+                    sum(_s.checkable for _s in _ruling.standings),
+                ),
+                (
+                    "arb_framing_eliminated",
+                    sum(bool(_s.eliminated_by) for _s in _ruling.standings),
+                ),
+                ("arb_framing_all_eliminated", int(_ruling.all_eliminated)),
+                ("arb_framing_assumption_refuted", _assumed.refuted),
+            ):
+                self._f._set_turn_metric(_mk, _mv)
+            self._f._log_debug(
+                f"🧭 Preplanner grounding (shadow): {len(_framings)} framing(s), "
+                f"{sum(_s.checkable for _s in _ruling.standings)} of "
+                f"{sum(_s.proposed for _s in _ruling.standings)} proposition(s) "
+                f"checkable; chosen names {_mine.confirmed} found, "
+                f"{len(_unknown)} unknown"
+                + (f" ({', '.join(_unknown[:4])})" if _unknown else "")
+                + (
+                    f"; assumptions name {len(_assumed_unknown)} unknown"
+                    if _assumed_unknown
+                    else ""
+                )
+                + (
+                    f"; assumptions refute {_assumed.refuted - len(_assumed_unknown)}"
+                    f" call relation(s)"
+                    if _assumed.refuted > len(_assumed_unknown)
+                    else ""
+                )
+                + (
+                    "; every framing eliminated — the least refuted would stand"
+                    if _ruling.all_eliminated
+                    else ""
+                )
+                + (
+                    f"; the index would back '{_ruling.recommended[:60]}'"
+                    if _ruling.would_change
+                    else "; the index backs the choice"
+                )
+            )
+            # ── What the planner should not plan around ──
+            _facts: List[str] = []
+            for _p, _r in list(_mine.rulings) + list(_assumed.rulings):
+                if _r.verdict is not False:
+                    continue
+                if _p.startswith("exists: "):
+                    # "is not in the code", not "does not exist": a design
+                    # assumption may name what it means to add ("observations
+                    # of type 'reference_site'"), and for that it is still
+                    # true and still what the planner needs.
+                    _line = (
+                        f"`{_p[len('exists: '):]}` is not in the code: no "
+                        f"symbol in the index and no code is named that"
+                    )
+                elif _p.startswith("calls: "):
+                    _a, _, _b = _p[len("calls: ") :].partition(" -> ")
+                    _line = f"{_a} does not call {_b}: the call graph has no such call"
+                else:
+                    continue
+                if _line not in _facts:
+                    _facts.append(_line)
+            return _facts[:3]
+        except Exception as _e:
+            self._f._log_debug(f"🧭 Preplanner grounding: skipped ({_e!r})")
+            return []
+
     async def preplan(
         self,
         question: str,
@@ -25724,6 +27987,7 @@ class AgenticPreplanner:
         # preplan can never leak a previous turn's assumptions into
         # this turn's forge.
         self._f._preplanner_assumptions = []
+        self._f._preplanner_assumptions_tested = False
         self._f._preplanner_question_type = ""  # S18: per-turn
         if not slot_free:
             return "", ""
@@ -25832,15 +28096,12 @@ class AgenticPreplanner:
                 f"preplan: {len(self._f._preplanner_assumptions)} "
                 f"assumption(s) logged for the forge"
             )
-            # Strategy visibility: the assumptions being tested are
-            # part of the method the user is watching — until now
-            # this was server-log only, and the chat showed the
-            # framing with no hint that its load-bearing assumptions
-            # enter the forge as claims-to-verify.
-            await self._f._emit_status(
-                f"🧭 [framing] Testing "
-                f"{len(self._f._preplanner_assumptions)} "
-                f"framing assumption(s) in the forge"
+            # Recorded, not shown: the forge is their one consumer and only a
+            # plan with a hypothesize step runs it, so recording them changes
+            # nothing on its own. The forge says "Testing … in the forge"
+            # itself, when it runs (_forge_hypothesis).
+            self._f._set_turn_metric(
+                "preplan_assumptions", len(self._f._preplanner_assumptions)
             )
         # difficulty is the pre-planner's semantic judgment of how much
         # investigative work the chosen framing needs; anything outside the
@@ -25984,6 +28245,33 @@ class AgenticPreplanner:
             )
             return "", ask
         if brief:
+            _facts = self._ground_framings(data, chosen, project_id)
+            # What the index refuted before planning, given to the planner as
+            # fact rather than orientation: round 8's framings planned around
+            # a `verify_static` step and `self._f._metacognitive_engine`,
+            # neither of which exists, and the steps went to look for them.
+            _on = (
+                getattr(
+                    getattr(self._f, "valves", None), "arbiter_framing_brief", "on"
+                )
+                == "on"
+            )
+            self._f._set_turn_metric("preplan_brief_facts", len(_facts) if _on else 0)
+            if _facts and _on:
+                _checked = (
+                    "Checked against the code index before planning — facts, "
+                    "not orientation: " + "; ".join(_facts) + "."
+                )
+                _tail = "Treat this as orientation, not orders"
+                brief = (
+                    brief.replace(_tail, _checked + "\n" + _tail, 1)
+                    if _tail in brief
+                    else brief.rstrip("\n") + "\n" + _checked + "\n\n"
+                )
+                self._f._log_debug(
+                    f"🧭 Preplanner grounding: the brief carries {len(_facts)} "
+                    f"refutation(s) to the planner"
+                )
             _qt_tag = f" [{question_type}]" if question_type else ""
             await self._f._emit_status(
                 f"🧭 Pre-planner: framing chosen — {chosen[:60]}{_qt_tag}"
@@ -27891,13 +30179,43 @@ class AgenticToolBroker:
             self._f._log_debug(f"module constant {_name} unreadable ({_e!r})")
         return ""
 
-    def _expand(self, sym: str, project_id: str) -> str:
+    def expand_for_claims(
+        self,
+        sym: str,
+        project_id: str,
+        claims: List[str],
+        sources: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """EXPAND for a reader that knows what it will be asked about.
+
+        A body past the cap comes back as the excerpt its claims are about
+        (_claim_excerpt) instead of its head, and its whole body lands in
+        `sources[sym]` when given; anything else as EXPAND returns it.
+        Never raises.
+        """
+        try:
+            _arg = str(sym or "").strip().strip("\"'")
+            if not _arg:
+                return "[EXPAND: empty argument]"
+            return self._expand(_arg, project_id, focus=claims, sources=sources)
+        except Exception as e:
+            return f"[EXPAND({sym}) failed: {e}]"
+
+    def _expand(
+        self,
+        sym: str,
+        project_id: str,
+        focus: Optional[List[str]] = None,
+        sources: Optional[Dict[str, str]] = None,
+    ) -> str:
         """Full body of a symbol from the first live block, char-capped.
 
         A name no live block holds is tried as a module-level constant
         (_module_constant) before it is reported missing: whether the
         resolver knows the name or not, since it resolves a constant's
-        name to itself without any block to read it from."""
+        name to itself without any block to read it from. With `focus`, a
+        body past the cap is excerpted around what those claims name, and
+        the whole body is kept in `sources` under `sym`."""
         qid = self._qid_for(sym, project_id)
         if not qid:
             _const = self._module_constant(sym, project_id)
@@ -27928,6 +30246,17 @@ class AgenticToolBroker:
         _cap = int(
             getattr(self._f.valves, "agentic_expand_max_chars", self._MAX_BODY_CHARS)
         )
+        if len(body) > _cap and focus:
+            _focused = _claim_excerpt(body, focus, _cap, qid)
+            if _focused:
+                if sources is not None:
+                    sources[sym] = body
+                self._f._log_debug(
+                    f"🤖 Evidence: {qid} is {len(body)} chars — excerpted "
+                    f"around what its {len(focus)} claim(s) name instead of "
+                    f"cut at {_cap}"
+                )
+                return f"### Body of {qid}\n```\n{_focused}\n```" + _exits_note
         if len(body) > _cap:
             # Actionable truncation: a silent mid-body cut leaves the model
             # blind to the trailing calls/returns (observed live: a truncated
@@ -27935,6 +30264,7 @@ class AgenticToolBroker:
             # how to get the rest instead of stopping.
             _shown = body[:_cap]
             _total = len(body)
+            _past = _writes_beyond_cut(body, _shown)
             # The honest advice depends on how much is missing: grepping back
             # a tail worth a fraction of the cap is a real recovery; a symbol
             # many times the cap cannot be reassembled that way. Pointing to
@@ -27953,6 +30283,7 @@ class AgenticToolBroker:
                     f"CANNOT be reassembled by expanding it — do not ask for "
                     f"its body again, and do not guess its remaining "
                     f"contents. Expand a NAMED member instead." + _hint + "]"
+                    + ("\n" + _past if _past else "")
                 )
             else:
                 body = (
@@ -27961,6 +30292,7 @@ class AgenticToolBroker:
                     f"chars. To see the rest, GREP a distinctive token from the "
                     f"missing region, or state that the tail of {qid} was not "
                     f"inspected — do NOT guess its remaining calls.]"
+                    + ("\n" + _past if _past else "")
                 )
         return f"### Body of {qid}\n```\n{body}\n```" + _exits_note
 
@@ -28289,6 +30621,41 @@ def _heads_of(line: str, sections: List[str]) -> str:
     _t = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s*", "", line.strip())
     _t = _t.strip("# *").strip().rstrip(":").strip()
     return next((_b for _b in _bare if _t == _b), "")
+
+
+def _outline_items(text: str) -> List[str]:
+    """The outline's lines, stripped, with each fenced block as one item.
+
+    A block comes back whole and dedented, between a "```lang" line and a
+    closing "```"; one left open is closed. Lines outside fences are
+    stripped and blank ones dropped, as before. Inside a fence nothing is
+    a heading, a body line or a name to backtick: it is code, and the
+    answer and _shown_test_code both need it exactly as written.
+    """
+    _items: List[str] = []
+    _code: Optional[List[str]] = None
+    _open = ""
+    for _raw in str(text or "").splitlines():
+        _s = _raw.strip()
+        if _code is None:
+            if _s.startswith("```"):
+                if _s.endswith("```") and len(_s) > 6:
+                    continue
+                _code, _open = [], _s
+            elif _s:
+                _items.append(_s)
+            continue
+        if _s.startswith("```") and not _s.strip("`"):
+            if "".join(_code).strip():
+                _body = textwrap.dedent("\n".join(_code)).strip("\n")
+                _items.append(f"{_open}\n{_body}\n```")
+            _code = None
+            continue
+        _code.append(_raw.rstrip())
+    if _code is not None and "".join(_code).strip():
+        _body = textwrap.dedent("\n".join(_code)).strip("\n")
+        _items.append(f"{_open}\n{_body}\n```")
+    return _items
 
 
 def _demote_headings(text: str) -> str:
@@ -29390,6 +31757,15 @@ class AgenticSynthesisComposer:
         )
         if _listing:
             out += ["READ DIRECTLY FROM THE CODE INDEX:", _listing, ""]
+        _relation = str(
+            getattr(getattr(self._f, "_agentic", None), "_named_relation", "") or ""
+        )
+        if _relation:
+            out += [
+                "THE RELATION THE QUESTION NAMES, READ FROM THE CODE INDEX:",
+                _relation,
+                "",
+            ]
         _unestablished = getattr(self._f, "_serial_unestablished", None) or []
         if _unestablished:
             out.append(
@@ -29397,6 +31773,11 @@ class AgenticSynthesisComposer:
                 "established:"
             )
             out += [f"- {' '.join(h.split())[:200]}" for h in _unestablished[:4]]
+            out.append(
+                "So the Conclusion line opens by saying no cause was "
+                "established, then states what the ✓ claims settle; an "
+                "explanation they do not settle is a candidate, said as unverified."
+            )
             out.append("")
         _claims = list(getattr(ledger, "claims", None) or [])
         if _claims:
@@ -29482,15 +31863,14 @@ class AgenticSynthesisComposer:
                 f"full directive stands"
             )
             return ""
-        # Fences are dropped and "#" is NOT: the section names are "##
-        # **Conclusión**" and so on, so filtering lines that start with a
-        # hash threw away every heading the next check then looked for.
-        # The outline came back complete and was discarded as empty.
-        _lines = [
-            _l.strip()
-            for _l in (_resp or "").splitlines()
-            if _l.strip() and not _l.strip().startswith("```")
-        ]
+        # "#" is NOT filtered: the section names are "## **Conclusión**" and
+        # so on, so filtering lines that start with a hash threw away every
+        # heading the next check then looked for. Fenced code is kept whole
+        # (_outline_items): read line by line, round 10's code section lost
+        # its fences and indentation, two "# ──" comments were dropped as
+        # headings, every identifier was backticked, and the answer that
+        # copied it copied the workspace notes after it too.
+        _lines = _outline_items(_resp)
         # Split "Heading: body" onto two lines before anything reads them.
         # Asked for a heading followed by a body line, the model regularly
         # answers with one line per section instead — "- ## Conclusión: the
@@ -29504,7 +31884,7 @@ class AgenticSynthesisComposer:
         # written for, and no other code has to know this ever happened.
         _split: List[str] = []
         for _l in _lines:
-            _m = re.match(r"^(.*?):\s+(\S.*)$", _l)
+            _m = None if _l.startswith("```") else re.match(r"^(.*?):\s+(\S.*)$", _l)
             if _m and _heads_of(_m.group(1), sections) and not _heads_of(_l, sections):
                 _split.append(_m.group(1).strip())
                 _split.append(_m.group(2).strip())
@@ -29560,7 +31940,7 @@ class AgenticSynthesisComposer:
             # same heading as "## **Conclusión**" for this purpose. The
             # normalisation itself lives at module level so the pre-pass
             # that splits inline bodies applies exactly this rule.
-            return _heads_of(_line, sections)
+            return "" if _line.startswith("```") else _heads_of(_line, sections)
 
         _named = sum(1 for _l in _lines if _heads(_l))
         if _named < len(sections):
@@ -29609,6 +31989,7 @@ class AgenticSynthesisComposer:
                     _body
                     and recheck_body
                     and _key_of.get(_heads(_l), "") == "proceed"
+                    and not _body.startswith("```")
                     and _RECHECK_LINE_RE.match(_body)
                 ):
                     self._f._log_debug(
@@ -29625,11 +32006,21 @@ class AgenticSynthesisComposer:
                     # section's own line, so Conclusion is told to state what
                     # the turn settled and How to proceed to name the next
                     # step, each with leave to say there is none.
-                    _kept.append(
-                        _fallbacks.get(_key_of.get(_heads(_l), ""), _generic)
-                        if _body.strip().upper().startswith("SKIP")
-                        else _body
-                    )
+                    _skipped = _body.strip().upper().startswith("SKIP")
+                    _key = _key_of.get(_heads(_l), "")
+                    if _body.startswith("```"):
+                        # Code straight under its heading: the heading keeps
+                        # it, and the line that was missing above it stays
+                        # missing rather than becoming the SKIP fallback.
+                        _skipped = False
+                    if _skipped and _key == "proceed" and recheck_body:
+                        # The placeholder is an instruction, and round 5
+                        # copied it into the answer word for word.
+                        _kept.append(recheck_body)
+                    else:
+                        _kept.append(
+                            _fallbacks.get(_key, _generic) if _skipped else _body
+                        )
                 _idx += 2
                 continue
             # A line shaped like a heading that resolves to no section in
@@ -29675,7 +32066,14 @@ class AgenticSynthesisComposer:
             f"🤖 Outline: {_named - _skip} section(s) planned in {_names}, "
             f"{_skip} skipped and dropped ({len(_resp or '')} chars)"
         )
-        return "\n".join(_kept)
+        # Code names in backticks, headings untouched: the line is what the
+        # answer develops, so it is where the convention is shown.
+        return "\n".join(
+            _l
+            if _l.lstrip().startswith(("#", "```"))
+            else _backtick_code_names(_l)
+            for _l in _kept
+        )
 
     def render(
         self,
@@ -29818,8 +32216,10 @@ class AgenticSynthesisComposer:
         # the setting it asked about (not a symbol) is not a ghost, and
         # abstaining told the reader the setting was not in the code while
         # its declaration had just been read.
-        if _all_citations_invalid and not str(
-            getattr(getattr(self._f, "_agentic", None), "_graph_listing", "") or ""
+        _agentic = getattr(self._f, "_agentic", None)
+        if _all_citations_invalid and not (
+            str(getattr(_agentic, "_graph_listing", "") or "")
+            or str(getattr(_agentic, "_named_relation", "") or "")
         ):
             _ghost_syms = sorted(
                 {q for c in ledger.claims for q in (c.invalid_qids or [])}
@@ -29922,18 +32322,31 @@ class AgenticSynthesisComposer:
                 "context above plus the verified evidence below.)"
             )
             lines.append("")
-        # Two findings that reach no step digest, and step digests never
-        # enter this prompt (R34): the answer read from the index, and a
-        # competition that established no cause. Stated as findings inside
-        # the fence, not as instructions after the section list: an
-        # instruction placed there was copied into the answer as section
-        # content, and the conclusion picked an unrelated mechanism.
+        # Findings that reach no step digest, and step digests never enter
+        # this prompt (R34): the answer read from the index, the relation the
+        # question names as the index settled it, and a competition that
+        # established no cause. Stated as findings inside the fence, not as
+        # instructions after the section list: an instruction placed there
+        # was copied into the answer as section content, and the conclusion
+        # picked an unrelated mechanism. The relation was shown to the steps
+        # only, and a question built on a call that does not exist got a
+        # design for caching it.
         _listing = str(
             getattr(getattr(self._f, "_agentic", None), "_graph_listing", "") or ""
         )
         if _listing:
             lines.append("Read directly from the code index:")
             lines.append(_listing)
+            lines.append("")
+        _relation = str(
+            getattr(getattr(self._f, "_agentic", None), "_named_relation", "") or ""
+        )
+        if _relation:
+            lines.append(
+                "The relation the question names, read from the code index "
+                "and the source:"
+            )
+            lines.append(_relation)
             lines.append("")
         _unestablished = getattr(self._f, "_serial_unestablished", None) or []
         if _unestablished:
@@ -29944,6 +32357,11 @@ class AgenticSynthesisComposer:
                 "makes none of them the cause:"
             )
             lines += [f"- {' '.join(h.split())[:300]}" for h in _unestablished[:4]]
+            lines.append(
+                "The Conclusion therefore opens by saying no cause was "
+                "established; an explanation the verified claims do not settle "
+                "is written as an unverified candidate, never as the cause."
+            )
             lines.append("")
         for s in plan.steps:
             if s.status != "done":
@@ -30516,8 +32934,23 @@ class AgenticSynthesisComposer:
                     "finding per item, each naming the symbol and what its "
                     "code showed. A line copied from here as it stands is a "
                     "section left unwritten.",
-                    "",
                 ]
+                # Round 9: on both turns that asked for something to be
+                # made (a design, a test file) the outline's step was right
+                # and the answer opened that section with "Nada;" anyway,
+                # in the voice of the three explain answers above it in the
+                # history: "Nada; los tests solo requieren ejecución".
+                + (
+                    [
+                        "This turn was asked to make something, so How to "
+                        "proceed is what to do with it — the change to "
+                        "apply, the tests to run — written as that step, "
+                        "not opened as if nothing were left to do.",
+                    ]
+                    if str(question_type or "") == "generative"
+                    else []
+                )
+                + [""]
                 # Split into lines, with a rule ahead of every heading. The
                 # outline arrived as ONE list element with newlines inside
                 # it, so _resolve_group_breaks never saw its headings and
@@ -31406,6 +33839,307 @@ class AgenticOrchestrator:
         except Exception:
             return ""
 
+    @staticmethod
+    def _shown_test_code(outline: str, plan: Any) -> Tuple[str, List[str]]:
+        """The fenced code with tests in the outline and steps, and the names."""
+        _texts = [str(outline or "")] + [
+            _s.output or "" for _s in getattr(plan, "steps", None) or []
+        ]
+        _blocks: List[str] = []
+        _names: List[str] = []
+        for _t in _texts:
+            for _b in re.findall(r"```(?:\w+)?\s*(.*?)```", _t, re.S):
+                _found = _TEST_DEF_RE.findall(_b)
+                if _found and _b not in _blocks:
+                    _blocks.append(_b)
+                for _n in _found:
+                    if _n not in _names:
+                        _names.append(_n)
+        return "\n\n".join(_blocks), _names
+
+    async def _run_shown_tests(
+        self, outline: str, plan: Any, project_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Run the tests this turn wrote before the answer shows them.
+
+        The code is the outline's and the steps' (_shown_test_code), run by
+        AgenticDynamicVerifier.run_shown_tests against the real bodies of the
+        functions and classes it calls. None when no test was written, every one of
+        them already ran this turn, or agentic_run_shown_tests is off.
+        Never raises.
+        """
+        try:
+            if not getattr(self._f.valves, "agentic_run_shown_tests", True):
+                return None
+            _code, _names = self._shown_test_code(outline, plan)
+            _ran = set(getattr(self._f, "_executed_test_names", None) or [])
+            if not _names or all(_n in _ran for _n in _names):
+                return None
+            _r = await self._dyn.run_shown_tests(_code, project_id)
+            if _r.get("dropped"):
+                self._f._log_debug(
+                    f"🧪 Shown tests: they carried their own copy of "
+                    f"{', '.join(_r['dropped'][:3])} — dropped, they run "
+                    f"against the indexed body"
+                )
+            if _r.get("status") == "skipped":
+                self._f._log_debug(f"🧪 Shown tests: not run — {_r.get('reason')}")
+            else:
+                self._f._bump_turn_metric("tests_shown_run", int(_r.get("total", 0)))
+                self._f._bump_turn_metric(
+                    "tests_shown_failed",
+                    max(0, int(_r.get("total", 0)) - int(_r.get("passed", 0))),
+                )
+                self._f._log_debug(
+                    f"🧪 Shown tests: {_r.get('status')} "
+                    f"{_r.get('passed', 0)}/{_r.get('total', 0)} against "
+                    f"{', '.join(_r.get('targets', []))}"
+                    + (f" — {_r['failures'][0][:120]}" if _r.get("failures") else "")
+                )
+            return _r
+        except Exception as _e:
+            self._f._log_debug(f"🧪 Shown tests: not run — {type(_e).__name__}")
+            return None
+
+    def _note_unrun_tests(
+        self,
+        outline: str,
+        plan: Any,
+        lang: str,
+        ran: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Say in the outline what became of the tests written this turn.
+
+        Round 9's test-writing turn: the outline step wrote eight tests into
+        its code section, the answer showed all eight, none reached the
+        sandbox, and the conclusion said they validated the function. When
+        _run_shown_tests ran them (`ran`), the result goes where it belongs:
+        all passing under what the evidence shows, anything else under what
+        was not verified. When they did not run, the gaps line says how
+        many never did, by their names against _executed_test_names, the
+        record the outlet's _audit_tests_shown reads. The outline comes back
+        unchanged when no test was written, all of them ran elsewhere, or
+        the section is missing. Never raises.
+        """
+        try:
+            _, _written = self._shown_test_code(outline, plan)
+            if not _written:
+                return outline
+            _es = lang == "es"
+            _total = int((ran or {}).get("total", 0) or 0)
+            _passed = int((ran or {}).get("passed", 0) or 0)
+            _key = "gaps"
+            if ran and ran.get("status") in ("pass", "fail") and _total:
+                _on = ", ".join(f"`{_t}`" for _t in ran.get("targets", [])[:3])
+                _fail = (ran.get("failures") or [""])[0][:140]
+                if _passed == _total:
+                    _key = "evidence"
+                    _say = (
+                        f"Los {_total} test(s) escritos en este turno se "
+                        f"ejecutaron contra el código real de {_on}: pasan todos."
+                        if _es
+                        else f"The {_total} test(s) written this turn ran "
+                        f"against the real code of {_on}: all pass."
+                    )
+                else:
+                    _say = (
+                        f"Los {_total} test(s) escritos en este turno se "
+                        f"ejecutaron contra el código real de {_on}: "
+                        f"{_total - _passed} fallan ({_fail})."
+                        if _es
+                        else f"The {_total} test(s) written this turn ran "
+                        f"against the real code of {_on}: "
+                        f"{_total - _passed} fail ({_fail})."
+                    )
+            else:
+                _ran = set(getattr(self._f, "_executed_test_names", None) or [])
+                _unrun = [_n for _n in _written if _n not in _ran]
+                if ran and ran.get("status") not in (None, "skipped"):
+                    # Composed (so recorded) but not run to a result.
+                    _unrun = list(_written)
+                if not _unrun:
+                    return outline
+                _why = str((ran or {}).get("reason", "") or "")[:100]
+                _say = (
+                    f"De los {len(_written)} test(s) escritos en este turno, "
+                    f"{len(_unrun)} no se ejecutaron"
+                    + (f" ({_why})" if _why else "")
+                    + ": lo que afirman está sin comprobar."
+                    if _es
+                    else f"Of the {len(_written)} test(s) written this turn, "
+                    f"{len(_unrun)} never ran"
+                    + (f" ({_why})" if _why else "")
+                    + ": what they assert is unchecked."
+                )
+                self._f._bump_turn_metric("tests_written_unrun", len(_unrun))
+            _head = (_SECTION_HEADINGS.get(lang) or _SECTION_HEADINGS["en"])[_key]
+            _lines = str(outline).split("\n")
+            _at = next(
+                (
+                    _i
+                    for _i, _l in enumerate(_lines)
+                    if _l.strip().strip("#*- ").strip().split(":")[0] == _head
+                ),
+                -1,
+            )
+            if _at < 0:
+                return outline
+            # The body is the next line with text, or the heading's own tail
+            # when the outline put both on one line ("- ## Gaps: …").
+            _body = next(
+                (
+                    _i
+                    for _i in range(_at + 1, len(_lines))
+                    if _lines[_i].strip() and _lines[_i].strip() != "---"
+                ),
+                -1,
+            )
+            if _body >= 0 and _lines[_body].lstrip().startswith("```"):
+                _lines.insert(_at + 1, _say)
+            elif (
+                ":" in _lines[_at]
+                or _body < 0
+                or _lines[_body].lstrip().startswith("#")
+            ):
+                _lines[_at] = _lines[_at].rstrip() + " " + _say
+            else:
+                _lines[_body] = _lines[_body].rstrip() + " " + _say
+            self._f._log_debug(f"🤖 Outline: {_say}")
+            return "\n".join(_lines)
+        except Exception:
+            return outline
+
+    def _hedge_unestablished_conclusion(self, outline: str, lang: str) -> str:
+        """Open the conclusion with the no-cause line when the competition owes it.
+
+        The turn's Stats say "no cause established" whenever the competition
+        tested candidates and established none (_serial_unestablished). In
+        round 10's three exploratory turns the workspace said so too, listing
+        the candidates, and each outline's conclusion still asserted a cause —
+        a new one, put together from settled claims, that nothing had tested —
+        which the answer then opened with. A conclusion that already says no
+        cause was established, or calls what it states unverified, is left as
+        written; any other gets _NO_CAUSE_LEADS in front, and the opening the
+        answer is seeded with carries the same words. Never raises: the
+        outline unchanged.
+        """
+        try:
+            if not getattr(self._f, "_serial_unestablished", None):
+                return outline
+            _head = (_SECTION_HEADINGS.get(lang) or _SECTION_HEADINGS["en"])[
+                "conclusion"
+            ]
+            _lines = str(outline or "").split("\n")
+            _at = next(
+                (
+                    _i
+                    for _i, _l in enumerate(_lines)
+                    if _l.strip().strip("#*- ").strip().split(":")[0] == _head
+                ),
+                -1,
+            )
+            if _at < 0:
+                return outline
+            _body = next(
+                (
+                    _i
+                    for _i in range(_at + 1, len(_lines))
+                    if _lines[_i].strip() and _lines[_i].strip() != "---"
+                ),
+                -1,
+            )
+            if _body < 0 or _lines[_body].lstrip().startswith(("#", "```")):
+                return outline
+            _text = _lines[_body].strip()
+            if _NO_CAUSE_SAID_RE.search(_text):
+                return outline
+            if len(_text) > 1 and _text[0].isupper() and _text[1].islower():
+                _text = _text[0].lower() + _text[1:]
+            _lead = _NO_CAUSE_LEADS.get(lang) or _NO_CAUSE_LEADS["en"]
+            _lines[_body] = _lead + _text
+            self._f._conclusion_no_cause_lead = _lead.rstrip()
+            self._f._bump_turn_metric("conclusion_hedged")
+            self._f._log_debug(
+                "🤖 Outline: the conclusion asserted a cause the competition did "
+                "not establish — it now opens with the no-cause line"
+            )
+            return "\n".join(_lines)
+        except Exception:
+            return outline
+
+    def _ground_outline_names(
+        self, outline: str, project_id: str, fixed: List[str]
+    ) -> str:
+        """Correct the code names the outline misspelt, before the answer copies them.
+
+        The outline is the last text the pipeline holds before the final
+        model writes, and the final model copies its names. Round 6's wrote
+        `_Srelation_edge_status_` and `_validate_call_relations_` — italics
+        eaten into the names — and the answer printed the first. Each body
+        line the outline model wrote is put to _answer_name_grounding and a
+        misspelt name is replaced by the existing one; the pipeline's own
+        lines (`fixed`) quote claims as they were made and stay as written.
+        Proposed and unknown names are counted, not touched: nothing here
+        knows what the name should have been. Never raises.
+        """
+        try:
+            if not outline or not getattr(
+                self._f.valves, "outline_name_correction", True
+            ):
+                return outline
+            idx = self._f._symbol_index
+            if idx is None:
+                return outline
+            _src = _active_sources(self._f._conversation_state_manager, project_id)
+            _lines = outline.split("\n")
+            _fixed = [_x for _x in fixed if _x]
+            _checked, _fixes, _proposed, _unknown = 0, [], [], []
+            _in_code = False
+            for _i, _l in enumerate(_lines):
+                # Code is checked by running it, not by its names: a local
+                # (`long_literal`) counted as unknown, and a correction could
+                # rename one that sits a letter away from a real symbol.
+                if _l.lstrip().startswith("```"):
+                    _in_code = not _in_code
+                    continue
+                if _in_code:
+                    continue
+                if _l.lstrip().startswith("#") or any(_l in _x for _x in _fixed):
+                    continue
+                _g = _answer_name_grounding(_l, idx, project_id, _src)
+                _checked += _g["checked"]
+                _proposed += _g["proposed"]
+                _unknown += _g["unknown"]
+                if _g["misspelt"]:
+                    _lines[_i], _n = _correct_misspelt_names(_l, _g["misspelt"])
+                    if _n:
+                        _fixes += _g["misspelt"]
+            if not _checked:
+                return outline
+            if _fixes:
+                self._f._bump_turn_metric("outline_names_corrected", len(_fixes))
+            self._f._log_debug(
+                f"🔤 Outline names: {_checked} checked"
+                + (
+                    " · corrected "
+                    + ", ".join(f"{_a} → {_b}" for _a, _b in _fixes[:4])
+                    if _fixes
+                    else ""
+                )
+                + (f" · {len(_proposed)} proposed" if _proposed else "")
+                + (
+                    f" · not in the code: {', '.join(_unknown[:4])}"
+                    if _unknown
+                    else ""
+                )
+            )
+            return "\n".join(_lines)
+        except Exception as _e:
+            self._f._log_debug(
+                f"🔤 Outline names: not checked ({type(_e).__name__})"
+            )
+            return outline
+
     def _asked_subjects(self, question: str, project_id: str) -> Dict[str, List[str]]:
         """
         The code names a question asks about, and which of them nobody read.
@@ -31414,8 +34148,10 @@ class AgenticOrchestrator:
         shape of a module-level constant, which the index does not hold.
         Anything else that looks like an identifier (a field, a valve) is
         left out: it has no body of its own to read. Read means its body
-        was rendered this turn, by either spelling (_note_body_shown).
-        Never raises.
+        was rendered this turn, by either spelling (_note_body_shown), or,
+        for a class, the body of one of its members: Block B never renders
+        a class whole, its members activate one by one, so a class asked
+        about by name is read through them or not at all. Never raises.
 
         Args:
             question: The user's question.
@@ -31444,7 +34180,12 @@ class AgenticOrchestrator:
                     if not _known and not _MODULE_CONSTANT_RE.match(_name):
                         continue
                     _asked.append(_name)
-                    if _name not in _seen and _name.rsplit(".", 1)[-1] not in _seen:
+                    _member = _name + "."
+                    if (
+                        _name not in _seen
+                        and _name.rsplit(".", 1)[-1] not in _seen
+                        and not any(str(_s).startswith(_member) for _s in _seen)
+                    ):
                         _unread.append(_name)
                         if not _known:
                             _unindexed.append(_name)
@@ -31778,12 +34519,11 @@ class AgenticOrchestrator:
                     project_id,
                     f"agentic_serial_step_{step.id}",
                 )
-                # Shadow only: reads the judged dossiers and decides nothing.
-                _bstatus = self._f._hypothesis_forge._rank_bayesian_shadow(
+                # Shadow only: reads the judged dossiers, decides nothing and
+                # so shows no status; its line is in the log.
+                self._f._hypothesis_forge._rank_bayesian_shadow(
                     _dossiers, _winner, project_id
                 )
-                if _bstatus:
-                    await self._f._emit_status(_bstatus)
                 await self._f._hypothesis_forge._record_serial_competition(
                     _dossiers, _winner, project_id
                 )
@@ -32210,12 +34950,21 @@ class AgenticOrchestrator:
         # Stashed for the Stats block. The status line above is emitted mid
         # step and the next one overwrites it; across seventeen investigate
         # steps in a run, two metacognitive lines go by unseen. This is the
-        # only place the result survives to where the reader looks.
+        # only place the result survives to where the reader looks. Read
+        # back from the turn's counters just bumped, not from this step's:
+        # each escalated step rewrote the line with its own figures, so a
+        # turn that re-tested 8 and refuted 1 over two steps reported the
+        # last step's "4 re-tested, 0 refuted".
         if n_tested:
+            _m = getattr(self._f, "_turn_metrics", None)
+            _m = _m if isinstance(_m, dict) else {}
+            _t = max(n_tested, int(_m.get("reinforce_tested", 0) or 0))
+            _r = max(n_refuted, int(_m.get("reinforce_refuted", 0) or 0))
+            _h = max(n_held, int(_m.get("reinforce_held", 0) or 0))
             self._f._measured_reinforcement = (
-                f"{n_tested} claim{'' if n_tested == 1 else 's'} re-tested, "
-                f"{n_refuted} refuted"
-                + (f", {n_held} held on too small a sample" if n_held else "")
+                f"{_t} claim{'' if _t == 1 else 's'} re-tested, "
+                f"{_r} refuted"
+                + (f", {_h} held on too small a sample" if _h else "")
             )
         if n_tested:
             await self._f._emit_status(
@@ -33249,9 +35998,12 @@ class AgenticOrchestrator:
         self._graph_listing_used = False
         if not self._named_relation:
             try:
-                self._graph_listing = self._f._meta_reasoning.list_named_relation(
+                # Reachability first: for a callable passed by reference
+                # the caller listing is empty, and an empty listing reads
+                # as absence.
+                self._graph_listing = self._f._meta_reasoning.list_reference_sites(
                     question, project_id
-                )
+                ) or self._f._meta_reasoning.list_named_relation(question, project_id)
             except Exception as _gl_err:
                 self._f._log_debug(f"🧭 Index answer: not listed ({_gl_err})")
         if not self._named_relation and not self._graph_listing:
@@ -33606,7 +36358,7 @@ class AgenticOrchestrator:
                 continue
 
             # -- cache lookup (invalidated by structure_hash mismatch) -----
-            if use_cache:
+            if use_cache and not step.fresh:
                 hit = await self._cache.get(project_id, structure_hash, step)
                 if hit is not None:
                     step.output = hit["output"]
@@ -33954,13 +36706,18 @@ class AgenticOrchestrator:
                 # conclusion, and its evidence never informed one. So a fresh
                 # analyze with the same goal follows the gap-fill: conclusion
                 # found missing evidence → gather → re-conclude. One extra
-                # analyze call, in this case only.
+                # analyze call, in this case only. Fresh for the step cache
+                # too: it keys on kind and goal, so it served all 12
+                # re-analyses measured (rounds 3 to 10, both A/B arms) the
+                # very analysis each was there to redo, and the bodies their
+                # gap-fills asked for were never read.
                 _reanalyze = None
                 if step.kind == "analyze":
                     _reanalyze = AgenticStep(
                         id=new_step.id + 1,
                         goal=step.goal,
                         kind="analyze",
+                        fresh=True,
                     )
                     plan.steps.insert(idx + 2, _reanalyze)
                 # Re-stamp display positions: the inserted step would
@@ -34472,6 +37229,27 @@ class AgenticOrchestrator:
                     f"## **{_HH['evidence']}**",
                     f"## **{_HH['gaps']}**",
                 ]
+                # The two sections whose content is a fact rather than a
+                # judgement. The gate above opens them on the accounts
+                # existing; this is what makes them writable, because the
+                # accounts themselves are not in the workspace the outline
+                # step reads.
+                _fixed_bodies = {
+                    "rivals": _account_outline_body(
+                        getattr(self._f, "_serial_rival_accounts", None),
+                        "rivals",
+                        _lang,
+                    ),
+                    "buried": _account_outline_body(
+                        getattr(self._f, "_serial_eliminated_accounts", None),
+                        "buried",
+                        _lang,
+                    ),
+                    # A count the ledger holds, not a judgement: left to the
+                    # step, it came back SKIP and the placeholder that
+                    # replaced it was copied into the answer.
+                    "gaps": self._gaps_body(question, project_id, _lang),
+                }
                 self._f._answer_outline = await self._composer.compose_outline(
                     plan,
                     question,
@@ -34480,28 +37258,20 @@ class AgenticOrchestrator:
                     _lang,
                     _secs,
                     _never,
-                    # The two sections whose content is a fact rather than a
-                    # judgement. The gate above opens them on the accounts
-                    # existing; this is what makes them writable, because
-                    # the accounts themselves are not in the workspace the
-                    # outline step reads.
-                    {
-                        "rivals": _account_outline_body(
-                            getattr(self._f, "_serial_rival_accounts", None),
-                            "rivals",
-                            _lang,
-                        ),
-                        "buried": _account_outline_body(
-                            getattr(self._f, "_serial_eliminated_accounts", None),
-                            "buried",
-                            _lang,
-                        ),
-                        # A count the ledger holds, not a judgement: left to
-                        # the step, it came back SKIP and the placeholder
-                        # that replaced it was copied into the answer.
-                        "gaps": self._gaps_body(question, project_id, _lang),
-                    },
+                    _fixed_bodies,
                     self._recheck_proceed_body(_lang, _action_now),
+                )
+                self._f._answer_outline = self._ground_outline_names(
+                    self._f._answer_outline, project_id, list(_fixed_bodies.values())
+                )
+                _shown_run = await self._run_shown_tests(
+                    self._f._answer_outline, plan, project_id
+                )
+                self._f._answer_outline = self._note_unrun_tests(
+                    self._f._answer_outline, plan, _lang, _shown_run
+                )
+                self._f._answer_outline = self._hedge_unestablished_conclusion(
+                    self._f._answer_outline, _lang
                 )
             except Exception as _e_ol:
                 self._f._log_debug(
@@ -34648,12 +37418,50 @@ class AgenticOrchestrator:
             self._f._turn_triangulation = {
                 "counts": _tri["counts"],
                 "pairs": _tri["pairs"],
+                "instruments": _tri.get("instruments") or {},
+                "loo": {
+                    **(_tri.get("loo") or {}),
+                    **(getattr(self._f, "_turn_forge_loo", None) or {}),
+                },
             }
+            _tprobe = _tri.get("probe") or {}
+            for _pk in ("discrepancies", "resolved", "sides_judge", "sides_graph"):
+                self._f._set_turn_metric(
+                    f"probe_{_pk}", int(_tprobe.get(_pk, 0) or 0)
+                )
+            _tloo = self._f._turn_triangulation["loo"]
+            self._f._set_turn_metric(
+                "cal_loo_agree", sum(int(_c[0]) for _c in _tloo.values())
+            )
+            self._f._set_turn_metric(
+                "cal_loo_disagree", sum(int(_c[1]) for _c in _tloo.values())
+            )
+            if _tloo:
+                self._f._log_debug(
+                    "🔺 [CALIBRATION] each instrument against the rest: "
+                    + " · ".join(
+                        f"{_lk.split(':', 1)[1]}@{_lk.split(':', 1)[0]} "
+                        f"{_lc[0]}/{_lc[0] + _lc[1]}"
+                        for _lk, _lc in sorted(_tloo.items())
+                    )
+                )
             for _tk, _tn in _tri["counts"].items():
                 self._f._set_turn_metric(f"tri_{_tk}", _tn)
+            _tprov = _tri.get("provenance") or {}
+            self._f._set_turn_metric(
+                "tri_prov_corroborated", int(_tprov.get("corroborated", 0) or 0)
+            )
+            self._f._set_turn_metric(
+                "tri_prov_unsettled", int(_tprov.get("unsettled", 0) or 0)
+            )
             self._f._log_debug(
                 "🔺 [TRIANGULATION] "
                 + " ".join(f"{_tk}={_tn}" for _tk, _tn in _tri["counts"].items())
+                + (
+                    f" · by provenance corroborated="
+                    f"{_tprov.get('corroborated', 0)} "
+                    f"unsettled={_tprov.get('unsettled', 0)}"
+                )
                 + (
                     " · pairs "
                     + " ".join(
@@ -34666,9 +37474,6 @@ class AgenticOrchestrator:
             )
             for _tnote in _tri["notes"]:
                 self._f._log_debug(f"🔺   {_tnote}")
-            _tstatus = AgenticEvidenceLedger.triangulation_status(_tri)
-            if _tstatus:
-                await self._f._emit_status(_tstatus)
             # Survivors the evidence did not separate from the winner. Only
             # 'independent' ones bear on whether the presented account is the
             # right one; 'competing' was settled by the ranking and
@@ -35137,7 +37942,13 @@ class AgenticOrchestrator:
                     "with one more "
                     "horizontal rule underneath the block, so the measured "
                     "lines are fenced off from whatever follows them the "
-                    "way they are fenced off from the answer above:\n\n" + _t_line
+                    "way they are fenced off from the answer above:\n\n"
+                    # The closing rule is shown, after a blank line: written
+                    # straight under the last bracket line, "---" turns that
+                    # line into a heading, and three answers of round 5 came
+                    # back with their confidence line in heading size.
+                    + _t_line.rstrip()
+                    + "\n\n---"
                     # ONCE, and said after the block, where it breaks: on a
                     # 7,338-character answer the block came back twice, the
                     # second copy rewritten from memory. Past a certain
@@ -35222,8 +38033,11 @@ class AgenticOrchestrator:
             # same reason the opening line does: the section that opens the
             # answer is the one most likely to carry a recommendation, and
             # it is decided first, before any of the gap block 4,800
-            # characters back has been acted on. One line naming them costs
-            # nothing and sits where the decision is made.
+            # characters back has been acted on. They go in a note of their
+            # own just before the opening lines, never under the heading:
+            # written after "## **Conclusión**", the sentence was the last
+            # thing before the answer and round 6 opened with it, translated,
+            # as its conclusion.
             _shelved = ""
             try:
                 _us = (getattr(self._f, "_agentic_coverage", None) or {}).get(
@@ -35231,20 +38045,46 @@ class AgenticOrchestrator:
                 ) or []
                 if _us:
                     _shelved = (
-                        "\n\nThis turn did NOT establish how these behave: "
+                        "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                        "NOT ESTABLISHED THIS TURN\n"
+                        "This turn did NOT establish how these behave: "
                         + ", ".join(_us[:8])
                         + (" …" if len(_us) > 8 else "")
                         + ". Do not open by proposing to fix any of them."
                     )
             except Exception:
                 _shelved = ""
+            # When no cause was established the conclusion's first words say
+            # so: from the outline when it had to be told
+            # (_hedge_unestablished_conclusion), always on the long route.
+            _lead = ""
+            if getattr(self._f, "_serial_unestablished", None):
+                _lead = getattr(self._f, "_conclusion_no_cause_lead", "") or (
+                    ""
+                    if _seed_from == "outline"
+                    else (
+                        _NO_CAUSE_LEADS.get(self._f._answer_language(question))
+                        or _NO_CAUSE_LEADS["en"]
+                    ).rstrip()
+                )
             _workspace += (
-                "\n\n[WORKSPACE NOTE — not part of your answer]\n"
+                _shelved + "\n\n[WORKSPACE NOTE — not part of your answer]\n"
                 "HOW YOUR ANSWER OPENS\n"
-                "Your answer begins with these two lines, exactly:\n\n"
-                "---\n\n" + _open_line + _shelved
+                + (
+                    "Your answer begins with these lines, exactly, and goes on "
+                    "from the last one:\n\n"
+                    if _lead
+                    else "Your answer begins with these two lines, exactly:\n\n"
+                )
+                + "---\n\n"
+                + _open_line
+                + (f"\n{_lead}" if _lead else "")
             )
-            self._f._log_debug(f"[ANSWER-SEED] {_open_line!r} from the {_seed_from}")
+            self._f._log_debug(
+                f"[ANSWER-SEED] {_open_line!r}"
+                + (f" + {_lead!r}" if _lead else "")
+                + f" from the {_seed_from}"
+            )
         dynamic_injections.append(("trailing", _workspace))
         # No trailing disclaimer here: a note in the last slot was copied
         # into every answer rather than obeyed. The findings block's own
@@ -38652,6 +41492,8 @@ class CommandRouter:
                         "arm": _arm or "(before arms)",
                         "counts": dict(_t.get("counts") or {}),
                         "pairs": dict(_t.get("pairs") or {}),
+                        "instruments": dict(_t.get("instruments") or {}),
+                        "loo": dict(_t.get("loo") or {}),
                     }
                 )
             except Exception:
@@ -38671,7 +41513,9 @@ class CommandRouter:
 
         Returns:
             {arm: {turns, flip_turns, counts: {field: n}, pairs:
-            {"a|b": [4 cells]}}}.
+            {"a|b": [4 cells]}, instruments: {"kind:a|b": [4 cells]}, loo:
+            {"kind:instrument": [agrees, disagrees]}}}. A row from before
+            calibration was recorded adds nothing to the last two.
         """
         _out: Dict[str, Dict[str, Any]] = {}
         for _r in rows:
@@ -38682,6 +41526,8 @@ class CommandRouter:
                     "flip_turns": 0,
                     "counts": {_k: 0 for _k in _TRIANGULATION_FIELDS},
                     "pairs": {},
+                    "instruments": {},
+                    "loo": {},
                 },
             )
             _a["turns"] += 1
@@ -38692,6 +41538,14 @@ class CommandRouter:
             for _p, _cells in _r["pairs"].items():
                 _acc = _a["pairs"].setdefault(_p, [0, 0, 0, 0])
                 for _i, _n in enumerate(list(_cells)[:4]):
+                    _acc[_i] += int(_n or 0)
+            for _p, _cells in (_r.get("instruments") or {}).items():
+                _acc = _a["instruments"].setdefault(_p, [0, 0, 0, 0])
+                for _i, _n in enumerate(list(_cells)[:4]):
+                    _acc[_i] += int(_n or 0)
+            for _p, _cells in (_r.get("loo") or {}).items():
+                _acc = _a["loo"].setdefault(_p, [0, 0])
+                for _i, _n in enumerate(list(_cells)[:2]):
                     _acc[_i] += int(_n or 0)
         return _out
 
@@ -38763,6 +41617,21 @@ class CommandRouter:
                 )
         if _agreement:
             _lines += ["", "Families judging the same claim as stated:"] + _agreement
+        _calibration: List[str] = []
+        for _arm in sorted(_tally):
+            for _p, (_yes, _no) in sorted(_tally[_arm].get("loo", {}).items()):
+                _kind, _inst = _p.split(":", 1) if ":" in _p else ("unknown", _p)
+                _calibration.append(
+                    f"- {_arm}: {_inst} on {_kind} claims agrees with the rest "
+                    f"of the evidence {_yes} of {_yes + _no} time(s)"
+                    + (f" ({100 * _yes // (_yes + _no)}%)" if _yes + _no else "")
+                )
+        if _calibration:
+            _lines += [
+                "",
+                "Each instrument against what the rest of the evidence rules "
+                "without it (calibration):",
+            ] + _calibration
         _lines += [
             "",
             "Shadow only: no verdict was changed. Confirmed out of scope is a "
@@ -38799,7 +41668,7 @@ class CommandRouter:
         _forge = self._f._hypothesis_forge
         _skipped = {
             "several competitions": 0,
-            "not ranked (shadow off, or no eligible rival)": 0,
+            "not ranked (shadow off, or no survivor)": 0,
         }
         _labels = _conn.execute(
             "SELECT o.project_id, o.turn_started, o.correct_rival, "
@@ -38823,7 +41692,7 @@ class CommandRouter:
                 continue
             _ranked = [_r for _r in _rivals if _r["bayes_posterior"] is not None]
             if not _ranked:
-                _skipped["not ranked (shadow off, or no eligible rival)"] += 1
+                _skipped["not ranked (shadow off, or no survivor)"] += 1
                 continue
             # ── what each ranking chose, and the shadow's belief in the truth ──
             _l1 = next((_r["h"] for _r in _rivals if _r["won"]), 0)
@@ -38837,18 +41706,27 @@ class CommandRouter:
                 )
             # ── the same competition at other values of d ──
             _facts: Dict[int, List[Dict[str, Any]]] = {}
-            for _pos, _kind, _verdict in _conn.execute(
-                "SELECT position, kind, verdict FROM metric_forge_facts "
+            for _pos, _kind, _verdict, _set, _by, _ast in _conn.execute(
+                "SELECT position, kind, verdict, settled, settled_by, asserted "
+                "FROM metric_forge_facts "
                 "WHERE project_id = ? AND turn_started = ? AND comp_ts = ?",
                 (_pid, _turn, _ranked[0]["comp_ts"]),
             ).fetchall():
                 _facts.setdefault(int(_pos), []).append(
-                    {"kind": str(_kind), "verdict": bool(_verdict)}
+                    BayesianRanking.fact_from_row(_kind, _verdict, _set, _by, _ast)
                 )
             _by_d: Dict[float, int] = {}
             for _d in _BAYES_SENSITIVITY_D:
                 _post, _none, _ = _forge._bayes_posterior_for(
-                    [_facts.get(_r["position"], []) for _r in _ranked], _pid, _turn, _d
+                    [
+                        BayesianRanking.weighed(
+                            _facts.get(_r["position"], []), _r["belt_standing"]
+                        )
+                        for _r in _ranked
+                    ],
+                    _pid,
+                    _turn,
+                    _d,
                 )
                 _top = max(range(len(_ranked)), key=lambda _i: _post[_i])
                 _by_d[_d] = _ranked[_top]["h"] if _post[_top] > _none else 0
@@ -43110,8 +45988,9 @@ class EpistemicRegime(str, Enum):
 
         Returns:
             Popperian for "direct" and "absent", where the graph can be
-            taken at its word; Lakatosian for "indirect" and "dynamic",
-            where the missing edge is one the graph would not have drawn.
+            taken at its word; Lakatosian for "indirect", "dynamic" and
+            "ambiguous", where the edge is one the graph would not have
+            drawn, or one it drew without saying what it reached.
         """
         if status in ("direct", "absent"):
             return cls.POPPERIAN_FALSIFICATION
@@ -43657,6 +46536,22 @@ class EvidenceScope(str, Enum):
     MENTION = "mention"
 
 
+# What each instrument's verdict depends on, by the name before its colon.
+# Two observations can be wrong for different reasons only when they depend
+# on nothing in common, and the family alone overstated that: the judge and
+# the sandbox's tests are both written by the model that wrote the claim, so
+# one misreading of the code can fail both; the graph and the reinforcement
+# both read the index. An instrument not named here depends on its family.
+# One that knows better declares its own (a web result, its origin).
+_INSTRUMENT_PROVENANCE: Dict[str, Tuple[str, ...]] = {
+    "graph": ("index",),
+    "index": ("index",),
+    "judge": ("model", "body"),
+    "sandbox": ("model", "runtime"),
+    "reinforce": ("index", "model"),
+}
+
+
 class EvidenceObservation(NamedTuple):
     """
     One instrument's verdict on one claim, kept beside every other.
@@ -43675,6 +46570,10 @@ class EvidenceObservation(NamedTuple):
         regime: The EpistemicRegime the instrument ruled under; None for an
             abstention, which rules under neither.
         detail: The instrument's own explanation, shortened.
+        provenance: What the verdict's being right depends on ("index",
+            "model", "web:<origin>"), when the instrument declares it; empty
+            for the instruments _INSTRUMENT_PROVENANCE knows by name
+            (EvidenceTriangulation.provenance_of).
     """
 
     instrument: str
@@ -43683,6 +46582,7 @@ class EvidenceObservation(NamedTuple):
     verdict: Optional[bool]
     regime: Optional[EpistemicRegime]
     detail: str = ""
+    provenance: Tuple[str, ...] = ()
 
     @classmethod
     def coerce(cls, raw: Any) -> Optional["EvidenceObservation"]:
@@ -43690,7 +46590,8 @@ class EvidenceObservation(NamedTuple):
         Rebuild an observation from its JSON form.
 
         Args:
-            raw: An observation, or the list json.dumps made of one.
+            raw: An observation, or the list json.dumps made of one; a list
+                from before provenance existed has one item fewer.
 
         Returns:
             The observation, or None when raw cannot be read as one.
@@ -43699,6 +46600,7 @@ class EvidenceObservation(NamedTuple):
             return raw
         try:
             _inst, _fam, _scope, _verdict, _regime, *_rest = raw
+            _prov = _rest[1] if len(_rest) > 1 else ()
             return cls(
                 instrument=str(_inst),
                 family=EvidenceFamily(_fam),
@@ -43706,6 +46608,11 @@ class EvidenceObservation(NamedTuple):
                 verdict=None if _verdict is None else bool(_verdict),
                 regime=None if _regime is None else EpistemicRegime(_regime),
                 detail=str(_rest[0]) if _rest else "",
+                provenance=(
+                    tuple(str(_p) for _p in _prov)
+                    if isinstance(_prov, (list, tuple))
+                    else ()
+                ),
             )
         except Exception:
             return None
@@ -43808,14 +46715,40 @@ class EvidenceTriangulation:
         """
         return a.family is not b.family
 
+    @staticmethod
+    def provenance_of(observation: EvidenceObservation) -> Tuple[str, ...]:
+        """What an observation's verdict depends on: as declared, else as
+        _INSTRUMENT_PROVENANCE knows its instrument, else its family."""
+        return (
+            tuple(observation.provenance or ())
+            or _INSTRUMENT_PROVENANCE.get(observation.instrument.split(":", 1)[0])
+            or (f"family:{observation.family.value}",)
+        )
+
+    @classmethod
+    def independent_by_provenance(
+        cls, a: EvidenceObservation, b: EvidenceObservation
+    ) -> bool:
+        """
+        Whether two observations can be wrong for different reasons, judged
+        by what each depends on rather than by family.
+
+        Returns:
+            True when their provenances share nothing. The judge and the
+            sandbox are different families and still not independent: both
+            rest on the model's reading of the code.
+        """
+        return not set(cls.provenance_of(a)) & set(cls.provenance_of(b))
+
     @classmethod
     def _independent_subset(
-        cls, observations: List[EvidenceObservation]
+        cls, observations: List[EvidenceObservation], by_provenance: bool = False
     ) -> List[EvidenceObservation]:
         """The observations that remain once each dependent one is dropped."""
+        _test = cls.independent_by_provenance if by_provenance else cls.independent
         _kept: List[EvidenceObservation] = []
         for _o in observations:
-            if all(cls.independent(_o, _k) for _k in _kept):
+            if all(_test(_o, _k) for _k in _kept):
                 _kept.append(_o)
         return _kept
 
@@ -43861,6 +46794,7 @@ class EvidenceTriangulation:
         cls,
         observations: List[EvidenceObservation],
         version_drift: bool = False,
+        by_provenance: bool = False,
     ) -> TriangulationRuling:
         """
         Rule on one claim from everything observed about it.
@@ -43870,6 +46804,10 @@ class EvidenceTriangulation:
             version_drift: True when the claim's subject is indexed in more
                 than one version, so instruments may have read different
                 code.
+            by_provenance: Judge independence by what each observation
+                depends on (independent_by_provenance) instead of by family.
+                The ledger rules both ways in shadow and counts where they
+                part.
 
         Returns:
             The ruling.
@@ -43894,7 +46832,7 @@ class EvidenceTriangulation:
             and _o.verdict is True
             and _o.scope is EvidenceScope.PROPOSITION
         ]
-        if len(cls._independent_subset(_converging)) >= 2:
+        if len(cls._independent_subset(_converging, by_provenance)) >= 2:
             _decisive.extend(((0, 1), _o) for _o in _converging)
         _held = len(
             cls._independent_subset(
@@ -43902,7 +46840,8 @@ class EvidenceTriangulation:
                     _o
                     for _o in _decided
                     if _o.regime is not _popper and _o.verdict is False
-                ]
+                ],
+                by_provenance,
             )
         )
         _short = any(
@@ -43925,7 +46864,7 @@ class EvidenceTriangulation:
             )
         _verdict = bool(_top[0].verdict)
         _backing = cls._independent_subset(
-            [_o for _, _o in _decisive if _o.verdict is _verdict]
+            [_o for _, _o in _decisive if _o.verdict is _verdict], by_provenance
         )
         return TriangulationRuling(
             verdict=_verdict,
@@ -43939,6 +46878,570 @@ class EvidenceTriangulation:
             held=_held,
             support_out_of_scope=_short,
             ruled_by=_ruled_by,
+        )
+
+
+# ── Decision arbiter: triangulation where a choice is still open ──
+#
+# EvidenceTriangulation rules on one claim; the arbiter puts it to work where
+# the pipeline still has a decision to make. The rule stays the one place
+# that says what independence and strength mean, so a "corroborated" at a
+# decision point means what it means in the ledger. What differs between
+# points is what may be observed there, at what cost, and what is done with
+# the rulings, and that is all the arbiter adds.
+
+# The words before a name that propose it rather than assume it: a framing
+# that says "add a new `WEB_SEARCH` family" is not wrong that it is missing.
+# At most two words between, none of them the preposition that turns to the
+# existing thing the new one goes into ("a new member to `EvidenceFamily`").
+_PROPOSED_NAME_RE = re.compile(
+    r"\b(?:new|nuev[oa]s?|adds?|adding|a[ñn]ad(?:e|ir|iendo)|crear?|creando"
+    r"|creates?|creating|introduc(?:e|es|ing|ir)|defin(?:e|es|ir)"
+    r"|propos(?:e|es|ing)|propon(?:e|er))\W+"
+    r"(?:(?!(?:to|into|in|on|of|from|en|de|del|al)\b)[\w`.]+\W+){0,2}$",
+    re.IGNORECASE,
+)
+# A call relation a framing states: "A calls B", "A llama a B".
+_FRAMING_CALL_RE = re.compile(
+    r"`?([A-Za-z_][\w.]*)`?\s+(?:calls|invokes|llama\s+a|invoca\s+a)\s+"
+    r"`?([A-Za-z_][\w.]*)`?"
+)
+
+
+def _framing_propositions(text: str) -> List[str]:
+    """The checkable propositions a framing or assumption rests on.
+
+    "exists: X" for each code name it uses (as _framing_grounding finds
+    them) that it does not propose to create, and "calls: A -> B" for each
+    call relation it states between two code names. A dotted name all in
+    lower case with no underscore is a file or an abbreviation
+    ("llama.cpp"), not code, as _backtick_code_names also reads it. Order
+    kept, repeats dropped. Never raises.
+    """
+    try:
+        _text = str(text or "")
+        _code = re.compile(
+            r"[\w.]*(?:_|\.)[\w.]*|[A-Z][a-z0-9]+[A-Z]\w*", re.ASCII
+        )
+        _props: List[str] = []
+        for _m in list(_PROSE_CODE_NAME_RE.finditer(_text)) + list(
+            re.finditer(r"`([A-Za-z_][\w.]*)`", _text)
+        ):
+            _name = _m.group(1).strip(".")
+            if re.fullmatch(r"[a-z0-9]+(?:\.[a-z0-9]+)+", _name):
+                continue
+            if _name and not _PROPOSED_NAME_RE.search(_text[: _m.start()][-60:]):
+                _props.append(f"exists: {_name}")
+        for _m in _FRAMING_CALL_RE.finditer(_text):
+            _a, _b = _m.group(1).strip("."), _m.group(2).strip(".")
+            if _code.fullmatch(_a) and _code.fullmatch(_b):
+                _props.append(f"calls: {_a} -> {_b}")
+        return list(dict.fromkeys(_props))
+    except Exception:
+        return []
+
+
+# ── Answer-level name grounding ──
+#
+# The same question the framing arbiter asks — is this name in the code? —
+# put to what the reader gets. Answers offer names to create far more freely
+# than framings do, so they get contexts of their own on top of the framing
+# ones: "implementar `X`", "un atributo `X`", "(por ejemplo, `X`)".
+_INTRODUCED_NAME_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])(?:implement(?:s|ing|a|ar|ando)?|agreg(?:a|ar|ando)"
+    r"|establec(?:e|er|iendo))\W+"
+    r"(?:(?!(?:to|into|in|on|of|from|en|de|del|al)\b)[\w`.]+\W+){0,2}"
+    r"|(?<![A-Za-z0-9])(?:un[oa]?|an?)\s+(?:(?:nuev[oa]|new)\s+)?"
+    r"(?:miembro|member|atributo|attribute|flag|campo|field|m[eé]todo|method"
+    r"|clase|class|funci[oó]n|function|clave|key|valve|par[aá]metro"
+    r"|parameter|observador|observer)(?:\s+[^\W\d_]+)?\W+"
+    r"|(?<![A-Za-z0-9])(?:por\s+ejemplo|p\.\s?ej\.|e\.g\.|for\s+(?:example"
+    r"|instance))\W*)$",
+    re.IGNORECASE,
+)
+# A misspelling is corrected only when it is this long and this close to
+# exactly one existing name: shorter names sit within two edits of too many.
+_NEAR_MISS_MIN_CHARS = 8
+# The top-level names of the standard library: `unittest.TestCase` in an
+# answer is not a name this code is expected to hold.
+_STDLIB_MODULES = frozenset(getattr(sys, "stdlib_module_names", ()))
+_NEAR_MISS_MAX_EDITS = 2
+_IDENT_POOL_CACHE: Dict[Tuple[str, int, int], Set[str]] = {}
+
+
+def _within_edits(a: str, b: str, k: int) -> Optional[int]:
+    """Levenshtein distance between a and b if it is at most k, else None."""
+    if abs(len(a) - len(b)) > k:
+        return None
+    _prev = list(range(len(b) + 1))
+    for _i, _ca in enumerate(a, 1):
+        _cur = [_i] + [0] * len(b)
+        for _j, _cb in enumerate(b, 1):
+            _cur[_j] = min(
+                _prev[_j] + 1, _cur[_j - 1] + 1, _prev[_j - 1] + (_ca != _cb)
+            )
+        if min(_cur) > k:
+            return None
+        _prev = _cur
+    return _prev[-1] if _prev[-1] <= k else None
+
+
+def _identifier_pool(idx: Any, project_id: str, sources: List[str]) -> Set[str]:
+    """Every code-shaped name a misspelling may be corrected to.
+
+    Indexed names, and the identifiers of the live code that look like code
+    (an underscore, an inner capital, all capitals): enum members and
+    attributes are not symbols, and plain words of a comment are not names.
+    Cached per project, index size and code size.
+    """
+    _names = idx.get_all_names(project_id) or set()
+    _key = (project_id, len(_names), sum(len(_s) for _s in sources))
+    _pool = _IDENT_POOL_CACHE.get(_key)
+    if _pool is None:
+        _pool = set(_names)
+        for _s in sources:
+            _pool.update(
+                _w
+                for _w in set(re.findall(r"(?<![\w])[A-Za-z_]\w{5,}", _s))
+                if "_" in _w or re.search(r"[a-z][A-Z]", _w) or _w.isupper()
+            )
+        _IDENT_POOL_CACHE.clear()
+        _IDENT_POOL_CACHE[_key] = _pool
+    return _pool
+
+
+def _answer_name_grounding(
+    text: str, idx: Any, project_id: str, sources: List[str]
+) -> Dict[str, Any]:
+    """The code names a piece of answer uses, against the index and the code.
+
+    Returns {"checked": distinct names, "proposed": [...], "misspelt":
+    [(written, existing)], "unknown": [...]}. A name found nowhere
+    (_framing_grounding) is proposed when any occurrence introduces it as
+    something to create (_PROPOSED_NAME_RE, _INTRODUCED_NAME_RE); the whole
+    text then means the new thing. Otherwise it is misspelt when a Markdown
+    italic ate into it (`_execute_`) or exactly one existing name is within
+    _NEAR_MISS_MAX_EDITS, and unknown when not. Fenced code is skipped: what
+    it defines is new by construction. Never raises.
+    """
+    _out: Dict[str, Any] = {"checked": 0, "proposed": [], "misspelt": [], "unknown": []}
+    try:
+        _raw = str(text or "")
+        _fenced = " ".join(re.findall(r"```.*?(?:```|$)", _raw, flags=re.S))
+        _text = re.sub(r"```.*?(?:```|$)", " ", _raw, flags=re.S)
+        _occ: List[Tuple[str, int]] = [
+            (_m.group(1).strip("."), _m.start(1))
+            for _m in _PROSE_CODE_NAME_RE.finditer(_text)
+        ] + [
+            (_m.group(1).strip("."), _m.start())
+            for _m in re.finditer(r"`([A-Za-z_][\w.]*)`", _text)
+        ] + [
+            # The name a code span opens with: `name_corrections: Dict[...]`,
+            # `_cache[key] = …`. Round 9's design answer proposed its field
+            # only in that shape, and it was reported as not in the code.
+            (_m.group(1).strip("."), _m.start())
+            for _m in re.finditer(r"`([A-Za-z_][\w.]*)(?=[(\[:=, ])", _text)
+        ]
+        _occ = [
+            (_n, _s)
+            for _n, _s in _occ
+            if _n
+            and not re.fullmatch(r"[a-z0-9]+(?:\.[a-z0-9]+)+", _n)
+            # A string literal ("name_correction") is a value, not a name.
+            and _text[_s - 1 : _s] not in ("'", '"')
+            # The standard library and unittest's API are not this code.
+            and _n.split(".", 1)[0] not in _STDLIB_MODULES
+            and not re.fullmatch(
+                r"(?:assert[A-Z]\w*|setUp|tearDown|setUpClass|tearDownClass)",
+                _n.rsplit(".", 1)[-1],
+            )
+        ]
+        _names = list(dict.fromkeys(_n for _n, _ in _occ))
+        _out["checked"] = len(_names)
+        if not _names:
+            return _out
+        _unknown = _framing_grounding(
+            " ".join(f"`{_n}`" for _n in _names), idx, project_id, sources
+        )[1]
+        if not _unknown:
+            return _out
+        _proposed = set()
+        for _n, _s in _occ:
+            # A leading underscore before a word is an italic opener here,
+            # and it would hide the verb from the boundary the regexes use.
+            _w = re.sub(r"(?<!\w)_+", " ", _text[:_s][-60:])
+            if _PROPOSED_NAME_RE.search(_w) or _INTRODUCED_NAME_RE.search(_w):
+                _proposed.add(_n)
+        # What the answer's own code defines, and a test it names, is new by
+        # construction; so is anything whose last part was offered as new
+        # once (`name_corrections`, then `state.name_corrections`).
+        _defined = {
+            _a or _b
+            for _a, _b in re.findall(
+                r"(?:def|class)\s+([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*[:=](?!=)", _fenced
+            )
+        }
+        _proposed_tails = {_p.rsplit(".", 1)[-1] for _p in _proposed}
+        for _n in _unknown:
+            _t = _n.rsplit(".", 1)[-1]
+            if (
+                _t in _defined
+                or _t in _proposed_tails
+                or re.fullmatch(r"Test[A-Z]\w*|test_\w+", _t)
+            ):
+                _proposed.add(_n)
+        _all = idx.get_all_qualified_names(project_id) or set()
+
+        def _indexed(_v: str) -> bool:
+            return _v in _all or bool(
+                {
+                    _q
+                    for _q in idx.get_qualified_names_for(
+                        _v.rsplit(".", 1)[-1], project_id
+                    )
+                    or set()
+                    if _q in _all
+                }
+            )
+
+        _pool: Optional[Set[str]] = None
+        for _n in _unknown:
+            if _n in _proposed:
+                _out["proposed"].append(_n)
+                continue
+            # ── Step 1: an italic that ate into the name ──
+            _variants = [
+                _v
+                for _v in dict.fromkeys(
+                    (_n.strip("_"), "_" + _n.strip("_"), _n.rstrip("_"), _n.lstrip("_"))
+                )
+                if _v and _v != _n
+            ]
+            _fix = next((_v for _v in _variants if _indexed(_v)), "") or next(
+                (
+                    _v
+                    for _v in _variants
+                    if not _framing_grounding(f"`{_v}`", idx, project_id, sources)[1]
+                ),
+                "",
+            )
+            # ── Step 2: one existing name within a couple of edits ──
+            _head, _, _tail = _n.rpartition(".")
+            if not _fix and len(_tail) >= _NEAR_MISS_MIN_CHARS:
+                if _pool is None:
+                    _pool = _identifier_pool(idx, project_id, sources)
+                _best, _hits = _NEAR_MISS_MAX_EDITS + 1, []
+                for _c in _pool:
+                    _d = _within_edits(_tail, _c, _NEAR_MISS_MAX_EDITS)
+                    # A name that differs only in its digits is a sibling
+                    # (`_HISTORY_V3` beside `_HISTORY_V2`), not a typo.
+                    if not _d or re.sub(r"\d", "", _c) == re.sub(r"\d", "", _tail):
+                        continue
+                    if _d < _best:
+                        _best, _hits = _d, [_c]
+                    elif _d == _best:
+                        _hits.append(_c)
+                if len(_hits) == 1:
+                    _fix = (_head + "." if _head else "") + _hits[0]
+            if _fix:
+                _out["misspelt"].append((_n, _fix))
+            else:
+                _out["unknown"].append(_n)
+        return _out
+    except Exception:
+        return _out
+
+
+def _correct_misspelt_names(
+    text: str, misspelt: List[Tuple[str, str]]
+) -> Tuple[str, int]:
+    """Write each misspelt name as the existing one, in code voice.
+
+    Bare, it becomes `existing`, which also stops Markdown reading its
+    underscores as italics; inside backticks only the name changes. Returns
+    the text and how many occurrences changed.
+    """
+    _count = 0
+    for _wrong, _right in misspelt:
+        _pat = re.compile(r"(?<![\w/.])" + re.escape(_wrong) + r"(?![\w/])")
+        _parts: List[str] = []
+        _last = 0
+        for _m in _pat.finditer(text):
+            _inside = text.count("`", 0, _m.start()) % 2 == 1
+            _parts.append(text[_last : _m.start()])
+            _parts.append(_right if _inside else f"`{_right}`")
+            _last = _m.end()
+            _count += 1
+        _parts.append(text[_last:])
+        text = "".join(_parts)
+    return text, _count
+
+
+def _active_sources(state_manager: Any, project_id: str) -> List[str]:
+    """The live code blocks' text, for a name the index does not hold."""
+    try:
+        return [
+            _b.content or ""
+            for _b in state_manager.get(project_id).active_blocks.values()
+            if not getattr(_b, "obsolete", False)
+        ]
+    except Exception:
+        return []
+
+
+class ArbiterObserver:
+    """One instrument the arbiter may consult on a proposition.
+
+    Attributes:
+        instrument: Name carried on its observations.
+        family: How it fails (EvidenceFamily).
+        cost: "free" (no model call), "cheap" (one short call) or "costly"
+            (a sandbox run, a long call); a decision point admits up to a
+            cost (DecisionArbiter.arbitrate).
+    """
+
+    instrument = ""
+    family = EvidenceFamily.STATIC_ANALYSIS
+    cost = "free"
+
+    def observe(self, proposition: str, project_id: str) -> List[EvidenceObservation]:
+        """Observations on the proposition; [] when it is not its kind."""
+        return []
+
+    def _observation(self, verdict: bool, detail: str) -> EvidenceObservation:
+        return EvidenceObservation(
+            instrument=self.instrument,
+            family=self.family,
+            scope=EvidenceScope.PROPOSITION,
+            verdict=verdict,
+            regime=EpistemicRegime.POPPERIAN_FALSIFICATION,
+            detail=detail[:_OBSERVATION_DETAIL_CHARS],
+        )
+
+
+class IndexExistenceObserver(ArbiterObserver):
+    """Whether a name exists: in the index, or written in the live code.
+
+    The index holds the whole corpus and the live blocks hold its locals
+    and parameters, so "nowhere" is a verdict it can be taken at its word
+    on (Popperian), and so is "somewhere".
+    """
+
+    instrument = "index:exists"
+
+    def __init__(self, idx: Any, sources: List[str]) -> None:
+        self._idx = idx
+        self._sources = sources
+
+    def observe(self, proposition: str, project_id: str) -> List[EvidenceObservation]:
+        if not proposition.startswith("exists: "):
+            return []
+        _name = proposition[len("exists: ") :]
+        _unknown = _framing_grounding(
+            f"`{_name}`", self._idx, project_id, self._sources
+        )[1]
+        return [
+            self._observation(
+                not _unknown,
+                "named nowhere in the index or the code"
+                if _unknown
+                else "found in the index or the code",
+            )
+        ]
+
+
+class GraphRelationObserver(ArbiterObserver):
+    """Whether A calls B, as far as the call graph can say.
+
+    MetacognitiveReasoningEngine._relation_in_graph abstains where the graph
+    cannot be trusted (an endpoint it does not know, a call it would not
+    draw), so what it does return is Popperian.
+    """
+
+    instrument = "graph:calls"
+
+    def __init__(self, meta: Any) -> None:
+        self._meta = meta
+
+    def observe(self, proposition: str, project_id: str) -> List[EvidenceObservation]:
+        if not proposition.startswith("calls: ") or self._meta is None:
+            return []
+        _a, _, _b = proposition[len("calls: ") :].partition(" -> ")
+        _verdict = self._meta._relation_in_graph(_a, _b, project_id)
+        if _verdict is None:
+            return []
+        return [
+            self._observation(
+                bool(_verdict), "edge drawn" if _verdict else "no edge, none hidden"
+            )
+        ]
+
+
+@dataclass(frozen=True)
+class OptionStanding:
+    """How one option of a decision stands against what was observed.
+
+    Attributes:
+        option: The option's text.
+        rulings: (proposition, ruling) for each proposition some observer
+            ruled on.
+        eliminated_by: The proposition a hard refutation killed it on, or "".
+        confirmed: Propositions ruled true.
+        refuted: Propositions ruled false.
+        corroborated: Propositions backed by two independent families.
+        anomalies: Propositions whose strongest observations disagree.
+        checkable: Propositions some observer could rule on.
+        proposed: Propositions the option rests on, ruled or not.
+    """
+
+    option: str
+    rulings: Tuple[Tuple[str, TriangulationRuling], ...] = ()
+    eliminated_by: str = ""
+    confirmed: int = 0
+    refuted: int = 0
+    corroborated: int = 0
+    anomalies: int = 0
+    checkable: int = 0
+    proposed: int = 0
+
+
+@dataclass(frozen=True)
+class DecisionRuling:
+    """What the arbiter would decide at one decision point.
+
+    Attributes:
+        point: The decision point ("framing", ...).
+        standings: One OptionStanding per option, in the options' order.
+        chosen: What the pipeline chose.
+        recommended: What the arbiter's policy would choose.
+        would_change: recommended differs from chosen.
+        all_eliminated: Every option was killed; recommended is then the
+            least refuted, and the decision needed an option it was not
+            given.
+    """
+
+    point: str
+    standings: Tuple[OptionStanding, ...] = ()
+    chosen: str = ""
+    recommended: str = ""
+    would_change: bool = False
+    all_eliminated: bool = False
+
+
+class DecisionArbiter:
+    """Triangulation at a decision point: eliminate, do not pick.
+
+    Each option rests on propositions; each proposition is put to the
+    observers the point admits and ruled on by EvidenceTriangulation.rule.
+    The policy is Popper's: an option is eliminated only by a hard
+    refutation (Popperian, of the proposition itself, from a family that
+    reads the code rather than a model's account of it), because an early
+    mistake would kill the right option for good and nothing downstream
+    could bring it back. Softer evidence ranks, never kills. The choice
+    already made stands unless it is eliminated; then the strongest
+    survivor replaces it. Pure: reads observers, returns a DecisionRuling.
+    """
+
+    _COSTS = ("free", "cheap", "costly")
+    _HARD_FAMILIES = (EvidenceFamily.STATIC_ANALYSIS, EvidenceFamily.EXECUTION)
+
+    @classmethod
+    def _hard_refutation(cls, observations: List[EvidenceObservation]) -> bool:
+        """Whether one observation alone may kill an option."""
+        return any(
+            _o.verdict is False
+            and _o.scope is EvidenceScope.PROPOSITION
+            and _o.regime is EpistemicRegime.POPPERIAN_FALSIFICATION
+            and _o.family in cls._HARD_FAMILIES
+            for _o in observations
+        )
+
+    @classmethod
+    def arbitrate(
+        cls,
+        point: str,
+        options: Dict[str, List[str]],
+        chosen: str,
+        observers: List[ArbiterObserver],
+        project_id: str,
+        budget: str = "free",
+    ) -> DecisionRuling:
+        """
+        Rule on a decision from what the admitted observers say.
+
+        Args:
+            point: The decision point's name.
+            options: Each option's text and the propositions it rests on.
+            chosen: The option the pipeline chose.
+            observers: The instruments to consult.
+            project_id: Project the observers read.
+            budget: The costliest observer admitted ("free", "cheap",
+                "costly").
+
+        Returns:
+            The ruling. An observer that raises is skipped.
+        """
+        _admitted = cls._COSTS[: cls._COSTS.index(budget) + 1]
+        _standings: List[OptionStanding] = []
+        for _option, _props in options.items():
+            _rulings: List[Tuple[str, TriangulationRuling]] = []
+            _killed = ""
+            for _p in _props:
+                _obs: List[EvidenceObservation] = []
+                for _ob in observers:
+                    if _ob.cost not in _admitted:
+                        continue
+                    try:
+                        _obs += _ob.observe(_p, project_id)
+                    except Exception:
+                        continue
+                if not any(_o.verdict is not None for _o in _obs):
+                    continue
+                _r = EvidenceTriangulation.rule(_obs)
+                _rulings.append((_p, _r))
+                if not _killed and _r.verdict is False and cls._hard_refutation(_obs):
+                    _killed = _p
+            _rs = [_r for _, _r in _rulings]
+            _standings.append(
+                OptionStanding(
+                    option=_option,
+                    rulings=tuple(_rulings),
+                    eliminated_by=_killed,
+                    confirmed=sum(_r.verdict is True for _r in _rs),
+                    refuted=sum(_r.verdict is False for _r in _rs),
+                    corroborated=sum(_r.corroborated for _r in _rs),
+                    anomalies=sum(_r.conflict == "anomaly" for _r in _rs),
+                    checkable=len(_rs),
+                    proposed=len(_props),
+                )
+            )
+        _alive = [_s for _s in _standings if not _s.eliminated_by]
+        _mine = next((_s for _s in _standings if _s.option == chosen), None)
+        if _mine is not None and not _mine.eliminated_by:
+            _pick = _mine
+        elif _alive:
+            _pick = max(
+                _alive,
+                key=lambda _s: (
+                    _s.corroborated,
+                    _s.confirmed - _s.anomalies,
+                    -_standings.index(_s),
+                ),
+            )
+        elif _standings:
+            _pick = min(
+                _standings,
+                key=lambda _s: (_s.refuted, _s.option != chosen),
+            )
+        else:
+            return DecisionRuling(point=point, chosen=chosen, recommended=chosen)
+        return DecisionRuling(
+            point=point,
+            standings=tuple(_standings),
+            chosen=chosen,
+            recommended=_pick.option,
+            would_change=_pick.option != chosen,
+            all_eliminated=not _alive,
         )
 
 
@@ -44024,16 +47527,9 @@ class MetacognitiveReasoningEngine:
     # (English and Spanish) is refuted by the edge EXISTING.
     _CALL_RELATION_RE = _RELATION_CALL_RE
     _NEG_RELATION_RE = _RELATION_NEG_RE
-    # A claim whose whole content is that a named symbol exists. It is the
-    # only shape the symbol index can confirm on its own; any other claim
-    # that merely names a symbol asserts something the index cannot see.
-    _EXISTENCE_CLAIM_RE = re.compile(
-        r"^(?:the\s+)?(?:(?:class|function|method|symbol|helper)\s+)?"
-        r"`?([A-Za-z_][\w.]*)`?\s+"
-        r"(?:exists?|existe|is\s+(?:defined|declared|present|implemented)"
-        r"(?:\s+in\s+[\w./`]+)?)\s*[.!]?$",
-        re.IGNORECASE,
-    )
+    # A claim whose whole content is that a named symbol exists (module
+    # level, where the static verifier reads it too).
+    _EXISTENCE_CLAIM_RE = _EXISTENCE_CLAIM_RE
 
     def __init__(self, filter_ref: "Filter") -> None:
         self._f = filter_ref
@@ -44250,7 +47746,14 @@ class MetacognitiveReasoningEngine:
 
         Only a question that names exactly two indexed callables is
         settled, first as caller and second as callee; anything else
-        returns "".
+        returns "". The names are read as written in backticks or dotted
+        first, and as prose only when that does not give two
+        (_relation_named_pair): then the question must state the relation
+        between them, and since prose does not fix which is the caller, the
+        index's direction is taken when only the reverse one holds, and
+        "neither way" is said when none does. Whether it was settled, and
+        from which reading, goes to the turn's metrics (named_relation,
+        named_relation_prose).
 
         Args:
             question: The user's question.
@@ -44262,9 +47765,21 @@ class MetacognitiveReasoningEngine:
         # ── Step 1: the two symbols the question names ──
         idx = self._f._symbol_index
         named = _named_indexed_symbols(question, idx, project_id)
+        _prose = len(named) != 2
+        if _prose:
+            named = _relation_named_pair(question, idx, project_id)
         if len(named) != 2:
             return ""
         caller, callee = named
+        # Prose does not fix the direction: "…en qué orden los usa B" names
+        # the caller last. Read from the wording, the relation is the one the
+        # index holds; written in backticks, it is the one the text orders.
+        if (
+            _prose
+            and _relation_edge_status(idx, caller, callee, project_id) == "absent"
+            and _relation_edge_status(idx, callee, caller, project_id) != "absent"
+        ):
+            caller, callee = callee, caller
         bare = callee.split(".")[-1]
         # ── Step 2: read the graph under the regime it allows ──
         status = _relation_edge_status(idx, caller, callee, project_id)
@@ -44275,7 +47790,7 @@ class MetacognitiveReasoningEngine:
                 f"{caller} does not reach {callee}: there is no call edge, no "
                 f"chain of at most {_RELATION_MAX_HOPS} calls and no hand-over "
                 f"by reference in the index."
-            )
+            ) + (f" Nor does {callee} reach {caller}." if _prose else "")
         else:
             # ── Step 3: the graph cannot draw it; the belt must find it ──
             dispatches = {
@@ -44308,9 +47823,93 @@ class MetacognitiveReasoningEngine:
                     f"{callee} ({status}); only the bodies can."
                 )
         self._f._log_debug(
-            f"🧭 Named relation: {caller} → {callee}: {status} — {statement[:160]}"
+            f"🧭 Named relation: {caller} → {callee}: {status}"
+            + (" (read from the question's wording)" if _prose else "")
+            + f" — {statement[:160]}"
         )
+        _set = getattr(self._f, "_set_turn_metric", None)
+        if callable(_set):
+            _set("named_relation", 1)
+            _set("named_relation_prose", int(_prose))
         return statement
+
+    def list_reference_sites(self, question: str, project_id: str) -> str:
+        """The code's answer to "is X ever executed?", when X has no caller.
+
+        Only for a reachability question (_REACH_QUESTION_RE) about exactly
+        one indexed callable that the call graph gives no direct caller —
+        where the graph's silence is the protective belt's case (a function
+        passed by reference), not evidence of absence. The live blocks are
+        parsed and walked (_reference_sites): the sites that name X without
+        calling it, the parameter each passes it as, and where that
+        parameter is read. Never raises: "" leaves the turn as it was.
+
+        Returns:
+            The listing as a step's output, or "".
+        """
+        try:
+            # ── Step 1: one callable, asked about reachability, no caller ──
+            if not _REACH_QUESTION_RE.search(question or ""):
+                return ""
+            idx = self._f._symbol_index
+            named = _named_indexed_symbols(question, idx, project_id, bare=True)
+            if len(named) != 1:
+                return ""
+            qid = named[0]
+            bare = qid.rsplit(".", 1)[-1]
+            if len(idx.get_qualified_names_for(bare, project_id) or ()) != 1:
+                return ""
+            if any(
+                getattr(_e, "type", "") == "calls"
+                for _e in idx.get_edges_in(bare, project_id) or []
+            ):
+                return ""
+            # ── Step 2: the live blocks, parsed once ──
+            state = self._f._conversation_state_manager.get(project_id)
+            sites: List[Tuple[str, int, str, str]] = []
+            hops: List[Tuple[str, int, str]] = []
+            for blk in list(state.active_blocks.values()):
+                if getattr(blk, "obsolete", False) or bare not in (blk.content or ""):
+                    continue
+                try:
+                    _tree = ast.parse(blk.content)
+                except Exception:
+                    continue
+                _s, _h = _reference_sites(_tree, blk.content.split("\n"), bare)
+                sites += _s
+                hops += _h
+            if not sites:
+                return ""
+            # ── Step 3: the listing ──
+            out = [
+                f"References to {qid} that are not calls, read from the code "
+                f"({len(sites)}). The call graph records no direct caller: a "
+                f"function handed over by reference is not an edge, so these "
+                f"sites are the path, not its absence.",
+            ]
+            for _own, _ln, _t, _kw in sites[:_REFERENCE_SITES_MAX]:
+                out.append(
+                    f"- {_own or '(module level)'}, line {_ln}: `{_t}`"
+                    + (f" — passed as `{_kw}`" if _kw else "")
+                )
+            if hops:
+                _kws = sorted({_kw for *_, _kw in sites if _kw})
+                out.append(
+                    "Where " + ", ".join(f"`{_k}`" for _k in _kws)
+                    + " is read — where the reference is handed on or run "
+                    f"({len(hops)}):"
+                )
+                for _own, _ln, _t in hops[:_REFERENCE_HOPS_MAX]:
+                    out.append(f"- {_own or '(module level)'}, line {_ln}: `{_t}`")
+            self._f._log_debug(
+                f"🧭 Index answer: {bare} has no caller — {len(sites)} "
+                f"reference site(s), {len(hops)} read(s) of the receiving "
+                f"parameter, listed from the code"
+            )
+            return "\n".join(out)
+        except Exception as _e:
+            self._f._log_debug(f"🧭 Index answer: reference sites not read ({_e!r})")
+            return ""
 
     def list_named_relation(self, question: str, project_id: str) -> str:
         """
@@ -44343,7 +47942,7 @@ class MetacognitiveReasoningEngine:
         else:
             return ""
         idx = self._f._symbol_index
-        named = _named_indexed_symbols(text, idx, project_id)
+        named = _named_indexed_symbols(text, idx, project_id, bare=True)
         if len(named) != 1:
             return ""
         qid = named[0]
@@ -45895,6 +49494,94 @@ class BayesianRanking:
         dossier.facts.append({"key": _key, "kind": _kind, "verdict": bool(verdict)})
         return True
 
+    @staticmethod
+    def settle_fact(
+        dossier: "HypothesisDossier",
+        claim: str,
+        settled: Optional[bool],
+        by: str,
+        asserted: bool,
+        refuted_as: str = "",
+    ) -> bool:
+        """
+        Record how triangulation settled a fact the dossier already holds.
+
+        ForgeFactTriangulation.rule_cycle rules each consequence a cycle
+        decided; this writes its ruling onto the fact note_fact kept for it,
+        once, as the fact's first verdict is the one that stands.
+        log_evidence then weighs the settled verdict, at the precision of the
+        families behind it, and an asserted fact with no derivation between
+        it and the hypothesis. Under the firmness gate the forge's analysis
+        step reads it too (ForgeFactTriangulation.result_line).
+
+        Args:
+            dossier: The dossier holding the fact.
+            claim: The consequence, as note_fact received it.
+            settled: The ruling's verdict; None leaves the fact unsettled.
+            by: "static", "judge" or "both" for whose families back it,
+                "none" when it is unsettled.
+            asserted: The consequence restates what the hypothesis asserts.
+            refuted_as: For a consequence the forge refuted, what that is
+                worth (ForgeFactTriangulation.refutation_kind); empty
+                otherwise.
+
+        Returns:
+            True when a fact was annotated.
+        """
+        _key = _prediction_key(claim)
+        _fact = next((_f for _f in dossier.facts if _f.get("key") == _key), None)
+        if not _key or _fact is None or "by" in _fact:
+            return False
+        _fact.update(settled=settled, by=str(by), asserted=bool(asserted))
+        if refuted_as:
+            _fact["refuted_as"] = str(refuted_as)
+        return True
+
+    @staticmethod
+    def standing_fact(belt_standing: str) -> Optional[Dict[str, Any]]:
+        """
+        The belt's standing on a rival, as one more fact about it.
+
+        An auxiliary's prediction is a consequence like any other: found
+        (PROGRESSIVE), it holds; looked for and not found (AD_HOC), it fails.
+        Untested is a pending test, which is no evidence either way
+        (AuxiliaryStanding). The graph is what looks for it.
+
+        Returns:
+            {"kind": "belt", "verdict": …}, or None when there is nothing.
+        """
+        if belt_standing == AuxiliaryStanding.PROGRESSIVE.value:
+            return {"kind": "belt", "verdict": True}
+        if belt_standing == AuxiliaryStanding.AD_HOC.value:
+            return {"kind": "belt", "verdict": False}
+        return None
+
+    @staticmethod
+    def weighed(
+        facts: List[Dict[str, Any]], belt_standing: str = ""
+    ) -> List[Dict[str, Any]]:
+        """What the ranking weighs for one rival: its facts and its belt's
+        standing (standing_fact). The live shadow and the recomputation of
+        /outcomes both build a rival's evidence here, so they cannot part."""
+        _belt = BayesianRanking.standing_fact(belt_standing)
+        return list(facts or []) + ([_belt] if _belt is not None else [])
+
+    @staticmethod
+    def fact_from_row(
+        kind: Any, verdict: Any, settled: Any, by: Any, asserted: Any
+    ) -> Dict[str, Any]:
+        """A fact as metric_forge_facts stored it, in the shape note_fact and
+        settle_fact give the live one; a row from before the settling keeps
+        the instrument's verdict alone."""
+        _fact: Dict[str, Any] = {"kind": str(kind), "verdict": bool(verdict)}
+        if by:
+            _fact.update(
+                settled=None if settled is None else bool(settled),
+                by=str(by),
+                asserted=bool(asserted),
+            )
+        return _fact
+
     # Base rates and accuracies are kept off 0 and 1: either end makes one
     # verdict infinitely informative, which no instrument here is.
     _P_FLOOR = 0.01
@@ -45983,6 +49670,11 @@ class BayesianRanking:
         ranking rivals against each other the error falls on all of them
         alike; for the size of the posterior it does not, which is why the
         posterior is not reported as a confidence until labels calibrate it.
+        A fact triangulation ruled (settle_fact) weighs its settled verdict,
+        or nothing when it left it unsettled; at the precision of the family
+        that settled it, or of both together when two did; and with d = 1
+        when it restates the hypothesis, as no derivation stands between
+        them.
 
         Args:
             facts: The rival's facts, as BayesianRanking.note_fact keeps them.
@@ -45994,14 +49686,24 @@ class BayesianRanking:
             Sum of log LR; 0.0 for a rival with no facts.
         """
         _total = 0.0
+        _q_judge = q_by_kind.get("judge", 0.8)
         for _f in facts or []:
             _kind = str(_f.get("kind", ""))
+            _by = str(_f.get("by", "") or "")
+            if _by == "none":
+                continue
+            _verdict = _f.get("settled") if _by else _f.get("verdict")
+            if _verdict is None:
+                continue
+            _q = _q_judge if _by == "judge" else q_by_kind.get(_kind, 0.8)
+            if _by == "both":
+                _q = 1.0 - (1.0 - _q) * (1.0 - _q_judge)
             _total += math.log(
                 BayesianRanking.likelihood_ratio(
-                    bool(_f.get("verdict")),
+                    bool(_verdict),
                     rates.get(_kind, 0.5),
-                    d,
-                    q_by_kind.get(_kind, 0.8),
+                    1.0 if _f.get("asserted") else d,
+                    _q,
                 )
             )
         return _total
@@ -46055,6 +49757,515 @@ class BayesianRanking:
         _z = sum(_w)
         return [_x / _z for _x in _w[:-1]], _w[-1] / _z
 
+
+# ── The forge's facts, triangulated, and the gate that kills on them ──
+
+
+class ForgeFactTriangulation:
+    """
+    What each fact a forge cycle decided is worth, and what may kill on it.
+
+    A cycle decides each consequence with the first instrument that can: the
+    graph, then the AST contract check, then the quoted-reading judge
+    (HypothesisForge._forge_hypothesis). This rules each decided consequence
+    with EvidenceTriangulation.rule, once the judge has read every static
+    refutation too (step 1 of the architecture). A refutation is firm when a
+    static instrument makes it or two independent families agree; weak when
+    the judge alone makes it or a second family contests it; invalid when the
+    instrument's verdict does not bear on the sentence (graph_scope).
+
+    firm_gate is step 2: a hypothesis dies on a firm refutation of something
+    it asserts (asserted_by), a weak one is held once by the belt, and a
+    refuted derivation kills nothing. forge_kill_gate says who decides: the
+    count gate with this one logged beside it ("shadow"), or this one
+    ("firm"). forge_triangulation_shadow turns the ruling itself off.
+    """
+
+    # The verbs that state a call, which is all a call edge can settle.
+    _CALL_VERB_RE = re.compile(
+        r"\b(?:calls?|invokes?|llama\s+a|invoca\s+a)\b", re.IGNORECASE
+    )
+
+    def __init__(self, filter_ref: "Filter") -> None:
+        self._f = filter_ref
+
+    @staticmethod
+    def _qualified(name: str) -> str:
+        """A code name as its last two parts: Class.method, or the bare name."""
+        _parts = [_p for _p in str(name or "").strip(".").split(".") if _p]
+        return ".".join(_parts[-2:])
+
+    @classmethod
+    def _relations(cls, text: str) -> Tuple[str, List[Tuple[str, str, str, bool]]]:
+        """
+        The relations a sentence states, read as _claim_verdict reads them.
+
+        Negations first, each then replaced by its two ends so that the
+        positive pattern cannot take "no" or "never" for a caller; then the
+        positive relations.
+
+        Returns:
+            (the sentence with each negation replaced, and for each relation
+            its span, its caller and its callee as written, and whether it is
+            negated).
+        """
+        _rest, _out = str(text or ""), []
+        for _m in _RELATION_NEG_RE.finditer(_rest):
+            _tok = re.findall(r"[A-Za-z_][\w.]*", _m.group(0))
+            _out.append((_m.group(0), _tok[0], _tok[-1], True))
+        for _span, _a, _b, _neg in list(_out):
+            _rest = _rest.replace(_span, f" {_a} {_b} ")
+        for _m in _RELATION_CALL_RE.finditer(_rest):
+            _tok = re.findall(r"[A-Za-z_][\w.]*", _m.group(0))
+            _out.append((_m.group(0), _tok[0], _tok[-1], False))
+        return _rest, _out
+
+    @staticmethod
+    def _names(text: str) -> Set[str]:
+        """The code names a text writes, each as its last two parts."""
+        _found = [_m.group(1) for _m in _PROSE_CODE_NAME_RE.finditer(text or "")]
+        _found += re.findall(r"`([A-Za-z_][\w.]*)`", text or "")
+        return {
+            ForgeFactTriangulation._qualified(_n)
+            for _n in _found
+            if ForgeFactTriangulation._qualified(_n)
+        }
+
+    @classmethod
+    def graph_scope(
+        cls, claim: str, verdict: Optional[bool] = None
+    ) -> EvidenceScope:
+        """
+        What the graph's verdict on a consequence was about.
+
+        _claim_verdict rules on the names and the calls a sentence states, from
+        the call graph alone. A call it finds or misses is the sentence itself
+        only when the sentence states nothing else: an existence fact, or one
+        call, positive or negated, that names no other code and has no value,
+        quantifier, condition or consequence beside it (_states_only_the_call).
+        Two shapes are beyond a call edge (MENTION): a relation that reads,
+        writes, uses or depends on instead of calling, since reading an
+        attribute draws no edge; and a negation under a condition, when
+        refuted, since "A never calls B when x" survives an edge taken on
+        another path. Confirmed, that negation holds: no call at all is none
+        under x. Round 10 killed a hypothesis on two refutations of that shape
+        whose sentences were true. Anything else is a part, which refutes and
+        never confirms.
+
+        Args:
+            claim: The consequence.
+            verdict: The graph's verdict; None reads it as a refutation.
+        """
+        _text = str(claim or "").strip()
+        if _EXISTENCE_CLAIM_RE.match(_text):
+            return EvidenceScope.PROPOSITION
+        _rest, _rels = cls._relations(_text)
+        if _rels and not any(cls._CALL_VERB_RE.search(_r[0]) for _r in _rels):
+            return (
+                EvidenceScope.COMPONENT if verdict is True else EvidenceScope.MENTION
+            )
+        _pairs = {
+            (_a.rsplit(".", 1)[-1], _b.rsplit(".", 1)[-1]) for _s, _a, _b, _n in _rels
+        }
+        if len(_pairs) != 1:
+            return EvidenceScope.COMPONENT
+        _ends = set(next(iter(_pairs)))
+        _others = [
+            _n for _n in cls._names(_text) if _n.rsplit(".", 1)[-1] not in _ends
+        ]
+        _condition = not _states_only_the_call(_rest, list(_ends))
+        if not _others and not _condition:
+            return EvidenceScope.PROPOSITION
+        if _rels[0][3] and _condition:
+            return (
+                EvidenceScope.PROPOSITION
+                if verdict is True
+                else EvidenceScope.MENTION
+            )
+        return EvidenceScope.COMPONENT
+
+    @classmethod
+    def observation(
+        cls, claim: str, instrument: str, verdict: Optional[bool]
+    ) -> EvidenceObservation:
+        """
+        One forge instrument's verdict on a consequence, as an observation.
+
+        The contract check reads only a sentence that is exactly a return or
+        an assert contract, and the judge is held to a quote from the bodies,
+        so both rule on the sentence as written (the ledger files the judge
+        the same way); the graph does where graph_scope says so. All three
+        decide only where they can be taken at their word, so a decided
+        verdict is Popperian.
+
+        Args:
+            claim: The consequence.
+            instrument: "graph", "contract" or "judge".
+            verdict: True, False, or None for an abstention.
+        """
+        return EvidenceObservation(
+            instrument=instrument,
+            family=(
+                EvidenceFamily.QUOTED_READING
+                if instrument == "judge"
+                else EvidenceFamily.STATIC_ANALYSIS
+            ),
+            scope=(
+                cls.graph_scope(claim, verdict)
+                if instrument == "graph"
+                else EvidenceScope.PROPOSITION
+            ),
+            verdict=verdict,
+            regime=(
+                EpistemicRegime.POPPERIAN_FALSIFICATION
+                if verdict is not None
+                else None
+            ),
+        )
+
+    @classmethod
+    def asserted_by(cls, claim: str, hypothesis: str, instrument: str) -> bool:
+        """
+        Whether a refuted consequence restates what its hypothesis asserts.
+
+        Popper's kill is for what the hypothesis says. A consequence the model
+        derived from it may fail by the derivation (the "deriving" error in
+        EPISTEMIC TOOLS), and then it informs Bayes and kills nothing.
+        Restated means every code name in the refuted part is one the
+        hypothesis writes: for a call the graph refuted, its two ends;
+        otherwise every name the consequence writes. Names compare as
+        Class.method, or by the last part where either side writes it bare. A
+        part with no code name counts as restated, so a doubt keeps the kill
+        the forge always made.
+        """
+        _h = cls._names(hypothesis)
+        _tails = {_n.rsplit(".", 1)[-1] for _n in _h}
+        _bare = {_n for _n in _h if "." not in _n}
+        _part: Set[str] = set()
+        if instrument == "graph":
+            for _span, _a, _b, _neg in cls._relations(claim)[1]:
+                if cls._CALL_VERB_RE.search(_span):
+                    _part |= {cls._qualified(_a), cls._qualified(_b)}
+        if not _part:
+            _part = cls._names(claim)
+
+        def _restated(_n: str) -> bool:
+            _tail = _n.rsplit(".", 1)[-1]
+            return _n in _h or ("." not in _n and _tail in _tails) or _tail in _bare
+
+        return all(_restated(_n) for _n in _part)
+
+    @staticmethod
+    def leave_one_out(
+        observations: List[EvidenceObservation],
+    ) -> Dict[str, List[int]]:
+        """
+        Each instrument against the rest, on one fact, as the ledger counts it.
+
+        AgenticEvidenceLedger.triangulate keeps the same tally ("loo"): an
+        instrument that decided the sentence as written (PROPOSITION), one way
+        only, agrees when its verdict is what the others rule without it;
+        nothing is counted where they rule nothing. A forge fact has two
+        observations only when the judge read a static refutation again, so
+        these cells measure the static refutations and the judge on them, and
+        a disagreement counts against both: they say how often the two agree,
+        not which one erred.
+
+        Returns:
+            {"forge:<instrument>": [agreements, disagreements]}.
+        """
+        _said: Dict[str, Set[bool]] = {}
+        for _o in observations:
+            if _o.verdict is not None and _o.scope is EvidenceScope.PROPOSITION:
+                _said.setdefault(_o.instrument, set()).add(bool(_o.verdict))
+        _out: Dict[str, List[int]] = {}
+        for _inst, _verdicts in _said.items():
+            if len(_verdicts) != 1:
+                continue
+            _without = EvidenceTriangulation.rule(
+                [_o for _o in observations if _o.instrument != _inst]
+            )
+            if _without.verdict is None:
+                continue
+            _cell = _out.setdefault(f"forge:{_inst}", [0, 0])
+            _cell[0 if next(iter(_verdicts)) is _without.verdict else 1] += 1
+        return _out
+
+    @staticmethod
+    def settled_by(ruling: TriangulationRuling) -> str:
+        """Whose families back a ruling's verdict: "static", "judge", "both",
+        or "none" when it settled nothing (BayesianRanking.settle_fact)."""
+        if ruling.verdict is None:
+            return "none"
+        if len(set(ruling.families)) >= 2:
+            return "both"
+        if EvidenceFamily.QUOTED_READING.value in ruling.families:
+            return "judge"
+        return "static"
+
+    @staticmethod
+    def is_firm(ruling: TriangulationRuling) -> bool:
+        """A verdict Popper may act on: a static instrument backs it, which is
+        deterministic where it decides, or two independent families do."""
+        return ruling.verdict is not None and (
+            ruling.level >= 2
+            or EvidenceFamily.STATIC_ANALYSIS.value in ruling.families
+        )
+
+    @classmethod
+    def refutation_kind(cls, ruling: TriangulationRuling) -> str:
+        """What a refutation the forge counted is worth, once ruled: "firm"
+        (Popper may act on it), "weak" (one family, or the families disagree)
+        or "invalid" (the instrument's check does not bear on the sentence as
+        written)."""
+        if ruling.verdict is False and cls.is_firm(ruling):
+            return "firm"
+        if ruling.verdict is False or ruling.conflict:
+            return "weak"
+        return "invalid"
+
+    @staticmethod
+    def result_line(dossier: "HypothesisDossier", claim: str, verdict: bool) -> str:
+        """
+        One result for the forge's analysis step, as the firmness gate reads it.
+
+        The analysis is told the index's verdicts are mechanical, and a rival
+        whose analysis concludes REFUTED cannot win its competition. Under
+        forge_kill_gate="firm" a refutation the gate sets aside reaches it as
+        what it is: rule_cycle records how each fact was settled
+        (BayesianRanking.settle_fact), and this words it. A fact with no
+        record keeps the forge's words.
+
+        Args:
+            dossier: The dossier holding the fact.
+            claim: The consequence.
+            verdict: The forge's decision on it.
+
+        Returns:
+            The line, without its bullet.
+        """
+        _key = _prediction_key(claim)
+        _fact = next((_f for _f in dossier.facts if _f.get("key") == _key), None)
+        _settled = (_fact or {}).get("settled")
+        _by = str((_fact or {}).get("by", ""))
+        _as = str((_fact or {}).get("refuted_as", ""))
+        if verdict:
+            if _settled is True and _by == "judge":
+                return f"CONFIRMED by a reading of the code: {claim}"
+            return f"CONFIRMED by the index: {claim}"
+        if _as == "weak" and _settled is False:
+            return f"REFUTED by a reading of the code alone: {claim}"
+        if _as == "weak":
+            return (
+                "CONTESTED: the index refutes it, a reading of the code "
+                f"confirms it: {claim}"
+            )
+        if _as == "invalid" and _settled is True:
+            return (
+                "CONFIRMED by a reading of the code; the index's check does "
+                f"not bear on it: {claim}"
+            )
+        if _as == "invalid":
+            return (
+                "UNDECIDABLE from the index, whose check does not bear on the "
+                f"sentence as written: {claim}"
+            )
+        return f"REFUTED by the index: {claim}"
+
+    @classmethod
+    def tally(
+        cls,
+        facts: List[Tuple[str, List[EvidenceObservation], bool]],
+        hypothesis: str = "",
+    ) -> Tuple[Dict[str, int], List[str]]:
+        """
+        One cycle's facts, ruled and counted.
+
+        Args:
+            facts: (consequence, its observations with the forge's own
+                decision first, whether the judge was asked as a second
+                family).
+            hypothesis: What the consequences were derived from (asserted_by).
+
+        Returns:
+            (counts, notes). counts holds _FORGE_TRIANGULATION_FIELDS and,
+            beside them, what firm_gate reads: firm_asserted and
+            weak_asserted. would_spare and would_kill stay 0, as only the
+            verdict can count them. A note names each refutation that is not
+            firm.
+        """
+        _n = {_k: 0 for _k in _FORGE_TRIANGULATION_FIELDS}
+        _n.update(firm_asserted=0, weak_asserted=0)
+        _notes: List[str] = []
+        for _text, _obs, _asked in facts:
+            _decided = [_o for _o in _obs if _o.verdict is not None]
+            if not _decided:
+                continue
+            _ruling = EvidenceTriangulation.rule(_obs)
+            _n["facts"] += 1
+            _n["second"] += int(_asked and len(_decided) > 1)
+            _n["corroborated"] += int(_ruling.corroborated)
+            _n["anomaly"] += int(bool(_ruling.conflict))
+            _n["judge_only"] += int(
+                all(_o.family is EvidenceFamily.QUOTED_READING for _o in _decided)
+            )
+            _n["out_of_scope"] += int(
+                _decided[0].verdict is True
+                and _ruling.verdict is None
+                and _ruling.support_out_of_scope
+            )
+            if _decided[0].verdict is not False:
+                continue
+            _n["refuted"] += 1
+            _kind = cls.refutation_kind(_ruling)
+            _n[_kind] += 1
+            if _kind != "invalid" and cls.asserted_by(
+                _text, hypothesis, _decided[0].instrument
+            ):
+                _n["asserted"] += 1
+                _n[f"{_kind}_asserted"] += 1
+            if _kind != "firm":
+                _notes.append(
+                    f"'{_text[:60]}' ("
+                    + "+".join(_o.instrument for _o in _decided)
+                    + ": "
+                    + (
+                        _ruling.conflict
+                        or ("one family" if _kind == "weak" else "beyond the edge")
+                    )
+                    + ")"
+                )
+        return _n, _notes
+
+    async def rule_cycle(
+        self,
+        facts: List[Tuple[str, str, bool]],
+        bodies: List[str],
+        cycle: int,
+        hypothesis: str = "",
+        dossier: Optional["HypothesisDossier"] = None,
+    ) -> Optional[Dict[str, int]]:
+        """
+        Rule one cycle's facts and count them, for the log and for firm_gate.
+
+        The judge reads every static refutation in one call, against the
+        bodies the cycle read (judge_texts skips the call when no body names
+        what the consequences are about). A fact the judge decided has no
+        second family to ask: the graph and the contract check had abstained
+        on it, which is why the judge was asked. It counts as judge_only.
+
+        Args:
+            facts: (consequence, instrument, verdict) for each consequence the
+                cycle decided, in the order it decided them.
+            bodies: The bodies the cycle read.
+            cycle: The cycle's number, for the log.
+            hypothesis: The hypothesis the consequences were derived from.
+            dossier: Where each fact's settling is written, for Bayes and the
+                analysis step (BayesianRanking.settle_fact); None writes
+                nothing.
+
+        Returns:
+            tally's counts; None when the ruling failed, which leaves the
+            count gate alone to decide. Never raises.
+        """
+        try:
+            # ── Step 1: each decision as an observation ──
+            _obs = [[self.observation(_c, _i, _v)] for _c, _i, _v in facts]
+            # ── Step 2: the judge reads each static refutation too ──
+            _ask = [
+                _k
+                for _k, _o in enumerate(_obs)
+                if _o[0].verdict is False
+                and _o[0].family is EvidenceFamily.STATIC_ANALYSIS
+            ]
+            if _ask and bodies:
+                _rulings = await AgenticEvidenceVerifier(self._f).judge_texts(
+                    [facts[_k][0] for _k in _ask],
+                    "\n\n".join(bodies),
+                    _FORGE_JUDGE_SYSTEM,
+                    purpose="triangulation",
+                )
+                for _k, _r in zip(_ask, _rulings):
+                    _obs[_k].append(self.observation(facts[_k][0], "judge", _r))
+            # ── Step 3: rule and count ──
+            _n, _notes = self.tally(
+                [(facts[_k][0], _o, _k in _ask) for _k, _o in enumerate(_obs)],
+                hypothesis,
+            )
+            for _key in _FORGE_TRIANGULATION_FIELDS:
+                if _n[_key]:
+                    self._f._bump_turn_metric(f"forge_tri_{_key}", _n[_key])
+            # ── Step 4: each instrument against the other, for calibration ──
+            _turn_loo = getattr(self._f, "_turn_forge_loo", None)
+            if isinstance(_turn_loo, dict):
+                for _o in _obs:
+                    for _key, (_yes, _no) in self.leave_one_out(_o).items():
+                        _cell = _turn_loo.setdefault(_key, [0, 0])
+                        _cell[0] += _yes
+                        _cell[1] += _no
+            # ── Step 5: each fact as Bayes weighs it and the analysis reads it ──
+            if dossier is not None:
+                for (_c, _i, _v), _o in zip(facts, _obs):
+                    _r = EvidenceTriangulation.rule(_o)
+                    BayesianRanking.settle_fact(
+                        dossier,
+                        _c,
+                        _r.verdict,
+                        self.settled_by(_r),
+                        self.asserted_by(_c, hypothesis, _i),
+                        self.refutation_kind(_r) if _v is False else "",
+                    )
+            self._f._log_debug(
+                f"🔺 [FORGE-TRIANGULATION] c{cycle}: {_n['facts']} fact(s) · "
+                f"refuted {_n['refuted']} (firm {_n['firm']}, weak {_n['weak']}, "
+                f"invalid {_n['invalid']}; asserted {_n['asserted']}) · second "
+                f"family on {_n['second']} · corroborated {_n['corroborated']} · "
+                f"anomaly {_n['anomaly']} · out of scope {_n['out_of_scope']} · "
+                f"judge only {_n['judge_only']}"
+                + (" — not firm: " + "; ".join(_notes[:3]) if _notes else "")
+            )
+            return _n
+        except Exception as _e:
+            self._f._log_debug(
+                f"🔺 [FORGE-TRIANGULATION] c{cycle}: not ruled — "
+                f"{type(_e).__name__}: {_e}"
+            )
+            return None
+
+    @staticmethod
+    def firm_gate(
+        ruled: Dict[str, int], gate: Dict[str, Any], held_before: bool
+    ) -> Tuple[str, str, bool]:
+        """
+        A forge cycle's verdict when only a firm fact may kill (step 2).
+
+        Popper on what the hypothesis asserts: one firm refutation of it kills,
+        whatever the cycle confirmed beside it, which the count gate let pass.
+        Lakatos on a weak one: the first is held and the hypothesis lives on,
+        unable to win while its belt is untested; another kills it as
+        degenerating. A refuted derivation and a refutation the instrument
+        could not make kill nothing and stay decided facts. Past the kill the
+        verdict is HypothesisForge._forge_verdict with every refutation held.
+
+        Args:
+            ruled: rule_cycle's counts for the cycle.
+            gate: The keyword arguments the count gate was called with.
+            held_before: The belt already holds a weak refutation of this
+                hypothesis.
+
+        Returns:
+            (verdict, cause, held): held is True when the belt takes this
+            cycle's weak refutation.
+        """
+        if ruled.get("firm_asserted", 0):
+            return "dead", "falsified", False
+        _weak = int(ruled.get("weak_asserted", 0))
+        if _weak and (held_before or _weak > 1):
+            return "dead", "degenerating", False
+        _verdict, _cause = HypothesisForge._forge_verdict(
+            **{**gate, "refutation_held": True}
+        )
+        return _verdict, _cause, _weak > 0
 
 class HypothesisForge:
     """Forge competing explanations, judge them, and remember the dead ones.
@@ -46771,6 +50982,10 @@ class HypothesisForge:
         # Consequences decided over the cycles already run, so that "no
         # foundation" is judged on the hypothesis and not on its last cycle.
         _decided_before = 0
+        # The firmness gate's state for this hypothesis: whether its belt holds
+        # a weak refutation, and whether it has parted from the count gate.
+        _weak_held = False
+        _gates_parted = False
         _cycles_max = int(self._f.valves.agentic_serial_cycles_max)
         _eff_c = getattr(self._f, "_agentic_effort_override", None)
         if _eff_c and len(_eff_c) > 1 and _eff_c[1] > 0:
@@ -46973,6 +51188,17 @@ class HypothesisForge:
                 )
             _assump = list(getattr(self._f, "_preplanner_assumptions", []) or [])[:4]
             _assump_blk = ""
+            if _cycle == 1 and _assump and not getattr(
+                self._f, "_preplanner_assumptions_tested", False
+            ):
+                # Once per turn, for the first hypothesis that takes them:
+                # the claim the pre-planner's status no longer makes.
+                self._f._preplanner_assumptions_tested = True
+                self._f._set_turn_metric("preplan_assumptions_tested", len(_assump))
+                await self._f._emit_status(
+                    f"🧭 [framing] Testing {len(_assump)} framing "
+                    f"assumption(s) in the forge"
+                )
             if _cycle == 1 and _assump:
                 _alines = "\n".join(f"- {a}" for a in _assump)
                 _assump_blk = (
@@ -47155,6 +51381,7 @@ class HypothesisForge:
             _by_graph, _by_contract = 0, 0
             _undecided_txt: List[str] = []
             _undecided_idx: List[int] = []
+            _cycle_facts: List[Tuple[str, str, bool]] = []
             for _c in _claims:
                 _v = self._f._meta_reasoning._claim_verified(_c, evidence, project_id)
                 _decided_by = "graph"
@@ -47188,6 +51415,7 @@ class HypothesisForge:
                     _undecided_txt.append(_c)
                 if _v is not None:
                     BayesianRanking.note_fact(_dossier, _c, _decided_by, _v)
+                    _cycle_facts.append((_c, _decided_by, _v))
                 if _v is True:
                     _conf_n += 1
                     _predictions_corroborated.add(_prediction_key(_c))
@@ -47224,8 +51452,7 @@ class HypothesisForge:
                     _rulings = await AgenticEvidenceVerifier(self._f).judge_texts(
                         _undecided_txt,
                         "\n\n".join(_expanded_parts),
-                        "You check claims against code shown in full. "
-                        "Answer ONLY with the JSON object requested.",
+                        _FORGE_JUDGE_SYSTEM,
                     )
                 except Exception as _e_ev:
                     self._f._log_debug(
@@ -47237,6 +51464,7 @@ class HypothesisForge:
                 for _txt, _r in zip(_undecided_txt, _rulings):
                     if _r is not None:
                         BayesianRanking.note_fact(_dossier, _txt, "judge", _r)
+                        _cycle_facts.append((_txt, "judge", _r))
                     if _r is True:
                         _conf_n += 1
                         _ev_conf += 1
@@ -47262,6 +51490,15 @@ class HypothesisForge:
                         f"against {len(_expanded_parts)} body/bodies — "
                         f"{_ev_conf} supported, {_ev_ref} contradicted"
                     )
+            # ── What this cycle's facts are worth (steps 1 and 2) ──
+            # Read by the firmness gate below; the facts stay as decided above.
+            _ruled: Optional[Dict[str, int]] = None
+            if _cycle_facts and getattr(
+                self._f.valves, "forge_triangulation_shadow", False
+            ):
+                _ruled = await ForgeFactTriangulation(self._f).rule_cycle(
+                    _cycle_facts, _expanded_parts, _cycle, hyp_text, _dossier
+                )
             _dossier.confirmed_checks = _n_conf_e
             _dossier.refuted_checks = _n_ref_e
             _dossier.predictions_corroborated = len(_predictions_corroborated)
@@ -47318,19 +51555,59 @@ class HypothesisForge:
             # interpret, asking invites the model to argue from its
             # expectations.
             if _conf_n or _ref_n:
+                # Under the firmness gate each result reads as triangulation
+                # settled it (ForgeFactTriangulation.result_line): a
+                # refutation the gate sets aside must not reach the analysis
+                # as mechanical, or its REFUTED keeps the rival from winning.
+                _as_ruled = (
+                    _ruled is not None
+                    and str(getattr(self._f.valves, "forge_kill_gate", "count"))
+                    == "firm"
+                )
                 _res_lines = []
+                _set_aside = 0
                 for _c in _dossier.refuted_claims[-4:]:
-                    _res_lines.append(f"REFUTED by the index: {_c}")
+                    _r_line = (
+                        ForgeFactTriangulation.result_line(_dossier, _c, False)
+                        if _as_ruled
+                        else f"REFUTED by the index: {_c}"
+                    )
+                    _set_aside += int(not _r_line.startswith("REFUTED by the index"))
+                    _res_lines.append(_r_line)
                 for _c in _dossier.confirmed_claims[-4:]:
-                    _res_lines.append(f"CONFIRMED by the index: {_c}")
+                    _res_lines.append(
+                        ForgeFactTriangulation.result_line(_dossier, _c, True)
+                        if _as_ruled
+                        else f"CONFIRMED by the index: {_c}"
+                    )
                 for _c in _dossier.unresolved_claims[-2:]:
                     _res_lines.append(f"UNDECIDABLE from the index: {_c}")
-                _an_prompt = (
-                    f"Hypothesis under test:\n{hyp_text}\n\n"
-                    f"Line of investigation this cycle: {_line}\n\n"
+                _res_head = (
                     "Experiment results (the code index ruled on each "
                     "consequence you derived; these verdicts are "
                     "mechanical and are not open to argument):\n"
+                )
+                _refuted_note = ""
+                if _as_ruled:
+                    _res_head = (
+                        "Experiment results (each consequence you derived, as "
+                        "the evidence settled it: a verdict by the index is "
+                        "mechanical and not open to argument, one by a "
+                        "reading of the code is open until another "
+                        "instrument agrees, and a CONTESTED or UNDECIDABLE "
+                        "result settles nothing):\n"
+                    )
+                    _refuted_note = " A CONTESTED or UNDECIDABLE result does not."
+                if _set_aside:
+                    self._f._log_debug(
+                        f"🔺 [FORGE-TRIANGULATION] c{_cycle}: the analysis "
+                        f"reads {_set_aside} refutation(s) as triangulation "
+                        f"settled them, not as the index's"
+                    )
+                _an_prompt = (
+                    f"Hypothesis under test:\n{hyp_text}\n\n"
+                    f"Line of investigation this cycle: {_line}\n\n"
+                    + _res_head
                     + "\n".join(f"- {r}" for r in _res_lines)
                     + (
                         f"\n\nYour prior reading:\n{_last_analysis[:600]}"
@@ -47358,6 +51635,7 @@ class HypothesisForge:
                     "hypothesis, but none of them confirms the step its "
                     "cause rests on.\n"
                     "VERDICT: REFUTED — a result contradicts that step."
+                    + _refuted_note
                 )
                 try:
                     _an = await self._f._llm_orchestrator.call_llm(
@@ -47426,7 +51704,7 @@ class HypothesisForge:
                 await self._f._emit_status(
                     f"🛡️ Lakatos belt · cycle {_cycle}: {_belt_line}"
                 )
-            _verdict, _cause = self._forge_verdict(
+            _gate = dict(
                 confirmed=_conf_n,
                 refuted=_ref_n,
                 resolvable_prev=_resolvable_prev,
@@ -47446,6 +51724,43 @@ class HypothesisForge:
                 refutation_held=_held,
                 decided_before=_decided_before,
             )
+            _verdict, _cause = self._forge_verdict(**_gate)
+            # Step 2, the firmness gate (ForgeFactTriangulation.firm_gate):
+            # logged beside the count gate in shadow, in its place when firm.
+            _mode = str(getattr(self._f.valves, "forge_kill_gate", "count"))
+            if _ruled is not None and _mode in ("shadow", "firm"):
+                _fv, _fc, _holds = ForgeFactTriangulation.firm_gate(
+                    _ruled, _gate, _weak_held
+                )
+                if not _gates_parted and (_verdict == "dead") != (_fv == "dead"):
+                    _gates_parted = True
+                    self._f._bump_turn_metric(
+                        "forge_tri_would_spare"
+                        if _verdict == "dead"
+                        else "forge_tri_would_kill"
+                    )
+                    self._f._log_debug(
+                        f"🔺 [FORGE-TRIANGULATION] c{_cycle}: the gates part on "
+                        f"'{hyp_text[:60]}' — count {_verdict}"
+                        + (f"/{_cause}" if _cause else "")
+                        + f", firmness {_fv}"
+                        + (f"/{_fc}" if _fc else "")
+                        + f" (firm asserted {_ruled.get('firm_asserted', 0)}, "
+                        f"weak asserted {_ruled.get('weak_asserted', 0)})"
+                        + ("" if _mode == "firm" else " — shadow")
+                    )
+                _weak_held = _weak_held or _holds
+                if _mode == "firm":
+                    _verdict, _cause = _fv, _fc
+                    if _holds:
+                        _dossier.belt_standing = AuxiliaryStanding.UNTESTED.value
+                        _dossier.belt_note = (
+                            "one_family_refutation: a refutation of what the "
+                            "hypothesis asserts rests on one family's reading; "
+                            "predicts: no firm fact contradicts it, and a "
+                            "second such refutation kills it as degenerating"
+                        )
+                        self._tag_strategy(_dossier, "belt:one_family")
             # Whether the earlier cycles' facts are what kept this one from
             # "unfounded": the same verdict without them, for the metrics.
             if (
@@ -48716,7 +53031,9 @@ class HypothesisForge:
         What the Bayesian shadow needs from history: base rates and the none prior.
 
         Base rates come from facts recorded before the turn being ranked,
-        so the facts being weighed never set their own rate. The prior of
+        so the facts being weighed never set their own rate, each counted as
+        triangulation settled it where it ruled and not at all where it left
+        the fact unsettled. The prior of
         "none" comes from the labelled competitions before it, in any
         project: how often the operator said no rival was right is a
         property of the forge, and per project there would be too few
@@ -48740,7 +53057,9 @@ class HypothesisForge:
         _all: Dict[str, Tuple[int, int]] = {}
         for _pid_filter, _into in ((project_id, _here), (None, _all)):
             for _kind, _true, _n in _conn.execute(
-                "SELECT kind, SUM(verdict), COUNT(*) FROM metric_forge_facts "
+                "SELECT kind, SUM(CASE WHEN settled_by = '' THEN verdict "
+                "ELSE settled END), SUM(settled_by != 'none') "
+                "FROM metric_forge_facts "
                 "WHERE turn_started < ? AND (? IS NULL OR project_id = ?) "
                 "GROUP BY kind",
                 (before, _pid_filter, _pid_filter),
@@ -48808,6 +53127,25 @@ class HypothesisForge:
             "contract": float(getattr(_v, "bayes_q_contract", 0.95)),
             "judge": float(getattr(_v, "bayes_q_judge", 0.8)),
         }
+        # An instrument's precision from how often it agreed with the rest,
+        # once that has as many observations as a warm base rate has facts.
+        _warm = int(getattr(_v, "bayes_warm_min", 30))
+        _from = {"graph": "valve", "judge": "valve", "contract": "valve"}
+        for _inst, (_ok, _n) in self._bayes_calibration(before).items():
+            if _n < _warm:
+                continue
+            _cal = min(BayesianRanking._P_CEIL, max(0.5, (_ok + 1.0) / (_n + 2.0)))
+            _from[_inst] = f"loo {_ok}/{_n}"
+            for _kind in (
+                ("graph_relation", "graph_symbol") if _inst == "graph" else (_inst,)
+            ):
+                _q_by_kind[_kind] = _cal
+        # The belt's prediction is looked for by the graph (standing_fact).
+        _q_by_kind["belt"] = _q_by_kind["graph_symbol"]
+        self._bayes_q_note = ", ".join(
+            f"{_i} {_q_by_kind['graph_symbol' if _i == 'graph' else _i]:.2f} {_s}"
+            for _i, _s in _from.items()
+        )
         _d = (
             float(getattr(_v, "bayes_derivation_reliability", 0.5))
             if d is None
@@ -48820,39 +53158,80 @@ class HypothesisForge:
         _post, _none = BayesianRanking.posterior(_logs, _none_w)
         return _post, _none, _cold
 
+    def _bayes_calibration(self, before: float) -> Dict[str, Tuple[int, int]]:
+        """
+        How often each instrument agreed with the others, before a turn.
+
+        The ledger's triangulation records, each turn, every instrument
+        against the ruling of the rest where both decided the same claim
+        (AgenticEvidenceLedger.triangulate, "loo"), and the forge adds its
+        own facts read by two families (ForgeFactTriangulation.leave_one_out,
+        "forge:<instrument>"). Summed over every project's earlier turns, by
+        instrument: the graph's checks as one ("graph:calls", "graph:exists",
+        "forge:graph", …), the judge, and the forge's contract check.
+
+        Returns:
+            {"graph": (agreements, observations), "judge": (…), "contract":
+            (…)}; empty when nothing was recorded or nothing can be read.
+            Never raises.
+        """
+        _sum: Dict[str, List[int]] = {}
+        try:
+            for (_raw,) in self._f._db_conn.execute(
+                "SELECT triangulation FROM metric_turns WHERE turn_started < ? "
+                "AND triangulation NOT IN ('', '{}')",
+                (before,),
+            ).fetchall():
+                try:
+                    _loo = (json.loads(_raw) or {}).get("loo") or {}
+                except Exception:
+                    continue
+                for _key, _cells in _loo.items():
+                    _inst = str(_key).split(":", 1)[-1]
+                    _name = "graph" if _inst.startswith("graph:") else _inst
+                    if _name not in ("graph", "judge", "contract"):
+                        continue
+                    _acc = _sum.setdefault(_name, [0, 0])
+                    _acc[0] += int(_cells[0] or 0)
+                    _acc[1] += int(_cells[0] or 0) + int(_cells[1] or 0)
+        except Exception:
+            return {}
+        return {_k: (_a[0], _a[1]) for _k, _a in _sum.items()}
+
     def _rank_bayesian_shadow(
         self,
         dossiers: List["HypothesisDossier"],
         winner: Optional["HypothesisDossier"],
         project_id: str,
-    ) -> str:
+    ) -> None:
         """
-        Rank the eligible rivals by posterior, beside Layer 1, and change nothing.
+        Rank every surviving rival by posterior, beside Layer 1, and change nothing.
 
-        Runs after the judgment, so the crucis facts are in, over exactly
-        the rivals Layer 1 was allowed to choose from (_l1_eligible). Writes
-        each ranked rival's posterior and rank, and the posterior of "none",
-        onto the dossiers, where _record_rivals persists them; logs one
-        line comparing the two picks. The winner, statuses and every other
-        field are left as the judgment set them. Never raises.
+        Runs after the judgment, so the crucis facts are in, over every
+        rival sealed plausible, those Layer 1 held back (its analysis did not
+        establish it, or its belt is untested) included: in rounds 3-10 the
+        shadow over Layer 1's eligible rivals alone ranked none in five of
+        seven competitions. Writes each ranked rival's posterior and rank,
+        and the posterior of "none", onto the dossiers, where _record_rivals
+        persists them; logs one line comparing the two picks and counts a
+        pick Layer 1 held back (bayes_pick_held). The winner, statuses and
+        every other field are left as the judgment set them. Never raises.
 
         Args:
             dossiers: Every dossier of the competition.
             winner: The judgment's winner, for the comparison line only.
             project_id: Current project identifier.
-
-        Returns:
-            A status line for the chat, or "" when nothing was ranked.
         """
         if not getattr(self._f.valves, "bayes_shadow", False):
-            return ""
+            return
         try:
-            # ── Step 1: the pool Layer 1 ranked ──
+            # ── Step 1: every survivor, and which Layer 1 held back ──
             _ids = set(getattr(self, "_l1_eligible", []) or [])
-            _pool = [d for d in dossiers if id(d) in _ids]
+            _pool = [d for d in dossiers if d.status == "plausible"]
+            _held = {id(d) for d in _pool if id(d) not in _ids}
             # ── Step 2: evidence, posterior, rank ──
             _post, _none, _cold = self._bayes_posterior_for(
-                [_x.facts for _x in _pool],
+                [BayesianRanking.weighed(_x.facts, _x.belt_standing) for _x in _pool],
                 project_id,
                 float(getattr(self._f, "_turn_started_at", 0.0)),
             )
@@ -48864,36 +53243,27 @@ class HypothesisForge:
             # ── Step 3: one line for the log ──
             _pick = _pool[_order[0]] if _order and _post[_order[0]] > _none else None
             _l1 = f"'{winner.hypothesis[:45]}'" if winner is not None else "no winner"
+            _l1_rank = (getattr(self, "_l1_ranks", {}) or {}).get(id(_pick), 0)
             _sh = (
-                f"'{_pick.hypothesis[:45]}' (P={_post[_order[0]]:.2f})"
+                f"'{_pick.hypothesis[:45]}' (P={_post[_order[0]]:.2f}, "
+                f"Layer 1 rank {_l1_rank}"
+                + (", held by Layer 1" if id(_pick) in _held else "")
+                + ")"
                 if _pick is not None
                 else "none of them"
             )
+            if _pick is not None and id(_pick) in _held:
+                self._f._bump_turn_metric("bayes_pick_held")
             self._f._log_debug(
-                f"🎲 [BAYES] shadow over {len(_pool)} eligible rival(s): "
-                f"Layer 1 → {_l1} | Bayes → {_sh} · P(none)={_none:.2f}"
+                f"🎲 [BAYES] shadow over {len(_pool)} survivor(s), {len(_held)} "
+                f"held by Layer 1: Layer 1 → {_l1} | Bayes → {_sh} · "
+                f"P(none)={_none:.2f}"
                 + (" · AGREE" if _pick is winner else " · DIFFER")
+                + f" · q: {getattr(self, '_bayes_q_note', '')}"
                 + (f" · cold: {', '.join(_cold)}" if _cold else "")
-            )
-            if not _pool:
-                return ""
-            return (
-                "🎲 Bayesian ranking (shadow, not used for the answer): "
-                + (
-                    f"'{_clip_words(_pick.hypothesis, 48)}' leads, "
-                    f"P={_post[_order[0]]:.2f}"
-                    if _pick is not None
-                    else f"no rival beats 'none' (P={_none:.2f})"
-                )
-                + (
-                    " — agrees with the judgment"
-                    if _pick is winner
-                    else " — differs from the judgment"
-                )
             )
         except Exception as _e:
             self._f._log_debug(f"🎲 [BAYES] shadow skipped ({_e!r})")
-        return ""
 
     def _dossier_symbols(
         self, d: "HypothesisDossier", project_id: str = ""
@@ -49102,7 +53472,7 @@ class HypothesisForge:
 
         _L: List[str] = [
             "---",
-            "\U0001f4cb **Investigation record** \u2014 rendered from "
+            _INVESTIGATION_RECORD_TITLE + " \u2014 rendered from "
             "the run's own data, not written by the model",
             "",
         ]
@@ -49439,6 +53809,13 @@ class HypothesisForge:
                             str(_fact.get("kind", "")),
                             int(bool(_fact.get("verdict"))),
                             str(_fact.get("key", ""))[:_RIVAL_TEXT_CHARS],
+                            (
+                                None
+                                if _fact.get("settled") is None
+                                else int(bool(_fact.get("settled")))
+                            ),
+                            str(_fact.get("by", "") or ""),
+                            int(bool(_fact.get("asserted"))),
                         )
                     )
                 self._f._record_metric(
@@ -61252,6 +65629,94 @@ class SemanticSeedInferencer:
     # Region: Main Seed Inference Entry Point
     # ------------------------------------------------------------------
 
+    def resolve_quoted_seeds(self, query: str, project_id: str) -> Dict[str, float]:
+        """Seed the symbols whose string literals hold text the query quotes.
+
+        A debugging question quotes what the program printed ("«quote not
+        found in any body»", "[METRICS-TURN]") and often names no symbol.
+        Round 10 asked three such questions; each began with no exact seed,
+        and the forge built its rivals around the nearest vocabulary instead
+        of the line that printed the text. A literal search, as deterministic
+        as _resolve_literal_seeds: a text more than _QUOTED_SEED_MAX symbols
+        print is vocabulary and seeds nothing, unless only a few of them hold it
+        as a whole literal: "unfounded" is in five symbols, and the three
+        that return or compare the value itself are the ones it names. Never
+        raises: {}.
+
+        They join the inferred seeds rather than standing in for them (the
+        call site of infer_seeds): a quote anchors the search, and the model
+        still reads the question for what it does not quote.
+
+        Args:
+            query: The user query.
+            project_id: Current project identifier.
+
+        Returns:
+            Qualified ids of the symbols that print a quoted text, at the
+            literal seed score.
+        """
+        if not getattr(self._f.valves, "seed_from_quoted_text", True):
+            return {}
+        try:
+            _spans = _quoted_spans(query)
+            if not _spans:
+                return {}
+            _idx = self._f._symbol_index
+            _all = set(_idx.get_all_qualified_names(project_id) or ())
+            _blocks = (
+                self._f._conversation_state_manager.get(project_id).active_blocks or {}
+            )
+            # ── Step 1: which symbols print each quote, and at which line ──
+            _hits: Dict[str, Dict[str, str]] = {_s: {} for _s in _spans}
+            _exact: Dict[str, Set[str]] = {_s: set() for _s in _spans}
+            for _block in list(_blocks.values()):
+                _content = getattr(_block, "content", "") or ""
+                if not _content:
+                    continue
+                for _name, (_start, _lits) in _symbol_literals(_content).items():
+                    for _s in _spans:
+                        _line = _quote_in_literals(_s, _lits)
+                        if _line:
+                            _hits[_s][_name] = f"line {_line - _start + 1}"
+                            if any(_lit == _s for _, _lit in _lits):
+                                _exact[_s].add(_name)
+            # ── Step 2: an indexed symbol for each, when the text is rare ──
+            seeds: Dict[str, float] = {}
+            _score = self._f.valves.seed_inference_score
+            for _s, _by in _hits.items():
+                if not _by:
+                    continue
+                if len(_by) > _QUOTED_SEED_MAX:
+                    if not 0 < len(_exact[_s]) <= _QUOTED_SEED_MAX:
+                        self._f._log_debug(
+                            f"🔎 Quoted text «{_s[:60]}» is in {len(_by)} symbols — "
+                            f"too common to seed"
+                        )
+                        continue
+                    _by = {_n: _w for _n, _w in _by.items() if _n in _exact[_s]}
+                _placed = []
+                for _name, _where in _by.items():
+                    _qid = _name if _name in _all else ""
+                    if not _qid:
+                        _cands = [
+                            _q
+                            for _q in _idx.get_qualified_names_for(
+                                _name.split(".")[-1], project_id
+                            )
+                            if _q in _all and _q.endswith("." + _name)
+                        ]
+                        _qid = _cands[0] if len(_cands) == 1 else ""
+                    if _qid:
+                        seeds[_qid] = _score
+                        _placed.append(f"{_qid} ({_where})")
+                if _placed:
+                    self._f._log_debug(
+                        f"🔎 Quoted text «{_s[:60]}» → " + ", ".join(_placed)
+                    )
+            return seeds
+        except Exception:
+            return {}
+
     def _resolve_literal_seeds(self, query: str, project_id: str) -> Dict[str, float]:
         """Seed symbols mentioned literally in the query, without LLM or fuzzy.
 
@@ -61936,7 +66401,14 @@ class InletOrchestrator:
         # sends the stored chat back each time and discards outlet edits,
         # so the inlet is the only place a leaked note can be taken out.
         try:
-            _scrubbed = {"notes": 0, "echoes": 0, "placeholders": 0, "repeat": 0}
+            _scrubbed = {
+                "notes": 0,
+                "echoes": 0,
+                "placeholders": 0,
+                "repeat": 0,
+                "glued_rules": 0,
+                "annotations": 0,
+            }
             _touched = 0
             for _m in messages or []:
                 if not isinstance(_m, dict) or _m.get("role") != "assistant":
@@ -61955,7 +66427,9 @@ class InletOrchestrator:
                     f"{_scrubbed['notes']} workspace note(s), "
                     f"{_scrubbed['echoes']} echoed directive(s), "
                     f"{_scrubbed['placeholders']} placeholder line(s), "
-                    f"{_scrubbed['repeat']} repeated section cycle(s) cut"
+                    f"{_scrubbed['repeat']} repeated section cycle(s) cut, "
+                    f"{_scrubbed['glued_rules']} rule(s) unglued, "
+                    f"{_scrubbed['annotations']} ledger annotation(s) removed"
                 )
         except Exception as _e_scrub:
             self._f._log_debug(f"🧽 History: scrub skipped ({_e_scrub!r})")
@@ -63898,6 +68372,15 @@ class Valves(BaseModel):
         le=1.0,
         description="Seed score assigned to LLM‑validated symbols (> lod3_threshold guarantees LOD‑3).",
     )
+    seed_from_quoted_text: bool = Field(
+        default=True,
+        description=(
+            "Seed the symbols whose string literals hold text the question "
+            "quotes («…», \"…\", `…`, [TAG]): a log line or a reason the "
+            "program printed leads to the code that prints it. A text more "
+            "than three symbols print seeds nothing."
+        ),
+    )
 
     # Only reaches the model when the call is NOT aligned to the KV
     # prefix. When it is — the normal case — call_llm removes the
@@ -64650,6 +69133,35 @@ class Valves(BaseModel):
             "range instead of leaving it blind."
         ),
     )
+    agentic_run_shown_tests: bool = Field(
+        default=True,
+        description=(
+            "When a turn writes tests (in a step or in the answer outline), "
+            "run them in the sandbox before the answer shows them, against "
+            "the real bodies of the module-level functions they call: a copy "
+            "of the function the model pasted next to its tests is dropped, "
+            "a project import is dropped, unittest methods are run as tests. "
+            "The answer then says how they came out — under what the "
+            "evidence shows when all pass, under what was not verified "
+            "otherwise. Needs agentic_exec_mode 'subprocess'. Counted as "
+            "tests_shown_run and tests_shown_failed."
+        ),
+    )
+    agentic_evidence_excerpt: bool = Field(
+        default=True,
+        description=(
+            "When a body the evidence judge reads is past "
+            "agentic_expand_max_chars, print the signature and the passages "
+            "that name what its claims mention, in body order with the "
+            "elided lines marked, instead of its first "
+            "agentic_expand_max_chars characters. The judge cannot ask for "
+            "more, and the line a claim turns on sits past a head cut as "
+            "often as before it: in rounds 6-8, 16 of 26 claims judged "
+            "against a cut body stayed indeterminate, against 10 of 199 "
+            "against a whole one. Counted as evidence_excerpt_* against "
+            "evidence_cut_*."
+        ),
+    )
 
     agentic_preplanner_timeout_s: int = Field(
         default=240,
@@ -64771,6 +69283,23 @@ class Valves(BaseModel):
             "pool-destroying)."
         ),
     )
+    split_turn_context_message: bool = Field(
+        default=True,
+        description=(
+            "Send the part of the user turn that every heavy call of a "
+            "turn shares — the profile and Block B — as a user message of "
+            "its own, ahead of the call's role. llama.cpp checkpoints where "
+            "the last user message starts, so each call leaves a checkpoint "
+            "at the end of that shared part and the next call of the turn "
+            "resumes there. As one message, the calls diverged at the role, "
+            "~1.3k tokens before their last checkpoint, and every one fell "
+            "back to the end of the system: ~11.5k tokens re-processed per "
+            "call, 116 s of one run's 583 s of prefill and 405 s of "
+            "another's. Chat endpoints only. Turn OFF if the chat template "
+            "rejects two consecutive user messages, or to measure against "
+            "the single-message turn."
+        ),
+    )
 
     agentic_early_exit: str = Field(
         default="off",
@@ -64882,6 +69411,42 @@ class Valves(BaseModel):
         ),
     )
 
+    arbiter_framing_brief: str = Field(
+        default="on",
+        description=(
+            "What the framing arbiter refuted against the code index — a "
+            "name the chosen framing or its assumptions use that exists "
+            "nowhere, a call the graph does not have — goes into the "
+            "planner's brief as fact, so no step is planned around it. "
+            "'on' (default) or 'off'. Needs arbiter_framing_mode not 'off'; "
+            "counted as preplan_brief_facts."
+        ),
+    )
+    arbiter_framing_mode: str = Field(
+        default="shadow",
+        description=(
+            "Triangulation at the framing decision (DecisionArbiter). "
+            "'shadow' (default): every pre-planner framing is ruled on by "
+            "the free observers — the symbol index and the call graph — and "
+            "what the arbiter would change is logged and counted "
+            "(preplan_would_change, arb_framing_*), never acted on. 'off': "
+            "nothing is ruled on. Acting on the ruling is not built yet."
+        ),
+    )
+    outline_name_correction: bool = Field(
+        default=True,
+        description=(
+            "Before the final model writes, the code names in the answer "
+            "outline are checked against the index and the live code, and "
+            "one written wrong — Markdown italics eaten into it, a typo "
+            "within two edits of exactly one existing name — is replaced by "
+            "the existing one, since the answer copies the outline's names. "
+            "Names offered as new ('implementar `X`', 'un atributo `X`') and "
+            "names found nowhere are counted, never changed. Counted as "
+            "outline_names_corrected; what the answer itself still gets wrong "
+            "is answer_names_misspelt and answer_names_unknown."
+        ),
+    )
     agentic_preplanner_max_tool_rounds: int = Field(
         default=2,
         ge=0,
@@ -65233,6 +69798,37 @@ class Valves(BaseModel):
             "refutation whatever the coverage, which is what it always "
             "did and is the A/B baseline (EpistemicRegime.for_coverage, "
             "ProtectiveBelt.sparse_sampling_ruling)."
+        ),
+    )
+
+    forge_triangulation_shadow: bool = Field(
+        default=True,
+        description=(
+            "Rule each forge cycle's decided consequences by triangulation, "
+            "in shadow (ForgeFactTriangulation). The judge reads each "
+            "refutation by the graph or the contract check too, every fact "
+            "is ruled by EvidenceTriangulation.rule, and a kill that rests "
+            "on refutations that are not firm is counted as would_spare. "
+            "No verdict changes. It costs one judge call in a cycle with a "
+            "static refutation whose bodies name what it is about."
+        ),
+    )
+
+    forge_kill_gate: str = Field(
+        default="shadow",
+        description=(
+            "Which gate kills a forged hypothesis. 'count': a cycle with two "
+            "refutations, or one and no confirmation, kills, as the forge "
+            "always did. 'firm': only a firm refutation of something the "
+            "hypothesis asserts kills; a weak one (the judge alone, or "
+            "contested) is held once by the belt and the rival cannot win, a "
+            "second kills it as degenerating, and a refuted derivation or a "
+            "refutation the instrument could not make kills nothing "
+            "(ForgeFactTriangulation.firm_gate); the forge's analysis step "
+            "reads each result as this gate does. 'shadow': the count gate "
+            "decides and the firmness gate is logged beside it, counting the "
+            "hypotheses it would spare or kill. Needs "
+            "forge_triangulation_shadow; without it the count gate decides."
         ),
     )
 
@@ -67055,7 +71651,8 @@ class Filter:
         # starts, so the invariant makes turn boundaries free but charges
         # each call ~30k tokens, and the prelim does the reverse; which is
         # cheaper depends on how many heavy calls the turn makes, and this
-        # census is what lets the logs tell.
+        # census is what lets the logs tell. `split` counts the calls that
+        # sent the volatile part as its own message, which pay it once.
         self._cut_census_this_turn: Dict[str, int] = {}
         # The Reading/Did pair the pipeline measured this turn, handed to
         # the outlet so the footer it writes is the pipeline's account and
@@ -67098,6 +71695,9 @@ class Filter:
         # Turn-wide because two different steps feed it and one of them
         # clears its own per-step list.
         self._execution_tally: List[Tuple[str, str]] = []
+        # Where each keyed unit sits in _execution_tally, so a cached result
+        # reused by a later step replaces its entry (_note_execution).
+        self._execution_keys: Dict[Tuple[str, str], int] = {}
         # Symbols the sandbox has executed so far THIS turn, across every
         # verify_dynamic step the plan carries. Cleared per turn beside the
         # rest of the per-turn state.
@@ -67405,6 +72005,8 @@ class Filter:
         ("foundation_rescued", 0),
         ("bayes_ranked", 0),
         ("bayes_differ", 0),
+        ("bayes_pick_held", 0),
+        *((f"forge_tri_{_k}", 0) for _k in _FORGE_TRIANGULATION_FIELDS),
         ("reinforce_tested", 0),
         ("reinforce_refuted", 0),
         ("reinforce_held", 0),
@@ -67413,6 +72015,41 @@ class Filter:
         ("never_updated_refuted", 0),
         ("conjunction_withheld", 0),
         ("proceed_recheck", 0),
+        ("preplan_framings", 0),
+        ("preplan_unknown_names", 0),
+        ("preplan_assumption_unknown", 0),
+        ("preplan_would_change", 0),
+        ("preplan_assumptions", 0),
+        ("preplan_assumptions_tested", 0),
+        ("arb_framing_checkable", 0),
+        ("arb_framing_eliminated", 0),
+        ("arb_framing_all_eliminated", 0),
+        ("arb_framing_assumption_refuted", 0),
+        ("named_relation", 0),
+        ("named_relation_prose", 0),
+        ("tri_prov_corroborated", 0),
+        ("tri_prov_unsettled", 0),
+        ("cal_loo_agree", 0),
+        ("cal_loo_disagree", 0),
+        ("probe_discrepancies", 0),
+        ("probe_resolved", 0),
+        ("probe_sides_judge", 0),
+        ("probe_sides_graph", 0),
+        ("preplan_brief_facts", 0),
+        ("outline_names_corrected", 0),
+        ("answer_names_misspelt", 0),
+        ("answer_names_unknown", 0),
+        ("evidence_excerpts", 0),
+        ("evidence_excerpt_claims", 0),
+        ("evidence_excerpt_indeterminate", 0),
+        ("evidence_cut_claims", 0),
+        ("evidence_cut_indeterminate", 0),
+        ("evidence_quotes_elided", 0),
+        ("tests_written_unrun", 0),
+        ("proceed_nothing_generative", 0),
+        ("tests_shown_run", 0),
+        ("tests_shown_failed", 0),
+        ("conclusion_hedged", 0),
         ("contradictions_symbol", 0),
         ("contradictions_subject", 0),
         ("outlet_missing", 0),
@@ -67421,6 +72058,15 @@ class Filter:
         ("seed_copied", 0),
         ("answer_list_items", 0),
     ) + tuple((f"tri_{_k}", 0) for _k in _TRIANGULATION_FIELDS)
+    # The counters the outlet's own audits add after the inlet froze the
+    # line's figures (_inlet_handoff_metrics). Only these are taken from the
+    # live counters, so a background call made while the answer streamed
+    # still never reaches the line.
+    _OUTLET_TURN_METRICS = (
+        "answer_names_misspelt",
+        "answer_names_unknown",
+        "proceed_nothing_generative",
+    )
 
     def _log_turn_metrics(
         self,
@@ -67464,6 +72110,9 @@ class Filter:
         """
         try:
             _m = dict(getattr(self, "_inlet_handoff_metrics", {}) or {})
+            _live = getattr(self, "_turn_metrics", None) or {}
+            for _k in getattr(self, "_OUTLET_TURN_METRICS", ()):
+                _m[_k] = _live.get(_k, 0)
             _m["answer_s"] = answer_s
             _m["total_s"] = float(_m.get("inlet_s", 0.0)) + answer_s
             _m["answer_tokens"] = answer_tokens
@@ -67621,7 +72270,12 @@ class Filter:
             int(system_tokens or 0),
             str(getattr(self, "_chat_id_this_turn", "") or ""),
             json.dumps(
-                getattr(self, "_turn_triangulation", None) or {},
+                getattr(self, "_turn_triangulation", None)
+                or (
+                    {"loo": self._turn_forge_loo}
+                    if getattr(self, "_turn_forge_loo", None)
+                    else {}
+                ),
                 separators=(",", ":"),
             ),
         )
@@ -67826,6 +72480,10 @@ class Filter:
     async def _emit_status(self, description: str, done: bool = False) -> None:
         """
         Emit a real-time status update to the UI via __event_emitter__.
+
+        Only for a step that changed the turn or the answer. A shadow
+        mechanism or a metric logs and emits nothing (EPISTEMIC TOOLS, top of
+        the file).
 
         Gated by enable_status_updates valve — no-op when disabled.
         No-op if event emitter is not available (non-streaming context).
@@ -68308,6 +72966,9 @@ class Filter:
             # The triangulation shadow's tally, for the turn's metric row;
             # empty on a turn the pipeline did not run.
             self._turn_triangulation = {}
+            # The forge's leave-one-out cells (ForgeFactTriangulation), merged
+            # into that tally's "loo" when the pipeline writes it.
+            self._turn_forge_loo: Dict[str, List[int]] = {}
             # Claims the static pass left unverified this turn, once each
             # (static_vacuous), across every verify pass.
             self._turn_vacuous_keys = set()
@@ -68335,13 +72996,18 @@ class Filter:
                 _n = _cc["calls"]
                 _vol = _cc.get("volatile", 0)
                 _per = _cc.get("volatile_per_call", 0)
+                # A split call leaves a checkpoint where the volatile part
+                # ends, so only the first of them pays for it.
+                _split = _cc.get("split", 0)
+                _paid = max(0, _vol - max(0, _split - 1) * _per)
                 self._log_debug(
                     f"📐 Cut census: {_n} heavy call(s) · "
                     f"invariant x{_cc.get('at_invariant', 0)}, "
                     f"turn-prelim x{_cc.get('at_turn_prelim', 0)} · "
                     f"cut at {_cc.get('cut_bytes', 0)} B · "
                     f"{_per} B (~{_per // 4} tokens) left volatile per call · "
-                    f"{_vol} B (~{_vol // 4} tokens) reprocessed this turn"
+                    + (f"sent as its own message x{_split} · " if _split else "")
+                    + f"≈{_paid} B (~{_paid // 4} tokens) reprocessed this turn"
                 )
             self._cut_census_this_turn = {}
             # Written by the forge only when a rival survives, read on every
@@ -68358,6 +73024,7 @@ class Filter:
             self._answer_outline = ""
             self._executed_test_names = []
             self._execution_tally = []
+            self._execution_keys = {}
             self._dynamic_targets_this_turn = 0
             self._answer_is_verbatim_echo = False
             self._prelim_stable_this_turn = ""
@@ -68378,6 +73045,7 @@ class Filter:
             self._serial_winner_corroboration = None
             self._serial_eliminated_accounts = []
             self._serial_unestablished = []
+            self._conclusion_no_cause_lead = ""
             _lf = getattr(self, "_llm_failures_this_turn", None) or {}
             if _lf.get("count"):
                 self._log_debug(
@@ -70022,6 +74690,8 @@ class Filter:
             if not _text.strip():
                 self._log_debug("[GAP-PROMOTION] not measured — empty answer")
                 return
+            # The record names the rivals' symbols, which would read as shelved.
+            _text = _text.split(_INVESTIGATION_RECORD_TITLE, 1)[0]
             # Every language table is consulted rather than one chosen from
             # the query: the answer's headings are already in front of us,
             # and matching them directly cannot disagree with itself the way
@@ -70030,6 +74700,9 @@ class Filter:
             for _tbl in _SECTION_HEADINGS.values():
                 for _k, _v in _tbl.items():
                     _by_name[_v.strip("# *").strip().casefold()] = _k
+            # Stats is not in that table (it stays English) and closes the
+            # prose: its lines are measured, not written.
+            _by_name["stats"] = "stats"
             _sections: Dict[str, str] = {}
             _current = ""
             for _l in _text.split("\n"):
@@ -70094,6 +74767,139 @@ class Filter:
             )
         except Exception as _e:
             self._log_debug(f"[GAP-PROMOTION] not measured — {type(_e).__name__}: {_e}")
+
+    def _audit_proceed_step(self, body: dict) -> None:
+        """Report a How to proceed that says nothing is left on a making turn.
+
+        On a generative turn (a design, a test file) there is always a step
+        after the answer: apply the change, run the tests. Round 9 opened
+        that section with "Nada;" on both such turns, the outline's step
+        sitting right under it, copied from the voice of the explain answers
+        earlier in the chat. Counted as proceed_nothing_generative; the
+        directive now asks for the step on these turns. Detection only.
+        """
+        try:
+            if str(getattr(self, "_preplanner_question_type", "") or "") != (
+                "generative"
+            ):
+                return
+            _msgs = body.get("messages") or []
+            _last = next(
+                (
+                    m
+                    for m in reversed(_msgs)
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            _text = (_last or {}).get("content") or ""
+            _heads = {
+                _tbl["proceed"].casefold() for _tbl in _SECTION_HEADINGS.values()
+            }
+            _body, _in = [], False
+            for _l in str(_text).split("\n"):
+                _h = _l.strip().strip("# *").strip().casefold()
+                if _l.lstrip().startswith("#"):
+                    if _in:
+                        break
+                    _in = _h in _heads
+                elif _in and _l.strip() and _l.strip() != "---":
+                    _body.append(_l.strip())
+            if not _body:
+                return
+            if _NOTHING_LEFT_RE.match(_body[0].lstrip("-*0123456789. ")):
+                self._bump_turn_metric("proceed_nothing_generative")
+                self._log_debug(
+                    f"[PROCEED-STEP] a making turn's How to proceed opens as "
+                    f"if nothing were left: {_body[0][:100]!r}"
+                )
+        except Exception as _e:
+            self._log_debug(f"[PROCEED-STEP] not measured — {type(_e).__name__}")
+
+    def _audit_answer_names(self, body: dict) -> None:
+        """Report the code names the answer uses that the code does not hold.
+
+        How to proceed is where an answer names what to change, and a name
+        there the code does not have is either a proposal, a misspelling or
+        something invented as if it existed. _answer_name_grounding tells
+        the three apart; this counts them for How to proceed and for the
+        rest of the answer, Stats and the appended investigation record
+        aside. What the outline misspelt was
+        corrected before the answer was written (_ground_outline_names), so
+        a misspelling counted here is one the final model made itself.
+
+        Detection only, like its siblings: outlet edits never reach the
+        reader.
+        """
+        try:
+            # ── Step 1: the answer, split by section ──
+            project_id = self._inlet_orch.get_project_id()
+            _msgs = body.get("messages") or []
+            _last = next(
+                (
+                    m
+                    for m in reversed(_msgs)
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            _text = (_last or {}).get("content") or ""
+            if not isinstance(_text, str) or not _text.strip():
+                self._log_debug("[NAME-GROUNDING] not measured — empty answer")
+                return
+            # The record cuts rival accounts at 140 characters, and round 10
+            # counted one cut mid-name as a misspelling no model wrote.
+            _text = _text.split(_INVESTIGATION_RECORD_TITLE, 1)[0]
+            if self._symbol_index is None:
+                self._log_debug("[NAME-GROUNDING] not measured — no index")
+                return
+            _by_name: Dict[str, str] = {}
+            for _tbl in _SECTION_HEADINGS.values():
+                for _k, _v in _tbl.items():
+                    _by_name[_v.strip("# *").strip().casefold()] = _k
+            # Stats is not in that table (it stays English) and closes the
+            # prose: its lines are measured, not written.
+            _by_name["stats"] = "stats"
+            _parts = {"proceed": "", "rest": ""}
+            _current = ""
+            for _l in _text.split("\n"):
+                _hit = _by_name.get(_l.strip().strip("# *").strip().casefold(), "")
+                if _hit:
+                    _current = _hit
+                elif _current and _current != "stats":
+                    _parts["proceed" if _current == "proceed" else "rest"] += _l + "\n"
+            if not _parts["proceed"].strip() and not _parts["rest"].strip():
+                self._log_debug("[NAME-GROUNDING] not measured — no sections")
+                return
+
+            # ── Step 2: each part against the index and the live code ──
+            _src = _active_sources(self._conversation_state_manager, project_id)
+            _line: List[str] = []
+            for _key in ("proceed", "rest"):
+                _g = _answer_name_grounding(
+                    _parts[_key], self._symbol_index, project_id, _src
+                )
+                self._bump_turn_metric("answer_names_misspelt", len(_g["misspelt"]))
+                self._bump_turn_metric("answer_names_unknown", len(_g["unknown"]))
+                _line.append(
+                    f"{_key}: {_g['checked']} name(s), "
+                    f"{len(_g['proposed'])} proposed, "
+                    f"{len(_g['misspelt'])} misspelt"
+                    + (
+                        " ("
+                        + ", ".join(f"{_a} → {_b}" for _a, _b in _g["misspelt"][:3])
+                        + ")"
+                        if _g["misspelt"]
+                        else ""
+                    )
+                    + f", {len(_g['unknown'])} not in the code"
+                    + (f" ({', '.join(_g['unknown'][:4])})" if _g["unknown"] else "")
+                )
+            self._log_debug("[NAME-GROUNDING] " + " | ".join(_line))
+        except Exception as _e:
+            self._log_debug(
+                f"[NAME-GROUNDING] not measured — {type(_e).__name__}: {_e}"
+            )
 
     def _audit_stats_fidelity(self, body: dict) -> None:
         """Report the Stats block the reader got against the one measured.
@@ -70410,6 +75216,8 @@ class Filter:
         self._audit_tests_shown(body)
         self._audit_stats_fidelity(body)
         self._audit_gap_promotion(body)
+        self._audit_answer_names(body)
+        self._audit_proceed_step(body)
         self._audit_index_versions()
         # Every turn the inlet handed over, measured or not: a speed
         # comparison that only sees pipeline turns is not one.
