@@ -23900,26 +23900,52 @@ class AgenticEvidenceVerifier:
         Of round 16's three claims left "read but unsettled", one named the
         helper that does the filtering (`_reinforce_can_inform`) without
         citing it, and one said how `_note_execution` is called while the
-        call itself sat in a body nobody fetched. Per claim of a subject
-        whose body is held: the call sites of the symbol a claim says is
-        called (_CLAIM_CALL_SHAPE_RE, _call_sites), and the bodies and
-        definitions of up to three symbols its text names
-        (AgenticToolBroker.classify), excerpted around the claim when long.
-        Within agentic_evidence_support_chars, in claim order; nothing
-        already printed is repeated. The judge's quote check covers them,
-        since they are in the bodies it is given. Never raises.
+        call itself sat in a body nobody fetched. For the claims of each
+        subject whose body is held (supporting_texts). Never raises.
 
         Returns:
-            {label: text} to add to the bodies, "" keys never.
+            {label: text} to add to the bodies.
+        """
+        _pairs = [
+            (_subject, str(claims[_i - 1].text or ""))
+            for _subject, _idxs in groups.items()
+            if _subject in bodies
+            for _i in _idxs
+            if 1 <= _i <= len(claims)
+        ]
+        return self.supporting_texts(_pairs, set(bodies), project_id, sources)
+
+    def supporting_texts(
+        self,
+        pairs: List[Tuple[str, str]],
+        held: Set[str],
+        project_id: str,
+        sources: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """
+        Call sites and named bodies that settle claims, beside what is held.
+
+        Per (subject, claim text): the call sites of the symbol a claim
+        says is called (_CLAIM_CALL_SHAPE_RE, _call_sites), and the bodies
+        and definitions of up to three symbols its text names
+        (AgenticToolBroker.classify), excerpted around the claim when long.
+        Within agentic_evidence_support_chars, in claim order; nothing in
+        `held` (names already printed) is repeated. Used by the evidence
+        judge (supporting_bodies) and the forge's (judge_texts). Never
+        raises.
+
+        Returns:
+            {label: text}.
         """
         out: Dict[str, str] = {}
         try:
             broker = AgenticToolBroker(self._f)
+            broker.footer_seen = set()
             budget = int(
                 getattr(self._f.valves, "agentic_evidence_support_chars", 12000)
             )
             used = 0
-            held = set(bodies)
+            held = set(held)
 
             def _named(_text: str) -> List[Tuple[int, str]]:
                 _got: List[Tuple[int, str]] = []
@@ -23932,67 +23958,61 @@ class AgenticEvidenceVerifier:
                             _got.append((_m.start(), _raw))
                 return _got
 
-            for _subject, _idxs in groups.items():
-                if _subject not in bodies:
-                    continue
-                for _i in _idxs:
-                    if not 1 <= _i <= len(claims):
+            for _subject, _text in pairs:
+                _names = _named(_text)
+                _kinds = {
+                    _raw: broker.classify(_raw, project_id) for _, _raw in _names
+                }
+                # ── Step 1: the call sites of what is said to be called ──
+                _shape = _CLAIM_CALL_SHAPE_RE.search(_text)
+                if _shape:
+                    _callable = [
+                        (_pos, _kinds[_raw][0])
+                        for _pos, _raw in _names
+                        if _kinds[_raw][1] == "body"
+                    ]
+                    _before = [
+                        _q for _pos, _q in _callable if _pos < _shape.start()
+                    ]
+                    _target = (
+                        _before[-1]
+                        if _before
+                        else (_callable[0][1] if _callable else "")
+                    )
+                    _key = f"call sites of {_target}"
+                    if _target and _key not in held:
+                        _sites = _call_sites(broker, _target, project_id)
+                        if not _sites.startswith("["):
+                            _sites = _sites[:_PREFETCH_MAX_CHARS]
+                            if used + len(_sites) <= budget:
+                                out[_key] = _sites
+                                held.add(_key)
+                                used += len(_sites)
+                # ── Step 2: the bodies and definitions it names ──
+                _taken = 0
+                for _, _raw in _names:
+                    _spelled, _kind, _ = _kinds[_raw]
+                    if _taken >= 3 or _kind not in ("body", "definition"):
                         continue
-                    _text = str(claims[_i - 1].text or "")
-                    _names = _named(_text)
-                    _kinds = {
-                        _raw: broker.classify(_raw, project_id) for _, _raw in _names
-                    }
-                    # ── Step 1: the call sites of what is said to be called ──
-                    _shape = _CLAIM_CALL_SHAPE_RE.search(_text)
-                    if _shape:
-                        _callable = [
-                            (_pos, _kinds[_raw][0])
-                            for _pos, _raw in _names
-                            if _kinds[_raw][1] == "body"
-                        ]
-                        _before = [
-                            _q for _pos, _q in _callable if _pos < _shape.start()
-                        ]
-                        _target = (
-                            _before[-1]
-                            if _before
-                            else (_callable[0][1] if _callable else "")
-                        )
-                        _key = f"call sites of {_target}"
-                        if _target and _key not in held:
-                            _sites = _call_sites(broker, _target, project_id)
-                            if not _sites.startswith("["):
-                                _sites = _sites[:_PREFETCH_MAX_CHARS]
-                                if used + len(_sites) <= budget:
-                                    out[_key] = _sites
-                                    held.add(_key)
-                                    used += len(_sites)
-                    # ── Step 2: the bodies and definitions it names ──
-                    _taken = 0
-                    for _, _raw in _names:
-                        _spelled, _kind, _ = _kinds[_raw]
-                        if _taken >= 3 or _kind not in ("body", "definition"):
-                            continue
-                        # A bare name the index resolves to a body already
-                        # printed under its qualified name is that body.
-                        if _spelled in held or _spelled.rsplit(".", 1)[-1] in {
-                            _h.rsplit(".", 1)[-1]
-                            for _h in held
-                            if not _h.startswith("call sites of ")
-                        }:
-                            continue
-                        _body = broker.expand_for_claims(
-                            _spelled, project_id, [_text], sources
-                        )
-                        if not _body or _body.lstrip().startswith("["):
-                            continue
-                        if used + len(_body) > budget:
-                            continue
-                        out[_spelled] = _body
-                        held.add(_spelled)
-                        used += len(_body)
-                        _taken += 1
+                    # A bare name the index resolves to a body already
+                    # printed under its qualified name is that body.
+                    if _spelled in held or _spelled.rsplit(".", 1)[-1] in {
+                        _h.rsplit(".", 1)[-1]
+                        for _h in held
+                        if not _h.startswith("call sites of ")
+                    }:
+                        continue
+                    _body = broker.expand_for_claims(
+                        _spelled, project_id, [_text], sources
+                    )
+                    if not _body or _body.lstrip().startswith("["):
+                        continue
+                    if used + len(_body) > budget:
+                        continue
+                    out[_spelled] = _body
+                    held.add(_spelled)
+                    used += len(_body)
+                    _taken += 1
             if out:
                 self._f._log_debug(
                     f"🤖 Evidence: {len(out)} supporting text(s) for what the "
@@ -24029,6 +24049,7 @@ class AgenticEvidenceVerifier:
         # alphabetical so two runs over the same ledger send the same
         # prompt, which a cache prefix depends on.
         broker = AgenticToolBroker(self._f)
+        broker.footer_seen = set()
         budget = int(getattr(self._f.valves, "agentic_evidence_max_chars", 48000))
         _w = weights or {}
         ordered = sorted(subjects, key=lambda s: (-_w.get(s, 1), s))
@@ -24376,6 +24397,24 @@ class AgenticEvidenceVerifier:
         # ── Step 1: nothing to judge, or nothing to judge against ──
         if not texts or not bodies_text.strip():
             return [None] * len(texts)
+        # What the claims name, and the calls they describe, beside the
+        # bodies the cycle read (supporting_texts). Only where the caller
+        # set project_id on this verifier (the forge's two judge calls).
+        _pid = str(getattr(self, "project_id", "") or "")
+        if _pid:
+            _held = set(
+                re.findall(r"### (?:Body|Definition) of ([\w.]+)", bodies_text)
+            ) | set(re.findall(r"(?:def|class)\s+(\w+)", bodies_text))
+            _extra = self.supporting_texts(
+                [("", str(_t)) for _t in texts], _held, _pid
+            )
+            if _extra:
+                bodies_text = (
+                    bodies_text
+                    + "\n\nAlso printed because the claims below name it or "
+                    "describe how it is called — quote it like any body:\n\n"
+                    + "\n\n".join(_extra.values())
+                )
 
         # ── Step 2: nothing in hand that COULD settle any of them ──
         # A quote settles a claim only if the body it comes from mentions
@@ -31841,7 +31880,11 @@ class AgenticToolBroker:
                     f"around what its {len(focus)} claim(s) name instead of "
                     f"cut at {_cap}"
                 )
-                return f"### Body of {qid}\n```\n{_focused}\n```" + _exits_note
+                return (
+                    f"### Body of {qid}\n```\n{_focused}\n```"
+                    + self._body_footer(qid, _focused, project_id)
+                    + _exits_note
+                )
         if len(body) > _cap:
             # Actionable truncation: a silent mid-body cut leaves the model
             # blind to the trailing calls/returns (observed live: a truncated
@@ -31879,7 +31922,60 @@ class AgenticToolBroker:
                     f"inspected — do NOT guess its remaining calls.]"
                     + ("\n" + _past if _past else "")
                 )
-        return f"### Body of {qid}\n```\n{body}\n```" + _exits_note
+        return (
+            f"### Body of {qid}\n```\n{body}\n```"
+            + self._body_footer(qid, body, project_id)
+            + _exits_note
+        )
+
+    # What one prompt already shows as a definition, for a caller laying out
+    # several bodies (_render_focus_symbols, fetch_bodies, the forge's cycle):
+    # set before its fetches, reset after. None outside one.
+    footer_seen: Optional[Set[str]] = None
+    footers_served = 0
+
+    def _body_footer(self, qid: str, shown: str, project_id: str) -> str:
+        """
+        The definitions footer of a body EXPAND serves, fenced, or "".
+
+        Block B and a step's focus carried the constants and Enums a body
+        uses (H45); every other reader of a body did not. Over rounds 15-16,
+        22 of 34 evidence-judge prompts, 19 of 29 forge analyses and 15 of
+        27 forge judgements showed a body without definitions it used: 232
+        in all. Served here, every caller of EXPAND gets them. What the
+        shared context already shows (_definitions_in_shared_context), the
+        symbol itself and, within one caller's prompt, what an earlier
+        body's footer showed (footer_seen) are not repeated. Only for a
+        caller that set footer_seen: a reader of the text, not a parser of
+        the code. Off with agentic_definitions_footer. Never raises.
+        """
+        try:
+            # Opt-in: a caller that reads the text sets footer_seen. Callers
+            # that cut the code out of EXPAND's fence (_body_of, the type
+            # resolver) parse it, and a second fence would break them.
+            if self.footer_seen is None or not getattr(
+                self._f.valves, "agentic_definitions_footer", True
+            ):
+                return ""
+            _skip: Set[str] = self.footer_seen
+            _skip |= set(
+                getattr(self._f, "_definitions_in_shared_context", None) or ()
+            )
+            _skip.add(qid)
+            _owner = ""
+            try:
+                _owner = self._f._symbol_index.get_parent_symbol(qid, project_id)
+            except Exception:
+                _owner = ""
+            _items = _definitions_footer(self, shown, project_id, _owner, _skip)
+            if not _items:
+                return ""
+            for _nm, _ in _items:
+                _note_definition_shown(self._f, _nm)
+            self.footers_served += len(_items)
+            return "\n```\n" + _render_definitions_footer(qid, _items) + "```"
+        except Exception:
+            return ""
 
     # A question names what it suspects in words, and a parameter names it
     # in parts of an identifier: the two meet on a shared 5-letter prefix
@@ -32985,8 +33081,8 @@ class AgenticStepExecutor:
         _footer_skip: Set[str] = set(
             getattr(self._f, "_definitions_in_shared_context", None) or ()
         ) | set(_in_view)
-        _footer_on = bool(getattr(self._f.valves, "agentic_definitions_footer", True))
-        footers = 0
+        _seen_before, _served_before = broker.footer_seen, broker.footers_served
+        broker.footer_seen = _footer_skip
         for sym in _fetchable:
             _spelled, _kind, _chars = broker.classify(sym, project_id)
             if (
@@ -33029,24 +33125,10 @@ class AgenticStepExecutor:
                     continue
                 skipped.append(sym)
                 continue
-            if _footer_on and not body.startswith("["):
-                _owner = ""
-                try:
-                    _owner = self._f._symbol_index.get_parent_symbol(
-                        broker.locate(sym, project_id) or sym, project_id
-                    )
-                except Exception:
-                    pass
-                _items = _definitions_footer(
-                    broker, body, project_id, _owner, _footer_skip
-                )
-                if _items:
-                    for _nm, _ in _items:
-                        _note_definition_shown(self._f, _nm)
-                    body += "\n\n" + _render_definitions_footer(sym, _items)
-                    footers += len(_items)
             served.append(body)
             used += len(body)
+        footers = broker.footers_served - _served_before
+        broker.footer_seen = _seen_before
         skipped.extend(_fetchable[_MAX_TOOLS_PER_ROUND:])
         if already:
             self._f._log_debug(
@@ -38411,6 +38493,18 @@ class AgenticOrchestrator:
                     note=self._f._log_debug,
                 )
             )
+            # The planner's `symbols` are its prediction of what the step
+            # reads; the goal it wrote is the step's own statement of it.
+            # In rounds 15-16, 6 of 61 steps had a goal naming a symbol
+            # that was neither in their focus nor in Block B, and read it
+            # a step late, if at all. Appended, so the planner's order
+            # still decides which bodies take the slots.
+            try:
+                for _nm in self._resolve_need(step.goal or "", project_id)[0][:4]:
+                    if _nm not in (step.symbols or []):
+                        step.symbols = list(step.symbols or []) + [_nm]
+            except Exception:
+                pass
             await self._executor.run(
                 step,
                 aligned_prefix,
@@ -52343,7 +52437,9 @@ class ForgeFactTriangulation:
                 and _o[0].family is EvidenceFamily.STATIC_ANALYSIS
             ]
             if _ask and bodies:
-                _rulings = await AgenticEvidenceVerifier(self._f).judge_texts(
+                _judge = AgenticEvidenceVerifier(self._f)
+                _judge.project_id = getattr(self, "project_id", "")
+                _rulings = await _judge.judge_texts(
                     [facts[_k][0] for _k in _ask],
                     "\n\n".join(bodies),
                     _FORGE_JUDGE_SYSTEM,
@@ -53238,6 +53334,7 @@ class HypothesisForge:
             if _widened:
                 _budget = 9000
             _seen_before = set(_expanded_qids)
+            _broker.footer_seen = set()
 
             def _take(text: str, key: str) -> bool:
                 """Accept a fetched body if it is new and fits."""
@@ -53647,7 +53744,9 @@ class HypothesisForge:
                     # prompts rather than the aligned prefix, which is
                     # not in scope here; the judge follows the same
                     # convention.
-                    _rulings = await AgenticEvidenceVerifier(self._f).judge_texts(
+                    _judge = AgenticEvidenceVerifier(self._f)
+                    _judge.project_id = project_id
+                    _rulings = await _judge.judge_texts(
                         _undecided_txt,
                         "\n\n".join(_expanded_parts),
                         _FORGE_JUDGE_SYSTEM,
@@ -53694,7 +53793,9 @@ class HypothesisForge:
             if _cycle_facts and getattr(
                 self._f.valves, "forge_triangulation_shadow", False
             ):
-                _ruled = await ForgeFactTriangulation(self._f).rule_cycle(
+                _tri = ForgeFactTriangulation(self._f)
+                _tri.project_id = project_id
+                _ruled = await _tri.rule_cycle(
                     _cycle_facts, _expanded_parts, _cycle, hyp_text, _dossier
                 )
             _dossier.confirmed_checks = _n_conf_e
