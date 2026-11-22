@@ -19696,6 +19696,37 @@ def _squash_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s.replace("\\n", " ").replace("⏎", " ")).strip()
 
 
+_QUOTE_CHARS_RE = re.compile(r"[\"'`]")
+
+
+def _quote_key(text: str) -> str:
+    """Text as a judge's quote is checked against it: squashed as
+    _squash_ws does, with ', " and ` read as one character.
+
+    A judge writing JSON turns the code's double quotes into single ones
+    rather than escape them, so `resolve("EXPAND", ...)` came back as
+    `resolve('EXPAND', ...)`, was not found literally, and a correct ruling
+    was dropped as "quote not found in any body": 18 of 136 rulings in
+    round 17, and the turn that asked why could not say. The same goes
+    for a `\n` written as a line break, which _squash_ws already absorbs.
+    """
+    return _QUOTE_CHARS_RE.sub("'", _squash_ws(str(text or "")))
+
+
+_JSON_FENCE_RE = re.compile(r"^\s*```[\w-]*[ \t]*\r?\n?|\r?\n?[ \t]*```\s*$")
+
+
+def _unfence_json(text: str) -> str:
+    """A JSON reply without a fence around it, and with nothing else removed.
+
+    The judges' replies were cleaned with .replace("```", ""), which also
+    emptied the backticks out of a quoted line such as
+    `cleaned = response.replace("```json", "")`: a quote no body holds, and
+    one the bodies hold now that ingestion keeps backticks.
+    """
+    return _JSON_FENCE_RE.sub("", str(text or "")).strip()
+
+
 def _quotes_in(output: str) -> List[str]:
     """The code a judge's output quotes, whitespace squashed."""
     out: List[Any] = []
@@ -19735,11 +19766,11 @@ def _evidence_set(
                 keep.add(q)
         if kind != "judge":
             continue
-        quotes = _quotes_in(text)
+        quotes = [_QUOTE_CHARS_RE.sub("'", _s) for _s in _quotes_in(text)]
         if not quotes:
             continue
         if flat is None:
-            flat = {q: _squash_ws(b) for q, b in shown.items()}
+            flat = {q: _quote_key(b) for q, b in shown.items()}
         for q, body in flat.items():
             if q in keep or (scope and q not in scope):
                 continue
@@ -24193,7 +24224,7 @@ class AgenticEvidenceVerifier:
             return {}
 
         # ── Step 2: parse, refusing anything malformed ──
-        cleaned = response.replace("```json", "").replace("```", "").strip()
+        cleaned = _unfence_json(response)
         raw = None
         try:
             raw = json.loads(cleaned).get("verdicts", [])
@@ -24228,9 +24259,9 @@ class AgenticEvidenceVerifier:
         # What a quote is checked against: each body as shown, and for a
         # subject shown as an excerpt, its whole body too. Round 9 discarded
         # 3 correct verdicts that quoted lines its excerpts had left out.
-        _shown = {s: " ".join(b.split()) for s, b in bodies.items()}
+        _shown = {s: _quote_key(b) for s, b in bodies.items()}
         _whole = {
-            s: " ".join(str(b).split())
+            s: _quote_key(str(b))
             for s, b in (sources or {}).items()
             if s in bodies and b
         }
@@ -24282,8 +24313,8 @@ class AgenticEvidenceVerifier:
             # that the judgement was made against code the judge was shown;
             # which of the shown bodies carried the line does not bear on it.
             if verdict in ("supported", "contradicted"):
-                _flat = " ".join(quote.split())
-                _flats = [" ".join(q.split()) for q in _quotes]
+                _flat = _quote_key(quote)
+                _flats = [_quote_key(q) for q in _quotes]
                 # Every element, not the joined string: a claim about
                 # four exits is settled by four quotes, and one that
                 # is not found still discards the whole verdict.
@@ -24477,20 +24508,20 @@ class AgenticEvidenceVerifier:
             return [None] * len(texts)
 
         # ── Step 3: parse and enforce the quote rule ──
-        cleaned = response.replace("```json", "").replace("```", "").strip()
+        cleaned = _unfence_json(response)
         try:
             raw = json.loads(cleaned).get("verdicts", [])
             assert isinstance(raw, list)
         except Exception:
             return [None] * len(texts)
-        flat = " ".join(bodies_text.split())
+        flat = _quote_key(bodies_text)
         out: List[Optional[bool]] = [None] * len(texts)
         dropped = 0
         for rv in raw:
             try:
                 n = int(rv.get("claim", 0))
                 verdict = str(rv.get("verdict", "")).strip().lower()
-                quote = " ".join(str(rv.get("quote", "")).split())
+                quote = _quote_key(str(rv.get("quote", "")))
             except Exception:
                 continue
             if not (1 <= n <= len(texts)):
@@ -46567,6 +46598,14 @@ class PatchApplier:
 # code, and indexed 0 symbols. Same groups as the valve's pattern.
 _FENCE_TRAILING_WS_RE = re.compile(r"```(\w*)[ \t]+\r?\n(.*?)```", re.DOTALL)
 
+# A fence glued to the text before it: "así:```python" or "x = 1```". The
+# run must end its line, after an optional language; one that does not is
+# code, as in replace("```json", ""), which the repair used to split with
+# a newline inside the string. Unseen while ingestion turned every
+# backtick into a quote: 144 lines of this plugin's own source match the
+# old pattern, and 1 comment this one.
+_GLUED_FENCE_RE = re.compile(r"([^\n`])(```[\w+-]*[ \t]*)(?=\r?\n|$)")
+
 
 class CodeBlockManager:
     """
@@ -47327,20 +47366,24 @@ class CodeBlockManager:
     @staticmethod
     def sanitize_text(text: str) -> str:
         """
-        Remove non-printable characters and replace backticks with single quotes.
+        Remove non-printable characters, and nothing else.
 
-        This prevents control characters from breaking the prompt formatting
-        and ensures backticks don't interfere with fenced code blocks.
+        It also turned every backtick into a single quote, so that none
+        could close a fenced block of the prompt. Only a run of three at
+        the start of a line can, and code seldom has one; code with a
+        backtick is common. 315 of the 1143 functions of this plugin's own
+        source have one, and each was shown, judged and run in the sandbox
+        as code nobody wrote: round 17 answered with a `_claim_terms` whose
+        regexes match quotes where the real ones match backticks, and ran
+        its tests against that copy.
 
         Args:
             text: The text to sanitize.
 
         Returns:
-            Sanitized text with no control characters and backticks replaced.
+            The text without control characters.
         """
-        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
-        cleaned = cleaned.replace("`", "'")
-        return cleaned
+        return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
 
     @staticmethod
     def format_block_context(block: "CodeBlock", is_latest: bool) -> str:
@@ -63977,6 +64020,66 @@ class MessageAssembler:
             "WHEN YOU WRITE CODE IN THIS REPLY: " + "; ".join(_rules) + "."
         )
 
+    def _evidence_only_injections(
+        self,
+        rest: List[Tuple[str, str]],
+        trailing: List[Tuple[str, str]],
+        need: int,
+        budget: int,
+    ) -> List[Tuple[str, str]]:
+        """
+        An over-budget answer prompt's injections, without the unused bodies.
+
+        The cut _evidence_only_parts makes after assembly, made before the
+        budget is applied: the bodies no agent used would leave anyway, and
+        leaving first they make the room the workspace needs, so code is cut
+        only if that is not enough. Records the turn's evidence stats and
+        marks the cut done, so the assembled prompt is not cut twice. Any
+        doubt returns `rest` as it came. Never raises.
+        """
+        try:
+            _f = self._f
+            if not getattr(_f.valves, "final_evidence_only", False):
+                return rest
+            _reg = getattr(_f, "_block_b_bodies_this_turn", None) or {}
+            _outs = list(getattr(_f, "_evidence_outputs_this_turn", None) or [])
+            _fm = re.search(
+                r"<agentic_findings>.*?</agentic_findings>",
+                "\n".join(_t for _, _t in trailing if _t),
+                re.S,
+            )
+            if not (_reg and _outs and _fm):
+                return rest
+            _q = str(
+                getattr(getattr(_f, "_agentic", None), "_turn_question", "") or ""
+            )[:20000]
+            _parts, _info = _evidence_only_prompt(
+                [_t or "" for _, _t in rest], _reg, _outs, _fm.group(0), _q
+            )
+            _f._evidence_stats_this_turn = {
+                "bodies": _info["bodies"],
+                "dropped": list(_info["dropped"]),
+                "chars": _info["chars"],
+            }
+            _f._evidence_cut_before_fit = True
+            _gone = _info["dropped"]
+            _f._log_debug(
+                f"🧹 Answer prompt over budget ({need} of {budget} tokens): "
+                + (
+                    f"{_info['kept']} of {_info['bodies']} Block B bodies kept, "
+                    f"{len(_gone)} left out before fitting ({_info['chars']} "
+                    f"chars): "
+                    + ", ".join(_gone[:8])
+                    + ("…" if len(_gone) > 8 else "")
+                    if _gone
+                    else f"no body to leave out ({_info['reason'] or 'all used'})"
+                )
+            )
+            return [(_p, _parts[_i]) for _i, (_p, _) in enumerate(rest)]
+        except Exception as _e:
+            self._f._log_debug(f"evidence-only before fitting skipped ({_e!r})")
+            return rest
+
     def _evidence_only_parts(self, head: str, moved: str) -> Tuple[str, str]:
         """
         The answer prompt's two Block B carriers, without the bodies no step used.
@@ -64052,6 +64155,8 @@ class MessageAssembler:
         """
         budget = self._f.valves.global_injection_token_budget
         priority_order = _INJECTION_PRIORITY
+        self._f._evidence_cut_before_fit = False
+        self._f._answer_trailing_text = ""
 
         # ── Restate the declared code preferences at the true end ───────────
         # Appended here, after the agentic pipeline has already appended its
@@ -64114,6 +64219,20 @@ class MessageAssembler:
 
         if budget > 0 and self._f.tokenizer:
             dynamic_injections.sort(key=lambda x: priority_order.get(x[0], 99))
+            # The workspace — findings, directives, the Stats lines the answer
+            # copies — is what the answer is written from, and it came last:
+            # when Block B filled the budget it was cut or dropped whole, and
+            # the answer copied the previous turn's Stats (round 17, turns 3
+            # and 4; once in round 15, twice in 16). It now has the first
+            # claim on the budget, the bodies no agent used leave next
+            # (_evidence_only_injections), and only then is code cut.
+            _trailing = [
+                _x for _x in dynamic_injections if _x[0] in _INJECTION_TRAILING
+            ]
+            _rest = [
+                _x for _x in dynamic_injections if _x[0] not in _INJECTION_TRAILING
+            ]
+            dynamic_injections = _trailing + _rest
             selected_dynamic: List[Tuple[str, str]] = []
             used_dyn = 0
             static_tokens = (
@@ -64136,6 +64255,13 @@ class MessageAssembler:
                 budget - static_tokens - hub_tier_tokens - user_prompt_tokens,
             )
 
+            _need = sum(
+                len(self._f.tokenizer.encode(_t)) for _, _t in dynamic_injections if _t
+            )
+            if _need > dyn_budget:
+                dynamic_injections = _trailing + self._evidence_only_injections(
+                    _rest, _trailing, _need, dyn_budget
+                )
             for prio, text in dynamic_injections:
                 if not text:
                     continue
@@ -64150,6 +64276,12 @@ class MessageAssembler:
                             (prio, text[: avail * 4] + "\n[truncated]")
                         )
                         break
+            if _need > dyn_budget:
+                self._f._answer_trailing_text = "\n\n".join(
+                    _t
+                    for _p, _t in _order_injections_for_render(selected_dynamic)
+                    if _p in _INJECTION_TRAILING
+                )
             dynamic_block = "\n\n".join(
                 t for _, t in _order_injections_for_render(selected_dynamic)
             )
@@ -64341,6 +64473,15 @@ class MessageAssembler:
                 _head = ""
                 if _cut is _pre_full and _stab and _pre_full.startswith(_stab):
                     _head = _pre_full[len(_stab) :].strip()
+                # Over budget the answer prompt stops extending the prelim —
+                # bodies left, or code was cut, to make room for the
+                # workspace — and the cut lands on _stab. Block B still goes
+                # in front of the question, where every other turn puts it.
+                _tail_txt = getattr(self._f, "_answer_trailing_text", "") or ""
+                if _cut is _stab and _tail_txt:
+                    _i = _moved.rfind(_tail_txt)
+                    if _i > 0 and _moved[:_i].strip():
+                        _head, _moved = _moved[:_i].strip(), _moved[_i:]
                 _last_user = None
                 for _m in reversed(messages):
                     if isinstance(_m, dict) and _m.get("role") == "user":
@@ -64350,7 +64491,8 @@ class MessageAssembler:
                     _last_user.get("content"), str
                 ):
                     _had_head = bool(_head)
-                    _head, _moved = self._evidence_only_parts(_head, _moved)
+                    if not getattr(self._f, "_evidence_cut_before_fit", False):
+                        _head, _moved = self._evidence_only_parts(_head, _moved)
                     final_system = _stab if _had_head else _cut
                     _last_user["content"] = (
                         (_head + "\n\n" if _head else "")
@@ -69431,12 +69573,12 @@ class InletOrchestrator:
         # The model sometimes glues an opening fence to the prose before it
         # ("así:```python"). Left as-is it defeats the fence regexes that
         # need a newline and re-enters the history to be imitated. Insert
-        # the newline before any ``` not at line start and not part of a
-        # longer run, and write the repaired text back into the in-place
-        # history. Runs BEFORE response_hash so idempotency keys the repair.
+        # the newline before a glued fence (_GLUED_FENCE_RE), and write the
+        # repaired text back into the in-place history. Runs BEFORE
+        # response_hash so idempotency keys the repair.
         # ------------------------------------------------------------------
         if self._f.valves.normalize_glued_fences and "```" in assistant_content:
-            _repaired = re.sub(r"([^\n`])(```)", r"\1\n\2", assistant_content)
+            _repaired = _GLUED_FENCE_RE.sub(r"\1\n\2", assistant_content)
             if _repaired != assistant_content:
                 self._f._log_debug(
                     "prev-assistant: repaired glued code fence(s) in "
@@ -77854,7 +77996,7 @@ class Filter:
                 elif isinstance(_last_a.get("content"), str) and (
                     "```" in _last_a["content"]
                 ):
-                    _fixed = re.sub(r"([^\n`])(```)", r"\1\n\2", _last_a["content"])
+                    _fixed = _GLUED_FENCE_RE.sub(r"\1\n\2", _last_a["content"])
                     if _fixed != _last_a["content"]:
                         _last_a["content"] = _fixed
                         self._log_debug(
