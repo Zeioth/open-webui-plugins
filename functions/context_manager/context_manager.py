@@ -980,7 +980,10 @@ _GAPS_WORDS: Dict[str, Dict[str, str]] = {
         ),
     },
 }
-_GAPS_CLAIM_CHARS = 110
+# Round 17 cut a 140-char claim at 110 and the answer copied it, "…" and
+# all, translated; claims run 60-200 chars. Past this, the cut lands at a
+# clause boundary when there is one in the second half.
+_GAPS_CLAIM_CHARS = 240
 
 
 def _answer_heading_language(answer: str) -> str:
@@ -1435,6 +1438,18 @@ _RECHECK_LINE_RE = re.compile(
 )
 
 
+def _gaps_claim_cut(text: str) -> str:
+    """A claim as the gaps line quotes it: whole when it fits, else cut."""
+    _t = text.rstrip(" .,;:")
+    if len(_t) <= _GAPS_CLAIM_CHARS:
+        return _t
+    _head = _t[:_GAPS_CLAIM_CHARS]
+    _at = max(_head.rfind(_s) for _s in (", ", "; ", " — ", " - ", ": "))
+    if _at < _GAPS_CLAIM_CHARS // 2:
+        _at = _head.rfind(" ")
+    return _head[:_at].rstrip(" .,;:—-") + "…"
+
+
 def _gaps_outline_body(
     open_claims: List[str],
     n_unoperationalizable: int,
@@ -1452,16 +1467,10 @@ def _gaps_outline_body(
     # ── Step 1: the parts that have something to report ──
     _parts: List[str] = []
     if open_claims:
-        # Cut at a word: "…as the count of cons…" was copied into an answer
-        # as it stood, half a word and all.
+        # Cut at a clause, else a word: "…as the count of cons…" was
+        # copied into an answer as it stood, half a word and all.
         _quoted = [
-            "«"
-            + (
-                _t.rstrip(" .,;:")
-                if len(_t) <= _GAPS_CLAIM_CHARS
-                else _t[:_GAPS_CLAIM_CHARS].rsplit(" ", 1)[0].rstrip(" .,;:") + "…"
-            )
-            + "»"
+            "«" + _gaps_claim_cut(_t) + "»"
             for _t in (" ".join(str(_c).split()) for _c in open_claims[:2])
             if _t
         ]
@@ -19713,6 +19722,143 @@ def _quote_key(text: str) -> str:
     return _QUOTE_CHARS_RE.sub("'", _squash_ws(str(text or "")))
 
 
+# The contract's example anchor. Round 18's contract gave a real-looking
+# one, `_quote_key(b)`, and a second reading copied it for 8 claims.
+_ANCHOR_PLACEHOLDER = "<characters copied from those lines>"
+
+
+def _bare_run(
+    anchor: Any, texts: List[str], once: bool = False
+) -> Optional[Tuple[int, int]]:
+    """Where a whitespace-free anchor first occurs in `texts`, as the
+    (first, last) line indexes it spans, or None — and None too, with
+    `once`, when its first part occurs twice. A list is fragments that
+    must follow one another in order. One find per fragment over the lines
+    joined, mapped back by their lengths."""
+    _frags = [anchor] if isinstance(anchor, str) else list(anchor)
+    if not _frags or not all(_frags):
+        return None
+    _bare = [re.sub(r"\s+", "", _quote_key(_x)) for _x in texts]
+    _all = "".join(_bare)
+    _i = _all.find(_frags[0])
+    if _i < 0 or (once and _all.find(_frags[0], _i + 1) >= 0):
+        return None
+    _end = _i + len(_frags[0])
+    for _f in _frags[1:]:
+        _j = _all.find(_f, _end)
+        if _j < 0:
+            return None
+        _end = _j + len(_f)
+    _at, _first = 0, None
+    for _k, _b in enumerate(_bare):
+        _next = _at + len(_b)
+        if _first is None and _i < _next:
+            _first = _k
+        if _first is not None and _end <= _next:
+            return _first, _k
+        _at = _next
+    return None
+
+
+def _anchor_lines(
+    anchor: str, nums: List[int], cited: Dict[int, Tuple[str, str]]
+) -> List[int]:
+    """The numbered lines an anchor (a _quote_key) names, or [].
+
+    In order: the cited lines; one line within three of a cited one; the
+    cited span widened to three lines before and six after, so an anchor
+    that runs over a statement's lines is found — the lines it spans are
+    the citation; and, for an anchor of 15 chars or more, the one place it
+    occurs in the body the cited lines belong to, however far the number
+    is. Whitespace is ignored on both sides (`_log_section("X"` is a call
+    written over three lines), and an anchor with "..." is matched by its
+    fragments — by its one fragment of 15 chars or more when the rest was
+    elided arguments. Round 19: 7 anchors ran over two or three lines, 4
+    sat once in their body far from the number given.
+    """
+    if len(anchor) < 3 or anchor == _quote_key(_ANCHOR_PLACEHOLDER) or not nums:
+        return []
+    _a = re.sub(r"\s+", "", anchor)
+    _fr = [_a]
+    if _ELISION_RE.search(_a):
+        _fr = [_f for _f in _ELISION_RE.split(_a) if len(_f) >= 4]
+        if not _fr or sum(len(_f) for _f in _fr) < (15 if len(_fr) == 1 else 12):
+            return []
+    _size = sum(len(_f) for _f in _fr)
+
+    def _has(_ns: List[int]) -> bool:
+        return _bare_run(_fr, [cited[_n][1] for _n in _ns]) is not None
+
+    if _has(nums):
+        return nums
+    for _n in nums:
+        for _m in range(_n - 3, _n + 4):
+            if _m in cited and cited[_m][0] == cited[_n][0] and _has([_m]):
+                return [_m]
+    _label = cited[nums[0]][0]
+    for _span in (
+        [
+            _m
+            for _m in range(min(nums) - 3, max(nums) + 7)
+            if _m in cited and cited[_m][0] == _label
+        ],
+        sorted(_m for _m, (_l, _) in cited.items() if _l == _label)
+        if _size >= 15
+        else [],
+    ):
+        _run = _bare_run(_fr, [cited[_m][1] for _m in _span], once=len(_span) > 10)
+        if _run:
+            return _span[_run[0] : _run[1] + 1]
+    return []
+
+
+# A judge's elision: "a ... b" stitches lines the body holds apart.
+_ELISION_RE = re.compile(r"\s*(?:\.\.\.|…)\s*")
+# A line the judge prompt numbered (AgenticEvidenceVerifier._number_lines).
+_CITED_LINE_NO_RE = re.compile(r"(?m)^[ \t]*\d{1,6}│ ?")
+_COMMENT_LINE_RE = re.compile(r"(?m)^[ \t]*#[^\n]*\n?")
+
+
+def _code_keys(text: str) -> Tuple[str, str]:
+    """A body as quotes are checked against it: _quote_key of it, and of it
+    without its comment-only lines, which a judge quoting several lines
+    skips (round 18: 733 chars, literal but for one comment)."""
+    _t = str(text or "")
+    return _quote_key(_t), _quote_key(_COMMENT_LINE_RE.sub("", _t))
+
+
+def _quote_found(quote_key: str, body_key: str) -> bool:
+    """Whether a quote (a _quote_key) is in a body (one of _code_keys).
+
+    Literally, or as a judge's elision: fragments split at "..." or "…",
+    each literal, in order, in the same body — at least two of 4 chars or
+    more, one of them 20 or more, so "x ... y" proves nothing. Round 18
+    lost 19 correct rulings to the elision, 12 of them in one turn.
+    """
+    if not quote_key or not body_key:
+        return False
+    if quote_key in body_key:
+        return True
+    _frags = [
+        _f for _f in (_x.strip() for _x in _ELISION_RE.split(quote_key))
+        if len(_f) >= 4
+    ]
+    if len(_frags) < 2 or max(len(_f) for _f in _frags) < 20:
+        return False
+    _at = 0
+    for _f in _frags:
+        _i = body_key.find(_f, _at)
+        if _i < 0:
+            return False
+        _at = _i + len(_f)
+    return True
+
+
+def _quote_in(quote_key: str, keys: Tuple[str, ...]) -> bool:
+    """_quote_found against any of a body's keys."""
+    return any(_quote_found(quote_key, _k) for _k in keys or ())
+
+
 _JSON_FENCE_RE = re.compile(r"^\s*```[\w-]*[ \t]*\r?\n?|\r?\n?[ \t]*```\s*$")
 
 
@@ -19766,7 +19912,14 @@ def _evidence_set(
                 keep.add(q)
         if kind != "judge":
             continue
-        quotes = [_QUOTE_CHARS_RE.sub("'", _s) for _s in _quotes_in(text)]
+        quotes = [
+            _q
+            for _q in (
+                _QUOTE_CHARS_RE.sub("'", _ELISION_RE.split(_s)[0]).strip()
+                for _s in _quotes_in(text)
+            )
+            if len(_q) >= 15
+        ]
         if not quotes:
             continue
         if flat is None:
@@ -22952,6 +23105,12 @@ class AgenticEvidenceLedger:
         _kind = claim.evidence_type or "reasoning"
         if _state == "unoperationalizable":
             return "unoperationalizable"
+        # A conclusion drawn from the code, as the judge ruled it: round
+        # 19's "if the discrepancy exists, it must be caused by (a) or (b)"
+        # counted against the turn as unresolved, which no reading could
+        # change.
+        if _state == "inference":
+            return "inference"
         if not _state:
             # Nothing ran — but WHY matters. A claim whose own subject was
             # never read is blind: retrieval failed, and that is a fixable
@@ -22992,6 +23151,7 @@ class AgenticEvidenceLedger:
         "blind",
         "uncovered",
         "unoperationalizable",
+        "inference",
     )
 
     def _proposition_key(self, claim: "LedgerClaim") -> tuple:
@@ -23081,6 +23241,29 @@ class AgenticEvidenceLedger:
                             _survivors.append(_top)
                 _keep.extend(_survivors)
                 _removed += len(_members) - len(_survivors)
+
+            # ── Step 2b: the same sentence under two subjects is one ──
+            # Round 18 recorded "Filter._cut_census_this_turn is not defined
+            # as a method on Filter" under Filter, confirmed, and under the
+            # attribute, blind: one assertion, counted settled and unread.
+            _by_text: Dict[str, List[Any]] = {}
+            for _c in _keep:
+                _by_text.setdefault(
+                    " ".join(str(_c.text or "").lower().split()), []
+                ).append(_c)
+            _keep = []
+            for _txt, _ms in _by_text.items():
+                if (
+                    len(_ms) == 1
+                    or not _txt
+                    or {"confirmed", "refuted"} <= {_m.verification for _m in _ms}
+                ):
+                    _keep.extend(_ms)
+                    continue
+                _keep.append(
+                    min(_ms, key=lambda _m: _rank.get(self.bucket_of(_m), 99))
+                )
+                _removed += len(_ms) - 1
 
             # ── Step 3: rewrite in the original order ──
             if _removed:
@@ -23401,6 +23584,7 @@ class AgenticEvidenceLedger:
             "blind": 0,
             "unoperationalizable": 0,
             "uncovered": 0,
+            "inference": 0,
         }
         # ── Step 2: place each claim by its verdict and its evidence ──
         # `blind` is split out of `structural` because the two mean opposite
@@ -23411,6 +23595,8 @@ class AgenticEvidenceLedger:
         # opened. Folding them together hides exactly the case worth finding.
         for claim in self.claims:
             out[self.bucket_of(claim)] += 1
+        # An inference is reported, not checked: out of the denominator.
+        out["total"] -= out["inference"]
         return out
 
     # ──────────────────────────────────────────────────────────────────────
@@ -23770,6 +23956,18 @@ _CALL_TARGET_RE = re.compile(
 )
 
 
+# Claims per evidence-judge call (AgenticEvidenceVerifier.judge).
+_JUDGE_LOT_CLAIMS = 10
+# Why a ruling is read again (AgenticEvidenceVerifier.judge).
+_REASK_REASONS = frozenset(
+    {
+        "quote not found in any body",
+        "its cited lines do not hold its anchor",
+        "quote came from another symbol's body",
+    }
+)
+
+
 class AgenticEvidenceVerifier:
     """Settle behavioural claims by reading the code they describe.
 
@@ -23801,12 +23999,12 @@ class AgenticEvidenceVerifier:
         "body is where the answer usually is. Some claims describe what "
         "one symbol obtains from another: 'A reads X from B'. Those are "
         "settled by B's body, and if B's body is also printed here you "
-        "may quote it. Quote only what is printed; a quote from code not "
+        "may cite it. Cite only what is printed; a citation of code not "
         "shown is discarded.\n\n"
         "Return ONLY a JSON object:\n"
         '{"verdicts": [{"claim": 1, "verdict": "supported", '
-        '"quote": "<literal text copied from the body>"}, '
-        '{"claim": 2, "verdict": "indeterminate", "quote": ""}]}\n\n'
+        '"lines": [57, 58], "anchor": "<characters copied from those lines>"}, '
+        '{"claim": 2, "verdict": "indeterminate", "lines": []}]}\n\n'
         "EVERY entry carries its own `claim` number, copied from the "
         "number printed beside that claim above. It is not optional and "
         "it does not carry over from the entry before: an entry without "
@@ -23822,19 +24020,35 @@ class AgenticEvidenceVerifier:
         'when the body states otherwise, "indeterminate" when the body '
         "shown does not settle it — which is a correct and useful answer, "
         "not a failure.\n"
-        'For "supported" and "contradicted" the quote is REQUIRED and '
-        "must be copied character for character from the body: it is "
-        "checked. A claim about SEVERAL places takes several quotes: "
-        "pass a LIST, one per place, and every one is checked, so a "
-        "claim that four exits do something is settled by four quotes "
-        "or not at all. A verdict whose quote is not found in the body is "
-        "discarded and the claim is recorded as unsettled, so an "
-        "approximate quote is worth less than an honest "
-        '"indeterminate".\n'
+        'For "supported" and "contradicted", `lines` is REQUIRED: the '
+        "numbers printed at the left of the code lines that state it, "
+        "before the │. Give an `anchor` too: a few characters copied from "
+        "one of those lines — the name, call or value that decides the "
+        "claim. Do not copy whole lines: the code is read back from the "
+        "numbers, and the anchor is checked against it. A claim about "
+        "SEVERAL places cites a line in each, so a claim that four exits "
+        "do something is settled by four lines or not at all. A ruling "
+        "whose lines do not hold its anchor is discarded and the claim is "
+        "recorded as unsettled, so a guessed number is worth less than an "
+        'honest "indeterminate".\n'
         "A claim that one symbol does something THROUGH or VIA another, or "
         "that a call is made WITH certain arguments, is contradicted by "
-        "the line that does it another way: quote that line (a call site "
-        "printed above counts). The absence of a line is not a quote.\n"
+        "the line that does it another way: cite that line (a call site "
+        "printed above counts). The absence of a line is not a citation.\n"
+        "Under some bodies the plugin prints SEARCH FACTS: how often a name "
+        "occurs in that body or in the project, from a complete search. A "
+        "claim that something is never called, never read, not done or "
+        "absent is settled by citing the search fact that shows it, and "
+        "contradicted by one that finds it. A search marked capped proves "
+        "no absence.\n"
+        'verdict is "inference" when the claim is not a fact about the '
+        "code but a conclusion drawn from it — a cause guessed at, a "
+        '"must be either A or B", a prediction, an explanation of why '
+        "something happens at run time — or a statement about this prompt "
+        "rather than the code (\"X is not provided\", \"none of the "
+        "symbols shown does Y\"): no line can settle it. It is reported "
+        "apart and counts neither way; give no lines. A claim about what "
+        "the code does, even one hard to settle, is not an inference.\n"
     )
 
     def __init__(self, filt):
@@ -23867,6 +24081,16 @@ class AgenticEvidenceVerifier:
         # nobody opened the symbol the claim describes.
         if not claim.subject:
             return False
+        # A constant has no call edge for the graph to check, so a claim
+        # about what it holds is settled by reading it or not at all: round
+        # 18's claim about what _PROSE_CODE_NAME_RE matches never ran.
+        _bare = claim.subject.rsplit(".", 1)[-1]
+        if (
+            not claim.verification
+            and len(_bare) > 2
+            and re.fullmatch(r"_*[A-Z][A-Z0-9_]*", _bare)
+        ):
+            return True
         # The subject's own body, not the citation list: the loop this
         # breaks is 'nobody read X, so the claim about X is labelled
         # structural, so nobody ever reads X'. A claim that merely
@@ -24101,6 +24325,8 @@ class AgenticEvidenceVerifier:
                 else broker.resolve("EXPAND", subject, project_id)
             )
             if not text or text.lstrip().startswith("["):
+                text = self._body_under_real_name(broker, subject, project_id)
+            if not text:
                 continue
             bodies[subject] = text
             used += len(text)
@@ -24115,6 +24341,96 @@ class AgenticEvidenceVerifier:
                 f"unread — raise agentic_evidence_max_chars to cover them"
             )
         return bodies
+
+    def narrow_subjects(self, claims: List["LedgerClaim"], project_id: str) -> int:
+        """Re-subject a claim made about a class to the one member it names.
+
+        "EvidenceObservation.coerce rebuilds the tuple from a JSON list"
+        was recorded under the class `EvidenceObservation`; a class has no
+        body the judge can read whole, so the claim never reached one
+        (round 20, the only "unchecked" claim of the run). When the text
+        names exactly one `Class.member` the index holds, that member is
+        the subject. Only open claims, only a bare class name. Never
+        raises; returns how many moved.
+        """
+        _moved = 0
+        try:
+            _si = self._f._symbol_index
+            for _c in claims:
+                _s = str(getattr(_c, "subject", "") or "")
+                if _c.verification or not re.fullmatch(r"[A-Z][A-Za-z0-9_]*", _s):
+                    continue
+                _ms = [
+                    _m
+                    for _m in dict.fromkeys(
+                        re.findall(
+                            r"\b" + re.escape(_s) + r"\.([A-Za-z_]\w*)", _c.text or ""
+                        )
+                    )
+                    if _si.find_blocks(f"{_s}.{_m}", project_id)
+                ]
+                if len(_ms) != 1:
+                    continue
+                _new = f"{_s}.{_ms[0]}"
+                _c.subject = _new
+                if _new not in (_c.valid_qids or []):
+                    _c.valid_qids = list(_c.valid_qids or []) + [_new]
+                _moved += 1
+            if _moved:
+                self._f._log_debug(
+                    f"🤖 Evidence: {_moved} claim(s) about a class re-subjected "
+                    f"to the member they name"
+                )
+        except Exception as _e:
+            self._f._log_debug(f"🤖 Evidence: subject narrowing skipped ({_e!r})")
+        return _moved
+
+    def _body_under_real_name(
+        self, broker: "AgenticToolBroker", subject: str, project_id: str
+    ) -> str:
+        """A subject's code when its name as cited has none, or "".
+
+        The name the code holds it under (locate): round 18 cited the
+        module function `_states_only_the_call` as a method of
+        `ForgeFactTriangulation`, and the claim never reached a judge. Else
+        its definition — a constant, a class attribute, a small class
+        (definition) — as the body the judge reads: a claim about what
+        `_PROSE_CODE_NAME_RE` matches is settled by the regex itself.
+        Never raises.
+
+        The name as cited is then a body seen this turn: round 20 settled
+        `ForgeFactTriangulation._states_only_the_call` three times from the
+        module function's code and still counted it "asserted unread",
+        because the unread list (refreshed from the bodies seen) held the
+        cited spelling, which no body is ever shown under.
+        """
+        try:
+            _seen = getattr(self._f, "_bodies_seen_this_turn", None)
+            _sp = broker.locate(subject, project_id) or ""
+            if _sp and _sp != subject:
+                _text = broker.resolve("EXPAND", _sp, project_id)
+                if _text and not _text.lstrip().startswith("["):
+                    self._f._log_debug(
+                        f"🤖 Evidence: {subject} read as {_sp}, the name the "
+                        f"code holds it under"
+                    )
+                    if isinstance(_seen, set):
+                        _seen.add(subject)
+                    return _text
+            _name = _sp or subject
+            _nm, _src = broker.definition(
+                _name, project_id, "class" if "." in _name else "module"
+            )
+            if _src:
+                self._f._log_debug(
+                    f"🤖 Evidence: {subject} read from its definition ({_nm})"
+                )
+                if isinstance(_seen, set):
+                    _seen.add(subject)
+                return f"### Definition of {_nm or _name}\n```\n{_src}\n```"
+        except Exception as _e:
+            self._f._log_debug(f"🤖 Evidence: {subject} unresolved ({_e!r})")
+        return ""
 
     def tally_shortened(
         self,
@@ -24162,13 +24478,15 @@ class AgenticEvidenceVerifier:
         groups: Dict[str, List[int]],
         bodies: Dict[str, str],
     ) -> str:
-        """Lay out each body followed by the claims made about it."""
+        """Lay out each body, its lines numbered, followed by its claims."""
         # ── Step 1: one section per subject whose body we hold ──
+        self._cited = {}
+        self._next_line = 1
         parts: List[str] = []
         for subject, idxs in groups.items():
             if subject not in bodies:
                 continue
-            parts.append(bodies[subject])
+            parts.append(self._number_lines(bodies[subject], subject))
             parts.append(f"\nClaims about {subject}:")
             for n in idxs:
                 parts.append(f"{n}. {claims[n - 1].text}")
@@ -24181,10 +24499,211 @@ class AgenticEvidenceVerifier:
                 "how it is called — quote it like any body:\n"
             )
             for _k in _extra:
-                parts.append(bodies[_k])
+                parts.append(self._number_lines(bodies[_k], _k))
                 parts.append("")
         # ── Step 3: the contract goes last, after all the evidence ──
         return "\n".join(parts) + "\n" + self._CONTRACT
+
+    def _search_facts(
+        self, subject: str, texts: List[str], whole: str, project_id: str
+    ) -> str:
+        """What the code holds of the names a subject's claims use, counted.
+
+        No line shows that something is absent, so a claim that a symbol
+        never calls X, that nothing does Y, or that a value is written and
+        never read could only come back indeterminate — round 19's three
+        absence claims and its `_forge_hypothesis` "when is_falsified
+        returns True" (the body never calls it) did. For each name or
+        quoted literal the claims use other than the subject's own, up to
+        4: how often it occurs in the subject's whole body, and — for a
+        claim that denies something — the symbols holding it across the
+        project. A capped search says so and proves no absence. Printed
+        under the body, numbered with it, cited like its code. Never
+        raises.
+        """
+        try:
+            _neg = re.compile(
+                r"\b(?:not|no|never|none|nothing|nowhere|without|only|"
+                r"isn't|doesn't|don't|cannot|neither|absent|missing)\b",
+                re.I,
+            )
+            _own = {_p for _p in subject.split(".") if _p}
+            _terms: List[Tuple[str, bool]] = []
+            for _tx in texts:
+                _cands = re.findall(r"`([^`]{3,80})`", _tx) + re.findall(
+                    r"""['"]([^'"\n]{6,60})['"]""", _tx
+                )
+                _cands += re.findall(r"\b[A-Za-z_]\w*_\w+\b|\b[a-z]+[A-Z]\w+\b", _tx)
+                for _c in _cands:
+                    _c = _c.strip().rstrip("()")
+                    _tail = _c.rsplit(".", 1)[-1] if re.fullmatch(
+                        r"[\w.]+", _c
+                    ) else _c
+                    if len(_tail) < 4 or _tail in _own or _c in _own:
+                        continue
+                    if all(_tail != _x for _x, _ in _terms):
+                        _terms.append((_tail, bool(_neg.search(_tx))))
+            if not _terms:
+                return ""
+            _lines_n = whole.count("\n") + 1
+            _broker = AgenticToolBroker(self._f)
+            _out: List[str] = []
+            for _term, _denies in _terms[:4]:
+                _ident = bool(re.fullmatch(r"\w+", _term))
+                _rx = re.compile(
+                    (r"\b" + re.escape(_term) + r"\b") if _ident else re.escape(_term)
+                )
+                _k = len(_rx.findall(whole))
+                # Where it sits, when it sits in few places: round 20's
+                # "_run_pipeline_inner initializes _measured_stats_lines"
+                # was true at line ~1500 of 2572, past any excerpt, and
+                # the judge read it as refuted from Filter.inlet's line.
+                _where = (
+                    [_l.strip()[:140] for _l in whole.split("\n") if _rx.search(_l)][:3]
+                    if 0 < _k <= 3
+                    else []
+                )
+                if _k and not _denies and not _where:
+                    continue
+                _out.append(
+                    f"«{_term}» occurs {_k} time(s) in the whole body of "
+                    f"{subject} ({_lines_n} lines searched)"
+                    + (": " + " | ".join(_where) if _where else "")
+                )
+                if not _denies:
+                    continue
+                _g = _broker._grep(_rx.pattern, project_id, own=True, where=True)
+                if _g.startswith("[GREP: no matches"):
+                    _out.append(
+                        f"«{_term}» occurs nowhere in the project (complete search)"
+                    )
+                elif _g.startswith("### GREP"):
+                    _hits = _g.split("\n")[1:]
+                    _in = list(
+                        dict.fromkeys(re.findall(r"\[in ([^\]]+)\]", "\n".join(_hits)))
+                    )
+                    _capped = len(_hits) >= _broker._MAX_GREP_LINES
+                    _out.append(
+                        f"«{_term}» occurs on {len(_hits)} line(s) in the project"
+                        + (
+                            " — search capped, not complete"
+                            if _capped
+                            else " (complete search)"
+                        )
+                        + (": in " + ", ".join(_in[:8]) if _in else "")
+                    )
+            if not _out:
+                return ""
+            self._f._bump_turn_metric("evidence_search_facts", len(_out))
+            return (
+                f"### Search facts for {subject} — computed by the plugin "
+                f"over the code; cite them like its lines\n" + "\n".join(_out)
+            )
+        except Exception as _e:
+            self._f._log_debug(f"🤖 Evidence: search facts skipped ({_e!r})")
+            return ""
+
+    def _number_lines(self, text: str, label: str) -> str:
+        """`text` with each code line numbered, the numbers recorded.
+
+        Headers (### …), fences and blank lines stay as they are, so the
+        prompt parses as before (_EVIDENCE_BODY_HEADER_RE). Numbers run on
+        across the bodies of one prompt, so a number names one line of one
+        body; self._cited maps it to (label, the line).
+        """
+        if not isinstance(getattr(self, "_cited", None), dict):
+            self._cited = {}
+            self._next_line = 1
+        _out: List[str] = []
+        for _ln in str(text or "").split("\n"):
+            if not _ln.strip() or _ln.startswith("### ") or _ln.lstrip().startswith(
+                "```"
+            ):
+                _out.append(_ln)
+                continue
+            _n = self._next_line
+            self._next_line += 1
+            self._cited[_n] = (label, _ln)
+            _out.append(f"{_n}│ {_ln}")
+        return "\n".join(_out)
+
+    def _ruling_quotes(
+        self,
+        rv: Dict[str, Any],
+        cited: Optional[Dict[int, Tuple[str, str]]] = None,
+        whole: Optional[Dict[str, str]] = None,
+    ) -> Tuple[List[str], str]:
+        """The code a ruling rests on, and how it was given.
+
+        By line number (_number_lines): the cited lines are read back from
+        the prompt, and the anchor must be in them — or, failing that, in
+        the three lines either side within the same body, where a count
+        off by a few lands, and then those lines are the citation. Runs of
+        consecutive lines become one quote each. Copying code character for
+        character failed in every way a model fails at it: quotes changed,
+        lines stitched with "...", a comment skipped — 27 rulings of 160 in
+        round 18. A copied `quote` is still read, without any numbers it
+        copied. `cited` is the map the prompt was numbered with, taken
+        before the call was awaited. `whole` holds the whole bodies of the
+        subjects shown as excerpts: an anchor of 15 chars or more found
+        once there, and not in the lines shown, is the line an excerpt left
+        out — the judge also reads the whole body in the shared prefix, and
+        round 19 cited three such lines by a number from the excerpt; the
+        rule for quotes of omitted lines (round 9) applies. Returns
+        (quotes, "lines" | "quote" | "unanchored" | "").
+        """
+        _cited = cited if cited is not None else getattr(self, "_cited", None) or {}
+        _raw = rv.get("lines")
+        if isinstance(_raw, (int, str)):
+            _raw = [_raw]
+        _nums: List[int] = []
+        if isinstance(_raw, list) and _cited:
+            for _x in _raw[:40]:
+                _m = re.fullmatch(
+                    r"\s*L?(\d+)[│:]?\s*(?:[-–]\s*L?(\d+)[│:]?)?\s*", str(_x)
+                )
+                if not _m:
+                    continue
+                _a = int(_m.group(1))
+                _b = int(_m.group(2) or _a)
+                if _a <= _b <= _a + 40:
+                    _nums.extend(range(_a, _b + 1))
+        _nums = [_n for _n in dict.fromkeys(_nums) if _n in _cited][:40]
+        _anchor = _quote_key(str(rv.get("anchor", "") or ""))
+        if _nums:
+            _hit = _anchor_lines(_anchor, _nums, _cited)
+            _w = (whole or {}).get(_cited[_nums[0]][0], "") if not _hit else ""
+            _bare_a = re.sub(r"\s+", "", _anchor)
+            if _w and len(_bare_a) >= 15 and not _ELISION_RE.search(_bare_a):
+                _wl = str(_w).split("\n")
+                _run = _bare_run(_bare_a, _wl, once=True)
+                if _run:
+                    return ["\n".join(_wl[_run[0] : _run[1] + 1])], "lines"
+            if _hit:
+                _runs: List[List[int]] = []
+                for _n in sorted(_hit):
+                    if (
+                        _runs
+                        and _n == _runs[-1][-1] + 1
+                        and _cited[_n][0] == _cited[_runs[-1][-1]][0]
+                    ):
+                        _runs[-1].append(_n)
+                    else:
+                        _runs.append([_n])
+                return (
+                    ["\n".join(_cited[_n][1] for _n in _r) for _r in _runs],
+                    "lines",
+                )
+        _rq = rv.get("quote", "")
+        _qs = _rq if isinstance(_rq, list) else [_rq]
+        _qs = [
+            _CITED_LINE_NO_RE.sub("", str(_q)).strip()
+            for _q in _qs
+            if str(_q or "").strip()
+        ]
+        if _qs:
+            return _qs, "quote"
+        return [], ("unanchored" if _nums else "")
 
     async def judge(
         self,
@@ -24194,7 +24713,120 @@ class AgenticEvidenceVerifier:
         aligned_prefix: str,
         sources: Optional[Dict[str, str]] = None,
     ) -> Dict[int, Tuple[str, str]]:
-        """Ask once for all claims; return {index: (verdict, quote)}.
+        """Rule on every claim; return {index: (verdict, quote)}.
+
+        In lots of at most _JUDGE_LOT_CLAIMS claims, each with its subjects'
+        bodies and every supporting text: given 17 claims, round 18's
+        closing sweep ruled on 2, and 8-claim calls rule on all. Then, with
+        agentic_evidence_reask, one more call for the claims that came back
+        without a usable ruling — none returned, or one whose citation
+        failed — each told why. A second ruling replaces the first only
+        when it settles the claim. Never raises.
+        """
+        out: Dict[int, Tuple[str, str]] = {}
+        self._citation_notes: Dict[int, str] = {}
+        _extra = {_k: _v for _k, _v in bodies.items() if _k not in groups}
+        _lots = self._judge_lots(groups, bodies)
+        if len(_lots) > 1:
+            self._f._log_debug(
+                f"🤖 Evidence: {sum(len(_v) for _v in groups.values())} claim(s) "
+                f"judged in {len(_lots)} lots of at most {_JUDGE_LOT_CLAIMS}"
+            )
+        def _lot_bodies(_lot: Dict[str, List[int]]) -> Dict[str, str]:
+            # A lot's subjects, every supporting text, and the body of any
+            # other subject its claims name: "A reads X from B" is settled
+            # by B's body, which may sit in another lot.
+            _lb = {_s: bodies[_s] for _s in _lot}
+            _said = " ".join(
+                str(claims[_n - 1].text or "")
+                for _v in _lot.values()
+                for _n in _v
+                if 1 <= _n <= len(claims)
+            )
+            for _s in groups:
+                if _s in bodies and _s not in _lb and _symbol_named_in(_s, _said):
+                    _lb[_s] = bodies[_s]
+            _lb.update(_extra)
+            return _lb
+
+        for _lot in _lots:
+            _lb = _lot_bodies(_lot)
+            out.update(
+                await self._judge_once(claims, _lot, _lb, aligned_prefix, sources)
+            )
+        if not getattr(self._f.valves, "agentic_evidence_reask", True):
+            return out
+        _why: Dict[int, str] = {}
+        _again: Dict[str, List[int]] = {}
+        for _s, _idxs in groups.items():
+            if _s not in bodies:
+                continue
+            for _n in _idxs:
+                if _n not in out:
+                    _why[_n] = "no ruling was returned for it"
+                elif out[_n][1] in _REASK_REASONS:
+                    _why[_n] = self._citation_notes.get(_n) or out[_n][1]
+                else:
+                    continue
+                _again.setdefault(_s, []).append(_n)
+        if not _why:
+            return out
+        _gained = 0
+        for _lot in self._judge_lots(_again, bodies):
+            _asked = sorted(_n for _v in _lot.values() for _n in _v)
+            _note = (
+                "SECOND READING. The previous reading left these claims "
+                "without a usable ruling:\n"
+                + "\n".join(f"- claim {_n}: {_why[_n]}" for _n in _asked)
+                + "\nRule on each of them, citing the numbered lines of its "
+                "own subject's body where the claim is about what that symbol "
+                "does."
+            )
+            _lb = _lot_bodies(_lot)
+            _second = await self._judge_once(
+                claims, _lot, _lb, aligned_prefix, sources, note=_note
+            )
+            for _n, _v in _second.items():
+                if _v[0] in ("supported", "contradicted") or _n not in out:
+                    _gained += _v[0] in ("supported", "contradicted")
+                    out[_n] = _v
+        self._f._bump_turn_metric("evidence_reask_settled", _gained)
+        self._f._log_debug(
+            f"🤖 Evidence: second reading of {len(_why)} claim(s) without a "
+            f"usable ruling — {_gained} settled"
+        )
+        return out
+
+    @staticmethod
+    def _judge_lots(
+        groups: Dict[str, List[int]], bodies: Dict[str, str]
+    ) -> List[Dict[str, List[int]]]:
+        """Groups packed into lots of at most _JUDGE_LOT_CLAIMS claims, in
+        order; a subject with more is split across lots of its own."""
+        _lots: List[Dict[str, List[int]]] = [{}]
+        for _s, _idxs in groups.items():
+            if _s not in bodies:
+                continue
+            for _i in range(0, len(_idxs), _JUDGE_LOT_CLAIMS):
+                _part = _idxs[_i : _i + _JUDGE_LOT_CLAIMS]
+                _size = sum(len(_v) for _v in _lots[-1].values())
+                if _lots[-1] and (
+                    _size + len(_part) > _JUDGE_LOT_CLAIMS or _s in _lots[-1]
+                ):
+                    _lots.append({})
+                _lots[-1][_s] = _part
+        return [_l for _l in _lots if _l]
+
+    async def _judge_once(
+        self,
+        claims: List["LedgerClaim"],
+        groups: Dict[str, List[int]],
+        bodies: Dict[str, str],
+        aligned_prefix: str,
+        sources: Optional[Dict[str, str]] = None,
+        note: str = "",
+    ) -> Dict[int, Tuple[str, str]]:
+        """Ask once for these claims; return {index: (verdict, quote)}.
 
         Verdicts whose quote is absent from the body are dropped rather
         than downgraded silently, because a quote that is not in the code
@@ -24204,7 +24836,24 @@ class AgenticEvidenceVerifier:
         them in Block B, so it is found there.
         """
         # ── Step 1: one call carrying every body and every claim ──
+        _pid = str(getattr(self, "project_id", "") or "")
+        if _pid and getattr(self._f.valves, "agentic_evidence_search_facts", True):
+            bodies = dict(bodies)
+            for _s, _idxs in groups.items():
+                if _s not in bodies:
+                    continue
+                _facts = self._search_facts(
+                    _s,
+                    [claims[_n - 1].text for _n in _idxs if 1 <= _n <= len(claims)],
+                    str((sources or {}).get(_s) or bodies[_s]),
+                    _pid,
+                )
+                if _facts:
+                    bodies[_s] = bodies[_s].rstrip() + "\n\n" + _facts
         prompt = self._render_prompt(claims, groups, bodies)
+        _cited_map = dict(getattr(self, "_cited", None) or {})
+        if note:
+            prompt = prompt[: -len(self._CONTRACT)] + note + "\n\n" + self._CONTRACT
         try:
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
@@ -24259,13 +24908,15 @@ class AgenticEvidenceVerifier:
         # What a quote is checked against: each body as shown, and for a
         # subject shown as an excerpt, its whole body too. Round 9 discarded
         # 3 correct verdicts that quoted lines its excerpts had left out.
-        _shown = {s: _quote_key(b) for s, b in bodies.items()}
+        _shown = {s: _code_keys(b) for s, b in bodies.items()}
         _whole = {
-            s: _quote_key(str(b))
+            s: _code_keys(str(b))
             for s, b in (sources or {}).items()
             if s in bodies and b
         }
         _searched = list(_shown.values()) + list(_whole.values())
+        _by_lines = 0
+        _derived: List[str] = []
         out: Dict[int, Tuple[str, str]] = {}
         dropped = 0
         _from_elided = 0
@@ -24283,12 +24934,17 @@ class AgenticEvidenceVerifier:
                 # check is per element, so one unfound quote still discards
                 # the verdict — the standard does not drop, the protocol
                 # widens.
-                _raw_q = rv.get("quote", "")
-                if isinstance(_raw_q, list):
-                    _quotes = [str(q).strip() for q in _raw_q if str(q).strip()]
-                else:
-                    _quotes = [str(_raw_q).strip()] if str(_raw_q).strip() else []
+                _quotes, _how = self._ruling_quotes(rv, _cited_map, sources)
                 quote = " ⏎ ".join(_quotes)
+                if _how == "unanchored":
+                    _notes = getattr(self, "_citation_notes", None)
+                    if isinstance(_notes, dict):
+                        _notes[n] = (
+                            f"you cited lines {rv.get('lines')} with the anchor "
+                            f"«{str(rv.get('anchor', '') or '')[:80]}», which is "
+                            f"not on or near those lines — copy the anchor "
+                            f"exactly from a line you cite"
+                        )
             except Exception:
                 continue
             # A ruling that names no claim cannot be placed. Position is not
@@ -24304,6 +24960,7 @@ class AgenticEvidenceVerifier:
                 "supported",
                 "contradicted",
                 "indeterminate",
+                "inference",
             ):
                 continue
             # Checked against every body in the prompt, not only the
@@ -24319,21 +24976,34 @@ class AgenticEvidenceVerifier:
                 # four exits is settled by four quotes, and one that
                 # is not found still discards the whole verdict.
                 _found = bool(_flats) and all(
-                    any(_q in _b for _b in _searched) for _q in _flats
+                    any(_quote_in(_q, _b) for _b in _searched) for _q in _flats
                 )
                 if not _found:
                     dropped += 1
-                    out[n] = ("indeterminate", "quote not found in any body")
+                    out[n] = (
+                        "indeterminate",
+                        "its cited lines do not hold its anchor"
+                        if _how == "unanchored"
+                        else "quote not found in any body",
+                    )
                     continue
-                if not all(any(_q in _b for _b in _shown.values()) for _q in _flats):
+                if _how == "lines":
+                    _by_lines += 1
+                    _derived.extend(_quotes)
+                if not all(
+                    any(_quote_in(_q, _b) for _b in _shown.values()) for _q in _flats
+                ):
                     _from_elided += 1
                 # Per element, not the joined string. ps171 made the quote
                 # check per element and left this reading the join, so two
                 # quotes from the same body — "a ⏎ b" — matched nothing and
                 # every multi-quote verdict counted as cross-symbol.
-                _own_shown = _shown.get(by_index[n], "")
-                _own_whole = _whole.get(by_index[n], "")
-                if any(_q not in _own_shown and _q not in _own_whole for _q in _flats):
+                _own_shown = _shown.get(by_index[n], ())
+                _own_whole = _whole.get(by_index[n], ())
+                if any(
+                    not _quote_in(_q, _own_shown) and not _quote_in(_q, _own_whole)
+                    for _q in _flats
+                ):
                     elsewhere += 1
                     # For a behavioural claim the distinction above does not
                     # hold: "A does P" is about A's own code, and nothing in
@@ -24368,6 +25038,19 @@ class AgenticEvidenceVerifier:
             self._f._log_debug(
                 f"🤖 Evidence: {dropped} verdict(s) discarded — the quote "
                 f"appears in none of the {len(bodies)} body/bodies read"
+            )
+        if _derived:
+            # The text of the cited lines is the quote: recorded for the
+            # answer prompt's evidence cut (_evidence_set), which reads
+            # judges' quotes and would find none in a reply of numbers.
+            self._f._note_evidence_output(
+                "agentic_evidence",
+                "\n".join(json.dumps({"quote": _q}) for _q in _derived),
+            )
+            self._f._bump_turn_metric("evidence_cited_by_line", _by_lines)
+            self._f._log_debug(
+                f"🤖 Evidence: {_by_lines} ruling(s) cited lines by number — "
+                f"read back from the prompt and checked against the bodies"
             )
         if _from_elided:
             self._f._bump_turn_metric("evidence_quotes_elided", _from_elided)
@@ -24483,13 +25166,16 @@ class AgenticEvidenceVerifier:
 
         # ── Step 3: one call, bodies first, contract last ──
         numbered = "\n".join(f"{n}. {t}" for n, t in enumerate(texts, 1))
+        self._cited = {}
+        self._next_line = 1
         prompt = (
-            bodies_text
+            self._number_lines(bodies_text, "")
             + "\n\nClaims to check against the code above:\n"
             + numbered
             + "\n\n"
             + self._CONTRACT
         )
+        _cited_map = dict(self._cited)
         try:
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
@@ -24514,14 +25200,15 @@ class AgenticEvidenceVerifier:
             assert isinstance(raw, list)
         except Exception:
             return [None] * len(texts)
-        flat = _quote_key(bodies_text)
+        flat = _code_keys(bodies_text)
         out: List[Optional[bool]] = [None] * len(texts)
         dropped = 0
+        _derived: List[str] = []
         for rv in raw:
             try:
                 n = int(rv.get("claim", 0))
                 verdict = str(rv.get("verdict", "")).strip().lower()
-                quote = _quote_key(str(rv.get("quote", "")))
+                _qs, _how = self._ruling_quotes(rv, _cited_map)
             except Exception:
                 continue
             if not (1 <= n <= len(texts)):
@@ -24529,10 +25216,18 @@ class AgenticEvidenceVerifier:
             if verdict == "indeterminate":
                 continue
             if verdict in ("supported", "contradicted"):
-                if not quote or quote not in flat:
+                _keys = [_quote_key(_q) for _q in _qs]
+                if not _keys or not all(_quote_in(_k, flat) for _k in _keys):
                     dropped += 1
                     continue
+                if _how == "lines":
+                    _derived.extend(_qs)
                 out[n - 1] = verdict == "supported"
+        if _derived:
+            self._f._note_evidence_output(
+                f"forge_{purpose}",
+                "\n".join(json.dumps({"quote": _q}) for _q in _derived),
+            )
         if dropped:
             self._f._log_debug(
                 f"🤖 Forge {purpose}: {dropped} ruling(s) discarded — quote "
@@ -24559,6 +25254,7 @@ class AgenticEvidenceVerifier:
             "supported": "confirmed",
             "contradicted": "refuted",
             "indeterminate": "unsupported",
+            "inference": "inference",
         }
         settled = 0
         for n, (verdict, quote) in verdicts.items():
@@ -24906,6 +25602,8 @@ class AgenticStaticVerifier:
         # claims the graph cannot speak to reach the reader's body.
         if getattr(self._f.valves, "agentic_evidence_verify", True):
             _ev = AgenticEvidenceVerifier(self._f)
+            _ev.project_id = project_id
+            _ev.narrow_subjects(claims, project_id)
             _groups = _ev.group_by_subject(claims)
             if _groups:
                 _whole_bodies: Dict[str, str] = {}
@@ -35573,6 +36271,108 @@ class AgenticOrchestrator:
             self._f._log_debug(f"need resolution skipped ({_e!r})")
         return _served, _unserved
 
+    def _bodies_to_change(self, question: str, project_id: str) -> str:
+        """The current code an answer that writes code is about to change.
+
+        Round 17's design turn named `AgenticEvidenceVerifier.apply`,
+        `AgenticSynthesisComposer.render` and `LedgerClaim` in its outline
+        and its unsettled list, held none of their bodies, and wrote code
+        against a `self._claims` and a `zip(claims, verdicts)` that do not
+        exist. On a turn whose code action is modify or generate, or whose
+        outline fences code, the bodies the outline, the question and the
+        unsettled subjects name — in that order — and the prompt does not
+        already hold go in, each with its definitions footer, up to
+        answer_code_bodies_chars and 4 bodies. A class goes in whole when
+        it is small (a dataclass whose fields the change adds to), never
+        as the container of a method. Never raises.
+        """
+        try:
+            _cap = int(getattr(self._f.valves, "answer_code_bodies_chars", 0) or 0)
+            if _cap <= 0:
+                return ""
+            _outline = str(getattr(self._f, "_answer_outline", "") or "")
+            _tc = (
+                self._f._project_state_manager.get_pstate(project_id).get(
+                    "turn_classification"
+                )
+                or {}
+            )
+            _action = str(_tc.get("code_action", "") or "")
+            if _action not in _CODE_WRITING_ACTIONS and "```" not in _outline:
+                return ""
+            _prose = re.sub(r"```.*?```", " ", _outline, flags=re.S)
+            _unsettled = (getattr(self._f, "_agentic_coverage", None) or {}).get(
+                "unsettled_subjects"
+            ) or []
+            _held = set(getattr(self._f, "_bodies_in_shared_context", None) or ())
+            _held |= set(getattr(self._f, "_block_b_bodies_this_turn", None) or {})
+            _names: List[str] = []
+            _small_classes: Set[str] = set()
+            for _src in (_prose, str(question or ""), " ".join(map(str, _unsettled))):
+                _cands = list(self._resolve_need(_src, project_id)[0])
+                for _raw in re.findall(r"\b[A-Z][A-Za-z0-9_]+\b", _src):
+                    _sp, _kind, _ = self._broker.classify(_raw, project_id)
+                    if _kind == "container" and _sp:
+                        _cands.append(_sp)
+                        _small_classes.add(_sp)
+                # In the order the text names them: the outline's first
+                # change is the one the answer writes first.
+                _pos = {
+                    _c: (_src.find(_c.rsplit(".", 1)[-1]) % (len(_src) + 1))
+                    for _c in _cands
+                }
+                for _n in sorted(_cands, key=lambda _c: _pos[_c]):
+                    if _n not in _names and _n not in _held:
+                        _names.append(_n)
+            if not _names:
+                return ""
+            _broker = AgenticToolBroker(self._f)
+            _broker.footer_seen = set()
+            _parts: List[str] = []
+            _used = 0
+            for _n in _names:
+                if len(_parts) >= 4:
+                    break
+                _tail = _n.rsplit(".", 1)[-1]
+                _focus = [_l for _l in _prose.split("\n") if _tail in _l]
+                _text = (
+                    _broker.expand_for_claims(_n, project_id, _focus)
+                    if _focus
+                    else _broker.resolve("EXPAND", _n, project_id)
+                )
+                if not _text or _text.lstrip().startswith("["):
+                    continue
+                if _n in _small_classes and (
+                    len(_text) > 6000
+                    or any(_m.startswith(_n + ".") for _m in _names)
+                ):
+                    continue
+                if _used + len(_text) > _cap and _parts:
+                    continue
+                _parts.append(f"# `{_n}` (current code)\n{_text.strip()}")
+                _used += len(_text)
+            if not _parts:
+                return ""
+            self._f._set_turn_metric("answer_code_bodies", len(_parts))
+            self._f._log_debug(
+                f"🧩 Answer writes code: {len(_parts)} current body/bodies "
+                f"given ({_used} chars): "
+                + ", ".join(_p.split("`")[1] for _p in _parts)
+            )
+            return (
+                "[WORKSPACE NOTE — not part of your answer]\n"
+                "THE CODE YOUR ANSWER CHANGES, as it stands now. Write every "
+                "change against these bodies: use the names, fields and "
+                "signatures they hold, and do not invent one they lack. "
+                "Print each function you change whole, as it reads after "
+                "the change; do not reprint one you leave as it is, and "
+                "never shorten one with `...`.\n\n"
+                + "\n\n".join(_parts)
+            )
+        except Exception as _e:
+            self._f._log_debug(f"🧩 Answer code bodies skipped ({_e!r})")
+            return ""
+
     # ──────────────────────────────────────────────────────────────────────
     # 2. Plan construction & prompt alignment
     # ──────────────────────────────────────────────────────────────────────
@@ -35824,11 +36624,41 @@ class AgenticOrchestrator:
         ]
         _blocks: List[str] = []
         _names: List[str] = []
+        _defined: Set[str] = set()
         for _t in _texts:
             for _b in re.findall(r"```(?:\w+)?\s*(.*?)```", _t, re.S):
                 _found = _TEST_DEF_RE.findall(_b)
-                if _found and _b not in _blocks:
-                    _blocks.append(_b)
+                if not _found or _b in _blocks:
+                    continue
+                # A later block redefining what an earlier one defines is
+                # an earlier draft of it — the outline comes first. Round
+                # 18's step wrote a TestClaimTerms of 2 tests after the
+                # outline's of 5; joined, the step's replaced the outline's,
+                # 2 ran and the answer showed 5.
+                try:
+                    _tree = ast.parse(textwrap.dedent(_b))
+                    _top = {
+                        _n.name
+                        for _n in _tree.body
+                        if isinstance(
+                            _n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                        )
+                    }
+                    _clash = _top & _defined
+                    if _clash:
+                        _tree.body = [
+                            _n
+                            for _n in _tree.body
+                            if getattr(_n, "name", None) not in _clash
+                        ]
+                        _b = ast.unparse(_tree)
+                        _found = _TEST_DEF_RE.findall(_b)
+                    _defined |= _top
+                except (SyntaxError, ValueError):
+                    pass
+                if not _found:
+                    continue
+                _blocks.append(_b)
                 for _n in _found:
                     if _n not in _names:
                         _names.append(_n)
@@ -39580,6 +40410,7 @@ class AgenticOrchestrator:
                 ("blind", "cov_blind"),
                 ("uncovered", "cov_uncovered"),
                 ("unoperationalizable", "cov_no_anchor"),
+                ("inference", "cov_inference"),
             ):
                 self._f._set_turn_metric(_mk, int(_cov.get(_ck, 0) or 0))
             # The triangulation shadow, over the claims the synthesis will
@@ -39754,6 +40585,11 @@ class AgenticOrchestrator:
                     _n_k = int(_cov.get(_k, 0) or 0)
                     if _n_k:
                         _t_open.append(f"{_n_k} {_w}")
+                if int(_cov.get("inference", 0) or 0):
+                    _t_open.append(
+                        f"{int(_cov.get('inference', 0))} inference(s) "
+                        f"not counted — not a fact about the code"
+                    )
                 if getattr(self._f, "_serial_unestablished", None):
                     _t_open.append("no cause established")
                 if _asked_coverage_words(_cov):
@@ -40257,6 +41093,9 @@ class AgenticOrchestrator:
                 + (f" + {_lead!r}" if _lead else "")
                 + f" from the {_seed_from}"
             )
+        _to_change = self._bodies_to_change(question, project_id)
+        if _to_change:
+            _workspace = _to_change + "\n\n" + _workspace
         dynamic_injections.append(("trailing", _workspace))
         # No trailing disclaimer here: a note in the last slot was copied
         # into every answer rather than obeyed. The findings block's own
@@ -64054,7 +64893,11 @@ class MessageAssembler:
                 getattr(getattr(_f, "_agentic", None), "_turn_question", "") or ""
             )[:20000]
             _parts, _info = _evidence_only_prompt(
-                [_t or "" for _, _t in rest], _reg, _outs, _fm.group(0), _q
+                [_t or "" for _, _t in rest],
+                _reg,
+                _outs,
+                _fm.group(0) + "\n" + str(getattr(_f, "_answer_outline", "") or ""),
+                _q,
             )
             _f._evidence_stats_this_turn = {
                 "bodies": _info["bodies"],
@@ -64108,8 +64951,14 @@ class MessageAssembler:
             _q = str(
                 getattr(getattr(_f, "_agentic", None), "_turn_question", "") or ""
             )[:20000]
+            # The outline says what the answer will write about: a body it
+            # names is one the answer uses, as much as one the findings name.
             _parts, _info = _evidence_only_prompt(
-                [head, moved], _reg, _outs, _fm.group(0), _q
+                [head, moved],
+                _reg,
+                _outs,
+                _fm.group(0) + "\n" + str(getattr(_f, "_answer_outline", "") or ""),
+                _q,
             )
             _f._evidence_stats_this_turn = {
                 "bodies": _info["bodies"],
@@ -65365,6 +66214,14 @@ def _COVERAGE_BLOCK(coverage: Optional[Dict[str, int]]) -> str:
         ),
         _row("uncovered", coverage.get("uncovered", 0), "nothing ran against it"),
     ]
+    if coverage.get("inference", 0):
+        lines.append(
+            _row(
+                "inference",
+                coverage.get("inference", 0),
+                "a conclusion, not a code fact — not counted",
+            )
+        )
     _uo = coverage.get("unoperationalizable", 0)
     if _uo:
         lines.append(
@@ -71687,6 +72544,40 @@ class Valves(BaseModel):
         ),
     )
 
+    agentic_evidence_search_facts: bool = Field(
+        default=True,
+        description=(
+            "Print, under each body the evidence judge reads, how often the "
+            "names its claims use occur in that body and — for a claim that "
+            "denies something — across the project, so an absence can be "
+            "cited. A few lines per subject."
+        ),
+    )
+
+    agentic_evidence_reask: bool = Field(
+        default=True,
+        description=(
+            "Read again, once, the claims the evidence judge left without a "
+            "usable ruling — none returned, or a citation that failed — "
+            "each with the reason. One more judge call on the turns that "
+            "need it."
+        ),
+    )
+
+    answer_code_bodies_chars: int = Field(
+        default=24000,
+        ge=0,
+        description=(
+            "Chars of current code given to an answer that writes code "
+            "(code action modify or generate, or a fenced outline): the "
+            "bodies, with their definitions footer, of what the outline, "
+            "the question or the unsettled subjects name and the prompt "
+            "does not already hold, at most 4; a class only when small. In "
+            "the answer's trailing workspace, so no shared prefix changes; "
+            "24000 is ~6K tokens. 0 turns it off."
+        ),
+    )
+
     agentic_prime_turn_prefix: bool = Field(
         default=True,
         description=(
@@ -76743,6 +77634,12 @@ class Filter:
                 _n = int(_cov.get(_key, 0) or 0)
                 if _n:
                     _open.append(f"{_n} {_word}")
+            # Same words as the pipeline's line.
+            if int(_cov.get("inference", 0) or 0):
+                _open.append(
+                    f"{int(_cov.get('inference', 0))} inference(s) "
+                    f"not counted — not a fact about the code"
+                )
             # Same words as the pipeline's line (_serial_unestablished).
             if getattr(self, "_serial_unestablished", None):
                 _open.append("no cause established")
