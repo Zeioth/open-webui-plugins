@@ -641,6 +641,17 @@ _DEDICATED_CAP_LABELS = frozenset({"design_critical_experiment"})
 # as a user message of their own (_split_turn_context): llama.cpp
 # checkpoints where the last user message starts, and each later call of
 # the turn resumes there instead of re-processing them (~11k tokens).
+#
+# Calls that read only what their own prompt carries are the exception
+# (isolate_reader_calls): the evidence judge, the forge's judges and
+# analysis, the outline, claim extraction, summaries and docstrings go out
+# with a short system message of their own. llama-server's prompt cache in
+# host memory (--cache-ram, on by default) holds the prefix state while
+# they run and restores it for the next call that carries it — round 20:
+# 0.23 s per save and 0.08 s per restore on average, and its token limit
+# grows with the memory one (server_prompt_cache::update), so the prefix
+# is not what it evicts. Without that cache every reader would cost the
+# next prefix call a full re-prefill: turn the valve off.
 # ═════════════════════════════════════════════════════════════════════════
 
 
@@ -675,6 +686,30 @@ def _split_turn_context(
     if not shared or not own:
         return "", ""
     return shared, own
+
+
+def _reads_only_its_prompt(filter_ref: Any) -> Optional[bool]:
+    """How a call that reads only its own prompt declares itself to call_llm.
+
+    False — its own system message, without the turn prefix — while
+    isolate_reader_calls is on; None — undeclared, so the size floor
+    decides, as before H59 — while it is off. Never raises.
+    """
+    try:
+        _on = getattr(filter_ref.valves, "isolate_reader_calls", True)
+    except Exception:
+        _on = True
+    return False if _on else None
+
+
+def _reader_system(filter_ref: Any, aligned_prefix: str, own: str) -> str:
+    """The system message of a reader that used to carry the turn prefix.
+
+    `own` while isolate_reader_calls is on, else the aligned prefix it
+    carried before H59, so turning the valve off restores those calls
+    byte for byte.
+    """
+    return own if _reads_only_its_prompt(filter_ref) is False else aligned_prefix
 
 # A boundary the sections are grouped by, resolved to a horizontal rule
 # only where a group exists on both sides. A sentinel rather than the rule
@@ -5578,6 +5613,10 @@ class ActivationGraph:
         # ActivationEngine.build_activation_graph).
         self.question_seeds: Set[str] = set()
         self.history_seeds: Set[str] = set()
+        # Of the question's seeds, those it named (exact or from a
+        # traceback) rather than those the inferencer guessed: what a
+        # refactoring question moves is the first (Case D).
+        self.named_seeds: Set[str] = set()
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. Seed activation
@@ -6824,6 +6863,26 @@ class ActivationEngine:
             key=lambda n: (_first_seen.get(n, 0), n),
         )
         partial = []
+
+        # A question that names a symbol has its seed. The partial matches
+        # added beside it were word overlaps — "tests" in "write tests for
+        # _claim_terms" seeded the plugin's own test machinery, five of the
+        # six bodies Block B then held — and over rounds 15-20 the steps
+        # used 7 of the 66 such seeds, against about half of the first
+        # three where the question named nothing. Named means written as
+        # code — dotted, snake_case, CamelCase or in backticks: a plain
+        # word that is also a method's name ("apply", "judge") names
+        # nothing, and the guesses still run.
+        _written: set = set()
+        for _m in _ASKED_NAME_RE.finditer(query or ""):
+            _written.update(re.findall(r"\w+", _m.group(1) or _m.group(2) or ""))
+        _named = [_e for _e in exact if _e in _written]
+        if _named:
+            self._f._log_debug(
+                f"[SEEDS] the question names {', '.join(_named[:4])} — "
+                f"no lexical partial seeds"
+            )
+            return [str(_e) for _e in exact if str(_e).strip()], []
 
         # ---- Region: If few exact matches, try CrossEncoder/LLM ----
         if len(exact) < 3 and len(query_words) > 0 and len(all_names) > 0:
@@ -8489,7 +8548,9 @@ Output only the symbol name.
         # not the question naming something.
         idx = self._f._symbol_index
         for name in list(exact_seeds) + [n for n, _ in tb_seeds]:
-            ag.question_seeds.update(idx.get_qualified_names_for(name, project_id))
+            _qs = idx.get_qualified_names_for(name, project_id)
+            ag.question_seeds.update(_qs)
+            ag.named_seeds.update(_qs)
         if inferred_seeds and (
             ag.question_seeds or not self._is_follow_up_shaped(query)
         ):
@@ -12256,6 +12317,71 @@ class ContextBuilder:
 
         return tier
 
+    def _impact_section(
+        self, ag: "ActivationGraph", query: str, project_id: str
+    ) -> str:
+        """Where the symbols a refactoring question names are called (Case D).
+
+        The Full Call Graph in Block A lists every caller, and Block B skips
+        any signature the skeleton holds, so pulling callers in at LOD-1
+        rendered nothing: rounds 16-20 logged 120 callers "pulled into Block
+        B" and showed none. What moving a symbol needs and the map does not
+        carry is the calls — what each caller passes and does with the
+        result. Only for symbols the question writes as code (dotted,
+        snake_case, CamelCase or in backticks): the callers of a guessed
+        seed are the impact of nothing asked. At most
+        lod_use_case_refactor_callers_max lines. Never raises.
+        """
+        try:
+            _cap = int(
+                getattr(self._f.valves, "lod_use_case_refactor_callers_max", 0) or 0
+            )
+            if _cap <= 0:
+                return ""
+            _written: Set[str] = set()
+            for _m in _ASKED_NAME_RE.finditer(query or ""):
+                _written.update(re.findall(r"\w+", _m.group(1) or _m.group(2) or ""))
+            _named = sorted(
+                _q
+                for _q in (getattr(ag, "named_seeds", None) or set())
+                if _q.rsplit(".", 1)[-1] in _written
+            )[:3]
+            if not _named:
+                self._f._log_debug(
+                    "Case D: the question writes no symbol as code — no impact "
+                    "section"
+                )
+                return ""
+            _broker = AgenticToolBroker(self._f)
+            _out: List[str] = []
+            _left = _cap
+            for _q in _named:
+                _cs = _call_sites(_broker, _q, project_id)
+                if not _cs.startswith("### Call sites of"):
+                    continue
+                _head, _, _rest = _cs.partition("\n")
+                _lines = [_l for _l in _rest.splitlines() if _l.strip()][:_left]
+                if not _lines:
+                    continue
+                _left -= len(_lines)
+                _out.append(_head + "\n" + "\n".join(_lines))
+                if _left <= 0:
+                    break
+            if not _out:
+                return ""
+            self._f._log_debug(
+                f"Case D: {_cap - _left} call site(s) of {', '.join(_named)} "
+                f"shown in Block B (impact analysis)"
+            )
+            return (
+                "\n### Impact: where the named symbols are called\n"
+                "_The Full Call Graph lists the callers; these are the calls._\n"
+                + "\n\n".join(_out)
+            )
+        except Exception as _e:
+            self._f._log_debug(f"Case D: impact section skipped ({_e!r})")
+            return ""
+
     def _build_hub_bodies_tier(self, project_id: str) -> Tuple[str, str, List[str]]:
         """
         Build the Hub-Bodies Tier: full bodies of top-N hubs by centrality,
@@ -13629,34 +13755,15 @@ class ContextBuilder:
             lod3 *= use_case_profile.get("lod3_mult", 1.0)
 
         # ------------------------------------------------------------------
-        # Step 6: Case D — pull in direct callers.
+        # Step 6: Case D — where what a refactoring question names is
+        # called. Appended at assembly (Step 17); see _impact_section.
         # ------------------------------------------------------------------
+        _impact = ""
         if (
             self._f.valves.enable_lod_by_use_case
             and active_use_case == UseCase.REFACTORING
-            and self._f.valves.lod_use_case_refactor_callers_max != 0
         ):
-            max_callers = self._f.valves.lod_use_case_refactor_callers_max
-            pulled = 0
-            for seed_qid in ag.get_seed_nodes():
-                meta = self._f._symbol_index.get_symbol_meta(seed_qid, project_id) or {}
-                bare = meta.get("name", seed_qid.rsplit(".", 1)[-1])
-                for edge in self._f._symbol_index.get_edges_in(bare, project_id):
-                    if max_callers > 0 and pulled >= max_callers:
-                        break
-                    caller_qid = edge.src
-                    if activated.get(caller_qid, 0.0) < lod1:
-                        activated[caller_qid] = max(
-                            activated.get(caller_qid, 0.0), lod1
-                        )
-                        pulled += 1
-                if max_callers > 0 and pulled >= max_callers:
-                    break
-            if pulled:
-                self._f._log_debug(
-                    f"Case D: pulled {pulled} direct caller(s) of seed symbol(s) "
-                    f"into Block B at LOD-1 (impact analysis)."
-                )
+            _impact = self._impact_section(ag, query, project_id)
 
         # ------------------------------------------------------------------
         # Step 7: Resolve call graph mode.
@@ -13735,6 +13842,21 @@ class ContextBuilder:
         _sticky_cap = self._f.valves.lod3_sticky_max_symbols
         _merit_lod3 = {q for q, s in activated.items() if s >= lod3}
         lod3_sticky: Dict[str, int] = dict(pstate.get("lod3_sticky", {}))
+        # Kept by use, not by having been rendered: a body the last turn's
+        # evidence never named leaves now instead of lingering for TTL
+        # turns. The prefix-stability purpose above does not hold: between
+        # consecutive primes Block B shared 10-27 tokens (rounds 16-20).
+        # A turn that recorded no use (no evidence cut) changes nothing.
+        _used = getattr(self._f, "_block_b_used_last_turn", None)
+        if isinstance(_used, set) and lod3_sticky:
+            _unused = sorted(q for q in lod3_sticky if q not in _used)
+            for q in _unused:
+                del lod3_sticky[q]
+            self._f._log_debug(
+                f"📌 Sticky: {len(lod3_sticky)} kept (used last turn), "
+                f"{len(_unused)} dropped unused"
+            )
+        self._f._block_b_used_last_turn = None
 
         # Read from the question's own seeds. get_seed_nodes() also holds
         # the history seeds, and the conversation names what it has been
@@ -14379,6 +14501,8 @@ class ContextBuilder:
                 "\n### Directly relevant code (high activation)\n"
                 + "\n".join(_lod3_parts)
             )
+        if _impact:
+            ordered.append(_impact)
 
         # ------------------------------------------------------------------
         # Step 18: Recency pointers for hub-tier seeds from the previous turn.
@@ -19980,6 +20104,7 @@ def _evidence_only_prompt(
     shown = {q: "\n".join(txt for _, txt in v) for q, v in found.items()}
     keep = _evidence_set(shown, outputs, findings, question)
     info["kept"] = sum(1 for q in found if q in keep)
+    info["used"] = sorted(q for q in found if q in keep)
     if not info["kept"]:
         info["reason"] = "no body is evidence"
         return list(parts), info
@@ -20079,13 +20204,32 @@ class LLMOrchestrator:
         except Exception:
             pass
 
+    def _note_own_context(self, label: str) -> None:
+        """Tally a call that went out on its own context, by label, per turn.
+
+        Read with the alignment tally at the turn boundary, so a run says
+        which calls left the prefix and how often: each one costs a prompt
+        cache swap and reads a few thousand tokens deep instead of a
+        hundred thousand. Digits fold to N, so the forge's per-step labels
+        count together. Never raises.
+        """
+        try:
+            _t = getattr(self._f, "_own_context_this_turn", None)
+            if _t is None:
+                _t = {}
+                self._f._own_context_this_turn = _t
+            _k = re.sub(r"\d+", "N", label or "unlabelled")
+            _t[_k] = _t.get(_k, 0) + 1
+        except Exception:
+            pass
+
     def _align_system_to_prefix(
         self,
         system_prompt: str,
         effective_model: str,
         prompt: str = "",
         response_format: Optional[Any] = None,
-        reasons_about_code: bool = True,
+        reasons_about_code: Optional[bool] = None,
     ) -> str:
         """Prepend the turn's preliminary system prompt to an auxiliary call.
 
@@ -20129,18 +20273,22 @@ class LLMOrchestrator:
         # the prefix and pays all of it (a classifier took ~90 s aligned,
         # under 1 s unaligned). Declared by the caller rather than inferred
         # from size: a long instruction block clears any size floor while
-        # asking nothing about the code. The floor keeps its job for
-        # everyone else.
-        if not reasons_about_code:
+        # asking nothing about the code.
+        if reasons_about_code is False:
             self._note_align("caller needs no code prefix")
             return system_prompt
 
+        # The floor guesses for a caller that did not say, and only for
+        # one. A call declared to need the map keeps it however short its
+        # prompt: experimentum_crucis asks in ~190 tokens for an edge that
+        # tells two hypotheses apart, and the floor sent all 20 of rounds
+        # 16-20 out without the call graph the edge is read from.
         _floor = 0
         try:
             _floor = int(getattr(self._f.valves, "align_aux_min_prompt_tokens", 0) or 0)
         except Exception:
             _floor = 0
-        if _floor > 0:
+        if _floor > 0 and reasons_about_code is None:
             try:
                 _own = len(system_prompt or "") + len(prompt or "")
                 if _own // 4 < _floor:
@@ -20289,14 +20437,15 @@ class LLMOrchestrator:
         enable_thinking: bool = True,
         log_raw_response: bool = False,
         return_meta: bool = False,
-        # DECIDE THIS for any new call site. True attaches the whole code
-        # prefix (~70k tokens); it is the default so a caller that needs it
-        # never silently loses it, but the opposite mistake is invisible: a
-        # classifier sending 46 tokens and waiting 90 s. The test is not
-        # size: does this call produce an identifier the index has to
-        # resolve? agentic_verify (457 tokens) does; agentic_evidence (5,884)
-        # does not — it judges quotes against bodies in its own prompt.
-        reasons_about_code: bool = True,
+        # DECIDE THIS for every call site; test_h59 fails on one that does
+        # not. The test is not size: does the output name or relate code
+        # its prompt does not carry? True — it reads the map (Block A, hub
+        # and Block B): a planner, a step, a hypothesis that must name real
+        # identifiers. False — it reads only its prompt: a classifier, or a
+        # reader such as the evidence judge, which declares itself through
+        # _reads_only_its_prompt so isolate_reader_calls can restore the
+        # prefix. None is undeclared: align_aux_min_prompt_tokens guesses.
+        reasons_about_code: Optional[bool] = None,
     ) -> Optional[Union[str, "LLMResult"]]:
         """
         Call the LLM with in-memory response cache and call deduplication.
@@ -20456,6 +20605,8 @@ class LLMOrchestrator:
             response_format=response_format,
             reasons_about_code=reasons_about_code,
         )
+        if reasons_about_code is False and system_prompt is _before_align:
+            self._note_own_context(label)
 
         # ── Drop a skeleton the aligned prefix already carries ─────────────
         # Two callers paste a project skeleton into their prompt
@@ -22735,15 +22886,7 @@ class AgenticEvidenceLedger:
                 subject=_subject or (qids[0] if qids else ""),
             )
             if claim.subject:
-                _subj = self._canonical_qid(claim.subject, project_id)
-                if _subj and _subj in (
-                    self._f._symbol_index.get_all_qualified_names(project_id) or set()
-                ):
-                    claim.subject = _subj
-                else:
-                    claim.subject = self._qualified_if_unique(
-                        claim.subject, project_id
-                    )
+                claim.subject = self._real_subject(claim, project_id)
             _known_here = self._known_names(project_id)
             _known_bare = {_q.rsplit(".", 1)[-1] for _q in _known_here}
             for qid in claim.qids:
@@ -22758,6 +22901,13 @@ class AgenticEvidenceLedger:
                     _canon in _known_here or _canon.rsplit(".", 1)[-1] in _known_bare
                 ):
                     _canon = self._qualified_if_unique(_canon, project_id)
+                    # Under the name the index holds it by, not a parent the
+                    # step invented: `ForgeFactTriangulation._states_only_
+                    # the_call` is the module function, and every check that
+                    # compares names (unread, buckets, bodies) needs the one
+                    # spelling a body is ever shown under.
+                    if _canon not in _known_here:
+                        _canon = self._located(qid, project_id) or _canon
                     if _canon in claim.valid_qids:
                         continue
                     claim.valid_qids.append(_canon)
@@ -23012,6 +23162,7 @@ class AgenticEvidenceLedger:
                 max_tokens=self._RECOVERY_MAX_TOKENS,
                 temperature=0.1,
                 label="claims_tail_recovery",
+                reasons_about_code=_reads_only_its_prompt(self._f),
                 response_format={"type": "json_object"},
                 enable_thinking=False,
             )
@@ -23629,6 +23780,67 @@ class AgenticEvidenceLedger:
         except Exception:
             return name
 
+    def _located(self, name: str, project_id: str) -> str:
+        """The spelling the broker serves `name` under, or "". Never raises."""
+        try:
+            _brk = AgenticToolBroker(self._f)
+            return _brk.locate(name, project_id) or ""
+        except Exception:
+            return ""
+
+    def _real_subject(self, claim: "LedgerClaim", project_id: str) -> str:
+        """A claim's subject under the name the code holds it by.
+
+        Canonical when the index has it; else where the broker locates it
+        (a member cited under a parent it does not have); and a bare class
+        whose claim names exactly one of its members is that member — "a
+        claim about EvidenceObservation.coerce" recorded under the class
+        has no body a judge can read. Fixed once here, so nothing
+        downstream has to recognise a second spelling of the same symbol:
+        round 20 counted a claim settled three times as asserted unread,
+        and another about a member as unchecked. Never raises.
+        """
+        _s = claim.subject
+        try:
+            _all = self._f._symbol_index.get_all_qualified_names(project_id) or set()
+            _c = self._canonical_qid(_s, project_id)
+            if _c and _c in _all:
+                _s = _c
+            else:
+                _s = self._qualified_if_unique(_s, project_id)
+                if _s not in _all:
+                    _loc = self._located(_s, project_id)
+                    if _loc and _loc != _s:
+                        self._f._log_debug(
+                            f"🤖 Ledger: subject '{_s}' is '{_loc}' in the code"
+                        )
+                        _s = _loc
+            # Members are held under the class's bare name even where the
+            # class itself carries its module ('mod.Cls' holds 'Cls.m').
+            _cls = _s.rsplit(".", 1)[-1]
+            if re.fullmatch(r"[A-Z][A-Za-z0-9_]*", _cls):
+                _ms = [
+                    _m
+                    for _m in dict.fromkeys(
+                        re.findall(
+                            r"\b" + re.escape(_cls) + r"\.([A-Za-z_]\w*)",
+                            claim.text or "",
+                        )
+                    )
+                    if f"{_cls}.{_m}" in _all
+                ]
+                if len(_ms) == 1:
+                    self._f._log_debug(
+                        f"🤖 Ledger: subject '{_s}' narrowed to the member the "
+                        f"claim names, '{_cls}.{_ms[0]}'"
+                    )
+                    _s = f"{_cls}.{_ms[0]}"
+                    if _s not in claim.qids:
+                        claim.qids.append(_s)
+        except Exception:
+            pass
+        return _s
+
     def _canonical_qid(self, qid: str, project_id: str) -> str:
         """
         Resolve a cited symbol to the name the index holds, or "".
@@ -23990,6 +24202,15 @@ class AgenticEvidenceVerifier:
     code is not evidence, however probable it sounds.
     """
 
+    # The system message of a judge on its own context. Short on purpose:
+    # the contract in the prompt says how to rule; this says only that the
+    # code in the prompt is all the code there is.
+    _READER_SYSTEM = (
+        "You check claims about code against the code shown in this "
+        "message. It is the only code you have: every line you cite and "
+        "every word you quote comes from it."
+    )
+
     _CONTRACT = (
         "You are checking claims against code that is shown to you in "
         "full. Decide from the code printed in this prompt — not from a "
@@ -24342,92 +24563,30 @@ class AgenticEvidenceVerifier:
             )
         return bodies
 
-    def narrow_subjects(self, claims: List["LedgerClaim"], project_id: str) -> int:
-        """Re-subject a claim made about a class to the one member it names.
-
-        "EvidenceObservation.coerce rebuilds the tuple from a JSON list"
-        was recorded under the class `EvidenceObservation`; a class has no
-        body the judge can read whole, so the claim never reached one
-        (round 20, the only "unchecked" claim of the run). When the text
-        names exactly one `Class.member` the index holds, that member is
-        the subject. Only open claims, only a bare class name. Never
-        raises; returns how many moved.
-        """
-        _moved = 0
-        try:
-            _si = self._f._symbol_index
-            for _c in claims:
-                _s = str(getattr(_c, "subject", "") or "")
-                if _c.verification or not re.fullmatch(r"[A-Z][A-Za-z0-9_]*", _s):
-                    continue
-                _ms = [
-                    _m
-                    for _m in dict.fromkeys(
-                        re.findall(
-                            r"\b" + re.escape(_s) + r"\.([A-Za-z_]\w*)", _c.text or ""
-                        )
-                    )
-                    if _si.find_blocks(f"{_s}.{_m}", project_id)
-                ]
-                if len(_ms) != 1:
-                    continue
-                _new = f"{_s}.{_ms[0]}"
-                _c.subject = _new
-                if _new not in (_c.valid_qids or []):
-                    _c.valid_qids = list(_c.valid_qids or []) + [_new]
-                _moved += 1
-            if _moved:
-                self._f._log_debug(
-                    f"🤖 Evidence: {_moved} claim(s) about a class re-subjected "
-                    f"to the member they name"
-                )
-        except Exception as _e:
-            self._f._log_debug(f"🤖 Evidence: subject narrowing skipped ({_e!r})")
-        return _moved
-
     def _body_under_real_name(
         self, broker: "AgenticToolBroker", subject: str, project_id: str
     ) -> str:
-        """A subject's code when its name as cited has none, or "".
+        """A subject's code when EXPAND serves none for it: its definition.
 
-        The name the code holds it under (locate): round 18 cited the
-        module function `_states_only_the_call` as a method of
-        `ForgeFactTriangulation`, and the claim never reached a judge. Else
-        its definition — a constant, a class attribute, a small class
-        (definition) — as the body the judge reads: a claim about what
-        `_PROSE_CODE_NAME_RE` matches is settled by the regex itself.
-        Never raises.
-
-        The name as cited is then a body seen this turn: round 20 settled
-        `ForgeFactTriangulation._states_only_the_call` three times from the
-        module function's code and still counted it "asserted unread",
-        because the unread list (refreshed from the bodies seen) held the
-        cited spelling, which no body is ever shown under.
+        A constant, a class attribute or a small class definition is the
+        body the judge reads — a claim about what `_PROSE_CODE_NAME_RE`
+        matches is settled by the regex itself (round 18). Names arrive
+        already as the code holds them (AgenticEvidenceLedger._real_subject),
+        so nothing here guesses at another spelling. Reading it counts as
+        reading the subject. Never raises.
         """
         try:
-            _seen = getattr(self._f, "_bodies_seen_this_turn", None)
-            _sp = broker.locate(subject, project_id) or ""
-            if _sp and _sp != subject:
-                _text = broker.resolve("EXPAND", _sp, project_id)
-                if _text and not _text.lstrip().startswith("["):
-                    self._f._log_debug(
-                        f"🤖 Evidence: {subject} read as {_sp}, the name the "
-                        f"code holds it under"
-                    )
-                    if isinstance(_seen, set):
-                        _seen.add(subject)
-                    return _text
-            _name = _sp or subject
             _nm, _src = broker.definition(
-                _name, project_id, "class" if "." in _name else "module"
+                subject, project_id, "class" if "." in subject else "module"
             )
             if _src:
                 self._f._log_debug(
                     f"🤖 Evidence: {subject} read from its definition ({_nm})"
                 )
+                _seen = getattr(self._f, "_bodies_seen_this_turn", None)
                 if isinstance(_seen, set):
                     _seen.add(subject)
-                return f"### Definition of {_nm or _name}\n```\n{_src}\n```"
+                return f"### Definition of {_nm or subject}\n```\n{_src}\n```"
         except Exception as _e:
             self._f._log_debug(f"🤖 Evidence: {subject} unresolved ({_e!r})")
         return ""
@@ -24832,8 +24991,9 @@ class AgenticEvidenceVerifier:
         than downgraded silently, because a quote that is not in the code
         means the judgement was not made against the code. `sources` holds
         the whole body of each subject shown as an excerpt: a quote from
-        its elided lines is still that symbol's code, and the judge reads
-        them in Block B, so it is found there.
+        its elided lines is still that symbol's code. A judge carrying the
+        turn prefix also reads them in Block B; one on its own context
+        (isolate_reader_calls) reads only what this prompt shows.
         """
         # ── Step 1: one call carrying every body and every claim ──
         _pid = str(getattr(self, "project_id", "") or "")
@@ -24857,12 +25017,14 @@ class AgenticEvidenceVerifier:
         try:
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
-                system_prompt=aligned_prefix,
+                system_prompt=_reader_system(
+                    self._f, aligned_prefix, self._READER_SYSTEM
+                ),
                 model_override=self._f.valves.cot_model_level2,
                 max_tokens=self._f.valves.agentic_verify_max_tokens,
                 temperature=0.1,
                 label="agentic_evidence",
-                reasons_about_code=False,
+                reasons_about_code=_reads_only_its_prompt(self._f),
                 response_format={"type": "json_object"},
                 enable_thinking=False,
             )
@@ -25179,11 +25341,14 @@ class AgenticEvidenceVerifier:
         try:
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
-                system_prompt=aligned_prefix,
+                system_prompt=_reader_system(
+                    self._f, aligned_prefix, self._READER_SYSTEM
+                ),
                 model_override=self._f.valves.cot_model_level2,
                 max_tokens=self._f.valves.agentic_verify_max_tokens,
                 temperature=0.1,
                 label=f"forge_{purpose}",
+                reasons_about_code=_reads_only_its_prompt(self._f),
                 response_format={"type": "json_object"},
                 enable_thinking=False,
             )
@@ -25603,7 +25768,6 @@ class AgenticStaticVerifier:
         if getattr(self._f.valves, "agentic_evidence_verify", True):
             _ev = AgenticEvidenceVerifier(self._f)
             _ev.project_id = project_id
-            _ev.narrow_subjects(claims, project_id)
             _groups = _ev.group_by_subject(claims)
             if _groups:
                 _whole_bodies: Dict[str, str] = {}
@@ -25881,6 +26045,7 @@ class AgenticStaticVerifier:
                 max_tokens=self._f.valves.agentic_verify_max_tokens,
                 temperature=0.1,
                 label="agentic_verify",
+                reasons_about_code=True,
                 enable_thinking=False,
             )
         except Exception:
@@ -28112,6 +28277,7 @@ if __name__ == "__main__":
                 max_tokens=self._f.valves.agentic_harness_max_tokens,
                 temperature=0.2,
                 label="agentic_harness",
+                reasons_about_code=True,
                 enable_thinking=False,
             )
         except Exception:
@@ -29389,6 +29555,7 @@ _lift_test_cases()
                 ),
                 max_tokens=self._f.valves.agentic_harness_max_tokens,
                 label="agentic_repair",
+                reasons_about_code=True,
                 enable_thinking=False,
             )
         except Exception as _e_rr:
@@ -30044,6 +30211,7 @@ class AgenticPreplanner:
                     max_tokens=self._f.valves.agentic_preplanner_max_tokens,
                     temperature=0.6,
                     label="agentic_preplanner",
+                    reasons_about_code=True,
                     enable_thinking=False,
                     total_timeout=(
                         float(_pp_to)
@@ -31246,6 +31414,7 @@ class AgenticPlanner:
                 max_tokens=self._f.valves.agentic_planner_max_tokens,
                 temperature=0.2,
                 label="agentic_planner",
+                reasons_about_code=True,
                 enable_thinking=False,
                 total_timeout=(
                     float(_pl_to)
@@ -34065,6 +34234,7 @@ class AgenticStepExecutor:
                     max_tokens=self._f.valves.agentic_step_max_tokens,
                     temperature=0.3,
                     label="agentic_step",
+                    reasons_about_code=True,
                     enable_thinking=False,
                     return_meta=True,
                 )
@@ -34212,6 +34382,13 @@ class AgenticSynthesisComposer:
     # ──────────────────────────────────────────────────────────────────────
     # 1. Workspace rendering
     # ──────────────────────────────────────────────────────────────────────
+
+    # The outline's system message on its own context: the workspace in
+    # its prompt holds everything it plans from (_outline_workspace).
+    _OUTLINE_SYSTEM = (
+        "You plan how an answer opens, from the workspace in this message "
+        "alone: what the turn found, what it checked and what it left open."
+    )
 
     _OUTLINE_CONTRACT = (
         "The investigation is finished; its question and workspace are "
@@ -34371,7 +34548,9 @@ class AgenticSynthesisComposer:
         _workspace = self._outline_workspace(plan, question, ledger)
         try:
             _resp = await self._f._llm_orchestrator.call_llm(
-                system_prompt=aligned_prefix,
+                system_prompt=_reader_system(
+                    self._f, aligned_prefix, self._OUTLINE_SYSTEM
+                ),
                 prompt=_workspace
                 + self._OUTLINE_CONTRACT.format(
                     sections="\n".join(f"- {x}" for x in sections),
@@ -34382,6 +34561,7 @@ class AgenticSynthesisComposer:
                 ),
                 max_tokens=1200,
                 label="agentic_outline",
+                reasons_about_code=_reads_only_its_prompt(self._f),
                 enable_thinking=False,
             )
         except Exception as _e:
@@ -36444,6 +36624,7 @@ class AgenticOrchestrator:
                 max_tokens=8,
                 temperature=0.0,
                 label="kv_prime",
+                reasons_about_code=True,
                 enable_thinking=False,
             )
             self._f._log_debug(
@@ -38022,6 +38203,7 @@ class AgenticOrchestrator:
                 max_tokens=400,
                 temperature=0.2,
                 label="agentic_generative_eval",
+                reasons_about_code=True,
                 response_format={"type": "json_object"},
                 enable_thinking=False,
             )
@@ -51807,6 +51989,7 @@ class EpistemicStrategies:
             ),
             temperature=0.0,
             label="design_critical_experiment",
+            reasons_about_code=_reads_only_its_prompt(self._f),
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
@@ -51930,6 +52113,7 @@ class EpistemicStrategies:
             max_tokens=0,
             temperature=0.0,
             label="peer_review_llm",
+            reasons_about_code=True,
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
@@ -52020,6 +52204,7 @@ class EpistemicStrategies:
             max_tokens=0,
             temperature=0.5,
             label="devil_advocate",
+            reasons_about_code=True,
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
@@ -52123,6 +52308,7 @@ class EpistemicStrategies:
             max_tokens=0,
             temperature=0.2,
             label="delimit_scope",
+            reasons_about_code=_reads_only_its_prompt(self._f),
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
@@ -52208,6 +52394,7 @@ class EpistemicStrategies:
             max_tokens=0,
             temperature=0.3,
             label="generate_predictions",
+            reasons_about_code=True,
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
@@ -52272,6 +52459,7 @@ class EpistemicStrategies:
             max_tokens=0,
             temperature=0.0,
             label="experimentum_crucis",
+            reasons_about_code=True,
             response_format={"type": "json_object"},
             enable_thinking=False,
         )
@@ -53760,6 +53948,7 @@ class HypothesisForge:
                 ),
                 model_override=self._f.valves.cot_model_level3,
                 label=label,
+                reasons_about_code=True,
             )
         except Exception as _e:
             self._f._log_debug(f"_generate_serial_candidate: call failed ({_e!r})")
@@ -54464,6 +54653,7 @@ class HypothesisForge:
                     ),
                     model_override=self._f.valves.cot_model_level3,
                     label=f"{label}_forge_c{_cycle}",
+                    reasons_about_code=True,
                     **_kw,
                 )
             except Exception as _e:
@@ -54828,6 +55018,7 @@ class HypothesisForge:
                         ),
                         model_override=self._f.valves.cot_model_level3,
                         label=f"{label}_analyze_c{_cycle}",
+                        reasons_about_code=_reads_only_its_prompt(self._f),
                     )
                 except Exception as _e_an:
                     _an = ""
@@ -55861,6 +56052,7 @@ class HypothesisForge:
                     ),
                     model_override=self._f.valves.cot_model_level3,
                     label=f"{label}_crucis_r{_round}",
+                    reasons_about_code=True,
                 )
             except Exception as _e:
                 self._f._log_debug(f"_judge_dossiers: crucis call failed ({_e!r})")
@@ -57895,6 +58087,7 @@ Code context (recent symbols referenced):
             max_tokens=0,
             temperature=0.2,
             label="commit_summary",
+            reasons_about_code=_reads_only_its_prompt(self._f),
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -58548,6 +58741,7 @@ Code context (recent symbols referenced):
             max_tokens=self._f.valves.oversized_summary_max_tokens,
             temperature=0.2,
             label="block_summary",
+            reasons_about_code=_reads_only_its_prompt(self._f),
             enable_thinking=False,
         )
         if summary:
@@ -59453,6 +59647,7 @@ class EnrichmentTasks:
             max_tokens=0,
             temperature=0.0,
             label=f"{label}_retry1",
+            reasons_about_code=_reads_only_its_prompt(self._f),
             response_format={"type": "json_object"},
             log_raw_response=False,
             enable_thinking=False,
@@ -59871,6 +60066,7 @@ class EnrichmentTasks:
                 max_tokens=0,
                 temperature=0.0,
                 label=label,
+                reasons_about_code=_reads_only_its_prompt(self._f),
                 response_format={"type": "json_object"},
                 log_raw_response=False,
                 enable_thinking=False,
@@ -64904,6 +65100,9 @@ class MessageAssembler:
                 "dropped": list(_info["dropped"]),
                 "chars": _info["chars"],
             }
+            # Read by the next turn's sticky tier (ContextBuilder, Step 8.5).
+            if _info.get("bodies"):
+                _f._block_b_used_last_turn = set(_info.get("used") or [])
             _f._evidence_cut_before_fit = True
             _gone = _info["dropped"]
             _f._log_debug(
@@ -64965,6 +65164,9 @@ class MessageAssembler:
                 "dropped": list(_info["dropped"]),
                 "chars": _info["chars"],
             }
+            # Read by the next turn's sticky tier (ContextBuilder, Step 8.5).
+            if _info.get("bodies"):
+                _f._block_b_used_last_turn = set(_info.get("used") or [])
             _gone = _info["dropped"]
             if not _gone:
                 _f._log_debug(
@@ -69391,6 +69593,7 @@ class SemanticSeedInferencer:
             max_tokens=self._f.valves.seed_inference_max_tokens,
             temperature=0.0,
             label="seed_inference",
+            reasons_about_code=True,
             response_format={"type": "json_object"},
             enable_thinking=False,
             log_raw_response=False,
@@ -71699,7 +71902,16 @@ class Valves(BaseModel):
 
     enable_hub_bodies_tier: bool = Field(
         default=True,
-        description="Inject full bodies of top‑N hubs as a cacheable tier between Block A and Block B.",
+        description=(
+            "Inject full bodies of top-N hubs as a cacheable tier between "
+            "Block A and Block B. Candidate for off: chosen by centrality, the "
+            "tier held plumbing — 9 of its 15 bodies were never operated on "
+            "over rounds 16-20, and 0.6% of them gave evidence — while it "
+            "sat in the context of every call (~4.5k tokens). The bodies a "
+            "question uses reach Block B by activation, or a step reads "
+            "them; the flow's spine is too large for a tier (Filter.inlet "
+            "~15k tokens, evidence in 6 of 45 turns)."
+        ),
     )
 
     # The hub tier is inside the invariant prefix and the Block A freeze
@@ -71913,7 +72125,12 @@ class Valves(BaseModel):
     lod_use_case_refactor_callers_max: int = Field(
         default=12,
         ge=0,
-        description="Max direct callers pulled into Block B at LOD‑1 for refactor (case D). 0 = unlimited.",
+        description=(
+            "Refactoring questions (case D): at most this many call sites "
+            "of the symbols the question names, shown in Block B — the "
+            "calls, since the Full Call Graph already lists the callers. "
+            "0 = no impact section."
+        ),
     )
 
     lod2_exit_ratio: float = Field(
@@ -72796,6 +73013,24 @@ class Valves(BaseModel):
             "another's. Chat endpoints only. Turn OFF if the chat template "
             "rejects two consecutive user messages, or to measure against "
             "the single-message turn."
+        ),
+    )
+
+    isolate_reader_calls: bool = Field(
+        default=True,
+        description=(
+            "Calls that read only what their own prompt carries — the "
+            "evidence judge, the forge's judges and analysis step, the "
+            "outline, claim extraction, scope delimitation, summaries and "
+            "docstrings — go out with a short system message of their own "
+            "instead of the turn prefix (Block A + hub + Block B). The "
+            "judge read a median of 4.4k tokens of its own inside ~118k "
+            "(round 20), and saw the bodies twice: numbered in its prompt "
+            "and unnumbered in Block B. Needs llama-server's host-memory "
+            "prompt cache (--cache-ram, on by default), which holds the "
+            "prefix while they run: without it each of them costs the "
+            "next prefix call a full re-prefill. OFF puts the prefix back "
+            "on all of them, exactly as before."
         ),
     )
 
@@ -75146,6 +75381,9 @@ class Filter:
         # that exists only once something has written it reads the
         # same as one nothing ever writes.
         self._align_outcomes_this_turn: Dict[str, int] = {}
+        # Calls that went out on their own context, by label
+        # (LLMOrchestrator._note_own_context).
+        self._own_context_this_turn: Dict[str, int] = {}
         # What each heavy call left on the volatile side of the cut. Both
         # boundaries are computed on every call: the session invariant
         # (static + hub) and the turn prelim (+ profile and Block B, the
@@ -76543,6 +76781,13 @@ class Filter:
                     + ", ".join(f"{k} x{v}" for k, v in sorted(_al.items()))
                 )
             self._align_outcomes_this_turn = {}
+            _oc = getattr(self, "_own_context_this_turn", None) or {}
+            if _oc:
+                self._log_debug(
+                    "\U0001f512 Own context (no prefix): "
+                    + ", ".join(f"{k} x{v}" for k, v in sorted(_oc.items()))
+                )
+            self._own_context_this_turn = {}
             # Read and cleared with the tally above, for the same reason: this
             # is the only place that sees a whole turn at once.
             _cc = getattr(self, "_cut_census_this_turn", None) or {}
