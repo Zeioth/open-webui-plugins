@@ -140,6 +140,7 @@ import difflib
 import zlib
 import sqlite3
 import ast
+import symtable
 import json
 import asyncio
 import threading
@@ -157,6 +158,7 @@ from typing import (
     Any,
     Tuple,
     Set,
+    FrozenSet,
     Iterable,
     Literal,
     Callable,
@@ -655,6 +657,26 @@ _DEDICATED_CAP_LABELS = frozenset({"design_critical_experiment"})
 # ═════════════════════════════════════════════════════════════════════════
 
 
+def _aligned_prelim_cap(valves: Any) -> int:
+    """The most tokens a turn's prelim may hold and still reach the six
+    agentic call sites whole. AgenticOrchestrator._aligned_prefix cuts it
+    there, and a cut prelim is not prelim + SEP (THE PREFIX INVARIANT): the
+    window, less the answer's reserve and 16000 for a call's own prompt and
+    reply, never under 8000."""
+    return max(
+        8000,
+        int(valves.context_window_tokens)
+        - int(valves.response_reserve_tokens)
+        - 16000,
+    )
+
+
+# What joins the prelim after Block B's bodies are chosen — suggestions,
+# headers, separators — kept free under that cap (SystemPromptBuilder.
+# _block_b_room). The quoted windows are counted apart, once they are known.
+_PRELIM_LATE_TOKENS = 800
+
+
 def _split_turn_context(
     system_prompt: str, prompt: str, invariant: str, prelim_full: str
 ) -> Tuple[str, str]:
@@ -688,6 +710,39 @@ def _split_turn_context(
     return shared, own
 
 
+def _cut_census_line(cc: Dict[str, Any]) -> str:
+    """
+    The turn's 📐 Cut census line, from what LLMOrchestrator._count_cut added
+    up over the heavy calls it sent.
+
+    A split call leaves a checkpoint where the volatile part ends, so only
+    the first of them pays for it. The calls that carried no turn context
+    are named, as they have no volatile part and nothing to split.
+    """
+    _n = int(cc.get("calls", 0) or 0)
+    _vol = int(cc.get("volatile", 0) or 0)
+    _per = int(cc.get("volatile_per_call", 0) or 0)
+    _split = int(cc.get("split", 0) or 0)
+    _paid = max(0, _vol - max(0, _split - 1) * _per)
+    _bare = cc.get("no_turn") or {}
+    return (
+        f"📐 Cut census: {_n} heavy call(s) · "
+        f"invariant x{cc.get('at_invariant', 0)}, "
+        f"turn-prelim x{cc.get('at_turn_prelim', 0)} · "
+        + (
+            f"{sum(_bare.values())} without the turn's context ("
+            + ", ".join(_k if _v == 1 else f"{_k} x{_v}" for _k, _v in _bare.items())
+            + ") · "
+            if _bare
+            else ""
+        )
+        + f"cut at {cc.get('cut_bytes', 0)} B · "
+        f"{_per} B (~{_per // 4} tokens) left volatile per call · "
+        + (f"sent as its own message x{_split} · " if _split else "")
+        + f"≈{_paid} B (~{_paid // 4} tokens) reprocessed this turn"
+    )
+
+
 def _reads_only_its_prompt(filter_ref: Any) -> Optional[bool]:
     """How a call that reads only its own prompt declares itself to call_llm.
 
@@ -700,6 +755,37 @@ def _reads_only_its_prompt(filter_ref: Any) -> Optional[bool]:
     except Exception:
         _on = True
     return False if _on else None
+
+
+_MAP_SECTION_HEADERS = ("## Full Call Graph", "## Project Skeleton", "## Classes")
+
+
+def _answer_system_without_map(system: str) -> str:
+    """The answer's system message without the code map (isolate_final_answer).
+
+    Block A's instructions — everything before its first map section — and
+    its "## Previous Feedback" section; the call graph, the skeleton and the
+    hub tier go. "" when no map section is found, so the caller keeps the
+    system it had. Never raises.
+    """
+    try:
+        _s = str(system or "")
+        _cuts = [
+            _i for _i in (_s.find("\n" + _h) for _h in _MAP_SECTION_HEADERS) if _i >= 0
+        ]
+        if not _cuts:
+            return ""
+        _at = min(_cuts)
+        _head = _s[:_at].rstrip()
+        _fb = _s.find("\n## Previous Feedback", _at)
+        _tail = ""
+        if _fb >= 0:
+            _end = _s.find("\n\n---\n\n", _fb)
+            _tail = _s[_fb : _end if _end > 0 else len(_s)].strip()
+        _out = _head + ("\n\n" + _tail if _tail else "")
+        return _out if _out.strip() else ""
+    except Exception:
+        return ""
 
 
 def _reader_system(filter_ref: Any, aligned_prefix: str, own: str) -> str:
@@ -890,6 +976,12 @@ _ASKS_FOR_TESTS_RE = re.compile(
     r"\b[^.?\n]{0,40}?\btests?\b",
     re.I,
 )
+# Over the signatures a test-writing outline is given
+# (AgenticSynthesisComposer._test_signatures).
+_TEST_SIGNATURES_HEAD = (
+    "SIGNATURES OF THE CODE THE QUESTION'S TESTS CALL, from the index — a "
+    "test calls each with these parameters, in this order:"
+)
 
 
 def _replace_fallback_bodies(text: str) -> Tuple[str, List[str]]:
@@ -1069,71 +1161,79 @@ def _states_tests_verdict(answer: str, say: str) -> bool:
     )
 
 
-def _put_in_section(answer: str, lang: str, key: str, line: str) -> str:
+# A test verdict stated in the present tense: "2 fallan", "1 de 4 falla",
+# "3 pass", "pasan todos". The past ("fallaban", "failed") reports a run
+# the answer can cite; the present is the answer's own verdict. Not "pasa"
+# or "passes": "el test 1 pasa `None`" passes an argument.
+_STATED_TESTS_COUNT_RE = re.compile(
+    r"\b(\d+)(?:\s+(?:de|of)\s+\d+)?\s+(?:tests?(?:\(s\))?\s+)?"
+    r"(fallan|falla|fails|fail|pasan|pass)\b",
+    re.I,
+)
+_STATED_TESTS_ALL_RE = re.compile(
+    r"\b(?:pasan todos|todos pasan|todos los tests pasan|all pass|all tests pass|"
+    r"all of them pass)\b",
+    re.I,
+)
+# What makes the words before a verdict a condition or an aim, not a
+# verdict: "comprueba que pasan todos", "if 2 fail", "deberían pasar".
+_VERDICT_HYPOTHETICAL_RE = re.compile(
+    r"\b(?:que|si|if|that|should|debería\w*|deben|must|para|hasta|until)\s+"
+    r"(?:\S+\s+){0,2}$",
+    re.I,
+)
+# A user message that reports a test run of its own ("me fallan 3",
+# "2 failed", a pytest summary): the answer's verdict may be the user's.
+_REPORTS_TEST_RUN_RE = re.compile(
+    r"\b(?:\d+\s+(?:failed|passed|errors?)|FAILED|fallan|falla|pasan|"
+    r"Traceback|AssertionError)\b"
+)
+
+
+def _stated_test_verdicts(answer: str) -> List[Tuple[str, int, str]]:
+    """The test verdicts an answer's prose states, outside its code.
+
+    Each as (kind, count, quote): "fail" with how many fail, "pass" with
+    how many pass, "all" for all passing; the quote is the verdict to the
+    end of its sentence, at most ~110 chars. Only sentences that speak of
+    tests, and not as a condition or an aim (_VERDICT_HYPOTHETICAL_RE).
     """
-    One line more at the end of one section of an answer.
-
-    In the section's own list style: a numbered list goes on numbering, a
-    bulleted one gets a bullet, prose a sentence of its own. A missing
-    section is written before Stats, or at the end when there is no Stats.
-    """
-    _heads = _SECTION_HEADINGS.get(lang) or _SECTION_HEADINGS["en"]
-    _want = _heads.get(key, "")
-    _text = str(answer).rstrip()
-    _trail = str(answer)[len(_text) :]
-    _lines = _text.split("\n")
-
-    def _title(_l: str) -> str:
-        return _l.strip().strip("#*- ").strip().split(":")[0]
-
-    def _heading(_l: str) -> bool:
-        return _l.lstrip().startswith("#")
-
-    _at = next(
-        (_i for _i, _l in enumerate(_lines) if _heading(_l) and _title(_l) == _want),
-        -1,
-    )
-    if _at >= 0:
-        _end = next(
-            (
-                _i
-                for _i in range(_at + 1, len(_lines))
-                if _heading(_lines[_i]) or _lines[_i].strip() == "---"
-            ),
-            len(_lines),
-        )
-        _last = next(
-            (_i for _i in range(_end - 1, _at, -1) if _lines[_i].strip()), _at
-        )
-        _prev = _lines[_last].strip() if _last > _at else ""
-        _num = re.match(r"(\d+)[.)]\s", _prev)
-        if _num:
-            _new = f"{int(_num.group(1)) + 1}. {line}"
-        elif _prev[:2] in ("- ", "* "):
-            _new = f"{_prev[0]} {line}"
-        else:
-            _new = line
-        _lines.insert(_last + 1, _new)
-        return "\n".join(_lines) + _trail
-    _block = ["---", "", f"## **{_want}**", line, ""]
-    _st = next(
-        (
-            _i
-            for _i, _l in enumerate(_lines)
-            if _heading(_l) and _title(_l) == "Stats"
-        ),
-        -1,
-    )
-    if _st < 0:
-        return "\n".join(_lines + [""] + _block[:-1]) + _trail
-    _pos = _st
-    for _i in range(_st - 1, -1, -1):
-        if _lines[_i].strip() == "---":
-            _pos = _i
+    _prose = re.sub(r"```.*?```", "\n", str(answer or ""), flags=re.S)
+    _out: List[Tuple[str, int, str]] = []
+    for _s in re.split(r"\n+|(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑ¿¡])", _prose):
+        if not re.search(r"\btests?\b", _s, re.I):
+            continue
+        _hits = [
+            (_m.start(), ("all", 0) if _m.re is _STATED_TESTS_ALL_RE else (
+                "fail" if _m.group(2).lower().startswith("fa") else "pass",
+                int(_m.group(1)),
+            ))
+            for _rx in (_STATED_TESTS_COUNT_RE, _STATED_TESTS_ALL_RE)
+            for _m in _rx.finditer(_s)
+        ]
+        for _at, (_kind, _n) in sorted(_hits):
+            if _VERDICT_HYPOTHETICAL_RE.search(_s[max(0, _at - 40) : _at]):
+                continue
+            if _kind == "fail" and _n == 0:
+                _kind = "all"
+            _q = " ".join(_s[_at:].split()).rstrip(".")
+            _q = _q if len(_q) <= 110 else _q[:109].rstrip() + "…"
+            _out.append((_kind, _n, _q))
             break
-        if _lines[_i].strip():
-            break
-    return "\n".join(_lines[:_pos] + _block + _lines[_pos:]) + _trail
+    return _out
+
+
+def _verdict_measured(kind: str, n: int, outcome: Tuple[str, int, int]) -> bool:
+    """Whether a stated verdict (_stated_test_verdicts) is what a run measured:
+    outcome is (status, failed, total), status "pass" or "fail"."""
+    _status, _failed, _total = outcome
+    if _status not in ("pass", "fail") or not _total:
+        return False
+    if kind == "all":
+        return not _failed
+    if kind == "fail":
+        return _failed == n
+    return _total - _failed == n
 
 
 # A relation stated as not holding: "no llama a", "nunca invoca", "does not
@@ -1233,6 +1333,71 @@ def _conclusion_line(lines: List[str], lang: str) -> int:
     if _body < 0 or lines[_body].lstrip().startswith(("#", "```")):
         return -1
     return _body
+
+
+def _conclusion_text(answer: str) -> Tuple[str, str]:
+    """
+    The prose an answer concludes with, and the section it was read from.
+
+    The Conclusion section, from its first line of text to the next heading,
+    rule or fence, however many blank lines sit under its heading. An answer
+    with no Conclusion heading is read by its first paragraph of prose, and
+    the second value is then "opening". ("", heading) for a Conclusion with
+    nothing under it, ("", "") for an answer with no prose at all.
+    """
+    _text = str(answer or "")
+    _lang = _answer_heading_language(_text)
+    _head = (_SECTION_HEADINGS.get(_lang) or _SECTION_HEADINGS["en"])["conclusion"]
+    _lines = _text.split("\n")
+
+    def _ends(_l: str) -> bool:
+        _s = _l.strip()
+        return _s.startswith(("#", "```", "~~~")) or bool(
+            re.fullmatch(r"(?:-{3,}|\*{3,}|_{3,})", _s)
+        )
+
+    _out: List[str] = []
+    _at = _conclusion_line(_lines, _lang)
+    if _at >= 0:
+        for _l in _lines[_at:]:
+            if _ends(_l):
+                break
+            _out.append(_l)
+        return " ".join(" ".join(_out).split()), _head
+    if any(_l.strip().strip("#*- ").strip().split(":")[0] == _head for _l in _lines):
+        return "", _head
+    for _l in _lines:
+        if not _l.strip() or _ends(_l):
+            if _out:
+                break
+            continue
+        _out.append(_l)
+    return " ".join(" ".join(_out).split()), ("opening" if _out else "")
+
+
+def _unsettled_named(text: str, subjects: Iterable[str]) -> List[str]:
+    """
+    The subjects a text names, by the code names it writes (_code_names).
+
+    A name written bare, or on self, is the subject with that last part; two
+    qualified names only when they are the same: `_quote_key` names
+    `AgenticEvidenceVerifier._quote_key`, and `Filter._judge_once` does not
+    name `AgenticEvidenceVerifier._judge_once`.
+    """
+    _written = [re.sub(r"^(?:self|cls)\.", "", _n) for _n in _code_names(text)]
+    _hits: List[str] = []
+    for _s in subjects:
+        _s = str(_s or "").strip()
+        if not _s or _s in _hits:
+            continue
+        _tail = _s.rsplit(".", 1)[-1]
+        if any(
+            _n == _s
+            or (_n.rsplit(".", 1)[-1] == _tail and ("." not in _n or "." not in _s))
+            for _n in _written
+        ):
+            _hits.append(_s)
+    return _hits
 
 
 def _settled_lead(
@@ -1389,16 +1554,8 @@ def _hedge_tests_claim(
         )
     _cut = _m.start("pre") if _m.group("pre") else _m.start("verb")
     _new = str(line)[:_cut] + _aim + str(line)[_m.end() :]
-    _all = failed >= total or not total
     if status == "fail":
         _stated = re.search(r"\bfall\w*|\bfail\w*", _new, re.I)
-        _tail = (
-            f"Ejecutados contra el código real, {failed} de {total} "
-            f"{'falla' if failed == 1 else 'fallan'}."
-            if _es
-            else f"Run against the real code, {failed} of {total} "
-            f"{'fails' if failed == 1 else 'fail'}."
-        )
     elif status == "absent":
         _stated = re.search(
             r"no (?:se )?escribi|ningún test|no hay tests|wrote no|wrote none|"
@@ -1406,25 +1563,41 @@ def _hedge_tests_claim(
             _new,
             re.I,
         )
-        _tail = (
-            "Este turno no escribió ninguno: lo que afirman está sin comprobar."
-            if _es
-            else "This turn wrote none: what they assert is unchecked."
-        )
     else:
         _stated = re.search(
             r"no se ejecut|sin ejecutar|never ran|not run|did not run", _new, re.I
         )
-        _tail = (
-            ("No se ejecutaron" if _all else f"{failed} de {total} no se ejecutaron")
-            + ": lo que afirman está sin comprobar."
-            if _es
-            else ("They never ran" if _all else f"{failed} of {total} never ran")
-            + ": what they assert is unchecked."
-        )
     if not _stated:
-        _new = _new.rstrip() + " " + _tail
+        _new = _new.rstrip() + " " + _tests_outcome_tail(lang, status, failed, total)
     return _new, True
+
+
+def _tests_outcome_tail(lang: str, status: str, failed: int, total: int) -> str:
+    """What became of the turn's tests, as the sentence that follows a claim
+    put as their aim: "fail", "unrun" or "absent" (_hedge_tests_claim)."""
+    _es = lang == "es"
+    _all = failed >= total or not total
+    if status == "fail":
+        return (
+            f"Ejecutados contra el código real, {failed} de {total} "
+            f"{'falla' if failed == 1 else 'fallan'}."
+            if _es
+            else f"Run against the real code, {failed} of {total} "
+            f"{'fails' if failed == 1 else 'fail'}."
+        )
+    if status == "absent":
+        return (
+            "Este turno no escribió ninguno: lo que afirman está sin comprobar."
+            if _es
+            else "This turn wrote none: what they assert is unchecked."
+        )
+    return (
+        ("No se ejecutaron" if _all else f"{failed} de {total} no se ejecutaron")
+        + ": lo que afirman está sin comprobar."
+        if _es
+        else ("They never ran" if _all else f"{failed} of {total} never ran")
+        + ": what they assert is unchecked."
+    )
 
 # The proceed line on a turn that wrote no code, when the outline step's
 # own line only sent the reader to check code the turn had already read:
@@ -1630,7 +1803,9 @@ def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
     again, twenty times over. Left in the history, each was copied by the
     next turns, which is how one bad answer became four. A fourth, the
     ledger's verdict annotations copied onto claims, did the same in round
-    8 (_strip_ledger_annotations).
+    8 (_strip_ledger_annotations). The plugin's note after an answer
+    (_outlet_note) goes too: it is not the model's, and an answer the model
+    reads as its own example must not end with one.
 
     Fenced code is left untouched, since this project's answers quote its
     own prompts. Only whole lines match, so prose that mentions a note is
@@ -1644,12 +1819,14 @@ def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
         "repeat": 0,
         "glued_rules": 0,
         "annotations": 0,
+        "outlet_notes": 0,
     }
     try:
         if not isinstance(text, str) or not text:
             return text, _counts
         _ph = _placeholder_lines()
         _source, _counts["annotations"] = _strip_ledger_annotations(text)
+        _source, _counts["outlet_notes"] = _strip_outlet_notes(_source)
         _lines = _source.split("\n")
         # ── Step 1: cut where the first heading comes round again ──
         _first = ""
@@ -1720,6 +1897,7 @@ def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
             "repeat": 0,
             "glued_rules": 0,
             "annotations": 0,
+            "outlet_notes": 0,
         }
 
 
@@ -2435,6 +2613,15 @@ _ANSWER_MARK_RE = re.compile(r"^\s*\[T\d+\]\s*")
 # through the event emitter, so that the next inlet can report whether the
 # host kept it in the history it hands back.
 _EMIT_PROBE_MARK = "[emit-probe]"
+# What the outlet appends after an answer through the event emitter, the one
+# channel that reaches the reader: outlet edits to the message are discarded
+# by the host. One line under a fixed label, which the inlet takes out again
+# before the answer is indexed, remembered or shown to the model as an
+# example of an answer (_strip_outlet_notes).
+_OUTLET_NOTE_LABELS: Dict[str, str] = {
+    "es": "> **Nota del plugin:**",
+    "en": "> **Plugin note:**",
+}
 
 
 def _strip_answer_footer(text: str) -> Tuple[str, int]:
@@ -2519,6 +2706,38 @@ def _strip_answer_footer(text: str) -> Tuple[str, int]:
     if _pending_rule:
         _out.append(_pending_rule)
         _out.extend(_held_blanks)
+    return "\n".join(_out), _n
+
+
+def _outlet_note(lines: List[str], lang: str) -> str:
+    """The note the outlet appends after an answer: the lines as one, under
+    the label of the answer's language; "" when there is nothing to say."""
+    _said = " ".join(" ".join(str(_l).split()) for _l in lines if str(_l).strip())
+    if not _said:
+        return ""
+    _label = _OUTLET_NOTE_LABELS.get(lang) or _OUTLET_NOTE_LABELS["en"]
+    return f"\n\n{_label} {_said}"
+
+
+def _strip_outlet_notes(text: str) -> Tuple[str, int]:
+    """Take out of an answer the notes the outlet appended (_outlet_note), and
+    the blank lines above each, leaving fenced code alone. Returns the text,
+    the same object when there was none, and how many went."""
+    _labels = tuple(_OUTLET_NOTE_LABELS.values())
+    _out: List[str] = []
+    _n = 0
+    _fence = False
+    for _l in str(text or "").split("\n"):
+        if _l.lstrip().startswith("```"):
+            _fence = not _fence
+        elif not _fence and _l.lstrip().startswith(_labels):
+            _n += 1
+            while _out and not _out[-1].strip():
+                _out.pop()
+            continue
+        _out.append(_l)
+    if not _n:
+        return text, 0
     return "\n".join(_out), _n
 
 
@@ -3123,13 +3342,16 @@ class Edge(BaseModel):
 
 
 def _strip_answer_scaffolding(text: str) -> str:
-    """Remove the turn mark and confidence footer from an answer.
+    """Remove the turn mark, the confidence footer and the plugin's note
+    from an answer.
 
-    Both are presentation this file requests, and both are re-read: the
-    previous answer is indexed and stored in long term memory, so whatever
-    ends it becomes the pattern the model imitates next turn. A measured
-    footer is only true of the turn that measured it, and carried forward
-    it is a number attached to the wrong evidence.
+    The first two are presentation this file requests, and both are re-read:
+    the previous answer is indexed and stored in long term memory, so
+    whatever ends it becomes the pattern the model imitates next turn. A
+    measured footer is only true of the turn that measured it, and carried
+    forward it is a number attached to the wrong evidence. The note the
+    outlet appends (_outlet_note) is the plugin's, not the model's: stored,
+    it would be indexed and remembered as part of the answer.
 
     Every footer is removed, not the last one, because a turn can end with
     more than one and the stale ones are exactly the problem. Matching is
@@ -3144,6 +3366,7 @@ def _strip_answer_scaffolding(text: str) -> str:
         if not isinstance(text, str) or not text:
             return text
         _out, _ = _strip_answer_footer(text)
+        _out, _ = _strip_outlet_notes(_out)
         _out = _ANSWER_MARK_RE.sub("", _out)
         return _out.strip() or text
     except Exception:
@@ -3274,14 +3497,122 @@ _EXCERPT_AFTER = 6
 _EXCERPT_MARK = "# [excerpt: "
 
 
+# A quoted literal: one quote character opens it and the same one closes it,
+# and a quote inside a word ("claim's") opens nothing (_quoted_literals).
+_QUOTED_LITERAL_RE = re.compile(r"""(?<![\w'"])(?:'([^'\n]+?)'|"([^"\n]+?)")(?!\w)""")
+
+
+def _quoted_literals(text: str, low: int, high: int) -> List[str]:
+    """The quoted literals of a text, each from `low` to `high` chars long.
+
+    Each literal is read whole before its length is weighed, so a short one
+    still closes where it ends. The pattern this replaces let either quote
+    open and either close, with the length inside it: in "returns 'x' when
+    called with 'dead (unfounded)'" it skipped 'x', read " when called with "
+    as the literal and lost 'dead (unfounded)'; "the claim's quote is found
+    in a body but not in 'X'" became a term too. Over R21-R23's 618 judged
+    claims it took 30 such gaps (' and ', "s verdict differs from the count
+    gate"), and the judge was shown 29 search facts about them, among them
+    "«s quote is found in a body but not in that claim» occurs nowhere in
+    the project (complete search)".
+    """
+    return [
+        _l
+        for _m in _QUOTED_LITERAL_RE.finditer(str(text or ""))
+        for _l in (_m.group(1) if _m.group(1) is not None else _m.group(2),)
+        if low <= len(_l) <= high
+    ]
+
+
+def _literal_pattern(text: str) -> str:
+    """`text` as a pattern that finds it word for word, but for its quotes.
+
+    Either quote stands for either, as in Python: a claim's `_cc['split']`
+    is the code's `_cc["split"]`, and its `'calls'` the code's "calls".
+    """
+    return "".join("['\"]" if _ch in "'\"" else re.escape(_ch) for _ch in text)
+
+
+# A hole in a literal a claim quotes: a format field ({N}, {_split}; braces
+# holding quotes are a dict or a set), a %-conversion, an elision, an <UPPER>
+# placeholder, or a capital letter alone ('N not executable', 'A calls B').
+_TEMPLATE_HOLE_RE = re.compile(
+    r"\{[^{}'\"\n]{0,40}\}"
+    r"|%(?:\([^()\n]{1,30}\))?[-#0 +]?\d*(?:\.\d+)?[sdifrx]"
+    r"|\.\.\.|\u2026"
+    r"|<[A-Z][A-Z_]*>"
+    r"|(?<![\w'\"])[A-Z](?![\w'\"])"
+)
+
+
+def _literal_template(text: str) -> Tuple[Optional[str], List[str]]:
+    """A literal with holes as the pattern of its fixed parts, and its holes.
+
+    The parts must stand in order on one line; one under 3 characters is
+    left to the holes around it, which also keeps the search linear. (None,
+    holes) when the parts are too thin to name a line — under 6 word
+    characters, none of 4, or more than 4 parts; (None, []) when the literal
+    has no hole.
+    """
+    _holes = [_m.group(0) for _m in _TEMPLATE_HOLE_RE.finditer(text)]
+    if not _holes:
+        return None, []
+    _parts = [
+        _p.strip() for _p in _TEMPLATE_HOLE_RE.split(text) if len(_p.strip()) >= 3
+    ]
+    _words = [len(re.findall(r"\w", _p)) for _p in _parts]
+    if len(_parts) > 4 or sum(_words) < 6 or max(_words, default=0) < 4:
+        return None, _holes
+    return r"[^\n]*?".join(_literal_pattern(_p) for _p in _parts), _holes
+
+
+# What sets a quoted phrase as an example of what a pattern or a check takes,
+# not as a literal of the code (_example_literals), and what joins one listed
+# literal to the next.
+_EXAMPLE_MARK_RE = re.compile(
+    r"(?:\be\.g\.|\bfor (?:example|instance)|\bsuch as|\blike|"
+    r"\bmatch(?:es|ing)?)[\s,:(]*$",
+    re.I,
+)
+_LIST_GLUE_RE = re.compile(r"\s*,?\s*(?:(?:and|or)\s+)?")
+
+
+def _example_literals(text: str) -> Set[str]:
+    """The quoted or backticked phrases of a claim that are examples of input.
+
+    A phrase (it holds a space) right after "e.g.", "for example", "such
+    as", "like" or "matches", or listed after one that is, is what a pattern
+    or a check is said to take: round 20's "_CALL_VERB_RE matches 'calls',
+    …, 'llama a'" (its pattern holds the words, not that text) and "claims
+    like 'the class Foo exists'" were each shown "occurs nowhere in the
+    project". A key ("keys like 'sparse_kills'") is still a literal.
+    """
+    _text = str(text or "")
+    _out: Set[str] = set()
+    _end, _listed = -1, False
+    for _m in re.finditer(r"`([^`\n]{2,80})`|" + _QUOTED_LITERAL_RE.pattern, _text):
+        _lit = next(_g for _g in _m.groups() if _g is not None)
+        _listed = bool(
+            _EXAMPLE_MARK_RE.search(_text[max(0, _m.start() - 40) : _m.start()])
+        ) or (
+            _listed
+            and _end >= 0
+            and bool(_LIST_GLUE_RE.fullmatch(_text[_end : _m.start()]))
+        )
+        if _listed and " " in _lit.strip():
+            _out.add(_lit)
+        _end = _m.end()
+    return _out
+
+
 def _claim_terms(texts: List[str], own: str) -> List[str]:
     """What claims name that a body line can contain: code names, literals.
 
     The parts of code names (_PROSE_CODE_NAME_RE, backticked spans) and the
-    quoted literals ('dead'), minus the parts of the symbol's own name,
-    which every line of its body would match. A part of a dotted name
-    counts whatever its shape (`step.output`); elsewhere a word counts only
-    when it looks like code. Order kept, repeats dropped.
+    quoted literals ('dead', _quoted_literals), minus the parts of the
+    symbol's own name, which every line of its body would match. A part of
+    a dotted name counts whatever its shape (`step.output`); elsewhere a
+    word counts only when it looks like code. Order kept, repeats dropped.
     """
     _skip = set(str(own or "").split(".")) | {"self", "cls"}
     _out: Dict[str, None] = {}
@@ -3304,8 +3635,8 @@ def _claim_terms(texts: List[str], own: str) -> List[str]:
                     or re.search(r"[a-z][A-Z]", _part)
                 ):
                     _out[_part] = None
-        for _m in re.finditer(r"""['"]([^'"\n]{2,40})['"]""", _t):
-            _out[_m.group(1)] = None
+        for _lit in _quoted_literals(_t, 2, 40):
+            _out[_lit] = None
     return list(_out)
 
 
@@ -3963,6 +4294,55 @@ def _output_is_degenerate(text: str) -> str:
         return f"compression {_ratio:.3f} ({_shape})"
     except Exception:  # noqa: BLE001 - diagnostics never raise
         return ""
+
+
+def _locally_bound_names(code: str) -> Dict[Tuple[str, int], FrozenSet[str]]:
+    """Per function of `code`, keyed (name, line of its def): the names a bare
+    call in its body reaches without leaving the function — its locals, its
+    parameters, and what it closes over from the functions around it. Read
+    from the compiler's symbol tables (symtable), which apply Python's
+    scoping rules exactly. {} when the code does not compile.
+
+    A call to such a name is not a call to an indexed symbol: the call graph
+    drew `_anchor_lines → _has` for its own helper and nine edges to
+    ForgeFactTriangulation._names from functions that call a local _names.
+    A name bound by an import is the exception, in the function or in one
+    around it: it names a function defined elsewhere, which may be indexed,
+    and is called as a module-level import is. Counted local, it dropped
+    every lazy import of a project's own modules: all 25 such calls in the
+    standard library's multiprocessing/context.py.
+    """
+    try:
+        _top = symtable.symtable(code, "<indexed>", "exec")
+    except Exception:
+        return {}
+    _out: Dict[Tuple[str, int], FrozenSet[str]] = {}
+    # Each table with what the functions around it bind: name → by import.
+    # A class body passes them through, as its methods still close over the
+    # function around it; the module binds globals, which close over nothing.
+    _stack: List[Tuple[Any, Dict[str, bool]]] = [(_top, {})]
+    while _stack:
+        _tb, _around = _stack.pop()
+        _kind = str(_tb.get_type()).rsplit(".", 1)[-1].lower()
+        _inner = _around if _kind != "module" else {}
+        if _kind == "function":
+            _own = {
+                _s.get_name(): _s.is_imported()
+                for _s in _tb.get_symbols()
+                if _s.is_local() or _s.is_parameter()
+            }
+            _out[(_tb.get_name(), _tb.get_lineno())] = frozenset(
+                [_n for _n, _imp in _own.items() if not _imp]
+                + [
+                    _s.get_name()
+                    for _s in _tb.get_symbols()
+                    if _s.is_free() and not _around.get(_s.get_name(), False)
+                ]
+            )
+            _inner = {**_around, **_own}
+        for _ch in _tb.get_children():
+            _stack.append((_ch, _inner))
+    return _out
 
 
 def qualify_symbol_name(
@@ -13562,6 +13942,48 @@ class ContextBuilder:
     # Region: Block B — Dynamic, per‑query LOD‑activated context
     # ------------------------------------------------------------------
 
+    def _block_b_budget(self, max_tokens: Optional[int] = None) -> int:
+        """Tokens Block B's LOD tiers may spend (build_block_b).
+
+        active_context_max_tokens, within what a multi-part answer leaves
+        (auto_budget_context_for_parts), and within `max_tokens`: the room
+        the turn's prelim leaves under the aligned calls' cap
+        (SystemPromptBuilder._block_b_room), less the quoted windows that
+        join Block B (_quoted_windows_text, counted as if none of them were
+        shown here already). A whole body that does not fit is left out;
+        past the cap, the calls cut one in the middle.
+        """
+        budget = self._f.valves.active_context_max_tokens or 32000
+        if (
+            self._f.valves.auto_budget_context_for_parts
+            and (
+                self._f.valves.enable_multi_phase_response
+                or self._f.valves.force_multi_phase_response
+            )
+            and self._f.valves.context_window_tokens > 0
+        ):
+            _SYSTEM_OVERHEAD = 2000
+            _available_for_context = (
+                self._f.valves.context_window_tokens
+                - self._f.valves.multi_phase_effective_max_tokens
+                - _SYSTEM_OVERHEAD
+            )
+            budget = min(budget, max(8000, _available_for_context))
+        if max_tokens is not None:
+            _qw = _quoted_windows_text(
+                getattr(self._f, "_turn_quoted_windows", None) or [], ""
+            )[0]
+            _room = max_tokens - (
+                self._f._tokens.estimate_code_tokens(_qw) if _qw else 0
+            )
+            if _room < budget:
+                self._f._log_debug(
+                    f"🅱️ Block B budget {budget} → {max(1000, _room)} tokens: "
+                    f"the room the aligned calls' cap leaves it"
+                )
+                budget = max(1000, _room)
+        return budget
+
     async def build_block_b(
         self,
         project_id: str,
@@ -13571,6 +13993,7 @@ class ContextBuilder:
         code_action_vector: dict,
         is_continuation: bool,
         use_case_override: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """
         Build Block B: dynamic per-query content with SWA-aware ordering.
@@ -13591,6 +14014,9 @@ class ContextBuilder:
             use_case_override: Pre-classified use case key; when provided,
                 classify_use_case is skipped (single classification per turn,
                 threaded down from inlet).
+            max_tokens: The room the turn's prelim leaves Block B under the
+                aligned calls' cap (SystemPromptBuilder._block_b_room), shared
+                with the quoted windows that join it; None for no such bound.
 
         Returns:
             The rendered Block B, or an empty string if no context is needed.
@@ -13780,23 +14206,7 @@ class ContextBuilder:
         # Step 8: Build LOD tiers with token budget.
         # ------------------------------------------------------------------
         total_tokens = 0
-        budget = self._f.valves.active_context_max_tokens or 32000
-
-        if (
-            self._f.valves.auto_budget_context_for_parts
-            and (
-                self._f.valves.enable_multi_phase_response
-                or self._f.valves.force_multi_phase_response
-            )
-            and self._f.valves.context_window_tokens > 0
-        ):
-            _SYSTEM_OVERHEAD = 2000
-            _available_for_context = (
-                self._f.valves.context_window_tokens
-                - self._f.valves.multi_phase_effective_max_tokens
-                - _SYSTEM_OVERHEAD
-            )
-            budget = min(budget, max(8000, _available_for_context))
+        budget = self._block_b_budget(max_tokens)
 
         tier_qids = set(psm.get_hub_tier_qids(project_id))
         injected_symbols: Set[str] = set(tier_qids)
@@ -15088,8 +15498,18 @@ class SignatureExtractor:
         Extract function, method, and class symbols from Python source code using AST.
 
         This method parses the code with `ast.parse()`, walks the tree, and creates
-        a `CodeSymbol` for each `FunctionDef`, `AsyncFunctionDef`, and `ClassDef`.
-        It also resolves the parent class for methods.
+        a `CodeSymbol` for each `FunctionDef`, `AsyncFunctionDef`, and `ClassDef`
+        that is not written inside a function. It also resolves the parent class
+        for methods.
+
+        A def or class inside a function is part of that function's body: it
+        is reachable only from there, its lines are in the function's own
+        range, and its calls are credited to it (_extract_calls_from_ast).
+        Indexed on its own it became a member of the enclosing class
+        (enrich_symbols_with_parent_info) under its bare name — 111 such defs
+        in this file, Filter._split and three pairs of _write among them —
+        which gave the map members and callers nobody wrote, and made a local
+        variable named like one look like a symbol.
 
         Args:
             code (str): The Python source code.
@@ -15105,23 +15525,39 @@ class SignatureExtractor:
 
         symbols = []
 
-        # Pre‑build a mapping from class names to their body nodes for quick lookup
-        class_bodies = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                class_bodies[node.name] = node
+        # ── Step 1: one pass for each def's class and the defs inside a def ──
+        # The class of a def is the one whose body holds it directly; it was
+        # found by walking the whole tree once per def: 51 s for this file
+        # here, and R23's first turn spent 26 s indexing it.
+        _defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        _class_of: Dict[int, str] = {}
+        _in_def: Set[int] = set()
+        _todo: List[Tuple[ast.AST, bool]] = [(tree, False)]
+        while _todo:
+            _node, _inside = _todo.pop()
+            for _ch in ast.iter_child_nodes(_node):
+                if isinstance(_ch, _defs):
+                    if _inside:
+                        _in_def.add(id(_ch))
+                    elif isinstance(_node, ast.ClassDef) and _ch in _node.body:
+                        _class_of[id(_ch)] = _node.name
+                _todo.append(
+                    (
+                        _ch,
+                        _inside
+                        or isinstance(_ch, (ast.FunctionDef, ast.AsyncFunctionDef)),
+                    )
+                )
 
+        # ── Step 2: the symbols, in the order ast.walk visits them ──
         for node in ast.walk(tree):
+            if id(node) in _in_def:
+                continue
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 name = node.name
-                # Determine if this function is a method (inside a class)
-                parent_class = ""
-                kind = "function"
-                for parent in ast.walk(tree):
-                    if isinstance(parent, ast.ClassDef) and node in parent.body:
-                        parent_class = parent.name
-                        kind = "method"
-                        break
+                # A method when a class body holds it directly
+                parent_class = _class_of.get(id(node), "")
+                kind = "method" if parent_class else "function"
                 # Build signature string (first line of the function definition)
                 _unparsed_lines = ast.unparse(node).split("\n")
                 signature = next(
@@ -15174,9 +15610,12 @@ class SignatureExtractor:
 
         For each Call node, determine the callee name and the enclosing
         function/method (caller), qualifying the caller with its parent class if
-        it is a method. A call inside a nested def is also credited to the def
-        that owns it (the one directly in a class or module body). Returns a dict
-        mapping caller qualified id → callee bare names.
+        it is a method. A call inside a def written inside a def — directly or
+        through a class defined there — is credited to the outer def, the one
+        symbol it belongs to (_extract_symbols_from_ast). A bare call to a name
+        the function binds itself or closes over is local and left out
+        (_locally_bound_names). Returns a dict mapping caller qualified id →
+        callee bare names.
 
         Single-pass NodeVisitor: class/function context is tracked on a stack as
         the tree is walked once, so the cost is O(nodes). The previous
@@ -15197,6 +15636,7 @@ class SignatureExtractor:
         from collections import defaultdict
 
         call_map: Dict[str, set] = defaultdict(set)
+        _local = _locally_bound_names(code)
 
         class _CallGraphVisitor(ast.NodeVisitor):
             """Walk the tree once, tracking the enclosing class and function."""
@@ -15204,10 +15644,11 @@ class SignatureExtractor:
             def __init__(self):
                 # ── Context stacks maintained during the single walk ──
                 self._class_stack: List[str] = []
-                self._func_stack: List[str] = []
-                # Per function on _func_stack, the function its calls are
-                # also credited to (see visit_Call); per scope, its kind.
+                # Per function being walked, the def its calls are credited
+                # to (see visit_Call) and the names a bare call in it reaches
+                # locally (_locally_bound_names); per scope, its kind.
                 self._owner_stack: List[str] = []
+                self._local_stack: List[FrozenSet[str]] = []
                 self._scope_kinds: List[str] = []
 
             def visit_ClassDef(self, node: ast.ClassDef):
@@ -15220,17 +15661,19 @@ class SignatureExtractor:
             def _visit_function(self, node):
                 parent_class = self._class_stack[-1] if self._class_stack else ""
                 caller_qid = qualify_symbol_name(node.name, parent_class)
-                # A def nested in another def keeps that def's owner; any
-                # other def (in a class or module body) owns itself.
-                nested = bool(self._scope_kinds) and self._scope_kinds[-1] == "def"
+                # A def inside a def, directly or through a class defined
+                # there, keeps that def's owner; any other def owns itself.
+                nested = "def" in self._scope_kinds
                 self._owner_stack.append(
                     self._owner_stack[-1] if nested else caller_qid
                 )
-                self._func_stack.append(caller_qid)
+                self._local_stack.append(
+                    _local.get((node.name, node.lineno), frozenset())
+                )
                 self._scope_kinds.append("def")
                 self.generic_visit(node)
                 self._scope_kinds.pop()
-                self._func_stack.pop()
+                self._local_stack.pop()
                 self._owner_stack.pop()
 
             def visit_FunctionDef(self, node: ast.FunctionDef):
@@ -15244,20 +15687,20 @@ class SignatureExtractor:
                 callee = None
                 if isinstance(node.func, ast.Name):
                     callee = node.func.id
+                    # Its own helper, a parameter, a closure's variable: an
+                    # edge to whatever symbol shares the name is false.
+                    if self._local_stack and callee in self._local_stack[-1]:
+                        callee = None
                 elif isinstance(node.func, ast.Attribute):
                     callee = node.func.attr
-                # ── Attribute the call to the innermost enclosing function ──
-                if callee and self._func_stack:
-                    call_map[self._func_stack[-1]].add(callee)
-                    # ── ...and to its owner ──
-                    # Calls are wired while a def nested in a method is still
-                    # a symbol without a class (enrichment adds one later),
-                    # but its key here carries one, so no symbol read the
-                    # calls filed under it: the index answered "callers:
-                    # none" for a method called only from a closure (a task
-                    # body, a visitor helper). The owner is a symbol under the
-                    # key it has always had, the call sits in its body, and
-                    # calls inside a lambda were already credited this way.
+                # ── Attribute the call to the def that owns it ──
+                # The owner is the symbol whose body holds the call: the
+                # enclosing def, or for a def inside a def the outer one, as
+                # calls inside a lambda always were. A closure's calls filed
+                # under its own key were read by no symbol: the index
+                # answered "callers: none" for a method called only from a
+                # task body or a visitor helper.
+                if callee and self._owner_stack:
                     call_map[self._owner_stack[-1]].add(callee)
                 self.generic_visit(node)
 
@@ -19581,6 +20024,96 @@ class LongTermMemory:
 # ==========================================================================
 
 
+# Whitespace a closing quote may stand before (_repair_json_strings).
+_JSON_WS_RE = re.compile(r"\s*")
+_JSON_ESCAPES = frozenset('"\\/bfnrt')
+
+
+def _repair_json_strings(text: str) -> str:
+    """`text` with what a model breaks inside JSON strings mended.
+
+    Three faults, each in a reply the strict decoder rejected: a double
+    quote left unescaped inside a string (R23's forge analysis quoted the
+    characters ('`") it was about), a backslash before a character JSON
+    does not escape (R22's claims tail wrote \\x27), and a raw line break
+    or tab. Only what stands inside braces is read, so prose around an
+    object stays as it is; a quote inside a string ends it only where what
+    follows can follow a string (, : } ] or the end). Valid JSON comes back
+    unchanged, so a caller tries this only after a strict parse failed.
+    Never raises.
+    """
+    _out: List[str] = []
+    _in = False
+    _depth = 0
+    _k, _n = 0, len(text)
+    while _k < _n:
+        _ch = text[_k]
+        if not _in:
+            if _ch in "{[" and (_depth or _ch == "{"):
+                _depth += 1
+            elif _ch in "}]" and _depth:
+                _depth -= 1
+            elif _ch == '"' and _depth:
+                _in = True
+            _out.append(_ch)
+            _k += 1
+        elif _ch == "\\":
+            _nx = text[_k + 1 : _k + 2]
+            if (_nx and _nx in _JSON_ESCAPES) or (
+                _nx == "u" and re.fullmatch(r"[0-9a-fA-F]{4}", text[_k + 2 : _k + 6])
+            ):
+                _out.append(text[_k : _k + 2])
+                _k += 2
+            else:
+                _out.append("\\\\")
+                _k += 1
+        elif _ch == '"':
+            _j = _JSON_WS_RE.match(text, _k + 1).end()
+            _next = text[_j : _j + 1]
+            _in = bool(_next) and _next not in ",:}]"
+            _out.append('\\"' if _in else _ch)
+            _k += 1
+        elif _ch < " ":
+            _out.append({"\n": "\\n", "\t": "\\t", "\r": "\\r"}.get(_ch, ""))
+            _k += 1
+        else:
+            _out.append(_ch)
+            _k += 1
+    return "".join(_out)
+
+
+def _json_object_with(text: str, key: str) -> Optional[Dict[str, Any]]:
+    """The last top-level JSON object in `text` that carries `key`, or None.
+
+    Every "{" is tried from the start, and an object once decoded is
+    skipped whole, so a "{}" a string quotes is never taken for the object:
+    the backward scan this replaces decoded the "{}" of a claim's
+    `(sources or {}).items()`, found no "analysis" and dropped the cycle's
+    claims — 4 forge replies and 25 claims in R21-R23. A reply the strict
+    decoder rejects is read once more mended (_repair_json_strings), which
+    recovered R23's fifth. Never raises.
+    """
+    _decoder = json.JSONDecoder()
+    _src = str(text or "")
+    for _s in (_src, _repair_json_strings(_src)):
+        _found = None
+        _i = _s.find("{")
+        while _i >= 0:
+            try:
+                _obj, _end = _decoder.raw_decode(_s, _i)
+            except ValueError:
+                _i = _s.find("{", _i + 1)
+                continue
+            if isinstance(_obj, dict) and key in _obj:
+                _found = _obj
+            _i = _s.find("{", _end)
+        if _found is not None:
+            return _found
+        if _s is not _src:
+            break
+    return None
+
+
 class JsonContracts:
     """Tolerant parsing of JSON contracts produced by an LLM.
 
@@ -19728,16 +20261,18 @@ class JsonContracts:
         exists to collect.
 
         Ladder: strip one wrapping fence if present, start at the first
-        brace, try a clean parse, then the truncation repair. The second
-        element of the returned tuple names which rung succeeded ("clean",
-        "salvaged") so the caller's log can distinguish a healthy response
-        from a rescued one.
+        brace, try a clean parse, then the same text with its strings
+        mended (_repair_json_strings), then the truncation repair. The
+        second element of the returned tuple names which rung succeeded
+        ("clean", "repaired", "salvaged") so the caller's log can
+        distinguish a healthy response from a rescued one.
 
         Args:
             response: Raw LLM response text.
 
         Returns:
-            (parsed dict or None, how): how is "clean", "salvaged" or "".
+            (parsed dict or None, how): how is "clean", "repaired",
+            "salvaged" or "".
         """
         if not response:
             return None, ""
@@ -19756,7 +20291,17 @@ class JsonContracts:
                 return data, "clean"
         except Exception:
             pass
+        _mended = _repair_json_strings(text)
+        if _mended != text:
+            try:
+                data = json.loads(_mended)
+                if isinstance(data, dict):
+                    return data, "repaired"
+            except Exception:
+                pass
         data = cls._repair_truncated_json(text)
+        if data is None and _mended != text:
+            data = cls._repair_truncated_json(_mended)
         return (data, "salvaged") if data is not None else (None, "")
 
 
@@ -20204,6 +20749,59 @@ class LLMOrchestrator:
         except Exception:
             pass
 
+    def _note_cache_use(self, label: str, own: bool, result: Any) -> None:
+        """Tally llama-server's reuse per turn, split by prefix and own context.
+
+        From the timings of each response (cache_n, prompt_n, prompt_ms).
+        A prefix call that processes more than 50k tokens right after an
+        own-context call means the host-memory prompt cache did not hold
+        the prefix while the reader ran — the one way isolate_reader_calls
+        costs more than it saves — and is said at once, in the run.
+        Never raises.
+        """
+        try:
+            _pn = getattr(result, "prefill_tokens", None)
+            if _pn is None:
+                return
+            _cn = int(getattr(result, "cache_tokens", 0) or 0)
+            _ms = float(getattr(result, "prefill_ms", 0.0) or 0.0)
+            _t = getattr(self._f, "_cache_use_this_turn", None)
+            if _t is None:
+                _t = {}
+                self._f._cache_use_this_turn = _t
+            _k = "own" if own else "prefix"
+            _r = _t.setdefault(_k, [0, 0, 0, 0.0, 0])
+            _r[0] += 1
+            _r[1] += _cn
+            _r[2] += int(_pn)
+            _r[3] += _ms
+            if (
+                not own
+                and int(_pn) > 50000
+                and getattr(self._f, "_last_call_was_own_context", False)
+            ):
+                _r[4] += 1
+                self._f._log_debug(
+                    f"⚠️ Cache: {label or 'a call'} re-processed {_pn} tokens "
+                    f"right after an own-context call — the prompt cache did not "
+                    f"hold the prefix. If this repeats, turn isolate_reader_calls "
+                    f"off."
+                )
+            self._f._last_call_was_own_context = bool(own)
+        except Exception:
+            pass
+        try:
+            # How deep the evidence judge reads, for [JUDGE-TURN].
+            if str(label or "").startswith("agentic_evidence"):
+                _depth = int(getattr(result, "cache_tokens", 0) or 0) + int(
+                    getattr(result, "prefill_tokens", 0) or 0
+                )
+                if _depth:
+                    self._f._bump_turn_metric("judge_calls", 1)
+                    self._f._bump_turn_metric("judge_depth_tokens", _depth)
+        except Exception:
+            pass
+
     def _note_own_context(self, label: str) -> None:
         """Tally a call that went out on its own context, by label, per turn.
 
@@ -20423,6 +21021,27 @@ class LLMOrchestrator:
                 )
         return _aligned
 
+    def _count_cut(self, census: Dict[str, Any], label: str) -> None:
+        """Add a heavy call to the turn's cut census as it is sent: its cut,
+        its volatile part, and its label when it carried no turn context
+        (_cut_census_line). Never raises."""
+        try:
+            _c = getattr(self._f, "_cut_census_this_turn", None)
+            if _c is None:
+                _c = {}
+                self._f._cut_census_this_turn = _c
+            _c["calls"] = _c.get("calls", 0) + 1
+            _c[census["at"]] = _c.get(census["at"], 0) + 1
+            _c["cut_bytes"] = census["cut"]
+            if census["volatile"]:
+                _c["volatile"] = _c.get("volatile", 0) + census["volatile"]
+                _c["volatile_per_call"] = census["volatile"]
+            if not census["carries"]:
+                _bare = _c.setdefault("no_turn", {})
+                _bare[label or "?"] = _bare.get(label or "?", 0) + 1
+        except Exception:
+            pass
+
     async def call_llm(
         self,
         prompt: str,
@@ -20605,7 +21224,8 @@ class LLMOrchestrator:
             response_format=response_format,
             reasons_about_code=reasons_about_code,
         )
-        if reasons_about_code is False and system_prompt is _before_align:
+        _own_ctx = reasons_about_code is False and system_prompt is _before_align
+        if _own_ctx:
             self._note_own_context(label)
 
         # ── Drop a skeleton the aligned prefix already carries ─────────────
@@ -20665,6 +21285,7 @@ class LLMOrchestrator:
         # full re-prefill. Reading order is unchanged — Block B still sits
         # between the hub tier and the role, across the message boundary.
         _split_shared = _split_own = ""
+        _census: Dict[str, Any] = {}
         try:
             # The invariant describes the SESSION, not the turn, so it is
             # remembered the moment it is published and read from there
@@ -20719,37 +21340,31 @@ class LLMOrchestrator:
                         _split_shared, _split_own = _split_turn_context(
                             system_prompt, prompt, _stab, _pre_full
                         )
-                    system_prompt = _cut
-                    prompt = _moved + "\n\n" + (prompt or "")
-
                     # ── Cut census ────────────────────────────────────────
                     # Per call, not per turn: the summary below fires once and
                     # says nothing about how many calls shared the turn, which
                     # is the whole variable. `volatile` is the prize — the
                     # bytes that would have been inside the system had the cut
                     # been made at the turn prelim instead, and that every
-                    # call of this turn therefore reprocesses.
-                    try:
-                        _c = getattr(self._f, "_cut_census_this_turn", None)
-                        if _c is None:
-                            _c = {}
-                            self._f._cut_census_this_turn = _c
-                        _c["calls"] = _c.get("calls", 0) + 1
-                        _c["at_invariant" if _cut == _stab else "at_turn_prelim"] = (
-                            _c.get(
-                                "at_invariant" if _cut == _stab else "at_turn_prelim",
-                                0,
-                            )
-                            + 1
-                        )
-                        _c["cut_bytes"] = len(_cut)
-                        if _pre_full and len(_pre_full) > len(_cut):
-                            _c["volatile"] = _c.get("volatile", 0) + (
-                                len(_pre_full) - len(_cut)
-                            )
-                            _c["volatile_per_call"] = len(_pre_full) - len(_cut)
-                    except Exception:
-                        pass
+                    # call of this turn therefore reprocesses. Read here, from
+                    # the call as it arrived; counted where it is sent, since
+                    # a call answered by one in flight or by the cache sends
+                    # nothing. A call that does not carry the turn's prelim —
+                    # seed_inference, which runs before it is built — has no
+                    # volatile part and nothing to split: counted apart, it
+                    # explains the census of five of round 23's turns, "10
+                    # heavy call(s)" beside "sent as its own message x9".
+                    _carries = bool(_pre_full) and system_prompt.startswith(_pre_full)
+                    _census = {
+                        "at": "at_invariant" if _cut == _stab else "at_turn_prelim",
+                        "cut": len(_cut),
+                        "carries": _carries,
+                        "volatile": (
+                            max(0, len(_pre_full) - len(_cut)) if _carries else 0
+                        ),
+                    }
+                    system_prompt = _cut
+                    prompt = _moved + "\n\n" + (prompt or "")
                     # Once per turn, not per call: forty of these would
                     # drown the log. Silence here is what let an earlier
                     # guard sit broken across several runs, so the fact
@@ -20931,6 +21546,10 @@ class LLMOrchestrator:
                         f"LLM call to {model}{label_str} – "
                         f"prompt size: ~{prompt_tokens} tokens"
                     )
+
+                # The cut census counts what is sent (_count_cut).
+                if _census:
+                    self._count_cut(_census, label)
 
                 # ── Shared turn context as its own user message ───────────
                 # The merged `prompt` stays the currency of the keys above
@@ -21147,13 +21766,23 @@ class LLMOrchestrator:
                                 f"    HEAD: {_head}\n"
                                 f"    TAIL: {_tail}"
                             )
+                        _pn = getattr(result, "prefill_tokens", None)
+                        _cache_txt = (
+                            f" · reused {getattr(result, 'cache_tokens', 0) or 0}"
+                            f" new {_pn} prefill "
+                            f"{(getattr(result, 'prefill_ms', 0) or 0) / 1000:.1f}s"
+                            if _pn is not None
+                            else ""
+                        )
                         self._f._log_debug(
                             f"[LLM] {model}{label_str} – "
                             f"in:{in_tokens} out:{out_tokens} "
                             f"took {time.monotonic() - t_start:.3f}s "
                             f"(waited {t_acquired - t_start:.3f}s)"
                             f"{' [TRUNCATED]' if result.truncated else ''}"
+                            f"{_cache_txt}"
                         )
+                        self._note_cache_use(label, _own_ctx, result)
                         self._f._record_metric(
                             "llm_call",
                             (
@@ -21437,6 +22066,39 @@ _CLAIM_OBSERVATIONS_MAX = 12
 _OBSERVATION_DETAIL_CHARS = 120
 # How much of the question the [METRICS-TURN] line repeats at its end.
 _METRICS_QUESTION_CHARS = 80
+# The rules [CTX-CALIBRATE] applies (Filter._log_ctx_use), from the review of
+# rounds 16-20: evidence per 1k tokens was 0.020 in the hub tier, 0.293 in
+# Block B and 0.036 in the map, and 61% of the symbols a turn used were in
+# view only through the map. Log only: no valve is changed.
+# The hub earns its tokens while its evidence per 1k tokens is at least
+# this share of Block B's.
+_CAL_HUB_KEEP_RATIO = 0.5
+# The map earns its tokens while at least this share of the symbols a turn
+# used were reached only through it.
+_CAL_MAP_KEEP_SHARE = 0.35
+# A prefix lost right after an own-context call costs a full re-prefill:
+# this many in one chat and isolate_reader_calls costs more than it saves.
+_CAL_PREFIX_LOST_MAX = 2
+
+
+def _in_zone(symbol: str, zone: Set[str]) -> bool:
+    """Whether a symbol is one of a zone's, by name or by a dotted tail.
+
+    The planner may write `Filter.inlet` where Block B registered the body
+    under a longer qualified name, or the other way round. Never raises.
+    """
+    try:
+        if not symbol or not zone:
+            return False
+        if symbol in zone:
+            return True
+        return any(
+            _z.endswith("." + symbol) or symbol.endswith("." + _z) for _z in zone
+        )
+    except Exception:
+        return False
+
+
 # What the triangulation shadow counts per turn
 # (AgenticEvidenceLedger.triangulate), in the order the [METRICS-TURN]
 # line and /outcomes print them.
@@ -21740,6 +22402,91 @@ def _edge_reaches(
     return None
 
 
+# The verbs whose absence the call graph can read as a refutation: it draws
+# calls. "uses", "reads", "writes" and "depends on" also name reads of locals
+# and writes through attributes, which it does not draw (_relation_reading).
+_RELATION_CALL_VERB_RE = re.compile(
+    r"\b(?:calls?|invokes?|llama\s+a|invoca\s+a)\b", re.IGNORECASE
+)
+
+
+def _relation_reading(
+    idx: Any, span: str, caller: str, callee: str, project_id: str
+) -> Tuple[str, str]:
+    """How far the call graph can rule on one relation a pattern matched.
+
+    "rule": an edge confirms it and its absence refutes it. "confirm": an
+    edge confirms it and its absence says nothing, for the two shapes the
+    relation patterns read as calls and are not. A verb other than a call
+    (`span`, the matched text, when given): "Filter.inlet reads _split" is
+    about a local variable and "call_llm writes _cut_census_this_turn" about
+    an attribute, and the graph draws neither. A class with one of its own
+    members: "Filter calls inlet" is how a model told to write only with the
+    names Filter and inlet said that inlet is Filter's method, and R23
+    hard-killed a true hypothesis on it. A sibling method that calls the
+    member still confirms it (_relation_edge_status reads a class as its
+    members). Returns (reading, why), why "" for "rule". Never raises:
+    "rule", the reading before this, on any failure.
+    """
+    try:
+        if span and not _RELATION_CALL_VERB_RE.search(str(span)):
+            return "confirm", "not a call: an edge confirms it, none refutes it"
+        _bare = str(callee or "").split(".")[-1]
+        _owner = str(caller or "").split(".")[-1]
+        for _cq in idx.get_qualified_names_for(_owner, project_id) or ():
+            if (idx.get_symbol_meta(_cq, project_id) or {}).get("kind") != "class":
+                continue
+            _members = idx.get_class_members(_cq.split(".")[-1], project_id) or []
+            if _bare in {_m.split(".")[-1] for _m in _members}:
+                return "confirm", f"{_bare} is a member of {_owner}, not a callee"
+        return "rule", ""
+    except Exception:
+        return "rule", ""
+
+
+def _names_as_written(text: str, names: Iterable[str]) -> List[str]:
+    """The indexed names a text writes as code, each as it is written.
+
+    For the vocabulary design_critical_experiment offers, which the model
+    must write its checkable claims in. Listed one word at a time, R23's
+    "Filter.inlet" came back as the claim "Filter calls inlet", and R22's
+    "the coverage guard", a plain word that is also a method's name, as
+    "is_falsified calls coverage": two true hypotheses hard-killed. A dotted
+    name is kept whole (Class.member, its last two parts, when the class is
+    capitalised) and its parts are not listed again; a name the text only
+    uses as a plain word — no underscore, no capital, not dotted, not in
+    backticks, not called — is left out. Sorted. Never raises.
+    """
+    try:
+        _names = set(names)
+        _out: Set[str] = set()
+        _covered: Set[str] = set()
+        for _m in re.finditer(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", str(text)):
+            _parts = _m.group(0).split(".")
+            if _parts[-1] not in _names:
+                continue
+            if _parts[-2][:1].isupper():
+                _out.add(".".join(_parts[-2:]))
+                _covered.update(_parts[-2:])
+            else:
+                _out.add(_parts[-1])
+                _covered.add(_parts[-1])
+        for _n in _names - _covered:
+            if (
+                "_" in _n
+                or _n[:1].isupper()
+                or re.search(r"[a-z][A-Z]", _n)
+                or re.search(
+                    r"`" + re.escape(_n) + r"`|\b" + re.escape(_n) + r"\(",
+                    str(text),
+                )
+            ):
+                _out.add(_n)
+        return sorted(_out)
+    except Exception:
+        return sorted(names)
+
+
 def _relation_edge_status(idx: Any, caller: str, callee: str, project_id: str) -> str:
     """
     Classify how a caller relates to a callee in the call graph.
@@ -21911,6 +22658,8 @@ def _restatement_signature(
     the first two cited symbols, reversed for a passive "called by". The
     cited symbols themselves are left out of the first two: every claim in
     the comparison shares them, so they say nothing about which fact it is.
+    A dotted name counts by its last part: `self._x`, `filt._x` and
+    `self._f._x` are one attribute however a claim reaches it.
     """
     # ── Step 1: the names every compared claim shares ──
     _own: Set[str] = set()
@@ -21933,6 +22682,8 @@ def _restatement_signature(
             or _t[:1].isdigit()
             or _t in ("none", "true", "false")
         ):
+            if not _quoted and "." in _t and not _t[:1].isdigit():
+                _t = _t.rsplit(".", 1)[-1]
             _code.add(_t)
     _words = {
         _w
@@ -22019,6 +22770,27 @@ _PROSE_CODE_NAME_RE = re.compile(
     r"|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+"
     r")(\(\))?(?![\w`/])"
 )
+
+
+def _code_names(text: str) -> List[str]:
+    """The code names a text writes, as written and in order: code-shaped in
+    prose (_PROSE_CODE_NAME_RE), or in backticks, with or without a call's
+    parentheses (`_quote_key()`, `_judge_once(claims)`)."""
+    _t = str(text or "")
+    _out: List[str] = []
+    for _n in [_m.group(1) for _m in _PROSE_CODE_NAME_RE.finditer(_t)] + re.findall(
+        r"`([A-Za-z_][\w.]*)(?:\([^`\n]*\))?`", _t
+    ):
+        _n = _n.rstrip(".")
+        if _n and _n not in _out:
+            _out.append(_n)
+    return _out
+
+
+def _code_name_tails(text: str) -> Set[str]:
+    """The code names a text writes (_code_names), each by its last part:
+    `Filter.inlet` is `inlet`."""
+    return {_n.rsplit(".", 1)[-1] for _n in _code_names(text)}
 
 
 def _backtick_code_names(line: str) -> str:
@@ -22143,6 +22915,61 @@ def _names_both_ends(text: str, ends: List[str]) -> bool:
         return True
     except Exception:
         return True
+
+
+def _names_beyond_ends(text: str, ends: List[str]) -> List[str]:
+    """The code names a call claim writes besides the ends of the check.
+
+    A key, a variable, an attribute, a third symbol: what the claim says of
+    them no edge can see, so the check settles a part of it. A name is an
+    end when its last part is an end's last part, or when it is made only
+    of the ends' parts ("HypothesisForge" for HypothesisForge._forge_loop);
+    a receiver before an end's name ("self._f._bump_turn_metric") is not a
+    name of its own. The forge's graph_scope reads the same way. Never
+    raises: ["?"], the cautious answer, on any failure.
+    """
+    try:
+        _tails, _parts = set(), set()
+        for _e in ends:
+            _p = [_x for _x in str(_e or "").split(".") if _x]
+            if _p:
+                _tails.add(_p[-1])
+                _parts.update(_p)
+        _text = str(text or "")
+        _found = [_m.group(1) for _m in _PROSE_CODE_NAME_RE.finditer(_text)]
+        _found += re.findall(r"`([A-Za-z_][\w.]*)`", _text)
+        _out: List[str] = []
+        for _n in _found:
+            _p = [_x for _x in _n.split(".") if _x]
+            if not _p or _p[-1] in _tails or all(_x in _parts for _x in _p):
+                continue
+            if _n not in _out:
+                _out.append(_n)
+        return _out
+    except Exception:
+        return ["?"]
+
+
+# A claim that a symbol calls itself, the one claim a check from a symbol to
+# itself tests.
+_SELF_CALL_CLAIM_RE = re.compile(
+    r"\b(?:itself|recursi(?:ve|vely|on)|recurs(?:es|ing)?|s[ií]\s+mism[oa]|"
+    r"recursiv[oa]|recursivamente)\b",
+    re.I,
+)
+
+
+def _is_self_check(src: str, dst: str) -> bool:
+    """Whether a call check runs from a symbol to itself: the same name, or
+    one end the bare last part of the other."""
+    _a, _b = str(src or "").strip(), str(dst or "").strip()
+    if not _a or not _b:
+        return False
+    if _a == _b:
+        return True
+    return ("." not in _a and _b.rsplit(".", 1)[-1] == _a) or (
+        "." not in _b and _a.rsplit(".", 1)[-1] == _b
+    )
 
 
 # Where each class, method and function of the last block read starts and
@@ -22483,11 +23310,113 @@ def _call_site_reading(
 
 
 _REFUTED_HEAD = (
-    "Refuted against the code — where anything above rests on one of these, "
-    "the code wins and that part does not hold:"
+    "Refuted against the code — each statement below is false, and after its "
+    "dash is what the check found in the code. Where anything above rests on "
+    "one of them, the code wins and that part does not hold:"
 )
 _REFUTED_MAX = 6
+# What a refuted claim keeps of the reading that refuted it (the judge's
+# cited lines, a search fact among them), and what the block shows of it.
+_REFUTING_DETAIL_CHARS = 900
+_REFUTED_QUOTE_CHARS = 600
 _BULLET_QIDS_RE = re.compile(r"\s\[([^\[\]\n]+)\]\s*$")
+
+
+def _refuted_key(claim: Any) -> str:
+    """A claim's statement, as two copies of it compare: round 25's twins
+    differed by the final stop one step's copy carried."""
+    return " ".join(
+        str(getattr(claim, "text", "") or "").casefold().split()
+    ).rstrip(" .;:")
+
+
+def _contested_keys(claims: List[Any]) -> Set[str]:
+    """The statements one check confirmed and another refuted (_refuted_key).
+
+    fold_restatements keeps the best of each verdict when twins disagree,
+    so both reach the workspaces: round 25's third turn listed "call_llm
+    splits the system prompt at the invariant boundary when …" under
+    "each statement below is false", ✗ under step 1 and ✓✓ under step 4,
+    each quoting the same lines.
+    """
+    _seen: Dict[str, Set[str]] = {}
+    for _c in claims or []:
+        _v = str(getattr(_c, "verification", "") or "")
+        if _v in ("confirmed", "refuted"):
+            _seen.setdefault(_refuted_key(_c), set()).add(_v)
+    return {_k for _k, _vs in _seen.items() if len(_vs) == 2}
+
+
+def _refuted_shown(claims: List[Any]) -> List[Any]:
+    """The refuted claims the block lists (_refuted_lines), in order.
+
+    One per statement — two steps that made the same claim made one — with
+    the longest reading any copy of it carries; at most _REFUTED_MAX. Not a
+    statement another check confirmed (_contested_keys): the block says
+    each is false, and that one is read both ways (_contested_lines).
+    """
+    _by: Dict[str, Any] = {}
+    _contested = _contested_keys(claims)
+    for _c in claims or []:
+        if getattr(_c, "verification", "") != "refuted":
+            continue
+        if _refuted_key(_c) in _contested:
+            continue
+        _k = _refuted_key(_c)
+        _was = _by.get(_k)
+        if _was is None:
+            if len(_by) < _REFUTED_MAX:
+                _by[_k] = _c
+        elif len(str(getattr(_c, "verification_detail", "") or "")) > len(
+            str(getattr(_was, "verification_detail", "") or "")
+        ):
+            _by[_k] = _c
+    return list(_by.values())
+
+
+_CONTESTED_HEAD = (
+    "Read both ways — two checks of each statement below disagree: one found "
+    "it in the code and one found it false, each after its dash. It is "
+    "settled neither way: nothing above may rest on it, and where the answer "
+    "uses it, it says the checks disagree:"
+)
+_CONTESTED_QUOTE_CHARS = 300
+
+
+def _contested_lines(claims: List[Any]) -> List[str]:
+    """The block naming the statements read both ways (_contested_keys), or
+    [] when there are none: each once, with what each check read, the
+    longest reading of each verdict; at most _REFUTED_MAX."""
+    _keys = _contested_keys(claims)
+    if not _keys:
+        return []
+    _best: Dict[Tuple[str, str], Any] = {}
+    _order: List[str] = []
+    for _c in claims or []:
+        _k = _refuted_key(_c)
+        _v = str(getattr(_c, "verification", "") or "")
+        if _k not in _keys or _v not in ("confirmed", "refuted"):
+            continue
+        if _k not in _order:
+            _order.append(_k)
+        _was = _best.get((_k, _v))
+        if _was is None or len(str(getattr(_c, "verification_detail", "") or "")) > len(
+            str(getattr(_was, "verification_detail", "") or "")
+        ):
+            _best[(_k, _v)] = _c
+    _rows: List[str] = []
+    for _k in _order[:_REFUTED_MAX]:
+        _yes, _no = _best[(_k, "confirmed")], _best[(_k, "refuted")]
+        _t = " ".join(str(getattr(_yes, "text", "") or "").split()).rstrip(" .")
+        _say = [
+            f"{_w}: "
+            + " ".join(str(getattr(_c, "verification_detail", "") or "").split())[
+                :_CONTESTED_QUOTE_CHARS
+            ]
+            for _w, _c in (("found", _yes), ("refuted", _no))
+        ]
+        _rows.append(f"- ⇄ {_t[:_CLAIMS_ONLY_MAX_CHARS]} — " + "; ".join(_say))
+    return [_CONTESTED_HEAD] + _rows if _rows else []
 
 
 def _refuted_lines(claims: List[Any]) -> List[str]:
@@ -22495,27 +23424,35 @@ def _refuted_lines(claims: List[Any]) -> List[str]:
 
     Placed straight after the synthesis because the synthesis is written
     before the checks run: a premise it states is refuted three sections
-    further down, and the model followed the synthesis.
+    further down, and the model followed the synthesis. Each comes with the
+    reading that refuted it, whole enough to show what the code does: round
+    24's "✗ … does not emit _from_elided to any metric" was cut before the
+    line that emits it, and its outline concluded the refuted statement.
     """
     _rows: List[str] = []
-    for _c in claims or []:
-        if getattr(_c, "verification", "") != "refuted":
-            continue
-        _t = " ".join(str(getattr(_c, "text", "") or "").split())[:220]
+    for _c in _refuted_shown(claims):
+        _t = " ".join(str(getattr(_c, "text", "") or "").split())
         _d = " ".join(str(getattr(_c, "verification_detail", "") or "").split())
-        _rows.append(f"- ✗ {_t}" + (f" — {_d[:160]}" if _d else ""))
-        if len(_rows) >= _REFUTED_MAX:
-            break
-    return [_REFUTED_HEAD] + _rows if _rows else []
+        _rows.append(
+            f"- ✗ {_t[:_CLAIMS_ONLY_MAX_CHARS]}"
+            + (f" — {_d[:_REFUTED_QUOTE_CHARS]}" if _d else "")
+        )
+    _both = _contested_lines(claims)
+    return ([_REFUTED_HEAD] + _rows if _rows else []) + (
+        ([""] if _rows and _both else []) + _both
+    )
 
 
-def _mark_refuted_bullets(text: str, claims: List[Any]) -> Tuple[str, int]:
-    """Mark the synthesis bullets the code refuted. Returns (text, marked).
+def _drop_refuted_bullets(text: str, claims: List[Any]) -> Tuple[str, int]:
+    """The synthesis without the bullets the code refuted, and how many.
 
     A claims-only synthesis (_claims_as_workspace_prose) lists the step's
-    claims as written, before any check ran. A bullet is marked when it is
-    a refuted claim, or restates one (_is_restatement) — the ledger keeps
+    claims as written, before any check ran. A bullet goes when it is a
+    refuted claim, or restates one (_is_restatement) — the ledger keeps
     one of a pair of restatements, and the other is still listed here.
+    Marked "✗ REFUTED:" and kept, it was the refuted statement read once
+    more as written, and round 24's outline concluded it; the refuted block
+    (_refuted_lines) lists each, with what the code reads.
     """
     _refuted = [
         _c for _c in claims or [] if getattr(_c, "verification", "") == "refuted"
@@ -22535,8 +23472,10 @@ def _mark_refuted_bullets(text: str, claims: List[Any]) -> Tuple[str, int]:
     ]
     _lines = text.split("\n")
     _n = 0
-    for _i, _l in enumerate(_lines):
+    _kept: List[str] = []
+    for _l in _lines:
         if not _l.startswith("- ") or _l.startswith("- ✗"):
+            _kept.append(_l)
             continue
         _body = _l[2:]
         _m = _BULLET_QIDS_RE.search(_body)
@@ -22549,9 +23488,10 @@ def _mark_refuted_bullets(text: str, claims: List[Any]) -> Tuple[str, int]:
             or (_qids and _is_restatement(_s, _sig))
             for _t, _s in _known
         ):
-            _lines[_i] = "- ✗ REFUTED: " + _body
             _n += 1
-    return "\n".join(_lines), _n
+            continue
+        _kept.append(_l)
+    return "\n".join(_kept), _n
 
 
 class AgenticEvidenceLedger:
@@ -22677,11 +23617,26 @@ class AgenticEvidenceLedger:
         # degrades to prose-only.
         data = None
         tail_start = None
+        _mended_at: List[int] = []
+
+        def _loads(_s: str) -> Any:
+            # Strict first; mended only when that fails (R22: a claim
+            # wrote \x27 inside its string and a recovery call was paid).
+            try:
+                return json.loads(_s)
+            except ValueError:
+                _m = _repair_json_strings(_s)
+                if _m == _s:
+                    raise
+                _out = json.loads(_m)
+                _mended_at.append(1)
+                return _out
+
         # (a) fenced blocks with any (or no) language tag — accept the LAST
         #     one whose content parses to a dict with a "claims" key.
         for fm in self._FENCE_RE.finditer(step.output):
             try:
-                cand = json.loads(fm.group(1).strip())
+                cand = _loads(fm.group(1).strip())
             except Exception:
                 continue
             if isinstance(cand, dict) and "claims" in cand:
@@ -22697,12 +23652,17 @@ class AgenticEvidenceLedger:
                     break
                 frag = step.output[pos:].strip().strip("`").strip()
                 try:
-                    cand = json.loads(frag)
+                    cand = _loads(frag)
                 except Exception:
                     continue
                 if isinstance(cand, dict) and "claims" in cand:
                     data, tail_start = cand, pos
                     break
+        if data is not None and _mended_at:
+            self._f._log_debug(
+                f"🤖 Ledger: step {step.id} claims tail read with its strings "
+                f"mended (an unescaped quote, backslash or line break)"
+            )
         # (c) R28: truncated-tail salvage. Outputs cut mid-JSON at the step
         #     token cap fired recovery calls of 65-79 s each (4 of 9). The
         #     truncation repairer of the metacog contracts recovers the
@@ -22718,7 +23678,9 @@ class AgenticEvidenceLedger:
                 frag = step.output[pos:].strip().strip("`").strip()
                 if '"claims"' not in frag:
                     continue
-                cand = JsonContracts._repair_truncated_json(frag)
+                cand = JsonContracts._repair_truncated_json(
+                    frag
+                ) or JsonContracts._repair_truncated_json(_repair_json_strings(frag))
                 if isinstance(cand, dict) and "claims" in cand:
                     data, tail_start = cand, pos
                     self._f._log_debug(
@@ -23306,13 +24268,15 @@ class AgenticEvidenceLedger:
     )
 
     def _proposition_key(self, claim: "LedgerClaim") -> tuple:
-        """The assertion a claim makes, stripped of how it was worded.
+        """The claims a restatement of this one can be among.
 
-        Subject and the symbols it cites — the rule already trusted for
-        structural claims, unchanged. Wording is deliberately not part of
-        it: four claims in one turn said Filter.inlet initializes
-        _bodies_seen_this_turn, and two differed only in writing the
-        attribute `filt.` where the others wrote `self.`.
+        Subject and the symbols it cites. Necessary, not sufficient: every
+        claim about a method citing only that method shares them, so the
+        wording decides within the group (_is_restatement, as the entry
+        dedupe in extract_and_validate does). Four claims in one turn said
+        Filter.inlet initializes _bodies_seen_this_turn, two writing
+        `filt.` where the others wrote `self.`; the signature reads a
+        dotted name by its last part, so they are still one.
 
         A polarity flag read from the text used to sit here as well, so
         that an assertion and its denial would not merge. It was removed
@@ -23351,75 +24315,18 @@ class AgenticEvidenceLedger:
         strongest of a set rather than the earliest. Rewrites self.claims
         so the tally, the dump and the workspace all read one list — two
         readings of a claim set is what produced a header at 86% over a
-        footer at 93% of the same turn.
+        footer at 93% of the same turn. What is one assertion is decided by
+        fold_restatements, which the outline's gaps line reads too.
 
         Returns the number of claims removed. Never raises.
         """
         _removed = 0
         try:
-            # ── Step 1: group by what each claim asserts ──
-            _groups: Dict[tuple, List[Any]] = {}
-            for _c in self.claims:
-                _groups.setdefault(self._proposition_key(_c), []).append(_c)
-
-            # ── Step 2: one survivor per proposition, best evidence first ──
-            _rank = {_b: _i for _i, _b in enumerate(self._BUCKET_RANK)}
-            _keep = []
-            for _key, _members in _groups.items():
-                if len(_members) == 1:
-                    _keep.append(_members[0])
-                    continue
-                _by_rank = sorted(
-                    _members,
-                    key=lambda _m: _rank.get(self.bucket_of(_m), 99),
-                )
-                _survivors = [_by_rank[0]]
-                # Twins with opposite verdicts are one proposition two
-                # instruments disagree on, or two assertions the key cannot
-                # tell apart. Neither is a reason to drop a side: the best
-                # of each verdict survives. Dropping one hid E3's refutation
-                # of "never updates decided_before" behind a confirmed
-                # "initialises it to 0", and the answer gave the refuted
-                # premise at 100% (conflict_is_anomaly).
-                _polar = {_m.verification for _m in _members}
-                if {"confirmed", "refuted"} <= _polar:
-                    self.twin_conflicts += 1
-                    for _side in ("confirmed", "refuted"):
-                        _top = next(
-                            (_m for _m in _by_rank if _m.verification == _side), None
-                        )
-                        if _top is not None and _top not in _survivors:
-                            _survivors.append(_top)
-                _keep.extend(_survivors)
-                _removed += len(_members) - len(_survivors)
-
-            # ── Step 2b: the same sentence under two subjects is one ──
-            # Round 18 recorded "Filter._cut_census_this_turn is not defined
-            # as a method on Filter" under Filter, confirmed, and under the
-            # attribute, blind: one assertion, counted settled and unread.
-            _by_text: Dict[str, List[Any]] = {}
-            for _c in _keep:
-                _by_text.setdefault(
-                    " ".join(str(_c.text or "").lower().split()), []
-                ).append(_c)
-            _keep = []
-            for _txt, _ms in _by_text.items():
-                if (
-                    len(_ms) == 1
-                    or not _txt
-                    or {"confirmed", "refuted"} <= {_m.verification for _m in _ms}
-                ):
-                    _keep.extend(_ms)
-                    continue
-                _keep.append(
-                    min(_ms, key=lambda _m: _rank.get(self.bucket_of(_m), 99))
-                )
-                _removed += len(_ms) - 1
-
-            # ── Step 3: rewrite in the original order ──
+            _keep, _twins = self.fold_restatements(self.claims)
+            self.twin_conflicts += _twins
+            _removed = len(self.claims) - len(_keep)
             if _removed:
-                _kept = {id(_c) for _c in _keep}
-                self.claims = [_c for _c in self.claims if id(_c) in _kept]
+                self.claims = _keep
                 self._f._log_debug(
                     f"🤖 Ledger: {_removed} claim(s) restated a proposition "
                     f"already recorded — {len(self.claims)} distinct "
@@ -23428,6 +24335,98 @@ class AgenticEvidenceLedger:
         except Exception as _e:
             self._f._log_debug(f"🤖 Ledger: restatement collapse skipped ({_e!r})")
         return _removed
+
+    def fold_restatements(self, claims: List[Any]) -> Tuple[List[Any], int]:
+        """The claims that stay once restatements fold, and the twin conflicts.
+
+        Within a group (_proposition_key), a claim folds into the best-
+        evidenced one it restates (_is_restatement on _restatement_signature,
+        the entry dedupe's rule); one that says something else stays, with
+        its own verdict. By the key alone the fold kept one claim per group:
+        of the 219 judged claims R21-R23 folded, 18 restated the claim they
+        were folded into, and 20 others left the tally open or contradicted,
+        among them R23's false "_note_cache_use is called ... at two
+        locations" under a true "called only from call_llm". Nothing is
+        rewritten here; collapse_restatements applies the result.
+
+        Args:
+            claims: The ledger's claims, in order.
+
+        Returns:
+            (survivors in their original order, groups of restatements whose
+            members reached opposite verdicts).
+        """
+        _rank = {_b: _i for _i, _b in enumerate(self._BUCKET_RANK)}
+
+        def _order(_m: Any) -> int:
+            return _rank.get(self.bucket_of(_m), 99)
+
+        # ── Step 1: group by subject and cited symbols ──
+        _groups: Dict[tuple, List[Any]] = {}
+        for _c in claims:
+            _groups.setdefault(self._proposition_key(_c), []).append(_c)
+
+        # ── Step 2: within a group, one survivor per assertion ──
+        _keep: List[Any] = []
+        _twins = 0
+        for _members in _groups.values():
+            if len(_members) == 1:
+                _keep.append(_members[0])
+                continue
+            # The best-evidenced member of each assertion comes first and
+            # stands for it: a claim joins the first whose wording it
+            # restates, compared with that one alone, so a chain of near
+            # paraphrases cannot pull a different fact in.
+            _sets: List[Tuple[Any, List[Any]]] = []
+            for _m in sorted(_members, key=_order):
+                _sig = _restatement_signature(
+                    _m.text, _m.subject, list(getattr(_m, "valid_qids", None) or [])
+                )
+                _home = next((_s for _s in _sets if _is_restatement(_s[0], _sig)), None)
+                if _home is None:
+                    _sets.append((_sig, [_m]))
+                else:
+                    _home[1].append(_m)
+            for _sig, _same in _sets:
+                _survivors = [_same[0]]
+                # Twins with opposite verdicts are one proposition two
+                # instruments disagree on. Neither is a reason to drop a
+                # side: the best of each verdict survives. Dropping one hid
+                # E3's refutation of "never updates decided_before" behind a
+                # confirmed "initialises it to 0", and the answer gave the
+                # refuted premise at 100% (conflict_is_anomaly).
+                if {"confirmed", "refuted"} <= {_m.verification for _m in _same}:
+                    _twins += 1
+                    for _side in ("confirmed", "refuted"):
+                        _top = next(
+                            (_m for _m in _same if _m.verification == _side), None
+                        )
+                        if _top is not None and _top not in _survivors:
+                            _survivors.append(_top)
+                _keep.extend(_survivors)
+
+        # ── Step 3: the same sentence under two subjects is one ──
+        # Round 18 recorded "Filter._cut_census_this_turn is not defined as a
+        # method on Filter" under Filter, confirmed, and under the attribute,
+        # blind: one assertion, counted settled and unread.
+        _by_text: Dict[str, List[Any]] = {}
+        for _c in _keep:
+            _norm = " ".join(str(_c.text or "").lower().split())
+            _by_text.setdefault(_norm, []).append(_c)
+        _keep = []
+        for _txt, _ms in _by_text.items():
+            if (
+                len(_ms) == 1
+                or not _txt
+                or {"confirmed", "refuted"} <= {_m.verification for _m in _ms}
+            ):
+                _keep.extend(_ms)
+                continue
+            _keep.append(min(_ms, key=_order))
+
+        # ── Step 4: in the original order ──
+        _kept = {id(_c) for _c in _keep}
+        return [_c for _c in claims if id(_c) in _kept], _twins
 
     def triangulate(self, project_id: str) -> Dict[str, Any]:
         """
@@ -24076,12 +25075,13 @@ class AgenticEvidenceLedger:
             for _m in self._NEG_RELATION_RE.finditer(_masked):
                 _nc, _ne = _m.group(1), _m.group(2)
                 _present = self._f._meta_reasoning._relation_in_graph(
-                    _nc, _ne, project_id
+                    _nc, _ne, project_id, _m.group(0)
                 )
                 _masked = _masked.replace(_m.group(0), " ")
                 if _present is True:
                     invalid.append(f"{_nc}_not_calls_{_ne}")
-            for caller, callee in self._CALL_RELATION_RE.findall(_masked):
+            for _rm in self._CALL_RELATION_RE.finditer(_masked):
+                caller, callee = _rm.group(1), _rm.group(2)
                 # Membership, not truthiness: the resolver echoes an
                 # unmatched name back, so a plain English word ("calls",
                 # "which") would pass as a symbol. It resolves camelCase
@@ -24122,6 +25122,15 @@ class AgenticEvidenceLedger:
                     )
                     continue
                 verified = _status == "direct"
+                _reading, _why = _relation_reading(
+                    self._f._symbol_index, _rm.group(0), caller, callee, project_id
+                )
+                if not verified and _reading == "confirm":
+                    self._f._log_debug(
+                        f"🔗 DIAG relation: '{_rm.group(0)[:80]}' NOT REFUTABLE "
+                        f"— {_why}; not counted either way"
+                    )
+                    continue
                 if not verified:
                     # A class is not a destination a call relation can have.
                     # Such a claim is not false, it is unevaluable, and
@@ -24162,10 +25171,24 @@ class AgenticEvidenceLedger:
 
 
 # The one claim shape whose quote must mention something specific: a named
-# call target. Anything vaguer cannot be checked this way without guessing.
+# call target (_call_target). Anything vaguer cannot be checked this way
+# without guessing.
 _CALL_TARGET_RE = re.compile(
-    r"\b(?:calls|invokes|delegates to|passes .{0,40}? to)\s+" r"([A-Za-z_][\w.]*)"
+    r"\b(?:calls|invokes|delegates to|passes .{0,40}? to)\s+(`)?([A-Za-z_][\w.]*)"
 )
+
+
+def _call_target(text: str) -> str:
+    """The call target a claim names — "calls X", "invokes X", "delegates to
+    X", "passes … to X" — when X is code: in backticks, or code-shaped in
+    prose (_PROSE_CODE_NAME_RE). "" when it names none: of the 11 quotes
+    rounds 21-23 counted as not naming their claim's target, 8 were the
+    target "that", "when", "B" or "Y"."""
+    for _m in _CALL_TARGET_RE.finditer(str(text or "")):
+        _t = _m.group(2).rstrip(".")
+        if _t and (_m.group(1) or _PROSE_CODE_NAME_RE.fullmatch(_t)):
+            return _t
+    return ""
 
 
 # Claims per evidence-judge call (AgenticEvidenceVerifier.judge).
@@ -24178,6 +25201,12 @@ _REASK_REASONS = frozenset(
         "quote came from another symbol's body",
     }
 )
+# How [JUDGE-TURN] names each of them.
+_REASK_SLUGS = {
+    "quote not found in any body": "not_found",
+    "its cited lines do not hold its anchor": "unanchored",
+    "quote came from another symbol's body": "cross_body",
+}
 
 
 class AgenticEvidenceVerifier:
@@ -24641,6 +25670,7 @@ class AgenticEvidenceVerifier:
         # ── Step 1: one section per subject whose body we hold ──
         self._cited = {}
         self._next_line = 1
+        self._breaks = set()
         parts: List[str] = []
         for subject, idxs in groups.items():
             if subject not in bodies:
@@ -24676,9 +25706,11 @@ class AgenticEvidenceVerifier:
         quoted literal the claims use other than the subject's own, up to
         4: how often it occurs in the subject's whole body, and — for a
         claim that denies something — the symbols holding it across the
-        project. A capped search says so and proves no absence. Printed
-        under the body, numbered with it, cited like its code. Never
-        raises.
+        project. A capped search says so and proves no absence. A literal
+        with holes the claim filled in ('… x{N}') is searched by its fixed
+        parts and proves no absence either; a quoted example of what a
+        pattern takes is no term (_example_literals). Printed under the
+        body, numbered with it, cited like its code. Never raises.
         """
         try:
             _neg = re.compile(
@@ -24689,11 +25721,14 @@ class AgenticEvidenceVerifier:
             _own = {_p for _p in subject.split(".") if _p}
             _terms: List[Tuple[str, bool]] = []
             for _tx in texts:
-                _cands = re.findall(r"`([^`]{3,80})`", _tx) + re.findall(
-                    r"""['"]([^'"\n]{6,60})['"]""", _tx
+                _ex = _example_literals(_tx)
+                _cands = re.findall(r"`([^`]{3,80})`", _tx) + _quoted_literals(
+                    _tx, 6, 60
                 )
                 _cands += re.findall(r"\b[A-Za-z_]\w*_\w+\b|\b[a-z]+[A-Z]\w+\b", _tx)
                 for _c in _cands:
+                    if _c in _ex:
+                        continue
                     _c = _c.strip().rstrip("()")
                     _tail = _c.rsplit(".", 1)[-1] if re.fullmatch(
                         r"[\w.]+", _c
@@ -24710,9 +25745,29 @@ class AgenticEvidenceVerifier:
             for _term, _denies in _terms[:4]:
                 _ident = bool(re.fullmatch(r"\w+", _term))
                 _rx = re.compile(
-                    (r"\b" + re.escape(_term) + r"\b") if _ident else re.escape(_term)
+                    (r"\b" + re.escape(_term) + r"\b")
+                    if _ident
+                    else _literal_pattern(_term)
                 )
                 _k = len(_rx.findall(whole))
+                # Holes the claim filled in are not in the code word for
+                # word: round 24's 'sent as its own message x{N}' (the code:
+                # x{_split}) was shown "occurs nowhere in the project", and a
+                # true claim was refuted. Its fixed parts are searched, and
+                # what they miss proves nothing: text is built from pieces.
+                _as = ""
+                if not _k and not _ident:
+                    _tpl, _holes = _literal_template(_term)
+                    if _holes and _tpl is None:
+                        continue
+                    if _tpl is not None:
+                        _rx = re.compile(_tpl)
+                        _k = len(_rx.findall(whole))
+                        _as = (
+                            ", read as a template with "
+                            + ", ".join(dict.fromkeys(_holes))
+                            + " standing for any text,"
+                        )
                 # Where it sits, when it sits in few places: round 20's
                 # "_run_pipeline_inner initializes _measured_stats_lines"
                 # was true at line ~1500 of 2572, past any excerpt, and
@@ -24724,18 +25779,21 @@ class AgenticEvidenceVerifier:
                 )
                 if _k and not _denies and not _where:
                     continue
-                _out.append(
-                    f"«{_term}» occurs {_k} time(s) in the whole body of "
-                    f"{subject} ({_lines_n} lines searched)"
-                    + (": " + " | ".join(_where) if _where else "")
-                )
+                if _k or not _as:
+                    _out.append(
+                        f"«{_term}»{_as} occurs {_k} time(s) in the whole body of "
+                        f"{subject} ({_lines_n} lines searched)"
+                        + (": " + " | ".join(_where) if _where else "")
+                    )
                 if not _denies:
                     continue
                 _g = _broker._grep(_rx.pattern, project_id, own=True, where=True)
                 if _g.startswith("[GREP: no matches"):
-                    _out.append(
-                        f"«{_term}» occurs nowhere in the project (complete search)"
-                    )
+                    if not _as:
+                        _out.append(
+                            f"«{_term}» occurs nowhere in the project "
+                            "(complete search)"
+                        )
                 elif _g.startswith("### GREP"):
                     _hits = _g.split("\n")[1:]
                     _in = list(
@@ -24743,7 +25801,8 @@ class AgenticEvidenceVerifier:
                     )
                     _capped = len(_hits) >= _broker._MAX_GREP_LINES
                     _out.append(
-                        f"«{_term}» occurs on {len(_hits)} line(s) in the project"
+                        f"«{_term}»{_as} occurs on {len(_hits)} line(s) "
+                        "in the project"
                         + (
                             " — search capped, not complete"
                             if _capped
@@ -24768,21 +25827,31 @@ class AgenticEvidenceVerifier:
         Headers (### …), fences and blank lines stay as they are, so the
         prompt parses as before (_EVIDENCE_BODY_HEADER_RE). Numbers run on
         across the bodies of one prompt, so a number names one line of one
-        body; self._cited maps it to (label, the line).
+        body; self._cited maps it to (label, the line). The first line after
+        a header or a fence opens a block and is recorded in self._breaks:
+        two numbers either side of one are not one passage (_ruling_quotes).
         """
         if not isinstance(getattr(self, "_cited", None), dict):
             self._cited = {}
             self._next_line = 1
+        if not isinstance(getattr(self, "_breaks", None), set):
+            self._breaks = set()
         _out: List[str] = []
+        _opens = True
         for _ln in str(text or "").split("\n"):
-            if not _ln.strip() or _ln.startswith("### ") or _ln.lstrip().startswith(
-                "```"
-            ):
+            if _ln.startswith("### ") or _ln.lstrip().startswith("```"):
+                _opens = True
+                _out.append(_ln)
+                continue
+            if not _ln.strip():
                 _out.append(_ln)
                 continue
             _n = self._next_line
             self._next_line += 1
             self._cited[_n] = (label, _ln)
+            if _opens:
+                self._breaks.add(_n)
+                _opens = False
             _out.append(f"{_n}│ {_ln}")
         return "\n".join(_out)
 
@@ -24791,6 +25860,8 @@ class AgenticEvidenceVerifier:
         rv: Dict[str, Any],
         cited: Optional[Dict[int, Tuple[str, str]]] = None,
         whole: Optional[Dict[str, str]] = None,
+        breaks: Optional[Set[int]] = None,
+        used: Optional[List[int]] = None,
     ) -> Tuple[List[str], str]:
         """The code a ruling rests on, and how it was given.
 
@@ -24798,7 +25869,12 @@ class AgenticEvidenceVerifier:
         the prompt, and the anchor must be in them — or, failing that, in
         the three lines either side within the same body, where a count
         off by a few lands, and then those lines are the citation. Runs of
-        consecutive lines become one quote each. Copying code character for
+        consecutive lines become one quote each, cut where a block opens
+        (`breaks`, the lines _number_lines recorded after a header or a
+        fence): R19-R23 lost 9 rulings that cited a body's last line and the
+        first of the block printed under it — its search facts, the
+        definitions it uses — read back as one quote that is in no body.
+        Copying code character for
         character failed in every way a model fails at it: quotes changed,
         lines stitched with "...", a comment skipped — 27 rulings of 160 in
         round 18. A copied `quote` is still read, without any numbers it
@@ -24808,10 +25884,18 @@ class AgenticEvidenceVerifier:
         once there, and not in the lines shown, is the line an excerpt left
         out — the judge also reads the whole body in the shared prefix, and
         round 19 cited three such lines by a number from the excerpt; the
-        rule for quotes of omitted lines (round 9) applies. Returns
-        (quotes, "lines" | "quote" | "unanchored" | "").
+        rule for quotes of omitted lines (round 9) applies. The caller
+        passes `whole` only for a judge that carried the prefix (H67).
+        `breaks` is taken with `cited`; without either, both are this
+        verifier's own. `used`, when given, receives the numbers of the
+        lines the quotes were read from, whose labels are the bodies the
+        ruling rests on (AgenticEvidenceVerifier._judge_once).
+        Returns (quotes, "lines" | "quote" | "unanchored" | "").
         """
         _cited = cited if cited is not None else getattr(self, "_cited", None) or {}
+        if breaks is None and cited is None:
+            breaks = getattr(self, "_breaks", None)
+        _opens = breaks or set()
         _raw = rv.get("lines")
         if isinstance(_raw, (int, str)):
             _raw = [_raw]
@@ -24837,6 +25921,8 @@ class AgenticEvidenceVerifier:
                 _wl = str(_w).split("\n")
                 _run = _bare_run(_bare_a, _wl, once=True)
                 if _run:
+                    if used is not None:
+                        used.append(_nums[0])
                     return ["\n".join(_wl[_run[0] : _run[1] + 1])], "lines"
             if _hit:
                 _runs: List[List[int]] = []
@@ -24845,10 +25931,13 @@ class AgenticEvidenceVerifier:
                         _runs
                         and _n == _runs[-1][-1] + 1
                         and _cited[_n][0] == _cited[_runs[-1][-1]][0]
+                        and _n not in _opens
                     ):
                         _runs[-1].append(_n)
                     else:
                         _runs.append([_n])
+                if used is not None:
+                    used.extend(sorted(_hit))
                 return (
                     ["\n".join(_cited[_n][1] for _n in _r) for _r in _runs],
                     "lines",
@@ -24913,8 +26002,44 @@ class AgenticEvidenceVerifier:
             out.update(
                 await self._judge_once(claims, _lot, _lb, aligned_prefix, sources)
             )
-        if not getattr(self._f.valves, "agentic_evidence_reask", True):
+        # For [JUDGE-TURN]: the first reading, then what the second changed.
+        _bump = getattr(self._f, "_bump_turn_metric", None) or (
+            lambda *_a, **_k: None
+        )
+        _judged = [_n for _s, _v in groups.items() if _s in bodies for _n in _v]
+        _bump("judge_lots", len(_lots))
+        _bump("judge_claims", len(_judged))
+        _bump(
+            "judge_first_settled",
+            sum(
+                1
+                for _n in _judged
+                if out.get(_n, ("",))[0] in ("supported", "contradicted")
+            ),
+        )
+
+        def _close() -> Dict[int, Tuple[str, str]]:
+            _bump(
+                "judge_open",
+                sum(
+                    1
+                    for _n in _judged
+                    if out.get(_n, ("indeterminate",))[0] == "indeterminate"
+                ),
+            )
+            _bump(
+                "judge_cross_body",
+                sum(
+                    1
+                    for _n in _judged
+                    if out.get(_n, ("", ""))[1]
+                    == "quote came from another symbol's body"
+                ),
+            )
             return out
+
+        if not getattr(self._f.valves, "agentic_evidence_reask", True):
+            return _close()
         _why: Dict[int, str] = {}
         _again: Dict[str, List[int]] = {}
         for _s, _idxs in groups.items():
@@ -24927,9 +26052,14 @@ class AgenticEvidenceVerifier:
                     _why[_n] = self._citation_notes.get(_n) or out[_n][1]
                 else:
                     continue
+                _bump(
+                    "judge_reask_"
+                    + _REASK_SLUGS.get(out[_n][1] if _n in out else "", "no_ruling"),
+                    1,
+                )
                 _again.setdefault(_s, []).append(_n)
         if not _why:
-            return out
+            return _close()
         _gained = 0
         for _lot in self._judge_lots(_again, bodies):
             _asked = sorted(_n for _v in _lot.values() for _n in _v)
@@ -24954,7 +26084,7 @@ class AgenticEvidenceVerifier:
             f"🤖 Evidence: second reading of {len(_why)} claim(s) without a "
             f"usable ruling — {_gained} settled"
         )
-        return out
+        return _close()
 
     @staticmethod
     def _judge_lots(
@@ -24991,9 +26121,10 @@ class AgenticEvidenceVerifier:
         than downgraded silently, because a quote that is not in the code
         means the judgement was not made against the code. `sources` holds
         the whole body of each subject shown as an excerpt: a quote from
-        its elided lines is still that symbol's code. A judge carrying the
-        turn prefix also reads them in Block B; one on its own context
-        (isolate_reader_calls) reads only what this prompt shows.
+        its elided lines is still that symbol's code for a judge carrying
+        the turn prefix, which reads them in Block B. One on its own context
+        (isolate_reader_calls) reads only what this prompt shows, so only
+        that settles its claims; `sources` still feeds the search facts.
         """
         # ── Step 1: one call carrying every body and every claim ──
         _pid = str(getattr(self, "project_id", "") or "")
@@ -25012,6 +26143,7 @@ class AgenticEvidenceVerifier:
                     bodies[_s] = bodies[_s].rstrip() + "\n\n" + _facts
         prompt = self._render_prompt(claims, groups, bodies)
         _cited_map = dict(getattr(self, "_cited", None) or {})
+        _blocks_at = set(getattr(self, "_breaks", None) or ())
         if note:
             prompt = prompt[: -len(self._CONTRACT)] + note + "\n\n" + self._CONTRACT
         try:
@@ -25068,17 +26200,52 @@ class AgenticEvidenceVerifier:
         # ── Step 3: keep only verdicts whose quote is really in the body ──
         by_index = {n: s for s, idxs in groups.items() for n in idxs}
         # What a quote is checked against: each body as shown, and for a
-        # subject shown as an excerpt, its whole body too. Round 9 discarded
-        # 3 correct verdicts that quoted lines its excerpts had left out.
+        # subject shown as an excerpt, its whole body too — only for a judge
+        # that carried the turn prefix, where Block B shows those lines.
+        # Round 9 discarded 3 correct verdicts that quoted lines its excerpts
+        # had left out. A judge on its own context (isolate_reader_calls)
+        # never saw them: a citation found only there was not read, and the
+        # path settled nothing in rounds 20-22 (H67).
+        _read_whole = _reads_only_its_prompt(self._f) is not False
         _shown = {s: _code_keys(b) for s, b in bodies.items()}
         _whole = {
             s: _code_keys(str(b))
             for s, b in (sources or {}).items()
-            if s in bodies and b
+            if s in bodies and b and _read_whole
         }
         _searched = list(_shown.values()) + list(_whole.values())
+        # A symbol's behaviour includes the definitions its own code uses:
+        # "_quote_key maps every quote to an apostrophe" is settled by
+        # _QUOTE_CHARS_RE, which _quote_key's body applies, and round 21
+        # demoted exactly that reading. Only bodies the subject's code names
+        # count: an unrelated body still cannot settle what it does.
+        _uses_memo: Dict[str, List[str]] = {}
+
+        def _used_by(_s: str) -> List[str]:
+            if _s not in _uses_memo:
+                _words = set(
+                    re.findall(
+                        r"\w+",
+                        str(bodies.get(_s, ""))
+                        + "\n"
+                        + str((sources or {}).get(_s, "")),
+                    )
+                )
+                _uses_memo[_s] = [
+                    _k
+                    for _k in _shown
+                    if _k != _s
+                    and re.fullmatch(r"[\w.]+", _k)
+                    and _k.rsplit(".", 1)[-1] in _words
+                ]
+            return _uses_memo[_s]
+
+        _via_uses = 0
+        _via_call = 0
         _by_lines = 0
         _derived: List[str] = []
+        # The bodies whose lines settled a verdict: evidence, for [CTX-USE].
+        _ev_bodies: Set[str] = set()
         out: Dict[int, Tuple[str, str]] = {}
         dropped = 0
         _from_elided = 0
@@ -25088,6 +26255,7 @@ class AgenticEvidenceVerifier:
         offtopic = 0
         _samples: List[str] = []
         for rv in raw:
+            _read_at: List[int] = []
             try:
                 n = int(rv.get("claim", 0))
                 verdict = str(rv.get("verdict", "")).strip().lower()
@@ -25096,7 +26264,13 @@ class AgenticEvidenceVerifier:
                 # check is per element, so one unfound quote still discards
                 # the verdict — the standard does not drop, the protocol
                 # widens.
-                _quotes, _how = self._ruling_quotes(rv, _cited_map, sources)
+                _quotes, _how = self._ruling_quotes(
+                    rv,
+                    _cited_map,
+                    sources if _read_whole else None,
+                    _blocks_at,
+                    used=_read_at,
+                )
                 quote = " ⏎ ".join(_quotes)
                 if _how == "unanchored":
                     _notes = getattr(self, "_citation_notes", None)
@@ -25162,10 +26336,46 @@ class AgenticEvidenceVerifier:
                 # every multi-quote verdict counted as cross-symbol.
                 _own_shown = _shown.get(by_index[n], ())
                 _own_whole = _whole.get(by_index[n], ())
-                if any(
-                    not _quote_in(_q, _own_shown) and not _quote_in(_q, _own_whole)
+                _outside = [
+                    _q
                     for _q in _flats
+                    if not _quote_in(_q, _own_shown) and not _quote_in(_q, _own_whole)
+                ]
+                if _outside and all(
+                    any(_quote_in(_q, _shown[_k]) for _k in _used_by(by_index[n]))
+                    for _q in _outside
                 ):
+                    _via_uses += 1
+                    _outside = []
+                # The other direction: a claim that cites the caller as well
+                # as the subject may quote the call. "_shown maps each subject
+                # to _code_keys(bodies[s]), producing two keys" is half read in
+                # _judge_once, which the claim cites, on the line that calls
+                # _code_keys — round 22 demoted it. Only a quoted line that
+                # names the subject is admitted: the caller's other lines
+                # still cannot settle what the subject does.
+                if _outside:
+                    _cl0 = claims[n - 1]
+                    _bare = str(by_index[n]).rsplit(".", 1)[-1]
+                    _named = re.compile(r"(?<!\w)" + re.escape(_bare) + r"(?!\w)")
+                    _cites = {
+                        str(_c)
+                        for _c in (
+                            list(getattr(_cl0, "valid_qids", None) or [])
+                            + list(getattr(_cl0, "qids", None) or [])
+                        )
+                    }
+                    _callers = [
+                        _k for _k in _shown if _k != by_index[n] and _k in _cites
+                    ]
+                    if _callers and all(
+                        _named.search(_q)
+                        and any(_quote_in(_q, _shown[_k]) for _k in _callers)
+                        for _q in _outside
+                    ):
+                        _via_call += 1
+                        _outside = []
+                if _outside:
                     elsewhere += 1
                     # For a behavioural claim the distinction above does not
                     # hold: "A does P" is about A's own code, and nothing in
@@ -25176,7 +26386,7 @@ class AgenticEvidenceVerifier:
                     _cl = claims[n - 1]
                     if getattr(
                         _cl, "claim_kind", ""
-                    ) == "behavioural" and not _CALL_TARGET_RE.search(_cl.text):
+                    ) == "behavioural" and not _call_target(_cl.text):
                         _own_only += 1
                         out[n] = (
                             "indeterminate",
@@ -25189,12 +26399,26 @@ class AgenticEvidenceVerifier:
                 # not rejected: a call through an alias or a local would fail
                 # this honestly, and two instances in one run is not a number
                 # to build a rule on.
-                _target = _CALL_TARGET_RE.search(claims[n - 1].text)
+                _target = _call_target(claims[n - 1].text)
                 if _target:
-                    _tail = _target.group(1).rsplit(".", 1)[-1]
+                    _tail = _target.rsplit(".", 1)[-1]
                     if _tail and _tail not in _flat:
                         offtopic += 1
                         _samples.append(f"{_tail} ∉ quote for claim {n}")
+            if verdict in ("supported", "contradicted"):
+                # The bodies its cited lines belong to. Every body the quote
+                # is in counted others the judge never cited, when they hold
+                # the same line: 17 of the 410 rulings recorded in rounds
+                # 21-23. A ruling that copied its quote cited no line, and
+                # rests on every body it is in.
+                _ev_bodies.update(
+                    {_cited_map[_x][0] for _x in _read_at if _x in _cited_map}
+                    or {
+                        _k
+                        for _k, _b in _shown.items()
+                        if any(_quote_in(_q, _b) for _q in _flats)
+                    }
+                )
             out[n] = (verdict, quote[:200])
         if dropped:
             self._f._log_debug(
@@ -25226,6 +26450,21 @@ class AgenticEvidenceVerifier:
                 f"other than the claim's own subject — cross-symbol "
                 f"readings, {elsewhere - _own_only} kept"
             )
+        _bump = getattr(self._f, "_bump_turn_metric", None) or (
+            lambda *_a, **_k: None
+        )
+        if _via_uses:
+            _bump("judge_via_uses", _via_uses)
+            self._f._log_debug(
+                f"🤖 Evidence: {_via_uses} verdict(s) settled by a definition "
+                f"the subject's own code uses — counted as its own body"
+            )
+        if _via_call:
+            _bump("judge_via_call", _via_call)
+            self._f._log_debug(
+                f"🤖 Evidence: {_via_call} verdict(s) settled by a call to the "
+                f"subject in a caller the claim cites"
+            )
         if _own_only:
             self._f._log_debug(
                 f"🤖 Evidence: {_own_only} behavioural verdict(s) demoted "
@@ -25243,6 +26482,13 @@ class AgenticEvidenceVerifier:
                 f"🤖 Evidence: {unindexed} verdict(s) named no claim and "
                 f"could not be placed — {len(out)} of {len(raw)} ruling(s) "
                 f"reached the ledger"
+            )
+        # Only bodies keyed by a symbol's name: a supporting text keyed by a
+        # description (call sites, search facts) is no zone's.
+        _seen_ev = getattr(self._f, "_judge_evidence_this_turn", None)
+        if isinstance(_seen_ev, set):
+            _seen_ev.update(
+                _k for _k in _ev_bodies if _k and not re.search(r"\s", _k)
             )
         return out
 
@@ -25330,6 +26576,7 @@ class AgenticEvidenceVerifier:
         numbered = "\n".join(f"{n}. {t}" for n, t in enumerate(texts, 1))
         self._cited = {}
         self._next_line = 1
+        self._breaks = set()
         prompt = (
             self._number_lines(bodies_text, "")
             + "\n\nClaims to check against the code above:\n"
@@ -25338,6 +26585,7 @@ class AgenticEvidenceVerifier:
             + self._CONTRACT
         )
         _cited_map = dict(self._cited)
+        _blocks_at = set(self._breaks)
         try:
             response = await self._f._llm_orchestrator.call_llm(
                 prompt=prompt,
@@ -25373,7 +26621,7 @@ class AgenticEvidenceVerifier:
             try:
                 n = int(rv.get("claim", 0))
                 verdict = str(rv.get("verdict", "")).strip().lower()
-                _qs, _how = self._ruling_quotes(rv, _cited_map)
+                _qs, _how = self._ruling_quotes(rv, _cited_map, breaks=_blocks_at)
             except Exception:
                 continue
             if not (1 <= n <= len(texts)):
@@ -25483,7 +26731,7 @@ class AgenticEvidenceVerifier:
                 f"body of {claim.subject} read: '{quote}'"
                 if verdict != "indeterminate"
                 else f"body of {claim.subject} read; it does not settle this"
-            )[:300]
+            )[: _REFUTING_DETAIL_CHARS if verdict == "contradicted" else 300]
             if verdict != "indeterminate":
                 settled += 1
         return settled
@@ -27075,7 +28323,14 @@ class AgenticStaticVerifier:
         guesses which relation among the cited symbols to look at. A call
         check between symbols the sentence does not both name tests some
         other claim, and neither confirms nor refutes this one
-        (_names_both_ends).
+        (_names_both_ends), and so does one from a symbol to itself, unless
+        the claim is that it calls itself (_is_self_check). A call claim
+        that names code besides the check's two ends states what no edge
+        holds (_names_beyond_ends): round 24's "_judge_once tracks metrics
+        via self._f._bump_turn_metric for judge_lots, judge_claims, …" was
+        confirmed by the edge _judge_once → _bump_turn_metric, keys and all,
+        and "self._measured_stats_lines is written in _run_pipeline_inner"
+        by a check from _run_pipeline_inner to itself.
 
         The pass decides only where the graph can be taken at its word
         and abstains everywhere else, so a decided verdict is Popperian.
@@ -27090,19 +28345,30 @@ class AgenticStaticVerifier:
             The observation, for LedgerClaim.observe.
         """
         kind = str(check.get("kind") or "")
+        _ends = [str(check.get("src") or ""), str(check.get("dst") or "")]
         if kind in ("calls", "called_by") and not _names_both_ends(
-            claim.text, [str(check.get("src") or ""), str(check.get("dst") or "")]
+            claim.text, _ends
         ):
             # A relation between symbols the sentence does not both name is
             # some other claim's: it tells nothing about this one.
             _scope = EvidenceScope.MENTION
+        elif (
+            kind in ("calls", "called_by")
+            and _is_self_check(*_ends)
+            and not _SELF_CALL_CLAIM_RE.search(str(claim.text or ""))
+        ):
+            # Neither is a symbol's call to itself, which the claim does not
+            # state: what it does say is some other check's to settle.
+            _scope = EvidenceScope.MENTION
         elif check.get("fallback"):
             _scope = EvidenceScope.COMPONENT
-        elif kind in ("calls", "called_by") and not _states_only_the_call(
-            claim.text, [str(check.get("src") or ""), str(check.get("dst") or "")]
+        elif kind in ("calls", "called_by") and (
+            _names_beyond_ends(claim.text, _ends)
+            or not _states_only_the_call(claim.text, _ends)
         ):
-            # The edge settles the call; an argument value, a quantifier or
-            # a consequence the sentence adds is the evidence pass's to read.
+            # The edge settles the call; a name, an argument value, a
+            # quantifier or a consequence the sentence adds is the evidence
+            # pass's to read.
             _scope = EvidenceScope.COMPONENT
         elif check.get("states_existence") or (
             kind == "exists"
@@ -27420,6 +28686,69 @@ class AgenticTestabilityClassifier:
         return list(reversed(parts))
 
 
+_FROM_IMPORT_LINE_RE = re.compile(
+    r"^([ \t]*)from[ \t]+([\w.]+)[ \t]+import[ \t]+"
+    r"\(?[ \t]*([\w, \t]+?)[ \t]*\)?[ \t]*$",
+    re.M,
+)
+
+
+def _top_level_names(src: str) -> Set[str]:
+    """Names a source defines at its top level: def, class, assignment. Never raises."""
+    try:
+        _tree = ast.parse(src)
+    except Exception:
+        return set()
+    _out: Set[str] = set()
+    for _n in _tree.body:
+        if isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _out.add(_n.name)
+        elif isinstance(_n, (ast.Assign, ast.AnnAssign)):
+            for _tg in _n.targets if isinstance(_n, ast.Assign) else [_n.target]:
+                if isinstance(_tg, ast.Name):
+                    _out.add(_tg.id)
+    return _out
+
+
+def _drop_self_imports(tests: str, defined: Set[str]) -> Tuple[str, int]:
+    """Turn `from M import a, b` into `pass` when the harness defines a and b.
+
+    The symbol under test and the project code it needs are pasted into the
+    harness itself, so there is no module to import them from. Round 22
+    wrote `from _edge_reaches import _edge_reaches` in every test, twice,
+    and both runs ended 0/5 on ModuleNotFoundError — a harness that never
+    reached the code it was testing. Only lines whose every name the harness
+    defines, with no `as`, from a module that does not exist, are touched:
+    `pass` keeps the indentation valid wherever the line stood. Never raises.
+    """
+    _count = 0
+
+    def _sub(m: "re.Match[str]") -> str:
+        nonlocal _count
+        _mod = m.group(2)
+        _names = [_x.strip() for _x in m.group(3).split(",") if _x.strip()]
+        if (
+            not _names
+            or any(" " in _x or _x not in defined for _x in _names)
+            or "." in _mod
+        ):
+            return m.group(0)
+        try:
+            import importlib.util as _ilu
+
+            if _ilu.find_spec(_mod) is not None:
+                return m.group(0)
+        except Exception:
+            return m.group(0)
+        _count += 1
+        return m.group(1) + "pass  # defined in this harness: " + ", ".join(_names)
+
+    try:
+        return _FROM_IMPORT_LINE_RE.sub(_sub, tests or ""), _count
+    except Exception:
+        return tests, 0
+
+
 class AgenticSandboxRunner:
     """
     Executes a composed harness in an isolated Python subprocess.
@@ -27691,6 +29020,10 @@ if __name__ == "__main__":
         "- If the symbol takes `self`, call it as "
         "`symbol(_FakeSelf(), other_args)`; set needed valve values first "
         "via a module-level dict assignment `VALVES = {{...}}`.\n"
+        "- The symbol under test, and any project code it needs, are "
+        "already defined in this same file: call them by name and never "
+        "import them — `from <symbol> import ...` fails, there is no such "
+        "module.\n"
         "- Only use these modules (already imported): asyncio, json, math, "
         "re, time, hashlib, itertools, functools, collections, enum.\n"
         "- No file, network, os, sys or subprocess access. No prints.\n"
@@ -28844,10 +30177,19 @@ _lift_test_cases()
             if callee_src
             else ""
         )
+        _body = _tw.dedent(body).strip()
+        tests, _dropped = _drop_self_imports(
+            tests, _top_level_names(dep_block) | _top_level_names(_body)
+        )
+        if _dropped:
+            self._f._log_debug(
+                f"🤖 verify_dynamic: {_dropped} import line(s) of names the "
+                f"harness itself defines turned into pass"
+            )
         harness = (
             self._SCAFFOLD_HEAD
             + dep_block
-            + _tw.dedent(body).strip()
+            + _body
             + "\n\n# === LLM-GENERATED TESTS ===\n"
             + tests
             + self._RUNNER_TAIL
@@ -33580,6 +34922,23 @@ class AgenticStepExecutor:
         "consistent, write 'consistent'."
     )
 
+    # For an analyze step on a turn whose question asks for tests
+    # (_ASKS_FOR_TESTS_RE). It is the step with the bodies in view, and the
+    # one that wrote them in rounds 21-24; told only to recommend, round
+    # 25's two wrote a list of what to test, and the outline, which sees no
+    # code, wrote them blind (`_claim_terms(body=…)`, 4 of 4 failing) or not
+    # at all.
+    _TESTS_MANDATE = (
+        "\n\nTHE QUESTION ASKS FOR TESTS. They are the concrete answer this "
+        "step owes, not a recommendation of what to test: write them, "
+        "complete, in ONE fenced python block of plain test functions "
+        "(def test_...). Each calls the code in the context above by its "
+        "real signature — the parameters its def line declares, in that "
+        "order; a classmethod or a staticmethod through its class — and "
+        "imports nothing from the project: the plugin runs them against the "
+        "real bodies before the answer is written, and says what they did.\n"
+    )
+
     _TOOLS_MENU = (
         "\n\nAt any point BEFORE finishing you may request local tools by "
         "emitting lines exactly like:\n"
@@ -33713,6 +35072,7 @@ class AgenticStepExecutor:
             ("kind_template", "always"),
             ("_SWEEP_METHODOLOGY", "sweep_goal"),
             ("_ANALYZE_METHODOLOGY", "analyze_charter"),
+            ("_TESTS_MANDATE", "tests_asked"),
             ("focus_symbols", "has_symbols"),
             ("_TOOLS_MENU", "always"),
             ("_MEMORY_MENU_LINE", "memory_on"),
@@ -34133,6 +35493,20 @@ class AgenticStepExecutor:
             ),
             "has_symbols": bool(step.symbols or getattr(step, "prefetched", None)),
             "memory_on": bool(getattr(self._f.valves, "napmem_tool_enable", False)),
+            # The user's question, not the planner's goal: the goal is a
+            # paraphrase, and "examinar … para definir los casos" is not a
+            # request for tests although the question was.
+            "tests_asked": bool(
+                step.kind == "analyze"
+                and _ASKS_FOR_TESTS_RE.search(
+                    str(
+                        getattr(
+                            getattr(self._f, "_agentic", None), "_turn_question", ""
+                        )
+                        or ""
+                    )
+                )
+            ),
         }
         # ── Step 3: assemble in the recipe's declared order ──
         _parts: List[str] = []
@@ -34444,18 +35818,19 @@ class AgenticSynthesisComposer:
         _tail = _synth.rfind('{"claims"')
         if _tail > 0:
             _synth = _synth[:_tail].rstrip().rstrip("`").rstrip()
+        _claims = list(getattr(ledger, "claims", None) or [])
         if _synth.strip():
-            _synth, _ = _mark_refuted_bullets(
-                _synth, list(getattr(ledger, "claims", None) or [])
-            )
+            _synth, _ = _drop_refuted_bullets(_synth, _claims)
             out += [
                 "SYNTHESIS:",
                 _close_dangling_fence(_demote_headings(_synth)[:_OUTLINE_SYNTH_CHARS]),
                 "",
             ]
-            _refuted = _refuted_lines(list(getattr(ledger, "claims", None) or []))
-            if _refuted:
-                out += _refuted + [""]
+        # With or without a synthesis, as the claims below leave out those
+        # this block lists.
+        _refuted = _refuted_lines(_claims)
+        if _refuted:
+            out += _refuted + [""]
         _listing = str(
             getattr(getattr(self._f, "_agentic", None), "_graph_listing", "") or ""
         )
@@ -34483,9 +35858,31 @@ class AgenticSynthesisComposer:
                 "explanation they do not settle is a candidate, said as unverified."
             )
             out.append("")
-        _claims = list(getattr(ledger, "claims", None) or [])
+        _sigs = self._test_signatures(plan, question)
+        if _sigs:
+            out += [_TEST_SIGNATURES_HEAD] + _sigs + [""]
+        _listed = {_refuted_key(_c) for _c in _refuted_shown(_claims)}
+        _both = _contested_keys(_claims)
+        _claims = [
+            _c
+            for _c in _claims
+            if not (_c.verification == "refuted" and _refuted_key(_c) in _listed)
+            and not (
+                _c.verification in ("confirmed", "refuted")
+                and _refuted_key(_c) in _both
+            )
+        ]
         if _claims:
-            out.append("CLAIMS (✓ settled against code, ✗ refuted, ? not settled):")
+            out.append(
+                "CLAIMS (✓ settled against code, ✗ refuted, ? not settled"
+                + (
+                    "; the refuted ones above are not repeated"
+                    if _listed
+                    else ""
+                )
+                + ("; nor those read both ways" if _both else "")
+                + "):"
+            )
             for _c in _claims[:_OUTLINE_MAX_CLAIMS]:
                 try:
                     _b = ledger.bucket_of(_c)
@@ -34499,6 +35896,70 @@ class AgenticSynthesisComposer:
                 out.append(f"- {_mark} {' '.join((_c.text or '').split())[:220]}")
             out.append("")
         return "\n".join(out) + "\n"
+
+    def _test_signatures(self, plan: "AgenticPlan", question: str) -> List[str]:
+        """The def lines of the code a test-writing turn's tests call.
+
+        The outline reads its workspace alone (isolate_reader_calls), so the
+        code it writes into Código is written without the bodies: before
+        round 21 it read them, and its tests called the functions right.
+        For a question that asks for tests (_ASKS_FOR_TESTS_RE): the symbols
+        it names and the plan's focus symbols, up to six, each with how it
+        is called. [] otherwise. Never raises.
+        """
+        try:
+            if not _ASKS_FOR_TESTS_RE.search(str(question or "")):
+                return []
+            _idx = getattr(self._f, "_symbol_index", None)
+            if _idx is None:
+                return []
+            _pid = str(getattr(self._f.valves, "project_id", "") or "")
+            _names = list(
+                dict.fromkeys(
+                    _named_indexed_symbols(str(question), _idx, _pid, bare=True)
+                    + [
+                        str(_q)
+                        for _s in getattr(plan, "steps", None) or []
+                        for _q in (getattr(_s, "symbols", None) or [])
+                    ]
+                )
+            )
+            _out: List[str] = []
+            _seen: Set[str] = set()
+            for _q in _names:
+                _sig = " ".join(str(_idx.get_signature(_q, _pid) or "").split())
+                if not _sig.startswith(("def ", "async def ")):
+                    continue
+                _meta = _idx.get_symbol_meta(_q, _pid) or {}
+                _how = ""
+                _owner = str(_meta.get("parent_symbol") or "")
+                # As the code names it: a module function by its own name,
+                # which the question's qid (module._f) and the plan's (_f)
+                # both resolve to.
+                _call = (f"{_owner}." if _owner else "") + str(
+                    _meta.get("name") or _q.rsplit(".", 1)[-1]
+                )
+                if _call in _seen:
+                    continue
+                _seen.add(_call)
+                if _meta.get("kind") == "method" and _owner:
+                    _first = re.search(r"\(\s*(\w*)", _sig)
+                    _arg = _first.group(1) if _first else ""
+                    _how = (
+                        f" — a classmethod, called as {_call}(…)"
+                        if _arg == "cls"
+                        else (
+                            f" — a method, called on an instance of {_owner}"
+                            if _arg == "self"
+                            else f" — a staticmethod, called as {_call}(…)"
+                        )
+                    )
+                _out.append(f"- `{_call}`{_how}: {_sig[:240]}")
+                if len(_out) >= 6:
+                    break
+            return _out
+        except Exception:
+            return []
 
     async def compose_outline(
         self,
@@ -35011,11 +36472,11 @@ class AgenticSynthesisComposer:
             # A finished-looking artifact in a competing order, ninety
             # lines above the directive, is a second template.
             _claims_now = list(getattr(ledger, "claims", None) or [])
-            _synth, _marked = _mark_refuted_bullets(_synth, _claims_now)
-            if _marked:
+            _synth, _dropped = _drop_refuted_bullets(_synth, _claims_now)
+            if _dropped:
                 self._f._log_debug(
-                    f"🤖 Workspace: {_marked} synthesis line(s) marked refuted "
-                    f"— the checks ran after the synthesis was written"
+                    f"🤖 Workspace: {_dropped} refuted synthesis line(s) left "
+                    f"out — the checks ran after the synthesis was written"
                 )
             lines.append("Synthesis (the pipeline's processed conclusion):")
             lines.append(_demote_headings(_synth))
@@ -35029,6 +36490,9 @@ class AgenticSynthesisComposer:
                 "context above plus the verified evidence below.)"
             )
             lines.append("")
+            _refuted = _refuted_lines(list(getattr(ledger, "claims", None) or []))
+            if _refuted:
+                lines += _refuted + [""]
         # Findings that reach no step digest, and step digests never enter
         # this prompt (R34): the answer read from the index, the relation the
         # question names as the index settled it, and a competition that
@@ -35070,6 +36534,7 @@ class AgenticSynthesisComposer:
                 "is written as an unverified candidate, never as the cause."
             )
             lines.append("")
+        _contested = _contested_keys(list(getattr(ledger, "claims", None) or []))
         for s in plan.steps:
             if s.status != "done":
                 continue
@@ -35084,7 +36549,16 @@ class AgenticSynthesisComposer:
                         if c.evidence_type == "dynamic"
                         else ("📖 " if c.evidence_type == "code" else "")
                     )
-                    if c.verification == "refuted":
+                    if (
+                        c.verification in ("confirmed", "refuted")
+                        and _refuted_key(c) in _contested
+                    ):
+                        # Its ✓✓ here under ✗ in another step's list read
+                        # as two findings; it is one, read both ways.
+                        lines.append(
+                            f"- ⇄ READ BOTH WAYS (see above): {c.text}"
+                        )
+                    elif c.verification == "refuted":
                         lines.append(
                             f"- {badge}✗ REFUTED: {c.text} "
                             f"({c.verification_detail})"
@@ -36646,14 +38120,12 @@ class AgenticOrchestrator:
 
         Same cap derivation as the aligned CoT path: the head is preserved,
         so the result is always a byte-prefix of the main call's system
-        prompt and the KV prefix invariant holds even when capped.
+        prompt. Capped, though, it is no longer the turn's prelim, which
+        the calls then cannot send as its own message: Block B is sized so
+        the prelim fits (_aligned_prelim_cap, SystemPromptBuilder.
+        _block_b_room).
         """
-        cap = max(
-            8000,
-            self._f.valves.context_window_tokens
-            - self._f.valves.response_reserve_tokens
-            - 16000,
-        )
+        cap = _aligned_prelim_cap(self._f.valves)
         # The separator is part of the prefix, not of the role. Without it
         # this route ended one token earlier than every other aligned call
         # — the prelim's final "." against their ".\n\n" — so neither
@@ -36757,25 +38229,19 @@ class AgenticOrchestrator:
     def _open_claims_after_fold(self) -> Tuple[List[str], int]:
         """Texts of the claims the tally will count open, and the anchorless.
 
-        Folded the way the tally folds (refresh_unread, then the best-
-        evidenced member of each proposition, as collapse_restatements
-        keeps it), without rewriting the ledger. Raises on a broken ledger;
-        callers guard.
+        Folded the way the tally folds (refresh_unread, then
+        fold_restatements, which collapse_restatements applies), without
+        rewriting the ledger. Raises on a broken ledger; callers guard.
         """
         _ledger = self._ledger
         _ledger.refresh_unread()
-        _rank = {_b: _i for _i, _b in enumerate(_ledger._BUCKET_RANK)}
-        # ── Step 1: the best-evidenced statement of each proposition ──
-        _best: Dict[tuple, Tuple[Any, str]] = {}
-        for _c in getattr(_ledger, "claims", None) or []:
-            _k = _ledger._proposition_key(_c)
-            _b = AgenticEvidenceLedger.bucket_of(_c)
-            if _k not in _best or _rank.get(_b, 99) < _rank.get(_best[_k][1], 99):
-                _best[_k] = (_c, _b)
+        # ── Step 1: what the tally will keep (fold_restatements) ──
+        _kept, _ = _ledger.fold_restatements(getattr(_ledger, "claims", None) or [])
         # ── Step 2: the ones that stay open after folding ──
         _open: List[str] = []
         _unop = 0
-        for _c, _b in _best.values():
+        for _c in _kept:
+            _b = AgenticEvidenceLedger.bucket_of(_c)
             if _b in ("read", "blind", "uncovered"):
                 _open.append(_c.text or "")
             elif _b == "unoperationalizable":
@@ -40595,6 +42061,10 @@ class AgenticOrchestrator:
                 ("inference", "cov_inference"),
             ):
                 self._f._set_turn_metric(_mk, int(_cov.get(_ck, 0) or 0))
+            # What the turn used, for [CTX-USE] at the handover.
+            _ntu = getattr(self._f, "_note_turn_use", None)
+            if callable(_ntu):
+                _ntu(plan.steps, self._ledger)
             # The triangulation shadow, over the claims the synthesis will
             # read. Counted, logged and kept for the turn's metric row; no
             # verdict is changed by it.
@@ -40673,9 +42143,10 @@ class AgenticOrchestrator:
             )
             # One line per claim, so reading the losing bucket is reading a
             # list rather than pairing claims with verdicts by index across
-            # two act types. Capped above any turn recorded so far.
+            # two act types. Capped above any turn recorded so far (44 claims
+            # before the fold, R23's second turn).
             _per: List[str] = []
-            for _c in self._ledger.claims[:40]:
+            for _c in self._ledger.claims[:80]:
                 # The ledger's own rule, not a second copy of it.
                 _bucket = self._ledger.bucket_of(_c)
                 if _bucket == "unoperationalizable":
@@ -48976,6 +50447,7 @@ class CodeBlockManager:
             return []
 
         edges: List[Edge] = []
+        _local = _locally_bound_names(code)
 
         # ── Step 2: single-pass visitor tracking enclosing class + function ──
         class _DataFlowVisitor(ast.NodeVisitor):
@@ -48984,8 +50456,9 @@ class CodeBlockManager:
             def __init__(self):
                 # ── Context stacks maintained during the single walk ──
                 self._class_stack: List[str] = []
-                # Each frame: (caller_qid, caller_bare_name, assigned_vars set)
-                self._func_stack: List[Tuple[str, str, Set[str]]] = []
+                # Each frame: (caller_qid, caller_bare_name, assigned_vars
+                # set, the names a bare call in it reaches locally)
+                self._func_stack: List[Tuple[str, str, Set[str], FrozenSet[str]]] = []
 
             def visit_ClassDef(self, node: ast.ClassDef):
                 self._class_stack.append(node.name)
@@ -49005,7 +50478,18 @@ class CodeBlockManager:
                             if isinstance(target, ast.Name):
                                 assigned_vars.add(target.id)
 
-                self._func_stack.append((caller_qid, caller_name, assigned_vars))
+                # A def inside a def is its owner's body, as for calls
+                # (_extract_calls_from_ast): no symbol stands for it.
+                if self._func_stack:
+                    caller_qid, caller_name = self._func_stack[-1][:2]
+                self._func_stack.append(
+                    (
+                        caller_qid,
+                        caller_name,
+                        assigned_vars,
+                        _local.get((node.name, node.lineno), frozenset()),
+                    )
+                )
                 self.generic_visit(node)
                 self._func_stack.pop()
 
@@ -49018,11 +50502,15 @@ class CodeBlockManager:
             def visit_Call(self, node: ast.Call):
                 # ── Attribute the call to the innermost enclosing function ──
                 if self._func_stack:
-                    caller_qid, caller_name, assigned_vars = self._func_stack[-1]
+                    caller_qid, caller_name, assigned_vars, _here = self._func_stack[
+                        -1
+                    ]
                     if caller_name in all_names:
                         callee_name = None
                         if isinstance(node.func, ast.Name):
                             callee_name = node.func.id
+                            if callee_name in _here:
+                                callee_name = None
                         elif isinstance(node.func, ast.Attribute):
                             callee_name = node.func.attr
 
@@ -50239,6 +51727,9 @@ _NEAR_MISS_MIN_CHARS = 8
 # The top-level names of the standard library: `unittest.TestCase` in an
 # answer is not a name this code is expected to hold.
 _STDLIB_MODULES = frozenset(getattr(sys, "stdlib_module_names", ()))
+# Python's builtins: AssertionError was 10 of the 23 names rounds 10-23
+# reported as not in the code (_answer_name_grounding).
+_PY_BUILTINS = frozenset(dir(sys.modules["builtins"]))
 
 
 def _drop_project_imports(stmts: List[ast.stmt]) -> int:
@@ -50363,8 +51854,10 @@ def _answer_name_grounding(
             and not re.fullmatch(r"[a-z0-9]+(?:\.[a-z0-9]+)+", _n)
             # A string literal ("name_correction") is a value, not a name.
             and _text[_s - 1 : _s] not in ("'", '"')
-            # The standard library and unittest's API are not this code.
+            # The standard library, the builtins and unittest's API are not
+            # this code.
             and _n.split(".", 1)[0] not in _STDLIB_MODULES
+            and _n.split(".", 1)[0] not in _PY_BUILTINS
             and not re.fullmatch(
                 r"(?:assert[A-Z]\w*|setUp|tearDown|setUpClass|tearDownClass)",
                 _n.rsplit(".", 1)[-1],
@@ -50902,6 +52395,7 @@ class MetacognitiveReasoningEngine:
                 self._relation_caller(_m.group(0), _ncaller, project_id),
                 _ncallee,
                 project_id,
+                _m.group(0),
             )
             _masked = _masked.replace(_m.group(0), " ")
             if _present is None:
@@ -50913,6 +52407,7 @@ class MetacognitiveReasoningEngine:
                 self._relation_caller(_m.group(0), caller, project_id),
                 callee,
                 project_id,
+                _m.group(0),
             )
             if verified is None:
                 continue
@@ -51373,6 +52868,7 @@ class MetacognitiveReasoningEngine:
         caller: str,
         callee: str,
         project_id: str,
+        span: str = "",
     ) -> Optional[bool]:
         """
         Check whether the SymbolGraph carries an edge caller→callee.
@@ -51397,7 +52893,10 @@ class MetacognitiveReasoningEngine:
         compared by its bare tail for the same reason. Any edge type the
         validator accepts (calls, reads, writes) satisfies any of the
         relation verbs: a claim phrased 'X uses Y' is confirmed by a
-        calls edge — lax on the verb, strict on the endpoints.
+        calls edge — lax on the verb, strict on the endpoints. No edge
+        refutes only what the graph would draw (_relation_reading): `span`,
+        the text the pattern matched, says whether the verb is a call, and
+        a class with its own member is never refuted by absence.
         """
         idx = self._f._symbol_index
         all_names = idx.get_all_names(project_id)
@@ -51418,6 +52917,12 @@ class MetacognitiveReasoningEngine:
         if (
             EpistemicRegime.for_edge_status(status)
             is EpistemicRegime.LAKATOSIAN_PROTECTIVE_BELT
+        ):
+            return None
+        if (
+            status != "direct"
+            and _relation_reading(idx, span, caller, callee, project_id)[0]
+            == "confirm"
         ):
             return None
         return status == "direct"
@@ -51497,7 +53002,9 @@ class MetacognitiveReasoningEngine:
                 verdict = _relations[key]
                 source = "evidence"
             elif project_id:
-                _present = self._relation_in_graph(_qcaller, _ncallee, project_id)
+                _present = self._relation_in_graph(
+                    _qcaller, _ncallee, project_id, _m.group(0)
+                )
                 verdict = None if _present is None else not _present
                 source = "SymbolGraph"
             if verdict is False:
@@ -51519,7 +53026,9 @@ class MetacognitiveReasoningEngine:
                 verdict = _relations[key]
                 source = "evidence"
             elif project_id:
-                verdict = self._relation_in_graph(_qcaller, callee, project_id)
+                verdict = self._relation_in_graph(
+                    _qcaller, callee, project_id, _m.group(0)
+                )
                 source = "SymbolGraph"
             if verdict is False:
                 return False, f"relation '{key}' does not exist in {source}"
@@ -51931,14 +53440,16 @@ class EpistemicStrategies:
         # ── Step 2: bound the vocabulary when evidence is available ──
         _bounds = ""
         if evidence is not None:
-            _syms = sorted(evidence.symbols_found)
+            _syms = _names_as_written(hypothesis, evidence.symbols_found)
             _rels = sorted(evidence.call_relations_valid)
             _bounds = (
                 "\nA symbol graph can settle exactly two kinds of "
                 "statement, and nothing else:\n"
-                "  (a) a relation between two indexed symbols — "
-                "'X calls Y' (also invokes / uses / reads / writes)\n"
-                "  (b) the existence of an indexed symbol\n\n"
+                "  (a) a call between two indexed functions or methods — "
+                "'X calls Y'\n"
+                "  (b) the existence of an indexed symbol\n"
+                "A method written Class.method is one symbol: write it "
+                "whole, never as its class calling it.\n\n"
                 f"Symbols this hypothesis names that ARE indexed: "
                 f"{_syms if _syms else 'none'}\n"
                 f"Relations detectable in its text: "
@@ -54667,20 +56178,15 @@ class HypothesisForge:
 
             _analysis, _claims = "", []
             _t = (_resp or "").strip()
-            _pos = len(_t)
-            for _ in range(6):
-                _pos = _t.rfind("{", 0, _pos)
-                if _pos < 0:
-                    break
-                try:
-                    _obj = _json.JSONDecoder().raw_decode(_t[_pos:])[0]
-                    _analysis = str(_obj.get("analysis", ""))
-                    _claims = [str(c) for c in (_obj.get("claims") or [])][
-                        : self._MAX_CLAIMS_PER_CYCLE
-                    ]
-                    break
-                except Exception:
-                    continue
+            # The object that carries the analysis, read whole and mended if
+            # it must be (_json_object_with): a backward scan took the "{}"
+            # a claim quoted for it and lost the cycle's claims.
+            _obj = _json_object_with(_t, "analysis")
+            if _obj is not None:
+                _analysis = str(_obj.get("analysis", ""))
+                _claims = [str(c) for c in (_obj.get("claims") or [])][
+                    : self._MAX_CLAIMS_PER_CYCLE
+                ]
             # The analysis comes FIRST in the object, so a response cut off
             # mid-claims still carries a complete one. A cycle whose prose
             # had correctly refuted its hypothesis ran on into 143 repeated
@@ -55528,6 +57034,20 @@ class HypothesisForge:
                 )
 
         _grave = self._load_graveyard(project_id, _sh)
+
+        def _ruled_out(_h: str, _c: str, _refuted: List[str]) -> str:
+            # What refuted a mechanism goes with it. Told only "(cause:
+            # falsified)", R23's generator wrote the refuted premise
+            # "_verify_target calls _note_execution" three times over, and
+            # each was forged and killed by the same missing call. The
+            # cause stays first: _collides cuts each line there.
+            _why = "; ".join(
+                f"«{' '.join(str(_r).split())[:140]}»" for _r in _refuted[:2]
+            )
+            return f"{_h} (cause: {_c}" + (
+                f"; the code refutes {_why})" if _why else ")"
+            )
+
         # Only causes that are evidence AGAINST the hypothesis exclude it from
         # future generation. `unfounded` means the cycles ended with no facts
         # either way, and `null_bar` that support never cleared the baseline;
@@ -55536,9 +57056,9 @@ class HypothesisForge:
         # another account" — while reporting it as ruled out.
         _refuting = ("falsified", "fabricated")
         _exclusions: List[str] = [
-            f"{h} (cause: {c})" for h, c, _u in _grave if c in _refuting
+            _ruled_out(h, c, _r) for h, c, _u, _r in _grave if c in _refuting
         ]
-        _unrefuted = [h for h, c, _u in _grave if c not in _refuting]
+        _unrefuted = [h for h, c, _u, _r in _grave if c not in _refuting]
         if _unrefuted:
             self._f._log_debug(
                 f"_forge_all: {len(_unrefuted)} graveyard entry/entries kept "
@@ -55549,12 +57069,23 @@ class HypothesisForge:
         # Empty when no graveyard entry carries it (pre-S7 rows or a
         # clean era), in which case generation is bit-identical to
         # before: the compass is data-gated at runtime.
+        # The graveyard is the era's, whatever question each burial
+        # answered: offered as "worth probing", turn 2's _quote_found and
+        # _squash_ws reached R23's turns 4 and 8, about the metrics line
+        # and _verify_target. Only ground that names something the
+        # question or this investigation's claims name is offered.
+        _here = _code_name_tails(question)
+        try:
+            for _lc in getattr(self._f._agentic._ledger, "claims", None) or []:
+                _here |= _code_name_tails(getattr(_lc, "subject", "") or "")
+        except Exception:
+            pass
         _compass: List[str] = []
-        for _h2, _c2, _u2 in _grave:
+        for _h2, _c2, _u2, _r2 in _grave:
             for _item in _u2:
                 if len(_compass) >= 8:
                     break
-                if _item not in _compass:
+                if _item not in _compass and _code_name_tails(_item) & _here:
                     _compass.append(_item)
         if _exclusions:
             self._f._log_debug(
@@ -55640,12 +57171,22 @@ class HypothesisForge:
             # suffix dilutes the similarity ratio enough to mask an
             # exact re-forge of a buried mechanism (caught in testing:
             # identical text scored 0.80 < 0.85 with the suffix on).
+            # A rival that restates one sealed or buried is the same
+            # mechanism in other words (_is_restatement, the rule for two
+            # claims): R23's three accounts of call_llm counting after the
+            # seal name the same six symbols, and the ratio scored them
+            # 0.06 to 0.17 — 0.32 to 0.48 read without difflib's junk
+            # heuristic, which on texts this long counted the commonest
+            # letters as junk. R21-R23 forged 7 such rivals, about 200 s.
+            _sig = _restatement_signature(cand, "", [])
             for _known in _exclusions + [d.hypothesis for d in _sealed]:
                 _core = _known.split(" (cause:")[0]
                 _ratio = difflib.SequenceMatcher(
-                    None, cand.lower(), _core.lower()
+                    None, cand.lower(), _core.lower(), autojunk=False
                 ).ratio()
-                if _ratio > 0.85:
+                if _ratio > 0.85 or _is_restatement(
+                    _sig, _restatement_signature(_core, "", [])
+                ):
                     return True
             return False
 
@@ -55887,8 +57428,13 @@ class HypothesisForge:
                 + (f"/{_dossier.cause_of_death}" if _dossier.cause_of_death else "")
             )
             _exclusions.append(
-                f"{_dossier.hypothesis} "
-                f"(cause: {_dossier.cause_of_death or _dossier.status})"
+                _ruled_out(
+                    _dossier.hypothesis,
+                    _dossier.cause_of_death or _dossier.status,
+                    _dossier.refuted_claims
+                    if _dossier.cause_of_death == "falsified"
+                    else [],
+                )
             )
         if _collision_count:
             # Kept for the conclusion status: a turn where every
@@ -56057,22 +57603,11 @@ class HypothesisForge:
             except Exception as _e:
                 self._f._log_debug(f"_judge_dossiers: crucis call failed ({_e!r})")
                 break
-            import json as _json
-
             _claim, _fav = "", ""
-            _t = (_resp or "").strip()
-            _pos = len(_t)
-            for _ in range(6):
-                _pos = _t.rfind("{", 0, _pos)
-                if _pos < 0:
-                    break
-                try:
-                    _obj = _json.JSONDecoder().raw_decode(_t[_pos:])[0]
-                    _claim = str(_obj.get("claim", "")).strip()
-                    _fav = str(_obj.get("if_true_supports", "")).strip().upper()
-                    break
-                except Exception:
-                    continue
+            _obj = _json_object_with((_resp or "").strip(), "claim")
+            if _obj is not None:
+                _claim = str(_obj.get("claim", "")).strip()
+                _fav = str(_obj.get("if_true_supports", "")).strip().upper()
             if not _claim or _fav not in (_CRUCIS_FIRST, _CRUCIS_SECOND):
                 break
             # The GRAPH judges — the model never does.
@@ -57072,9 +58607,9 @@ class HypothesisForge:
         project_id: str,
         structure_hash: str,
         limit: int = 12,
-    ) -> List[Tuple[str, str, List[str]]]:
+    ) -> List[Tuple[str, str, List[str], List[str]]]:
         """
-        Load (hypothesis, cause, unexplored) for the burials that still hold.
+        Load (hypothesis, cause, unexplored, refuted) for the burials that hold.
 
         A death recorded against code that has since changed is not
         returned: the mechanism could be true now, so it must be forgeable
@@ -57102,7 +58637,7 @@ class HypothesisForge:
                 "ORDER BY created_at DESC",
                 (project_id,),
             ).fetchall()
-            _out: List[Tuple[str, str, List[str]]] = []
+            _out: List[Tuple[str, str, List[str], List[str]]] = []
             _fingerprints: Dict[str, str] = {}
             _retired = 0
             for _r in _rows:
@@ -57123,9 +58658,13 @@ class HypothesisForge:
                 if len(_out) >= limit:
                     continue
                 _unexp: List[str] = []
+                _refd: List[str] = []
                 if isinstance(_payload, dict):
                     _unexp = [str(u) for u in (_payload.get("unexplored") or [])][:6]
-                _out.append((str(_r[0]), str(_r[1]), _unexp))
+                    _refd = [str(u) for u in (_payload.get("refuted") or [])][:6]
+                elif isinstance(_payload, list):
+                    _refd = [str(u) for u in _payload][:6]
+                _out.append((str(_r[0]), str(_r[1]), _unexp, _refd))
             if _retired:
                 self._f._log_debug(
                     f"🪦 graveyard: {_retired} burial(s) retired — the code "
@@ -62391,6 +63930,7 @@ class SystemPromptBuilder:
         pstate_raw["hub_tier_text"] = hub_tier_text
         pstate_raw["hub_tier_hash"] = hub_tier_hash
         psm.set_hub_tier_qids(project_id, hub_tier_qids)
+        self._f._hub_tier_this_turn = set(hub_tier_qids or [])
         psm.set_hub_tier_prev_seeds(
             project_id,
             psm.get_hub_tier_seeds_this_turn(project_id),
@@ -62466,6 +64006,9 @@ class SystemPromptBuilder:
             slot_free,
             code_action_vector=code_action_vector,
             use_case=use_case,
+            max_tokens=self._block_b_room(
+                static_block, hub_tier_text, dynamic_injections
+            ),
         )
         if active_ctx:
             dynamic_injections.append(("critical", active_ctx))
@@ -63130,6 +64673,39 @@ class SystemPromptBuilder:
                     return True
         return False
 
+    def _block_b_room(
+        self,
+        static_block: str,
+        hub_tier: str,
+        injections: List[Tuple[str, str]],
+    ) -> Optional[int]:
+        """Tokens Block B's bodies may take, or None without a tokenizer.
+
+        What keeps the turn's prelim under the aligned calls' cap
+        (_aligned_prelim_cap) once the rest of it is counted as it stands —
+        Block A, the hub tier, the profile, the user's instructions, the
+        injections made so far — with _PRELIM_LATE_TOKENS kept for what
+        joins after. Past that cap the six agentic call sites cut the
+        prelim's tail, Block B's last bodies: round 24's fourth turn went
+        some 1,400 tokens over, and nine calls read Block B without its end
+        and could not send it as its own message.
+        """
+        _tk = self._f.tokenizer
+        if not _tk:
+            return None
+        try:
+            _parts = [
+                static_block,
+                hub_tier,
+                getattr(self._f, "_profile_block_this_turn", "") or "",
+                getattr(self._f, "_original_system_prompt", "") or "",
+            ] + [_text for _, _text in injections]
+            _used = sum(len(_tk.encode(_p)) for _p in _parts if _p)
+            return _aligned_prelim_cap(self._f.valves) - _PRELIM_LATE_TOKENS - _used
+        except Exception as _e:
+            self._f._log_debug(f"🅱️ Block B room not computed ({_e!r})")
+            return None
+
     async def _build_activated_code(
         self,
         user_query: str,
@@ -63139,8 +64715,12 @@ class SystemPromptBuilder:
         slot_free: bool,
         code_action_vector: Optional[dict] = None,
         use_case: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> Optional[str]:
-        """Obtain LOD-activated code context for the current query, if applicable."""
+        """Obtain LOD-activated code context for the current query, if applicable.
+
+        `max_tokens` bounds Block B's bodies (_block_b_room); None leaves
+        build_block_b its own budget."""
         if not (is_code_session and self._f.valves.enable_code_awareness):
             return None
 
@@ -63158,6 +64738,7 @@ class SystemPromptBuilder:
                 code_action_vector=code_action_vector,
                 is_continuation=not slot_free,
                 use_case_override=use_case,
+                max_tokens=max_tokens,
             )
 
             # --- Check suppression before falling back ---
@@ -63297,6 +64878,11 @@ class SystemPromptBuilder:
         across turns, while the dynamic tail re-prefills as needed.
         """
         budget = self._f.valves.global_injection_token_budget
+        # Never past what the aligned calls take whole (_aligned_prelim_cap),
+        # less 64 tokens for the separators: Block B is sized to fit
+        # (_block_b_room), and this trims what joined it after.
+        _cap = _aligned_prelim_cap(self._f.valves) - 64
+        budget = min(budget, _cap) if budget > 0 else _cap
         priority_order = _INJECTION_PRIORITY
 
         if budget > 0 and self._f.tokenizer:
@@ -63317,8 +64903,16 @@ class SystemPromptBuilder:
                 if getattr(self._f, "_original_system_prompt", "")
                 else 0
             )
+            # The profile opens the dynamic region (below), so it is counted.
+            _prof = getattr(self._f, "_profile_block_this_turn", "") or ""
+            profile_tokens = len(self._f.tokenizer.encode(_prof)) if _prof else 0
             dyn_budget = max(
-                0, budget - static_tokens - hub_tier_tokens - user_prompt_tokens
+                0,
+                budget
+                - static_tokens
+                - hub_tier_tokens
+                - user_prompt_tokens
+                - profile_tokens,
             )
 
             for prio, text in dynamic_injections:
@@ -63331,7 +64925,22 @@ class SystemPromptBuilder:
                 elif prio in _INJECTION_KEEP_UNDER_PRESSURE:
                     avail = dyn_budget - used
                     if avail > 20:
-                        selected.append((prio, text[: avail * 4] + "\n[truncated]"))
+                        # Cut by tokens: four characters a token is more
+                        # than code holds, and the cut overshot the cap.
+                        selected.append(
+                            (
+                                prio,
+                                self._f._tokens.truncate_text_to_tokens(
+                                    text, avail - 8
+                                )
+                                + "\n[truncated]",
+                            )
+                        )
+                        self._f._log_debug(
+                            f"🧩 Prelim over its budget ({budget} tokens): a "
+                            f"{prio} injection cut to {avail - 8} of {tok} "
+                            f"tokens, what followed it left out"
+                        )
                         break
             dynamic_block = "\n\n".join(
                 t for _, t in _order_injections_for_render(selected)
@@ -65545,6 +67154,15 @@ class MessageAssembler:
                     if not getattr(self._f, "_evidence_cut_before_fit", False):
                         _head, _moved = self._evidence_only_parts(_head, _moved)
                     final_system = _stab if _had_head else _cut
+                    if getattr(self._f.valves, "isolate_final_answer", False):
+                        _lean = _answer_system_without_map(final_system)
+                        if _lean:
+                            self._f._log_debug(
+                                f"🔒 Answer prompt: own context — system cut "
+                                f"from {len(final_system)} to {len(_lean)} "
+                                f"chars (no call graph, skeleton or hub tier)"
+                            )
+                            final_system = _lean
                     _last_user["content"] = (
                         (_head + "\n\n" if _head else "")
                         + _last_user["content"].rstrip()
@@ -65605,6 +67223,13 @@ class MessageAssembler:
             # also wrong. Written here, with the metric that is already
             # unconditional, for the same reason that one is.
             self._f._last_system_prompt_tokens = total_system_tok
+
+        # The map's and the hub tier's sizes for [CTX-USE]: the same texts
+        # the turn's prefix carried. Block B is measured by its bodies
+        # (_ctx_use_figures): here it also holds the workspace.
+        _nzs = getattr(self._f, "_note_zone_sizes", None)
+        if callable(_nzs):
+            _nzs(static_block, hub_tier_text)
 
         # ── Token breakdown log ─────────────────────────────────────────
         if self._f.valves.debug and self._f.tokenizer and final_system.strip():
@@ -70007,6 +71632,7 @@ class InletOrchestrator:
                 "repeat": 0,
                 "glued_rules": 0,
                 "annotations": 0,
+                "outlet_notes": 0,
             }
             _touched = 0
             for _m in messages or []:
@@ -70028,6 +71654,7 @@ class InletOrchestrator:
                     f"{_scrubbed['placeholders']} placeholder line(s), "
                     f"{_scrubbed['repeat']} repeated section cycle(s) cut, "
                     f"{_scrubbed['glued_rules']} rule(s) unglued, "
+                    f"{_scrubbed['outlet_notes']} plugin note(s), "
                     f"{_scrubbed['annotations']} ledger annotation(s) removed"
                 )
         except Exception as _e_scrub:
@@ -71901,10 +73528,10 @@ class Valves(BaseModel):
     )
 
     enable_hub_bodies_tier: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Inject full bodies of top-N hubs as a cacheable tier between "
-            "Block A and Block B. Candidate for off: chosen by centrality, the "
+            "Block A and Block B. Off by default: chosen by centrality, the "
             "tier held plumbing — 9 of its 15 bodies were never operated on "
             "over rounds 16-20, and 0.6% of them gave evidence — while it "
             "sat in the context of every call (~4.5k tokens). The bodies a "
@@ -72085,7 +73712,11 @@ class Valves(BaseModel):
     )
 
     lod3_sticky_turns: int = Field(
-        default=4,
+        # Off since run 22: between consecutive primes Block B shares only
+        # its header (22-23 tokens, run 21), so a carried body saves no
+        # prefill, and one transition in eight carried anything. What a
+        # follow-up needs the history seeds activate, or a step reads.
+        default=0,
         ge=0,
         description=(
             "Keep LOD3 bodies rendered for this many extra turns after their "
@@ -73013,6 +74644,20 @@ class Valves(BaseModel):
             "another's. Chat endpoints only. Turn OFF if the chat template "
             "rejects two consecutive user messages, or to measure against "
             "the single-message turn."
+        ),
+    )
+
+    isolate_final_answer: bool = Field(
+        default=True,
+        description=(
+            "The final answer goes out with Block A's instructions only — "
+            "no call graph, skeleton or hub tier. What it answers from is "
+            "already in its user turn: the evidence-only Block B, the "
+            "workspace and the outline. Like the evidence-only cut, it keeps "
+            "the answer from describing code no step read, and it reads "
+            "~16k tokens instead of ~115k. Applied only where the answer "
+            "prompt was split at the prefix junction (agentic turns). Needs "
+            "--cache-ram like isolate_reader_calls. OFF = as before."
         ),
     )
 
@@ -75384,6 +77029,9 @@ class Filter:
         # Calls that went out on their own context, by label
         # (LLMOrchestrator._note_own_context).
         self._own_context_this_turn: Dict[str, int] = {}
+        # llama-server's reuse per turn (LLMOrchestrator._note_cache_use).
+        self._cache_use_this_turn: Dict[str, list] = {}
+        self._last_call_was_own_context = False
         # What each heavy call left on the volatile side of the cut. Both
         # boundaries are computed on every call: the session invariant
         # (static + hub) and the turn prelim (+ profile and Block B, the
@@ -75392,14 +77040,25 @@ class Filter:
         # each call ~30k tokens, and the prelim does the reverse; which is
         # cheaper depends on how many heavy calls the turn makes, and this
         # census is what lets the logs tell. `split` counts the calls that
-        # sent the volatile part as its own message, which pay it once.
-        self._cut_census_this_turn: Dict[str, int] = {}
+        # sent the volatile part as its own message, which pay it once;
+        # `no_turn` the ones, by label, that carried no turn context.
+        self._cut_census_this_turn: Dict[str, Any] = {}
         # What final_evidence_only works from, per turn: the exact text Block
         # B rendered for each body, what the investigating agents produced,
         # and what the answer prompt left out (for [METRICS-TURN]).
         self._block_b_bodies_this_turn: Dict[str, List[str]] = {}
         self._evidence_outputs_this_turn: List[Tuple[Any, ...]] = []
         self._evidence_stats_this_turn: Dict[str, Any] = {}
+        # What [CTX-USE] reads at the handover (_ctx_use_figures): the zones'
+        # sizes, the hub tier's symbols, the bodies whose lines settled a
+        # verdict, and what the plan and the claims named.
+        self._ctx_zone_tokens: Dict[str, int] = {}
+        self._hub_tier_this_turn: Set[str] = set()
+        self._judge_evidence_this_turn: Set[str] = set()
+        self._turn_use: Dict[str, Any] = {}
+        # The chat's running totals for [CTX-CALIBRATE], restarted when the
+        # chat or the configuration it measures changes.
+        self._calibration_window: Dict[str, Any] = {}
         # The Reading/Did pair the pipeline measured this turn, handed to
         # the outlet so the footer it writes is the pipeline's account and
         # not the model's recollection of it. Cleared per turn beside the
@@ -75896,6 +77555,9 @@ class Filter:
                 f"chat={str(_m.get('chat', '') or '-')[:8]} q={_qhash} "
                 f"qtype={_m.get('qtype', '-')} {_fields} question=\"{_shown}\""
             )
+            _lcu = getattr(self, "_log_ctx_use", None)
+            if callable(_lcu):
+                _lcu(_m)
         except Exception as _e:
             self._log_debug(f"[METRICS-TURN] skipped ({_e!r})")
 
@@ -75934,6 +77596,338 @@ class Filter:
             _m[key] = _m.get(key, 0) + amount
         except Exception:
             pass
+
+    def _note_zone_sizes(self, block_a: str, hub: str) -> None:
+        """Token sizes of the map and the hub tier, for [CTX-USE].
+
+        Block A is the map (call graph and skeleton) and changes only with
+        the code, so its count is kept under its hash; the hub tier is
+        counted each turn. Without a tokenizer, chars / 4. Never raises.
+        """
+        try:
+            _tok = getattr(self, "tokenizer", None)
+
+            def _n(_text: str) -> int:
+                if not _text:
+                    return 0
+                return len(_tok.encode(_text)) if _tok else len(_text) // 4
+
+            _key = hashlib.md5(
+                (block_a or "").encode("utf-8", "replace")
+            ).hexdigest()
+            _kept = getattr(self, "_block_a_tokens_kept", None) or ("", 0)
+            if _kept[0] != _key:
+                _kept = (_key, _n(block_a or ""))
+                self._block_a_tokens_kept = _kept
+            self._ctx_zone_tokens = {"map": int(_kept[1]), "hub": _n(hub or "")}
+        except Exception:
+            pass
+
+    def _note_turn_use(self, steps: List[Any], ledger: Any) -> None:
+        """What the turn used, for [CTX-USE].
+
+        The symbols its done steps targeted, those its claims cite, and the
+        subject of each structural claim — the kind a call-graph edge
+        answers. Inferences are left out, as coverage leaves them out.
+        Never raises.
+        """
+        try:
+            _targets = {
+                str(_q)
+                for _s in list(steps or [])
+                if getattr(_s, "status", "") == "done"
+                for _q in (getattr(_s, "symbols", None) or [])
+                if str(_q).strip()
+            }
+            _cited: Set[str] = set()
+            _structural: List[str] = []
+            for _c in list(getattr(ledger, "claims", None) or []):
+                try:
+                    if ledger.bucket_of(_c) == "inference":
+                        continue
+                except Exception:
+                    pass
+                _qs = [
+                    str(_q)
+                    for _q in (getattr(_c, "valid_qids", None) or [])
+                    if str(_q).strip()
+                ]
+                _cited.update(_qs)
+                if getattr(_c, "claim_kind", "") == "structural":
+                    _structural.append(
+                        str(getattr(_c, "subject", "") or "")
+                        or (_qs[0] if _qs else "")
+                    )
+            self._turn_use = {
+                "targets": _targets,
+                "cited": _cited,
+                "structural": _structural,
+            }
+        except Exception:
+            pass
+
+    def _ctx_use_figures(self) -> Dict[str, Any]:
+        """This turn's use of each context zone, frozen at the handover.
+
+        A symbol is used when a done step targeted it, a claim cites it or
+        lines of its body settled a verdict of the evidence judge, which
+        also makes it evidence: without that last, round 23's map twice had
+        more evidence than use (1 used, 4 evidence). Each goes to the first
+        zone that held it when the
+        turn started — the hub tier, then Block B — and otherwise to the map:
+        in view only through the call graph and the skeleton, and reached
+        with tools. Rounds 16-20, measured offline: 61% of the used symbols
+        and 57% of the evidence came from the map alone. Block B's size is
+        that of the bodies it rendered, the text evidence can come from.
+        Empty when the agentic pipeline did not run. Never raises.
+        """
+        try:
+            _use = getattr(self, "_turn_use", None) or {}
+            if not _use:
+                return {}
+            _hub = set(getattr(self, "_hub_tier_this_turn", None) or ())
+            _reg = getattr(self, "_block_b_bodies_this_turn", None) or {}
+            _bb = set(_reg)
+            _held = _hub | _bb
+            _tk = getattr(self, "tokenizer", None)
+            _bb_tokens = sum(
+                len(_tk.encode(_x)) if _tk else len(_x) // 4
+                for _texts in _reg.values()
+                for _x in (_texts or [])
+                if _x
+            )
+
+            def _split(_syms: Set[str]) -> Dict[str, int]:
+                _h = {_s for _s in _syms if _in_zone(_s, _hub)}
+                _b = {_s for _s in _syms - _h if _in_zone(_s, _bb)}
+                return {
+                    "hub": len(_h),
+                    "block_b": len(_b),
+                    "map": len(_syms) - len(_h) - len(_b),
+                }
+
+            _targets = set(_use.get("targets") or ())
+            _evidence = set(getattr(self, "_judge_evidence_this_turn", None) or ())
+            _structural = list(_use.get("structural") or [])
+            _cache = getattr(self, "_cache_use_this_turn", None) or {}
+            return {
+                "tokens": {
+                    **dict(getattr(self, "_ctx_zone_tokens", None) or {}),
+                    "block_b": _bb_tokens,
+                },
+                "present": {"hub": len(_hub), "block_b": len(_bb)},
+                "used": _split(_targets | set(_use.get("cited") or ()) | _evidence),
+                "evidence": _split(_evidence),
+                "targets": len(_targets),
+                "targets_map": sum(1 for _s in _targets if not _in_zone(_s, _held)),
+                "structural": len(_structural),
+                "structural_map": sum(
+                    1 for _s in _structural if not _in_zone(_s, _held)
+                ),
+                "cache": {_k: list(_v) for _k, _v in _cache.items()},
+            }
+        except Exception:
+            return {}
+
+    def _log_ctx_use(self, m: Dict[str, Any]) -> None:
+        """[CTX-USE], [JUDGE-TURN] and [CTX-CALIBRATE] for one answered turn.
+
+        [CTX-USE]: each zone's size, how many symbols the turn used from it
+        and how many gave evidence, per 1k tokens (_ctx_use_figures); and the
+        navigation only the map allows — plan targets and structural claims
+        on symbols neither the hub nor Block B held. [JUDGE-TURN]: the
+        evidence judge's first reading, the second one by reason, the
+        rescues, what stayed open and the depth it read at. Then the chat's
+        running totals (_log_ctx_calibration). Skipped on turns the pipeline
+        did not run. Never raises.
+        """
+        try:
+            _c = m.get("ctx_use") or {}
+            if not (m.get("pipeline") and _c):
+                return
+            _t = m.get("t", 0)
+            _tok = _c.get("tokens") or {}
+            _used = _c.get("used") or {}
+            _ev = _c.get("evidence") or {}
+            _pres = _c.get("present") or {}
+
+            def _zone(_name: str, _key: str, _what: str) -> str:
+                _n = int(_tok.get(_key, 0) or 0)
+                _e = int(_ev.get(_key, 0) or 0)
+                return (
+                    f"{_name} ~{_n / 1000:.1f}k tok{_what}: "
+                    f"{_used.get(_key, 0)} used, {_e} evidence"
+                    + (f" ({_e / (_n / 1000):.3f}/1k)" if _n else "")
+                )
+
+            _parts = [
+                _zone("map", "map", ", only there"),
+                _zone("Block B", "block_b", f", {_pres.get('block_b', 0)} bodies"),
+                _zone("hub", "hub", f", {_pres.get('hub', 0)} bodies")
+                if getattr(self.valves, "enable_hub_bodies_tier", False)
+                else "hub off",
+                f"plan targets {_c.get('targets', 0)} "
+                f"({_c.get('targets_map', 0)} only in the map)",
+                f"structural claims {_c.get('structural', 0)} "
+                f"({_c.get('structural_map', 0)} on a subject the hub and "
+                f"Block B lacked)",
+            ]
+            self._log_debug(f"[CTX-USE] t={_t} · " + " · ".join(_parts))
+
+            def _i(_k: str) -> int:
+                return int(m.get(_k, 0) or 0)
+
+            if _i("judge_claims"):
+                _re = {
+                    _r: _i(f"judge_reask_{_r}")
+                    for _r in ("no_ruling", "unanchored", "cross_body", "not_found")
+                }
+                _calls = _i("judge_calls")
+                _own = _reads_only_its_prompt(self) is False
+                _open_end = _i("cov_read") + _i("cov_blind") + _i("cov_uncovered")
+                self._log_debug(
+                    f"[JUDGE-TURN] t={_t} · {_i('judge_claims')} claim(s) in "
+                    f"{_i('judge_lots')} lot(s): {_i('judge_first_settled')} "
+                    f"settled on first reading · re-asked {sum(_re.values())} "
+                    f"(no ruling {_re['no_ruling']}, unanchored "
+                    f"{_re['unanchored']}, cross-body {_re['cross_body']}, not "
+                    f"found {_re['not_found']}) → "
+                    f"{_i('evidence_reask_settled')} settled · demoted "
+                    f"cross-body {_i('judge_cross_body')} · settled through "
+                    f"the subject's definitions {_i('judge_via_uses')}, through "
+                    f"a cited caller {_i('judge_via_call')} · left "
+                    f"indeterminate {_i('judge_open')}"
+                    + (
+                        f" · open at the end {_open_end} of {_i('claims')} "
+                        f"(read {_i('cov_read')}, blind {_i('cov_blind')}, "
+                        f"uncovered {_i('cov_uncovered')})"
+                        if _i("claims")
+                        else ""
+                    )
+                    + (
+                        f" · ~{_i('judge_depth_tokens') / _calls / 1000:.1f}k "
+                        f"tok per call ({'own context' if _own else 'prefix'})"
+                        if _calls
+                        else ""
+                    )
+                )
+            self._log_ctx_calibration(m, _c)
+        except Exception as _e:
+            self._log_debug(f"[CTX-USE] skipped ({_e!r})")
+
+    def _log_ctx_calibration(self, m: Dict[str, Any], c: Dict[str, Any]) -> None:
+        """Add a turn to the chat's window and log [CTX-CALIBRATE].
+
+        The window is one chat under one configuration (hub tier, sticky
+        turns, isolated readers, isolated answer): a test run asks its
+        questions in one chat, so the run's last line is its verdict. The
+        rules (_CAL_*) are the review's, applied to the window's totals:
+        the hub stays while its evidence per 1k tokens nears Block B's; the
+        map stays while about half of what a turn uses is reached only
+        through it; isolated readers stay while the prompt cache keeps the
+        prefix they leave. The first reading's settle rate and the
+        cross-body demotions are printed for comparing runs. Log only: no
+        valve is changed. Never raises.
+        """
+        try:
+            _sig = (
+                bool(getattr(self.valves, "enable_hub_bodies_tier", False)),
+                int(getattr(self.valves, "lod3_sticky_turns", 0) or 0),
+                _reads_only_its_prompt(self) is False,
+                bool(getattr(self.valves, "isolate_final_answer", False)),
+            )
+            _chat = str(m.get("chat", "") or "-")
+            _w = getattr(self, "_calibration_window", None) or {}
+            if _w.get("key") != (_chat, _sig):
+                _w = {"key": (_chat, _sig)}
+                self._calibration_window = _w
+
+            def _add(_k: str, _v: Any) -> None:
+                _w[_k] = _w.get(_k, 0) + (_v or 0)
+
+            _add("turns", 1)
+            for _z in ("hub", "block_b", "map"):
+                _add(f"tok_{_z}", (c.get("tokens") or {}).get(_z, 0))
+                _add(f"used_{_z}", (c.get("used") or {}).get(_z, 0))
+                _add(f"ev_{_z}", (c.get("evidence") or {}).get(_z, 0))
+            for _k in (
+                "judge_claims",
+                "judge_first_settled",
+                "judge_cross_body",
+                "claims",
+                "cov_read",
+                "cov_blind",
+                "cov_uncovered",
+            ):
+                _add(_k, int(m.get(_k, 0) or 0))
+            _cache = c.get("cache") or {}
+            _add("own_calls", (list(_cache.get("own") or []) + [0])[0])
+            _add("prefix_lost", (list(_cache.get("prefix") or []) + [0] * 5)[4])
+
+            def _per1k(_e: float, _n: float) -> float:
+                return _e / (_n / 1000) if _n else 0.0
+
+            _bb = _per1k(_w["ev_block_b"], _w["tok_block_b"])
+            _all = _w["used_hub"] + _w["used_block_b"] + _w["used_map"]
+            _share = _w["used_map"] / _all if _all else 0.0
+            _parts = []
+            if _sig[0]:
+                _hr = _per1k(_w["ev_hub"], _w["tok_hub"])
+                _parts.append(
+                    f"hub {_hr:.3f} evidence/1k vs Block B {_bb:.3f} (keeps at "
+                    f"≥{_CAL_HUB_KEEP_RATIO:.0%} of it) → "
+                    + (
+                        "keep"
+                        if _bb and _hr >= _CAL_HUB_KEEP_RATIO * _bb
+                        else "turn enable_hub_bodies_tier off"
+                    )
+                )
+            _parts.append(
+                f"map: {_share:.0%} of used symbols reached only through it "
+                f"(keeps at ≥{_CAL_MAP_KEEP_SHARE:.0%}) → "
+                + (
+                    "keep"
+                    if _share >= _CAL_MAP_KEEP_SHARE or not _all
+                    else "below the rule — review what the map costs"
+                )
+            )
+            _parts.append(
+                f"evidence per 1k tok: Block B {_bb:.3f}, map "
+                f"{_per1k(_w['ev_map'], _w['tok_map']):.3f}"
+            )
+            _jc = _w["judge_claims"]
+            if _jc:
+                _parts.append(
+                    f"judge: {_w['judge_first_settled'] / _jc:.0%} settled on "
+                    f"first reading, {_w['judge_cross_body'] / _jc:.0%} demoted "
+                    f"cross-body"
+                )
+            if _w["claims"]:
+                _open = _w["cov_read"] + _w["cov_blind"] + _w["cov_uncovered"]
+                _parts.append(
+                    f"claims open at the end {_open} of {_w['claims']} "
+                    f"({_open / _w['claims']:.0%})"
+                )
+            if _sig[2]:
+                _lost = _w["prefix_lost"]
+                _parts.append(
+                    f"prefix lost {_lost} time(s) after {_w['own_calls']} "
+                    f"own-context call(s) → "
+                    + (
+                        "turn isolate_reader_calls off"
+                        if _lost >= _CAL_PREFIX_LOST_MAX
+                        else "keep isolate_reader_calls"
+                    )
+                )
+            self._log_debug(
+                f"[CTX-CALIBRATE] chat {_chat[:8]} · {_w['turns']} turn(s) · hub "
+                f"{'on' if _sig[0] else 'off'}, sticky {_sig[1]}, readers "
+                f"{'own context' if _sig[2] else 'with the prefix'}, answer "
+                f"{'own context' if _sig[3] else 'with the map'} · "
+                + " · ".join(_parts)
+            )
+        except Exception as _e:
+            self._log_debug(f"[CTX-CALIBRATE] skipped ({_e!r})")
 
     def _record_metric_many(self, table: str, rows: List[tuple]) -> None:
         """
@@ -76227,6 +78221,32 @@ class Filter:
             f"[EMIT-PROBE] appended {len(_block)} chars through the event "
             f"emitter ({'with' if _lines else 'without'} measured Stats lines)"
         )
+
+    async def _emit_outlet_note(self, note: str, emitter: Any) -> None:
+        """
+        Append the outlet's note after the answer (_outlet_note), and log
+        whether it went.
+
+        Only through the outlet's own emitter: the one the inlet stored is
+        cleared when it ends and, with two turns overlapping, may belong to
+        the other message. Never raises.
+        """
+        if not note:
+            return
+        _said = note.strip()[:300]
+        if not emitter:
+            self._log_debug(
+                f"[OUTLET-NOTE] not sent (no event emitter) — the reader does "
+                f"not see: {_said}"
+            )
+            return
+        if await self._emit_message(note, emitter=emitter):
+            self._log_debug(f"[OUTLET-NOTE] sent after the answer — {_said}")
+        else:
+            self._log_debug(
+                f"[OUTLET-NOTE] not sent (the emitter refused it) — the reader "
+                f"does not see: {_said}"
+            )
 
     def _check_emit_probe_in_history(self, body: dict) -> None:
         """
@@ -76788,30 +78808,32 @@ class Filter:
                     + ", ".join(f"{k} x{v}" for k, v in sorted(_oc.items()))
                 )
             self._own_context_this_turn = {}
+            _cu = getattr(self, "_cache_use_this_turn", None) or {}
+            if _cu:
+                _parts = []
+                for _k in ("prefix", "own"):
+                    if _k in _cu:
+                        _n, _c, _p, _ms, _lost = _cu[_k]
+                        _parts.append(
+                            f"{_k} calls {_n}: reused {_c} tokens, processed "
+                            f"{_p} in {_ms / 1000:.1f}s"
+                            + (f", {_lost} lost the prefix" if _lost else "")
+                        )
+                self._log_debug("\U0001f4ca Cache this turn: " + " · ".join(_parts))
+            self._cache_use_this_turn = {}
             # Read and cleared with the tally above, for the same reason: this
             # is the only place that sees a whole turn at once.
             _cc = getattr(self, "_cut_census_this_turn", None) or {}
             if _cc.get("calls"):
-                _n = _cc["calls"]
-                _vol = _cc.get("volatile", 0)
-                _per = _cc.get("volatile_per_call", 0)
-                # A split call leaves a checkpoint where the volatile part
-                # ends, so only the first of them pays for it.
-                _split = _cc.get("split", 0)
-                _paid = max(0, _vol - max(0, _split - 1) * _per)
-                self._log_debug(
-                    f"📐 Cut census: {_n} heavy call(s) · "
-                    f"invariant x{_cc.get('at_invariant', 0)}, "
-                    f"turn-prelim x{_cc.get('at_turn_prelim', 0)} · "
-                    f"cut at {_cc.get('cut_bytes', 0)} B · "
-                    f"{_per} B (~{_per // 4} tokens) left volatile per call · "
-                    + (f"sent as its own message x{_split} · " if _split else "")
-                    + f"≈{_paid} B (~{_paid // 4} tokens) reprocessed this turn"
-                )
+                self._log_debug(_cut_census_line(_cc))
             self._cut_census_this_turn = {}
             self._block_b_bodies_this_turn = {}
             self._evidence_outputs_this_turn = []
             self._evidence_stats_this_turn = {}
+            self._ctx_zone_tokens = {}
+            self._hub_tier_this_turn = set()
+            self._judge_evidence_this_turn = set()
+            self._turn_use = {}
             # Written by the forge only when a rival survives, read on every
             # turn by the answer's confidence line. Without this, a turn whose
             # competition left no survivor is divided by the previous turn's.
@@ -78018,6 +80040,11 @@ class Filter:
                 "question": str(getattr(self, "_turn_user_question", "") or ""),
                 "inlet_s": time.time() - float(getattr(self, "_turn_started_at", 0.0)),
                 "system_tokens": self._inlet_handoff_tokens,
+                "ctx_use": (
+                    self._ctx_use_figures()
+                    if callable(getattr(self, "_ctx_use_figures", None))
+                    else {}
+                ),
             }
         except Exception:
             self._inlet_handoff_ts = None
@@ -78175,6 +80202,15 @@ class Filter:
         So a red line here is real and a green one proves nothing. It is
         still worth having: the explicit-mention shape is the common one,
         and a rule whose compliance is never observed cannot be improved.
+
+        What is read is the Conclusion (_conclusion_text), and its names are
+        matched against the unsettled subjects with a bare name by its last
+        part (_unsettled_named). The opening used to be the first two
+        paragraphs, which under a blank line after the heading were the rule
+        and the heading alone: three of round 23's ten answers, among them
+        the second, which read green while its conclusion rested on
+        `_quote_key`, a subject that turn left unsettled. A turn whose answer
+        has no conclusion to read says so instead of reading green.
         """
         try:
             _cov = getattr(self, "_agentic_coverage", None)
@@ -78194,15 +80230,24 @@ class Filter:
             )
             if _last is None or not isinstance(_last.get("content"), str):
                 return
-            # The opening paragraph only: the sections below are allowed to
-            # discuss what was not settled, and are asked to.
+            # The conclusion only: the sections below are allowed to discuss
+            # what was not settled, and are asked to.
             _text = _ANSWER_MARK_RE.sub("", _last["content"]).lstrip()
-            _open = _text.split("\n\n", 2)
-            _head = " ".join(("\n\n".join(_open[:2])).split())[:1500]
-            _hits = [_s for _s in _unsettled if _s and _s in _head]
+            _read, _where = _conclusion_text(
+                _text.partition(_INVESTIGATION_RECORD_TITLE)[0]
+            )
+            _what = "opening paragraph" if _where == "opening" else _where
+            if not _read:
+                self._log_debug(
+                    "⚪ Synthesis: not measured — the answer has no "
+                    + (f"text under {_where}" if _where else "prose")
+                    + " to read"
+                )
+                return
+            _hits = _unsettled_named(_read, _unsettled)
             if _hits:
                 self._log_debug(
-                    f"🔴 Synthesis: the opening paragraph names "
+                    f"🔴 Synthesis: the {_what} names "
                     f"{len(_hits)} symbol(s) this turn did not settle ("
                     + ", ".join(_hits[:4])
                     + ") — the supplied list of unsettled propositions did "
@@ -78210,7 +80255,7 @@ class Filter:
                 )
             else:
                 self._log_debug(
-                    "🟢 Synthesis: the opening paragraph rests on nothing "
+                    f"🟢 Synthesis: the {_what} rests on nothing "
                     "this turn left unsettled"
                 )
         except Exception as _e_aud:
@@ -78412,9 +80457,68 @@ class Filter:
         except Exception as _e:
             self._log_debug(f"[SETTLED-ANSWER] skipped ({_e!r})")
 
-    def _seal_tests_verdict(self, body: dict) -> None:
+    async def _run_answer_tests(self, body: dict) -> None:
+        """Run the tests the answer shows that nothing ran, once it is written.
+
+        The sandbox runs the tests the outline and the steps wrote, before
+        the answer (AgenticOrchestrator._run_shown_tests). Round 25's last
+        answer wrote its own, which nothing ran, and said they failed with
+        a TypeError; run against the real code, they pass. They run here
+        now, on a turn the pipeline ran and the cache did not serve, and
+        _seal_tests_verdict says what they did. The result is kept in
+        _turn_answer_run, {} when nothing ran. Never raises.
         """
-        Put in the answer what became of this turn's tests when it leaves it out.
+        self._turn_answer_run = {}
+        try:
+            if not getattr(self.valves, "agentic_run_shown_tests", True):
+                return
+            _m = getattr(self, "_turn_metrics", None) or {}
+            if not int(_m.get("pipeline", 0) or 0) or int(
+                _m.get("from_cache", 0) or 0
+            ):
+                return
+            _last = next(
+                (
+                    m
+                    for m in reversed(body.get("messages") or [])
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None or not isinstance(_last.get("content"), str):
+                return
+            _answer = _last["content"].partition(_INVESTIGATION_RECORD_TITLE)[0]
+            _ran = set(getattr(self, "_executed_test_names", None) or [])
+            _blocks = [
+                textwrap.dedent(_b)
+                for _b in re.findall(r"```(?:\w+)?\s*(.*?)```", _answer, re.S)
+                if any(_n not in _ran for _n in _TEST_DEF_RE.findall(_b))
+            ]
+            _dyn = getattr(getattr(self, "_agentic", None), "_dyn", None)
+            if not _blocks or _dyn is None:
+                return
+            try:
+                _pid = self._inlet_orch.get_project_id()
+            except Exception:
+                _pid = self.valves.project_id
+            _r = await _dyn.run_shown_tests("\n\n".join(_blocks), _pid)
+            self._turn_answer_run = dict(_r or {})
+            self._log_debug(
+                f"🧪 Answer's tests, run after it: {_r.get('status')} "
+                f"{_r.get('passed', 0)}/{_r.get('total', 0)}"
+                + (
+                    f" against {', '.join(_r.get('targets', [])[:3])}"
+                    if _r.get("targets")
+                    else f" — {_r.get('reason', '')}"
+                )
+            )
+        except Exception as _e:
+            self._log_debug(f"🧪 Answer's tests: not run ({_e!r})")
+
+    def _seal_tests_verdict(self, body: dict) -> str:
+        """
+        What the reader is owed about this turn's tests and the answer does
+        not say, as the note the outlet appends after it (_outlet_note).
 
         AgenticOrchestrator._note_unrun_tests writes the measured verdict
         into the outline: the tests ran and all pass, some fail, or some
@@ -78422,13 +80526,19 @@ class Filter:
         "1 falla"), and both answers dropped it; one then showed five tests
         that were not the five that ran and said they validated the
         function. The verdict is a measurement, like the confidence footer,
-        so it goes back in, under the section the outline put it in. Tests
-        the answer shows that never reached the sandbox are said to be
-        unchecked in the same place, on a turn the pipeline ran and the
-        cache did not serve; _audit_tests_shown, after this, still reports
-        them. And a conclusion that says the tests prove it ("los tests
-        verifican correctamente…", both of round 12's) is put as their aim,
-        with what became of them (_hedge_tests_claim). Never raises.
+        so the reader gets it when the answer leaves it out. So do tests the
+        answer shows that never reached the sandbox, on a turn the pipeline
+        ran and the cache did not serve (_audit_tests_shown, after this,
+        still reports them), and a conclusion that says the tests prove it
+        ("los tests verifican correctamente…", both of round 12's), which
+        the note says, with what became of them (_hedge_tests_claim).
+
+        Said after the answer, not written into it: the host discards outlet
+        edits to the message, so the seven verdicts rounds 12 to 23 wrote in
+        never reached the reader (round 23's last turn showed three tests
+        nothing ran and said nothing of it), while the audits after this one
+        read them as the model's. Returns "" when there is nothing to say.
+        Never raises.
         """
         try:
             _last = next(
@@ -78440,23 +80550,122 @@ class Filter:
                 None,
             )
             if _last is None or not isinstance(_last.get("content"), str):
-                return
-            _answer, _sep, _record = _last["content"].partition(
-                _INVESTIGATION_RECORD_TITLE
-            )
+                return ""
+            _answer = _last["content"].partition(_INVESTIGATION_RECORD_TITLE)[0]
             if not _answer.strip():
-                return
+                return ""
             _said = getattr(self, "_turn_tests_said", None) or {}
             _lang = str(_said.get("lang") or _answer_heading_language(_answer))
             _es = _lang == "es"
-            _adds: List[Tuple[str, str]] = []
+            _adds: List[str] = []
             _shown: List[str] = []
             _never: List[str] = []
             _m = getattr(self, "_turn_metrics", None) or {}
+            _after = getattr(self, "_turn_answer_run", None) or {}
+            _after_total = int(_after.get("total", 0) or 0)
+            _after_failed = _after_total - int(_after.get("passed", 0) or 0)
+            _after_outcome: Tuple[str, int, int] = ("", 0, 0)
+            if _after.get("status") in ("pass", "fail") and _after_total:
+                _after_outcome = (
+                    "pass" if not _after_failed else "fail",
+                    _after_failed,
+                    _after_total,
+                )
+            # ── Step 0: a verdict the answer states that nothing measured ──
+            # Round 25's last answer wrote "Los 2 test(s) … se ejecutaron
+            # contra el código real …: 2 fallan (TypeError …)", the plugin's
+            # own sentence, of two tests nothing had run, and both pass. A
+            # verdict is the answer's to state only when a run before it
+            # measured it; one the run after it confirms stands too.
+            _before: Tuple[str, int, int] = (
+                str(_said.get("status") or ""),
+                int(_said.get("failed", 0) or 0),
+                int(_said.get("total", 0) or 0),
+            )
+            _wrong = 0
+            if int(_m.get("pipeline", 0) or 0) and not int(
+                _m.get("from_cache", 0) or 0
+            ):
+                _user = next(
+                    (
+                        str(_u.get("content") or "")
+                        for _u in reversed(body.get("messages") or [])
+                        if isinstance(_u, dict) and _u.get("role") == "user"
+                    ),
+                    "",
+                )
+                for _kind, _n, _q in (
+                    []
+                    if _REPORTS_TEST_RUN_RE.search(_user)
+                    else _stated_test_verdicts(_answer)
+                ):
+                    if _verdict_measured(_kind, _n, _before) or _verdict_measured(
+                        _kind, _n, _after_outcome
+                    ):
+                        continue
+                    _wrong += 1
+                    _measured = _before[0] in ("pass", "fail")
+                    _adds.append(
+                        (
+                            f"La respuesta afirma «{_q}», y no es lo que se midió."
+                            if _measured
+                            else f"La respuesta afirma «{_q}», pero cuando se "
+                            "escribió no se había ejecutado ningún test: no es "
+                            "una medida."
+                        )
+                        if _es
+                        else (
+                            f"The answer states “{_q}”, and that is not what "
+                            "was measured."
+                            if _measured
+                            else f"The answer states “{_q}”, but no test had run "
+                            "when it was written: it is not a measurement."
+                        )
+                    )
+                    self._log_debug(
+                        "outlet: the answer states a test verdict "
+                        + ("the run contradicts" if _measured else "nothing measured")
+                        + f" — «{_q}»"
+                    )
             # ── Step 1: the verdict the outline carried ──
+            # Said even when the answer says it too, once it also says
+            # something else: the reader is owed which of the two holds.
             _say = str(_said.get("say") or "")
-            if _say and not _states_tests_verdict(_answer, _say):
-                _adds.append((str(_said.get("key") or "gaps"), _say))
+            if _say and (_wrong or not _states_tests_verdict(_answer, _say)):
+                _adds.append(_say)
+            # ── Step 1b: the answer's own tests, run after it ──
+            # Always said: the answer was written before they ran, so what
+            # it says of them is not a measurement (round 25: "2 fallan" of
+            # two tests that pass).
+            if _after_outcome[0]:
+                _on = ", ".join(f"`{_x}`" for _x in _after.get("targets", [])[:3])
+                _fail = (_after.get("failures") or [""])[0][:140]
+                _adds.append(
+                    (
+                        f"Los {_after_total} test(s) que muestra esta respuesta "
+                        f"se ejecutaron después de escribirla, contra el código "
+                        f"real de {_on}: "
+                        + (
+                            "pasan todos."
+                            if not _after_failed
+                            else f"{_after_failed} "
+                            f"{'falla' if _after_failed == 1 else 'fallan'} "
+                            f"({_fail})."
+                        )
+                    )
+                    if _es
+                    else (
+                        f"The {_after_total} test(s) this answer shows ran "
+                        f"after it was written, against the real code of {_on}: "
+                        + (
+                            "all pass."
+                            if not _after_failed
+                            else f"{_after_failed} "
+                            f"{'fails' if _after_failed == 1 else 'fail'} "
+                            f"({_fail})."
+                        )
+                    )
+                )
             # ── Step 2: tests shown that never ran ──
             if int(_m.get("pipeline", 0) or 0) and not int(
                 _m.get("from_cache", 0) or 0
@@ -78490,7 +80699,7 @@ class Filter:
                     )
                 )
                 if _unrun and not _states_tests_verdict(_answer, _not_run):
-                    _adds.append(("gaps", _not_run))
+                    _adds.append(_not_run)
             # ── Step 3: a conclusion that says the tests prove it ──
             # The tests it shows, when some never ran; else the outline's;
             # else none at all, on a turn asked for tests that wrote none.
@@ -78498,9 +80707,13 @@ class Filter:
                 ("unrun", len(_never), len(_shown))
                 if _never
                 else (
-                    str(_said.get("status") or ""),
-                    int(_said.get("failed", 0) or 0),
-                    int(_said.get("total", 0) or 0),
+                    (
+                        str(_said.get("status") or ""),
+                        int(_said.get("failed", 0) or 0),
+                        int(_said.get("total", 0) or 0),
+                    )
+                    if _said.get("status")
+                    else _after_outcome
                 )
             )
             if not _outcome[0] and not _shown and int(_m.get("pipeline", 0) or 0):
@@ -78514,30 +80727,33 @@ class Filter:
                 )
                 if _ASKS_FOR_TESTS_RE.search(_asked):
                     _outcome = ("absent", 0, 0)
-            _hedged = False
             _lines = _answer.split("\n")
             _ci = _conclusion_line(_lines, _lang)
-            if _ci >= 0:
-                _new, _hedged = _hedge_tests_claim(_lines[_ci], _lang, *_outcome)
-                if _hedged:
-                    _lines[_ci] = _new
-                    _answer = "\n".join(_lines)
-                    self._log_debug(
-                        "outlet: the conclusion said the tests prove it — put as "
-                        f"their aim ({_outcome[0]} {_outcome[1]}/{_outcome[2]})"
-                    )
-            if not _adds and not _hedged:
-                return
-            for _key, _line in _adds:
-                _answer = _put_in_section(_answer, _lang, _key, _line)
-            _last["content"] = _answer + _sep + _record
-            if _adds:
-                self._log_debug(
-                    "outlet: the tests' verdict put in the answer — "
-                    + " · ".join(_line for _key, _line in _adds)[:300]
+            if _ci >= 0 and _hedge_tests_claim(_lines[_ci], _lang, *_outcome)[1]:
+                # The claim first, then what became of the tests: the lines
+                # above when they say it, else a sentence of its own.
+                _claim = (
+                    "La conclusión presenta los tests como prueba."
+                    if _es
+                    else "The conclusion presents the tests as proof."
                 )
+                _adds.insert(
+                    0,
+                    (
+                        _claim
+                        if _adds
+                        else _claim + " " + _tests_outcome_tail(_lang, *_outcome)
+                    ),
+                )
+                self._log_debug(
+                    "outlet: the conclusion said the tests prove it — the note "
+                    f"says what became of them ({_outcome[0]} {_outcome[1]}/"
+                    f"{_outcome[2]})"
+                )
+            return _outlet_note(_adds, _lang)
         except Exception as _e:
             self._log_debug(f"outlet: tests' verdict skipped ({_e!r})")
+            return ""
 
     def _audit_tests_shown(self, body: dict) -> None:
         """Report which tests the answer shows that the sandbox never ran.
@@ -79214,6 +81430,7 @@ class Filter:
         # turn), so a later non-pipeline turn cannot inherit a stale
         # record from an earlier question.
         # ------------------------------------------------------------------
+        _tests_note = ""
         try:
             _rec = getattr(self, "_serial_investigation_record", "")
             if _rec:
@@ -79238,11 +81455,16 @@ class Filter:
                     )
             self._mark_answer_turn(body)
             self._replace_asserted_confidence(body)
-            self._seal_tests_verdict(body)
+            await self._run_answer_tests(body)
+            _tests_note = self._seal_tests_verdict(body)
             self._seal_settled_answer(body)
             self._seal_fallback_bodies(body)
         except Exception as _e:
             self._log_debug(f"outlet: record append skipped ({_e!r})")
+        # What the answer leaves out of its tests reaches the reader after
+        # it, through this outlet's own emitter: edits to the message above
+        # do not (_seal_tests_verdict).
+        await self._emit_outlet_note(_tests_note, __event_emitter__)
 
         # The audits run beside the confidence footer, not inside it. They
         # used to hang off the end of _replace_asserted_confidence, which
