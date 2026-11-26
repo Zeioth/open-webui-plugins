@@ -1703,7 +1703,9 @@ def _gaps_outline_body(
 _WORKSPACE_NOTE_MARK = "[WORKSPACE NOTE — not part of your answer]"
 _DIRECTIVE_ECHO_PREFIXES: Tuple[str, ...] = (
     "That block goes in your answer ONCE",
-    "Your answer begins with these two lines",
+    "Your answer begins with these",
+    "You are at the end of the answer.",
+    "This turn's evidence was counted.",
     "The line under each heading says what this turn established",
     "The line under each heading is a summary of that section",
     "This turn did NOT establish how these behave",
@@ -1794,8 +1796,15 @@ def _strip_ledger_annotations(text: str) -> Tuple[str, int]:
         return text, 0
 
 
-def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
+def _scrub_history_answer(
+    text: str, live: bool = False
+) -> Tuple[str, Dict[str, int]]:
     """Remove from a past answer what the prompt said was not answer.
+
+    `live`, for the answer just written (Filter._seal_live_answer): only the
+    notes, the echoed directives and a repeated cycle, which are not answer;
+    the annotations, placeholders and rules other seals and audits read are
+    left for them.
 
     Three things, each measured in one chat: a workspace note copied whole,
     with its label; the outline's placeholder line written as the body of a
@@ -1824,9 +1833,11 @@ def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
     try:
         if not isinstance(text, str) or not text:
             return text, _counts
-        _ph = _placeholder_lines()
-        _source, _counts["annotations"] = _strip_ledger_annotations(text)
-        _source, _counts["outlet_notes"] = _strip_outlet_notes(_source)
+        _ph = set() if live else _placeholder_lines()
+        _source = text
+        if not live:
+            _source, _counts["annotations"] = _strip_ledger_annotations(text)
+            _source, _counts["outlet_notes"] = _strip_outlet_notes(_source)
         _lines = _source.split("\n")
         # ── Step 1: cut where the first heading comes round again ──
         _first = ""
@@ -1875,7 +1886,7 @@ def _scrub_history_answer(text: str) -> Tuple[str, Dict[str, int]]:
             if _st in _ph:
                 _counts["placeholders"] += 1
                 continue
-            if _st == "---" and _kept and _kept[-1].strip():
+            if not live and _st == "---" and _kept and _kept[-1].strip():
                 # A rule under a line of text is a setext heading in
                 # Markdown; left in the history, the next answer copies it.
                 _kept.append("")
@@ -6638,6 +6649,155 @@ _NO_CAUSE_SAID_RE = re.compile(
     r"|\bno cause\b|\bnot established\b|\bunverified\b|\bcould not establish",
     re.IGNORECASE,
 )
+
+# A sentence that presents what it says as a finding of the checks: "El
+# código confirma que …", "se verificó que …", "the code shows that …".
+_CONFIRMS_THAT_RE = re.compile(
+    r"\b(?:confirm(?:a|an|ó|aron|ado|ada|s|ed)|demuestra(?:n)?|muestra(?:n)?|"
+    r"verific(?:a|an|ó|aron)|corrobora(?:n)?|constata(?:n)?|establece(?:n)?|"
+    r"shows?|showed|demonstrates|proves|verifie[sd]|establishes)\s+(?:que|that)\b",
+    re.I,
+)
+# The words before such a verb that make it no finding: a negation, a
+# condition, an aim ("no confirma que", "si el código muestra que").
+_CONFIRM_NOT_ASSERTED_RE = re.compile(
+    r"(?:\b(?:no|not|nunca|ni|sin|never|cannot)|n't)\s+(?:\w+\s+){0,2}$"
+    r"|\b(?:si|if|para|to|hasta|until|cuando|when|whether)\s+(?:\S+\s+){0,3}$",
+    re.I,
+)
+# A sentence that already says what it states is not settled.
+_SAYS_UNSETTLED_RE = re.compile(
+    r"\bsin verificar\b|\bno (?:se )?(?:verific|confirm|le[yí]d?)\w*"
+    r"|\bunverified\b|\bnot (?:been )?(?:verified|confirmed|read|settled|"
+    r"established)\b|\bqueda(?:n)? (?:abiert|pendient|sin)\w*"
+    r"|\bremains? (?:open|unverified)\b",
+    re.I,
+)
+# The head of a sentence whose finding is all that follows it.
+_CONFIRMS_HEAD_RE = re.compile(
+    r"^(?:(?:el|la|los|las)\s+(?:código|evidencia|lectura|índice|cuerpo)"
+    r"(?:\s+de\s+`[^`\n]+`)?\s+|se\s+|the\s+(?:code|evidence|reading|index|body)"
+    r"(?:\s+of\s+`[^`\n]+`)?\s+|it\s+is\s+)?"
+    r"(?:confirm(?:a|an|ó|s|ed)|demuestra(?:n)?|muestra(?:n)?|verific(?:a|an|ó)|"
+    r"shows?|demonstrates|proves|verifie[sd]|establishes)\s+(?:que|that)\s+",
+    re.I,
+)
+# How a sentence the checks did not back is said (_hedge_unbacked_evidence):
+# in front of one whose finding is all that follows its head, after any
+# other. {t} names what no check confirmed.
+_UNBACKED_SAID = {
+    "es": (
+        "Sin verificar lo que dice de {t} (ninguna comprobación de este turno "
+        "lo confirmó): ",
+        " Lo que dice de {t} está sin verificar: ninguna comprobación de este "
+        "turno lo confirmó.",
+    ),
+    "en": (
+        "What this says of {t} is unverified (no check this turn confirmed "
+        "it): ",
+        " What it says of {t} is unverified: no check this turn confirmed it.",
+    ),
+}
+_CODE_TERM_WORDS = frozenset(
+    {
+        "true", "false", "none", "self", "cls", "dict", "list", "str", "int",
+        "len", "bool", "set", "tuple", "return", "and", "or", "not", "if",
+        "else", "for", "in", "is", "def", "class", "async", "await", "lambda",
+        "get", "items",
+    }
+)
+_CODE_IDENT_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
+_BARE_CODE_TERM_RE = re.compile(
+    r"(?<![\w`.])(?:[A-Za-z_]\w*\.[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*|\w*_\w+)"
+    r"(?![\w`])"
+)
+
+
+def _verified_corpus(claims: List[Any], extra: List[str]) -> str:
+    """What this turn's checks read and settled, as one casefolded text.
+
+    A confirmed claim's statement, its reading and the symbols it cites;
+    of a refuted or contested one (_contested_keys) only the reading,
+    which is code read; and `extra`, the facts read from the index. Never
+    a claim nothing settled, a synthesis, or a candidate the competition
+    tested.
+    """
+    _both = _contested_keys(claims)
+    _parts: List[str] = [str(_x or "") for _x in extra or []]
+    for _c in claims or []:
+        _v = str(getattr(_c, "verification", "") or "")
+        if _v not in ("confirmed", "refuted"):
+            continue
+        _parts.append(str(getattr(_c, "verification_detail", "") or ""))
+        if _v == "confirmed" and _refuted_key(_c) not in _both:
+            _parts.append(str(getattr(_c, "text", "") or ""))
+            _parts += [str(_q) for _q in getattr(_c, "valid_qids", None) or []]
+            _parts.append(str(getattr(_c, "subject", "") or ""))
+    return " ".join(" ".join(_parts).casefold().split())
+
+
+def _code_terms(sentence: str) -> List[str]:
+    """The code a sentence names: what it puts in backticks, a «quoted» text
+    of two words or more or with code in it, and the dotted or underscored
+    names it writes bare. Each once, in order; not Python's own words."""
+    # Markdown italics, not code: "_Sin …", "… símbolos._".
+    _s = re.sub(
+        r"(?<![\w`])_(?=[A-ZÁÉÍÓÚÑ¿¡])|(?<=[.!?:;,])_(?!\w)", "", str(sentence)
+    )
+    _out: List[str] = []
+    for _span in re.findall(r"`([^`\n]{1,160})`", _s):
+        _ids = _CODE_IDENT_RE.findall(_span)
+        if len(_ids) == 1 and _ids[0] == _span.strip():
+            _out.append(_span.strip())
+        else:
+            _out += [_i for _i in _ids if "_" in _i or "." in _i]
+    for _lit in re.findall(r"«([^»\n]{3,100})»", _s):
+        if len(_lit.split()) >= 2 or re.search(r"[_.(){}=\[\]]", _lit):
+            _out.append(_lit.strip())
+    for _b in _BARE_CODE_TERM_RE.findall(re.sub(r"`[^`\n]*`|«[^»\n]*»", " ", _s)):
+        _parts = _b.split(".")
+        if (
+            _b.isascii()
+            and not _b.endswith("_")
+            and ("." not in _b or max(len(_x) for _x in _parts) >= 3)
+        ):
+            _out.append(_b)
+    _seen: Set[str] = set()
+    _res: List[str] = []
+    for _x in _out:
+        _k = " ".join(_x.casefold().split())
+        if len(_k.strip("_")) < 3 or _k in _CODE_TERM_WORDS or _k in _seen:
+            continue
+        _seen.add(_k)
+        _res.append(_x)
+    return _res
+
+
+def _term_backed(term: str, corpus: str) -> bool:
+    """Whether the checks' text (_verified_corpus) names a term. A text
+    quoted from a log carries the run's numbers ("x8"): its words are what
+    the code holds."""
+    _t = " ".join(str(term).casefold().split())
+    if _t in corpus:
+        return True
+    _chunks = [_c.strip() for _c in re.split(r"\d+", _t) if len(_c.strip()) >= 4]
+    return bool(_chunks) and all(_c in corpus for _c in _chunks)
+
+
+def _unbacked_confirmation(sentence: str, corpus: str) -> List[str]:
+    """What a sentence presents as a finding of the checks that no check
+    of the turn names (_verified_corpus), or [] when it presents nothing as
+    one, says it is not settled, or names only what the checks read."""
+    _s = str(sentence or "")
+    if _SAYS_UNSETTLED_RE.search(_s):
+        return []
+    if not any(
+        not _CONFIRM_NOT_ASSERTED_RE.search(_s[max(0, _m.start() - 30) : _m.start()])
+        for _m in _CONFIRMS_THAT_RE.finditer(_s)
+    ):
+        return []
+    return [_x for _x in _code_terms(_s) if not _term_backed(_x, corpus)]
+
 
 # A file name a claim put in front of a symbol (AgenticEvidenceLedger.
 # _canonical_qid).
@@ -38574,6 +38734,108 @@ class AgenticOrchestrator:
         except Exception:
             return outline
 
+    def _hedge_unbacked_evidence(self, outline: str, lang: str) -> str:
+        """Say unverified what the evidence section presents as confirmed and
+        no check of the turn confirmed.
+
+        The outline reads its workspace alone, without the code, so a finding
+        it writes can only come from there. Round 25's third turn wrote "El
+        código confirma que `_carries` solo es verdadero cuando … y que el
+        contador de «sent as its own message» se incrementa exclusivamente
+        para las llamadas que cumplen esa condición": no claim had settled
+        it, the first half was a claim left unsettled, and the conclusion
+        above called the same account an unverified candidate. A sentence
+        that presents itself as a finding (_CONFIRMS_THAT_RE) and names code
+        no confirmed claim, refuting reading or index fact names
+        (_verified_corpus) is said unverified as to that code
+        (_UNBACKED_SAID): in front of it when its finding is all that
+        follows its head, after it otherwise. Any other sentence, and every
+        other section, is left as written. Never raises: the outline
+        unchanged.
+        """
+        try:
+            _head = (_SECTION_HEADINGS.get(lang) or _SECTION_HEADINGS["en"])[
+                "evidence"
+            ]
+            _lines = str(outline or "").split("\n")
+            _at = next(
+                (
+                    _i
+                    for _i, _l in enumerate(_lines)
+                    if _l.strip().strip("#*- ").strip().split(":")[0] == _head
+                ),
+                -1,
+            )
+            if _at < 0:
+                return outline
+            _ag = getattr(self._f, "_agentic", None)
+            _corpus = _verified_corpus(
+                list(getattr(getattr(self, "_ledger", None), "claims", None) or []),
+                [
+                    str(getattr(_ag, "_graph_listing", "") or ""),
+                    str(getattr(_ag, "_named_relation", "") or ""),
+                ],
+            )
+            _lead, _tail = _UNBACKED_SAID.get(lang) or _UNBACKED_SAID["en"]
+            _es = lang == "es"
+            _named: List[str] = []
+            _fence = False
+            for _i in range(_at + 1, len(_lines)):
+                _l = _lines[_i]
+                if _l.lstrip().startswith("```"):
+                    _fence = not _fence
+                    continue
+                if _fence or not _l.strip() or _l.strip() == "---":
+                    continue
+                if _l.lstrip().startswith("#"):
+                    break
+                _pieces = re.split(r"(?<=[.!?])(\s+)(?=[A-ZÁÉÍÓÚÑ¿¡`«])", _l)
+                for _j in range(0, len(_pieces), 2):
+                    _s = _pieces[_j]
+                    _miss = _unbacked_confirmation(_s, _corpus)
+                    if not _miss:
+                        continue
+                    _say = [
+                        f"`{_x}`"
+                        if _CODE_IDENT_RE.fullmatch(_x)
+                        else (f"«{_x}»" if _es else f"“{_x}”")
+                        for _x in _miss[:2]
+                    ]
+                    # "Sin verificar … de A ni de B"; "Lo que dice de A y de B".
+                    _t = (" ni de " if _es else " and of ").join(_say)
+                    _t_tail = (" y de " if _es else " and of ").join(_say)
+                    if _tail.format(t=_t_tail).strip() in _l:
+                        continue
+                    _bullet = re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", _s)
+                    _pre = _bullet.group(0) if _bullet else ""
+                    _head_m = _CONFIRMS_HEAD_RE.match(_s[len(_pre) :])
+                    if _head_m:
+                        _pieces[_j] = (
+                            _pre
+                            + _lead.format(t=_t)
+                            + _s[len(_pre) + _head_m.end() :]
+                        )
+                    else:
+                        _end = _s.rstrip()
+                        _pieces[_j] = (
+                            _end
+                            + ("" if _end.endswith((".", "!", "?")) else ".")
+                            + _tail.format(t=_t_tail)
+                        )
+                    _named += _miss[:2]
+                _lines[_i] = "".join(_pieces)
+            if not _named:
+                return outline
+            self._f._bump_turn_metric("evidence_hedged", len(_named))
+            self._f._log_debug(
+                "🤖 Outline: the evidence section presented as confirmed what no "
+                f"check this turn confirmed ({', '.join(_named[:4])}) — said "
+                "unverified"
+            )
+            return "\n".join(_lines)
+        except Exception:
+            return outline
+
     def _lead_with_settled_answer(self, outline: str, lang: str) -> str:
         """
         Make the outline's conclusion answer yes or no as the index settled.
@@ -41173,12 +41435,20 @@ class AgenticOrchestrator:
                 # A verify step runs the static verifier and a present step
                 # pastes an artifact: neither renders a focus, so bodies and
                 # broker answers attached to one were never shown — two of
-                # round 15's five broker answers.
+                # round 15's five broker answers. Nor does a hypothesize step
+                # under the serial method, which skips the executor for the
+                # forge, and the forge is given the question: round 25's
+                # third turn asked for _split_turn_context, the line that
+                # decides what the census counts, and attached to step 2 it
+                # reached no step that makes claims. Rounds 10-25 sent 15
+                # of their 110 requests to one.
+                _no_focus = ("verify", "present") + (
+                    ("hypothesize",)
+                    if bool(getattr(self._f.valves, "agentic_serial_method", False))
+                    else ()
+                )
                 for _s in plan.steps[idx + 1 :]:
-                    if _s.status in ("", "pending") and _s.kind not in (
-                        "verify",
-                        "present",
-                    ):
+                    if _s.status in ("", "pending") and _s.kind not in _no_focus:
                         _next_step = _s
                         break
                 # Partitioned, not counted: a gap naming a symbol is
@@ -41921,6 +42191,9 @@ class AgenticOrchestrator:
                     self._f._answer_outline, _lang
                 )
                 self._f._answer_outline = self._lead_with_settled_answer(
+                    self._f._answer_outline, _lang
+                )
+                self._f._answer_outline = self._hedge_unbacked_evidence(
                     self._f._answer_outline, _lang
                 )
             except Exception as _e_ol:
@@ -77459,6 +77732,8 @@ class Filter:
         ("tests_shown_run", 0),
         ("tests_shown_failed", 0),
         ("conclusion_hedged", 0),
+        ("evidence_hedged", 0),
+        ("answer_notes_scrubbed", 0),
         ("contradictions_symbol", 0),
         ("contradictions_subject", 0),
         ("outlet_missing", 0),
@@ -77474,6 +77749,7 @@ class Filter:
     _OUTLET_TURN_METRICS = (
         "answer_names_misspelt",
         "answer_names_unknown",
+        "answer_notes_scrubbed",
         "proceed_nothing_generative",
     )
 
@@ -80362,6 +80638,66 @@ class Filter:
         except Exception as _e_ord:
             self._log_debug(f"[SECTION-ORDER] audit skipped ({_e_ord!r})")
 
+    async def _seal_live_answer(self, body: dict, emitter: Any) -> None:
+        """Take the workspace out of the answer the reader sees.
+
+        Round 26's third answer copied the end of its prompt after its last
+        section, notes and all: "[WORKSPACE NOTE — not part of your answer]
+        YOUR STATS SECTION", "BEFORE YOU CLOSE" and its instructions, "NOT
+        ESTABLISHED THIS TURN", and "HOW YOUR ANSWER OPENS" with the opening
+        again. The history scrub (_scrub_history_answer) took it out of what
+        the next turn read; the reader kept it. So did the repairs above:
+        OpenWebUI discards the outlet's edits to body["messages"], so the
+        glued-fence repair and the scaffolding guard changed only the copy
+        the audits read.
+
+        Here the live answer loses its notes, its echoed directives and a
+        repeated cycle (_scrub_history_answer, live), and when it differs
+        from what the model streamed — by this or by those repairs — the
+        reader's copy is replaced with it through the outlet's emitter
+        ({"type": "replace"}), before anything is appended. The record and
+        the seals after this one still edit only the body, as before. Never
+        raises.
+        """
+        try:
+            _last = next(
+                (
+                    m
+                    for m in reversed(body.get("messages") or [])
+                    if isinstance(m, dict) and m.get("role") == "assistant"
+                ),
+                None,
+            )
+            if _last is None or not isinstance(_last.get("content"), str):
+                return
+            _new, _c = _scrub_history_answer(_last["content"], live=True)
+            _n = _c["notes"] + _c["echoes"] + _c["repeat"]
+            if _n and _new.strip():
+                _last["content"] = _new
+                self._bump_turn_metric("answer_notes_scrubbed", _n)
+            _was = getattr(self, "_streamed_answer", None)
+            if _was is None or _last["content"] == _was:
+                return
+            _what = (
+                f"{_c['notes']} note(s), {_c['echoes']} echoed directive(s)"
+                + (", a repeated cycle" if _c["repeat"] else "")
+                if _n
+                else "the repairs above"
+            )
+            if not emitter:
+                self._log_debug(
+                    f"[OUTLET-SCRUB] not sent (no event emitter) — the reader "
+                    f"still sees what was taken out: {_what}"
+                )
+                return
+            await emitter({"type": "replace", "data": {"content": _last["content"]}})
+            self._log_debug(
+                f"[OUTLET-SCRUB] the reader's copy replaced — {_what} taken out "
+                f"({len(_was) - len(_last['content'])} chars)"
+            )
+        except Exception as _e:
+            self._log_debug(f"[OUTLET-SCRUB] skipped ({_e!r})")
+
     def _seal_fallback_bodies(self, body: dict) -> None:
         """Replace a section fallback body the answer printed as its text
         (_replace_fallback_bodies): round 13's P4 showed "Muestra el código
@@ -81324,6 +81660,21 @@ class Filter:
         self._outlet_turns = self._inlet_turns
         start_time = time.monotonic()
         self._log_section("CONTEXT MANAGER - OUTLET START")
+        # As the model streamed it, before the repairs below: what the
+        # reader has on screen (_seal_live_answer).
+        try:
+            self._streamed_answer = next(
+                (
+                    str(m.get("content"))
+                    for m in reversed(body.get("messages") or [])
+                    if isinstance(m, dict)
+                    and m.get("role") == "assistant"
+                    and isinstance(m.get("content"), str)
+                ),
+                None,
+            )
+        except Exception:
+            self._streamed_answer = None
 
         if not (HAS_SENTENCE and HAS_CHROMA and self.valves.enable_code_awareness):
             self._log_debug("outlet: prerequisites not met, returning body unchanged")
@@ -81430,6 +81781,7 @@ class Filter:
         # turn), so a later non-pipeline turn cannot inherit a stale
         # record from an earlier question.
         # ------------------------------------------------------------------
+        await self._seal_live_answer(body, __event_emitter__)
         _tests_note = ""
         try:
             _rec = getattr(self, "_serial_investigation_record", "")
